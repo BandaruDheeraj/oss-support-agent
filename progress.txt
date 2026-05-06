@@ -1,0 +1,12 @@
+# Ralph Progress Log
+Started: 2026-05-06
+Project: OSS Autonomous Fix Loop
+---
+2026-05-06: PRD initialized with 19 user stories across 4 implementation phases
+  Phase 1 (core pipeline, no email): US-001 .. US-009
+  Phase 2 (email loop):              US-011 .. US-013
+  Phase 3 (full sandbox + retries):  US-015 .. US-017
+  Phase 4 (hardening):               US-018, US-019
+  Plus: US-010 docs agent (fast path), US-014 build agent.
+  Next: start at US-001 (manifest loader + schema).
+---

@@ -1,0 +1,306 @@
+{
+  "project": "OSS Autonomous Fix Loop",
+  "description": "A repo-agnostic autonomous agent harness that triages open source GitHub issues, runs a human-in-the-loop design review via email, and ships verified fixes as PRs from a fork. Agents never write directly to upstream — the only path is a reviewed PR from a fork. Configured per-repo via a manifest. See plan/PRD v0.1 (May 2026).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Repo manifest loader and schema",
+      "description": "As an operator, I need a manifest schema and loader so the orchestrator can configure itself per-repo without code changes. Manifest fields: repo, trigger_label (default agent-fix), fork_org, branch_prefix (default agent/scope-), test_command, approval_keywords, pm_email, issue_types, sandbox_services, max_retries (default 3), skip_pm_gate.",
+      "acceptanceCriteria": [
+        "Manifest schema defined (JSON Schema or equivalent) covering every field in PRD section 3.1",
+        "Loader reads a YAML or JSON manifest from a configurable path and validates against the schema",
+        "Defaults applied when fields are omitted (trigger_label=agent-fix, branch_prefix=agent/scope-, max_retries=3)",
+        "Invalid manifests fail fast with a clear, field-level error message",
+        "Example manifest from PRD section 3.2 (Arize-ai/openinference) loads and validates successfully",
+        "Unit tests cover: valid manifest, missing required field, invalid types, defaults applied"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "Orchestrator state machine and persistence",
+      "description": "As the system, I need a central state machine that owns full pipeline state for an issue group so runs can survive restarts and resume from the last completed stage. States: TRIGGERED, TRIAGING, PM_SCORING, EMAIL_PENDING, SWEEP_PENDING, FORKING, AGENT_RUNNING, SANDBOX_RUNNING, EVAL_RUNNING, PR_OPEN, FAILED, SKIPPED.",
+      "acceptanceCriteria": [
+        "State machine implemented with all 12 states from PRD section 7.2 and explicit allowed transitions",
+        "Run state persisted to SQLite (single-machine default) with schema migrations",
+        "On restart, in-flight runs resume from their last persisted state",
+        "Illegal transitions raise an error and do not mutate state",
+        "Each state transition is logged with timestamp, run_id, and prior/new state",
+        "Unit tests cover happy path, restart-resume, and illegal transition rejection"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "GitHub webhook listener and event router",
+      "description": "As the system, I need to receive GitHub issue.opened and issue.labeled events and dispatch them into the orchestrator after looking up the matching repo manifest.",
+      "acceptanceCriteria": [
+        "HTTP endpoint accepts GitHub webhook POSTs and verifies the X-Hub-Signature-256 HMAC",
+        "Handles issue.opened and issue.labeled events; ignores all other event types",
+        "Looks up the manifest for the source repo; events for repos with no manifest enter SKIPPED state",
+        "Events without the trigger_label (or skip_pm_gate label) are ignored on issue.labeled",
+        "Creates a new orchestrator run in TRIGGERED state and returns 202 Accepted within 1 second",
+        "Webhook secret is read from environment, never logged",
+        "Integration test sends a signed payload and verifies a run is created"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "Triage agent",
+      "description": "As the orchestrator, I need a triage agent that classifies an issue (bug_fix / new_feature / docs), identifies the affected module, and emits a confidence score and one-sentence summary so downstream agents have structured context.",
+      "acceptanceCriteria": [
+        "Inputs: issue title, body, labels, author; manifest module taxonomy; shallow repo tree (top two directory levels)",
+        "Outputs: issue_type in {bug_fix, new_feature, docs}, affected_module path, confidence float 0-1, summary string",
+        "Confidence below 0.6 posts a clarification comment on the issue and halts the run pending a reply",
+        "Routes bug_fix and new_feature to PM agent; routes docs to docs agent (fast path); routes skip_pm_gate label directly to fork creation",
+        "Triage completes in under 90 seconds for a typical issue",
+        "Unit tests with fixture issues cover each issue_type, low-confidence path, and skip_pm_gate path"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "PM agent design scoring (no email yet)",
+      "description": "As the orchestrator (Phase 1), I need a PM agent that scores design complexity and auto-routes based on the score, so the core pipeline can run end-to-end before the email loop is built.",
+      "acceptanceCriteria": [
+        "Searches all open issues for the same module / error pattern / API surface",
+        "Reads the last 30 merged PRs touching the affected module",
+        "Reads relevant spec or design docs in the repo",
+        "Emits design_needed boolean and a reasoning summary",
+        "Heuristics from PRD section 4.2: new/changed public API, >=3 related open issues, intentional-but-contested behaviour, change spans >2 modules, or title/body contains 'rethink', 'redesign', 'breaking', 'architecture' all set design_needed=true",
+        "In Phase 1 mode, design_needed=true auto-routes to FAILED with a 'design needed - email loop not yet implemented' note; design_needed=false routes to FORKING",
+        "Unit tests cover each scoring heuristic"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "Fork creation and branch management",
+      "description": "As the orchestrator, I need to fork the upstream repo into fork_org and create a deterministically named branch per issue group, so all agent writes are isolated from upstream.",
+      "acceptanceCriteria": [
+        "One fork per confirmed issue group (not per issue), created under fork_org via the GitHub API",
+        "If a fork already exists for fork_org/repo, sync it with upstream main before branching",
+        "Branch name format: {branch_prefix}{issue-ids-sorted-numerically}, e.g. agent/scope-142-156-203",
+        "If the branch already exists, reset it to fork main (treated as a retry)",
+        "No agent ever receives a token with write access to upstream",
+        "Integration test against a sandbox upstream repo creates a fork, branches deterministically, and reuses the existing fork on a second run"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "Fix agent operating on the fork branch",
+      "description": "As the orchestrator, I need a fix agent that patches existing code on the fork branch given the agreed design and confirmed issue list as context.",
+      "acceptanceCriteria": [
+        "Receives: agreed design summary, confirmed issue list, affected module source, existing tests for the module, last 20 commits for the module",
+        "Reads the full module before making any changes",
+        "Makes only targeted changes within the issue scope; does not refactor unrelated code",
+        "Writes or updates tests for every code change",
+        "Commits with message format: fix({module}): {one-line summary} — closes #{issue_ids}",
+        "All writes go to the fork branch only; verified by the GitHub token scope used"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "Basic sandbox runner (test suite only)",
+      "description": "As the orchestrator (Phase 1), I need a sandbox runner that executes the manifest test_command on the fork branch via GitHub Actions and captures stdout/stderr/exit code, so fixes are verified before a PR is opened.",
+      "acceptanceCriteria": [
+        "Triggered via workflow_dispatch on the fork using the GitHub API",
+        "Runs test_command from the manifest; captures stdout, stderr, and exit code",
+        "Sandbox has no external network access except sandbox_services declared in the manifest",
+        "Each run is fully isolated; fork branch is checked out fresh; no state persists between runs",
+        "Sandbox run duration capped at 15 minutes (configurable per manifest)",
+        "Outputs are made available to the eval agent as structured artifacts"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "Eval agent (pass/fail) and PR creation",
+      "description": "As the orchestrator (Phase 1), I need an eval agent that produces a pass/fail verdict from sandbox outputs and, on pass, opens a PR from the fork to upstream so a human reviewer can merge.",
+      "acceptanceCriteria": [
+        "Eval agent emits: overall_pass, per_issue_verdict map, regression_detected (false in Phase 1), retry_context (if failing), pr_summary",
+        "On overall_pass=true, opens a PR from fork branch to upstream default branch",
+        "PR title format: [agent-fix] {one-line summary from eval agent}",
+        "PR body includes: agreed design summary, grouped issues with per-issue verdict, link to sandbox run logs",
+        "Labels applied: agent-fix plus one label per issue type addressed; reviewers are NOT auto-assigned",
+        "On overall_pass=false, run transitions to AGENT_RUNNING for retry up to max_retries (no eval context injection yet — that lands in Phase 3)",
+        "After max_retries exceeded, transitions to FAILED"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "Docs agent (fast path)",
+      "description": "As the orchestrator, I need a docs agent that handles issues classified as docs without going through the PM gate, so trivial documentation fixes ship quickly.",
+      "acceptanceCriteria": [
+        "Triggered directly from triage when issue_type=docs",
+        "Updates documentation, READMEs, and specs only — never application code",
+        "Commits with message format: docs: {one-line summary} — closes #{issue_ids}",
+        "Routes to the same sandbox + eval + PR flow as the fix agent",
+        "Skips PM agent entirely"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "Gmail MCP integration (send + watcher)",
+      "description": "As the PM agent (Phase 2), I need to send and receive email through the Gmail MCP so design conversations can run end-to-end through the user's existing inbox.",
+      "acceptanceCriteria": [
+        "Send: PM agent posts emails via Gmail MCP with subject [agent-fix] {repo}/{issue_number}: {issue_title}",
+        "Reply-to header points to a monitored address that routes back to the orchestrator",
+        "Watcher polls Gmail MCP every 60 seconds for unread replies on threads with the [agent-fix] subject prefix",
+        "On reply detected: extracts body, appends to conversation history, wakes the PM agent for that run",
+        "Approval keyword detection: case-insensitive substring match against manifest approval_keywords",
+        "Threading: same subject and thread ID maintained across the full conversation for one issue group",
+        "Unit tests cover send, poll, approval detection (positive + negative)"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "PM agent email conversation loop",
+      "description": "As the user, I want a multi-turn email design conversation with the PM agent until I send an approval keyword, so I can shape the design before any code is written.",
+      "acceptanceCriteria": [
+        "Initial design brief sent within 5 minutes of a design_needed=true score",
+        "Brief contains all 6 fields from PRD section 5.2: issue summary, affected module, related open issues, recent PR context, 2-3 proposed approach options with tradeoffs, open questions",
+        "On each user reply, PM agent re-reads full thread history and responds within 60 seconds",
+        "PM agent never restates resolved decisions — only surfaces what is still unresolved",
+        "Loop exits when a reply contains any approval keyword from the manifest",
+        "Run state EMAIL_PENDING persists across orchestrator restarts"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "Issue sweep and scope confirmation",
+      "description": "As the user, after I approve a design I want a single email proposing the full set of related open issues this design closes, so I can confirm the scope before a fork is created.",
+      "acceptanceCriteria": [
+        "After approval, PM agent searches all open issues against the agreed design",
+        "Produces two groups: high_confidence (design directly closes) and maybe_in_scope (partial overlap), each with one-sentence reasons",
+        "Sends scope confirmation email per PRD section 5.3 format with instruction to reply with final issue numbers or 'all'",
+        "Parser handles freeform prose replies (e.g. 'include 142 and 156 but drop 201') and 'all'",
+        "Confirmed list is passed to the orchestrator as the scope for fork creation",
+        "Run state SWEEP_PENDING persists across restarts"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "Build agent for new_feature scaffolding",
+      "description": "As the orchestrator, I need a build agent that scaffolds new modules or features mirroring existing patterns in the repo, so new_feature issues are handled distinctly from bug fixes.",
+      "acceptanceCriteria": [
+        "Receives: agreed design, confirmed issue list, two most similar existing modules (identified by triage), CONTRIBUTING.md or equivalent if present",
+        "Mirrors structure of reference modules; does not invent new patterns",
+        "Creates module file, test file, and updates any index/registry files the repo uses",
+        "Does not update external documentation — defers to a follow-up docs agent pass",
+        "Commits with message format: feat({module}): {one-line summary} — closes #{issue_ids}"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "Usability agent",
+      "description": "As a maintainer, I want a usability agent that exercises the change as a real user would, so PRs surface developer-experience problems that tests miss.",
+      "acceptanceCriteria": [
+        "Installs the changed package fresh in the sandbox",
+        "Exercises the affected API as a new user would (import paths, error messages, common workflows)",
+        "Reports on developer experience, not just pass/fail",
+        "Output is structured and consumed by the eval agent and PR body",
+        "Runs in the same isolated sandbox as the test suite"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "Regression guard (upstream main diff)",
+      "description": "As a maintainer, I want a regression guard that diffs observable behaviour of the fork branch against upstream main, so any behavioural change is flagged before the PR is opened.",
+      "acceptanceCriteria": [
+        "Checks out upstream main in a parallel sandbox job",
+        "Runs the same shared test cases on both fork branch and upstream main",
+        "Diffs observable outputs and flags any change",
+        "Eval agent sets regression_detected=true if any change is found",
+        "Regression details appear in the PR body and per-issue verdicts"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "Retry loop with eval context injection",
+      "description": "As the orchestrator, I need to feed eval retry_context back into the fix or build agent on failure so the agent can correct its own mistakes up to max_retries.",
+      "acceptanceCriteria": [
+        "On overall_pass=false, eval agent emits structured retry_context summarising what failed",
+        "Orchestrator re-dispatches the fix or build agent with retry_context appended to its inputs",
+        "Retries up to manifest max_retries (default 3)",
+        "Retry count is visible in the PR body when the run eventually succeeds",
+        "After max_retries exceeded: emails the user with full retry_context from all attempts, labels the upstream issue agent-failed, preserves the fork branch, transitions to FAILED"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "Manifest validation, schema versioning, and multi-repo support",
+      "description": "As an operator, I need manifest schema versioning and multi-repo support so I can evolve the manifest without breaking existing configured repos and coordinate runs that span multiple repos.",
+      "acceptanceCriteria": [
+        "Manifests declare a schema_version; loader rejects unknown versions with a clear message",
+        "Migration path documented for breaking schema changes",
+        "Multi-repo manifest support: one logical issue scope can map to coordinated runs across two or more repos",
+        "Cross-repo runs share a single email thread and a single eval verdict",
+        "Tests cover: old version rejection, multi-repo dispatch, single-thread email aggregation"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "Cost guardrails, fork cleanup, and run history dashboard",
+      "description": "As an operator, I need a per-run token/cost cap, a fork cleanup policy, and a run history view so the system is operable in production.",
+      "acceptanceCriteria": [
+        "Per-run token and cost cap configurable in the manifest; on breach the run halts and the user is emailed with the partial state",
+        "Fork cleanup policy configurable: immediate-after-merge | delayed | never; default delayed-after-merge",
+        "Run history dashboard (CLI or minimal web view) lists runs with state, duration, retry count, cost",
+        "Test coverage exists across all four scenario types from PRD section 8.1 (simple bug fix, feature with design, retry success, max retries exceeded)"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
