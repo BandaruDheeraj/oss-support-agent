@@ -855,3 +855,9 @@ Project: OSS Autonomous Fix Loop
   - Added unit tests core/introspection-email-loop.test.ts covering: first-reply approval, two-revision-then-approval, max-iterations exceeded, persisted-state resume, quoted-text approval false-positive guard.
   Verified: npm test -- --runTestsByPath core/introspection-email-loop.test.ts; npm run build
 ---
+2026-05-07: US-107 Introspection orchestration and activation — DONE
+  - Added core/agents/introspection-orchestration.ts implementing runIntrospection orchestration: per-repo serialization (in-flight promise lock), gather->draft->approval loop->writeAdapterFiles->addGitHubLabels, rollback of newly written configs on label failure, activation logging, and optional triggering-event re-queue.
+  - Added writeAdapterFiles(force) + rollbackWrittenAdapterFiles helpers and idempotent addGitHubLabels.
+  - Added unit tests core/agents/introspection-orchestration.test.ts covering happy path, partial-failure rollback, concurrent queueing, re-queue verification, and idempotent label creation.
+  Verified: tsc --noEmit; jest --runInBand --runTestsByPath core/agents/introspection-orchestration.test.ts
+---

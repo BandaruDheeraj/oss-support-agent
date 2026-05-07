@@ -145,8 +145,8 @@
         "Unit tests cover: full happy path, partial-failure rollback (file written but labels failed), concurrent-event queueing, re-queue verification, idempotent label creation"
       ],
       "priority": 7,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented introspection orchestration + activation in core/agents/introspection-orchestration.ts: runIntrospection serializes per-repo execution (in-flight promise lock), runs gatherRepoSignals -> generateDraftAdapter -> approval loop -> writeAdapterFiles -> addGitHubLabels, rolls back newly-written configs on label failure, logs activation, and can re-queue the triggering event. Added writeAdapterFiles(force) + rollback helper and idempotent addGitHubLabels. Added Jest unit tests (core/agents/introspection-orchestration.test.ts) covering happy path, rollback on partial failure, concurrency queueing, event re-queue, and idempotent label creation. Verified: tsc --noEmit; jest --runInBand --runTestsByPath core/agents/introspection-orchestration.test.ts."
     },
     {
       "id": "US-108",
