@@ -24,26 +24,27 @@ import * as path from 'path';
 import { verifySignature } from '../core/webhook/signature';
 import type { IssueEvent } from '../core/webhook/types';
 import { loadAdapter } from '../core/adapter-loader';
-import { runTriage } from '../core/agents/triage';
-import type { TriageInput } from '../core/agents/triage-types';
-import { createDefaultTriageClassifier } from '../core/llm/openrouter-triage-classifier';
 
 import { FsManifestRegistry } from './clients/manifest-registry';
-import { GitHubIssueCommenter } from './clients/github-rest';
+import { runPipeline, defaultWorkspaceRoot } from './run-pipeline';
 
 interface RequiredEnv {
   GITHUB_TOKEN: string;
   WEBHOOK_SECRET: string;
+  DEFAULT_FORK_ORG: string;
 }
 
 interface OptionalEnv {
   PORT: number;
   OPENROUTER_API_KEY: string | undefined;
   REPO_ROOT: string;
+  WORKSPACE_ROOT: string;
+  GIT_AUTHOR_NAME: string;
+  GIT_AUTHOR_EMAIL: string;
 }
 
 function loadEnv(): RequiredEnv & OptionalEnv {
-  const required = ['GITHUB_TOKEN', 'WEBHOOK_SECRET'];
+  const required: Array<keyof RequiredEnv> = ['GITHUB_TOKEN', 'WEBHOOK_SECRET', 'DEFAULT_FORK_ORG'];
   for (const name of required) {
     if (!process.env[name] || process.env[name]!.trim() === '') {
       // eslint-disable-next-line no-console
@@ -62,27 +63,21 @@ function loadEnv(): RequiredEnv & OptionalEnv {
   return {
     GITHUB_TOKEN: process.env.GITHUB_TOKEN!,
     WEBHOOK_SECRET: process.env.WEBHOOK_SECRET!,
+    DEFAULT_FORK_ORG: process.env.DEFAULT_FORK_ORG!,
     PORT: port,
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
     REPO_ROOT: process.env.REPO_ROOT ?? process.cwd(),
+    WORKSPACE_ROOT: process.env.WORKSPACE_ROOT ?? defaultWorkspaceRoot(),
+    GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? 'oss-support-agent',
+    GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? 'agent@users.noreply.github.com',
   };
 }
 
-function buildTriageInput(
-  payload: IssueEvent,
-  triggerLabel: string | undefined,
-  skipPmGateLabel: string | undefined
-): TriageInput {
-  const labels = (payload.issue.labels ?? []).map((l) => l.name);
-  return {
-    number: payload.issue.number,
-    title: payload.issue.title ?? '',
-    body: payload.issue.body ?? '',
-    labels,
-    author: payload.issue.user?.login ?? 'unknown',
-    repoTree: [],
-    hasSkipPmGate: !!skipPmGateLabel && labels.includes(skipPmGateLabel),
-    url: `https://github.com/${payload.repository.full_name}/issues/${payload.issue.number}`,
+function buildLog(repoFullName: string): (msg: string) => void {
+  return (msg: string) => {
+    const ts = new Date().toISOString();
+    // eslint-disable-next-line no-console
+    console.log(`${ts} ${repoFullName} ${msg}`);
   };
 }
 
@@ -90,8 +85,7 @@ async function processIssueEvent(
   payload: IssueEvent,
   eventType: string,
   registry: FsManifestRegistry,
-  commenter: GitHubIssueCommenter,
-  repoRoot: string
+  env: ReturnType<typeof loadEnv>
 ): Promise<{ status: number; body: any }> {
   if (eventType !== 'issues') {
     return { status: 200, body: { status: 'ignored', reason: `event=${eventType}` } };
@@ -102,6 +96,7 @@ async function processIssueEvent(
   if (!repoFullName) {
     return { status: 400, body: { error: 'Missing repository.full_name' } };
   }
+  const log = buildLog(repoFullName);
 
   if (!['opened', 'labeled'].includes(action)) {
     return { status: 200, body: { status: 'ignored', reason: `action=${action}` } };
@@ -109,15 +104,14 @@ async function processIssueEvent(
 
   const manifest = registry.getManifest(repoFullName);
   if (!manifest) {
-    log(repoFullName, `[skip] no manifest at configs/${repoFullName}/manifest.yaml`);
-    log(repoFullName, '       run introspection offline before live mode can process this repo');
+    log(`[skip] no manifest at configs/${repoFullName}/manifest.yaml`);
+    log('       run introspection offline before live mode can process this repo');
     return {
       status: 202,
       body: { status: 'skipped', reason: 'manifest-not-found-introspection-not-wired' },
     };
   }
 
-  // Honour trigger_label / skip_pm_gate_label gating for "labeled" events.
   if (action === 'labeled') {
     const labelName = (payload as any).label?.name;
     if (
@@ -131,13 +125,12 @@ async function processIssueEvent(
     }
   }
 
-  log(repoFullName, `[issue#${payload.issue.number}] ${action}: "${payload.issue.title}"`);
+  log(`[issue#${payload.issue.number}] ${action}: "${payload.issue.title}"`);
 
-  // Load the adapter. Block introspection in live mode.
   let adapter;
   try {
     adapter = await loadAdapter(repoFullName, {
-      repoRoot,
+      repoRoot: env.REPO_ROOT,
       runIntrospection: async () => {
         throw new Error(
           `Live mode does not run introspection. Run it offline for ${repoFullName} first.`
@@ -145,55 +138,42 @@ async function processIssueEvent(
       },
     });
   } catch (err: any) {
-    log(repoFullName, `[error] adapter load failed: ${err?.message ?? err}`);
+    log(`[error] adapter load failed: ${err?.message ?? err}`);
     return { status: 500, body: { status: 'error', reason: 'adapter-load-failed' } };
   }
 
-  // Triage.
-  const input = buildTriageInput(payload, manifest.trigger_label, manifest.skip_pm_gate_label);
-  const classifier = createDefaultTriageClassifier();
-
-  let routing;
-  try {
-    routing = await runTriage(repoFullName, payload.issue.number, input, adapter, commenter, {
-      typeClassifier: classifier,
+  // Fire-and-log the pipeline. We respond 202 immediately so GitHub doesn't time out
+  // the webhook delivery; the actual run continues in the background.
+  void runPipeline({
+    payload,
+    manifest,
+    adapter,
+    deps: {
+      token: env.GITHUB_TOKEN,
+      forkOrg: env.DEFAULT_FORK_ORG,
+      workspaceRoot: env.WORKSPACE_ROOT,
+      authorName: env.GIT_AUTHOR_NAME,
+      authorEmail: env.GIT_AUTHOR_EMAIL,
+      log,
+    },
+  })
+    .then((result) => {
+      log(`[pipeline] complete: ${JSON.stringify(result)}`);
+    })
+    .catch((err: any) => {
+      log(`[pipeline] FATAL: ${err?.message ?? err}`);
+      if (err?.stack) log(err.stack);
     });
-  } catch (err: any) {
-    log(repoFullName, `[error] triage failed: ${err?.message ?? err}`);
-    return { status: 500, body: { status: 'error', reason: 'triage-failed' } };
-  }
-
-  log(
-    repoFullName,
-    `[triage] action=${routing.action} type=${routing.result.issueType} ` +
-      `module=${routing.result.affectedModule} confidence=${routing.result.confidence.toFixed(2)}`
-  );
-
-  // Phase 1 stops here. Subsequent stages are TODO.
-  log(repoFullName, '[todo] PM agent / fork / fix / build / sandbox / eval / PR — not yet wired in live mode');
 
   return {
     status: 202,
-    body: {
-      status: 'accepted',
-      action: routing.action,
-      issueType: routing.result.issueType,
-      affectedModule: routing.result.affectedModule,
-      confidence: routing.result.confidence,
-    },
+    body: { status: 'accepted', message: 'pipeline running in background; see server logs' },
   };
-}
-
-function log(repoFullName: string, msg: string): void {
-  const ts = new Date().toISOString();
-  // eslint-disable-next-line no-console
-  console.log(`${ts} ${repoFullName} ${msg}`);
 }
 
 function startServer(): void {
   const env = loadEnv();
   const registry = new FsManifestRegistry(env.REPO_ROOT);
-  const commenter = new GitHubIssueCommenter(env.GITHUB_TOKEN);
 
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
@@ -231,13 +211,7 @@ function startServer(): void {
       }
 
       try {
-        const result = await processIssueEvent(
-          payload,
-          eventType,
-          registry,
-          commenter,
-          env.REPO_ROOT
-        );
+        const result = await processIssueEvent(payload, eventType, registry, env);
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.body));
       } catch (err: any) {
@@ -254,6 +228,10 @@ function startServer(): void {
     console.log(`[server] oss-support-agent webhook listening on :${env.PORT}`);
     // eslint-disable-next-line no-console
     console.log(`[server] repo root: ${path.resolve(env.REPO_ROOT)}`);
+    // eslint-disable-next-line no-console
+    console.log(`[server] workspace root: ${path.resolve(env.WORKSPACE_ROOT)}`);
+    // eslint-disable-next-line no-console
+    console.log(`[server] fork org: ${env.DEFAULT_FORK_ORG}`);
     // eslint-disable-next-line no-console
     console.log(
       `[server] LLM: ${env.OPENROUTER_API_KEY ? 'OpenRouter (real)' : 'heuristic (no OPENROUTER_API_KEY)'}`

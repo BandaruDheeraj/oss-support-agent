@@ -6,3 +6,6 @@ dist/
 *.map
 src/manifest/__tests__/fixtures/
 src/_write_test*.tmp
+data/workspaces/
+data/state/
+data/inbox/
