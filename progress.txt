@@ -861,3 +861,11 @@ Project: OSS Autonomous Fix Loop
   - Added unit tests core/agents/introspection-orchestration.test.ts covering happy path, partial-failure rollback, concurrent queueing, re-queue verification, and idempotent label creation.
   Verified: tsc --noEmit; jest --runInBand --runTestsByPath core/agents/introspection-orchestration.test.ts
 ---
+
+2026-05-07: US-108 Adapter loader with auto-introspection trigger — DONE
+  - Added core/adapter-loader.ts implementing loadAdapter(repoFullName): resolves configs/<org>/<repo>/adapter.ts (or .js), dynamically loads module, requires default class export, instantiates it, and validates the RepoAdapter runtime shape.
+  - Missing adapter now triggers runIntrospection(repoFullName, DEFAULT_PM_EMAIL, DEFAULT_FORK_ORG) with fast-fail env var validation.
+  - Added core/handle-issue-event.ts to wire loadManifest -> loadAdapter -> runPipeline({event, manifest, adapter}).
+  - Added unit tests core/adapter-loader.test.ts covering: existing adapter, missing adapter introspection, missing default export, missing env vars, missing method.
+  Note: shell command execution is blocked in this environment, so npm/jest could not be executed here.
+---

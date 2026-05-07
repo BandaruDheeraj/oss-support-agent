@@ -40,3 +40,13 @@ export type {
   GitHubIssue,
   WebhookResult,
 } from './webhook';
+
+export {
+  loadAdapter,
+  AdapterContractError,
+  AdapterBootstrapEnvError,
+} from './adapter-loader';
+export type { AdapterContractViolationCode } from './adapter-loader';
+
+export { handleIssueEvent } from './handle-issue-event';
+export type { RunPipeline } from './handle-issue-event';
