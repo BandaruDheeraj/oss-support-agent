@@ -1,0 +1,60 @@
+services:
+  - type: web
+    name: oss-support-agent
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    autoDeploy: true
+
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+
+    healthCheckPath: /healthz
+
+    # Single instance only. The Gmail watcher keeps an in-memory cursor and
+    # dual replicas would race / double-process replies.
+    numInstances: 1
+
+    disk:
+      name: state
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: STATE_ROOT
+        value: /var/data/state
+      - key: WORKSPACE_ROOT
+        value: /var/data/workspaces
+
+      # Required — set these in the Render dashboard (mark as secret)
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: DEFAULT_FORK_ORG
+        sync: false
+
+      # Optional — required only for live PM design loop / introspection
+      - key: GMAIL_CLIENT_ID
+        sync: false
+      - key: GMAIL_CLIENT_SECRET
+        sync: false
+      - key: GMAIL_REFRESH_TOKEN
+        sync: false
+      - key: GMAIL_USER_EMAIL
+        sync: false
+      - key: REPLY_TO_ADDRESS
+        sync: false
+
+      # Optional — falls back to heuristic LLM if absent
+      - key: OPENROUTER_API_KEY
+        sync: false
+
+      # Optional — git author for fix commits
+      - key: GIT_AUTHOR_NAME
+        value: oss-support-agent
+      - key: GIT_AUTHOR_EMAIL
+        value: agent@users.noreply.github.com
