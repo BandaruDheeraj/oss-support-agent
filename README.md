@@ -42,3 +42,14 @@ These are included on all OpenRouter requests.
 
 `core/` must never import from `configs/`. This is enforced by `npm run lint`.
 `configs/` may import from `core/` (typically from `core/adapter.interface.ts`).
+
+## Onboarding a new repo (US-112)
+
+High-level flow:
+1. Ensure defaults are set: `DEFAULT_PM_EMAIL` and `DEFAULT_FORK_ORG`.
+2. Trigger introspection either by:
+   - adding the repo to an operator watched list and running `bootstrapWatchedRepos()`, or
+   - labeling an issue with the trigger label (default `agent-fix`) and letting the handler call introspection when `configs/<org>/<repo>/manifest.yaml` is missing.
+3. Introspection generates `configs/<org>/<repo>/{manifest.yaml,adapter.ts}`.
+4. Required labels are created on the upstream repo (`agent-fix`, `trivial-fix`, `agent-failed`, `needs-design`).
+5. The original issue event is re-processed through the normal pipeline now that the adapter/manifest exist.

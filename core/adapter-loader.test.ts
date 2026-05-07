@@ -171,4 +171,61 @@ describe('loadAdapter (US-108)', () => {
       await rmrf(root);
     }
   });
+
+  test('rejects adapter with synchronous method implementations', async () => {
+    const root = await makeTempRoot();
+    try {
+      const repo = 'acme/syncmethod';
+      const adapterPath = path.join(root, 'configs', 'acme', 'syncmethod', 'adapter.ts');
+
+      await writeFile(
+        adapterPath,
+        `export default class SyncAdapter {
+          // classifyModule is sync
+          classifyModule() { return '.'; }
+          async getTestCommands() { return []; }
+          async getSandboxServices() { return []; }
+          async runCustomEval() { return { passed: true, summary: 'ok', retryContext: [] }; }
+          async getPRMetadata() { return { extraLabels: [], extraBodySections: [] }; }
+        }\n`
+      );
+
+      await expect(loadAdapter(repo, { repoRoot: root })).rejects.toMatchObject({
+        name: 'AdapterContractError',
+        code: 'sync_method',
+        repoFullName: repo,
+        adapterPath,
+      } satisfies Partial<AdapterContractError>);
+    } finally {
+      await rmrf(root);
+    }
+  });
+
+  test('rejects unsafe classifyModule return values', async () => {
+    const root = await makeTempRoot();
+    try {
+      const repo = 'acme/badmodule';
+      const adapterPath = path.join(root, 'configs', 'acme', 'badmodule', 'adapter.ts');
+
+      await writeFile(
+        adapterPath,
+        `export default class BadModuleAdapter {
+          async classifyModule() { return '../secrets'; }
+          async getTestCommands() { return []; }
+          async getSandboxServices() { return []; }
+          async runCustomEval() { return { passed: true, summary: 'ok', retryContext: [] }; }
+          async getPRMetadata() { return { extraLabels: [], extraBodySections: [] }; }
+        }\n`
+      );
+
+      await expect(loadAdapter(repo, { repoRoot: root })).rejects.toMatchObject({
+        name: 'AdapterContractError',
+        code: 'invalid_classify_module',
+        repoFullName: repo,
+        adapterPath,
+      } satisfies Partial<AdapterContractError>);
+    } finally {
+      await rmrf(root);
+    }
+  });
 });

@@ -18,7 +18,9 @@ export type AdapterContractViolationCode =
   | 'adapter_not_found'
   | 'missing_default_export'
   | 'default_export_not_class'
-  | 'missing_method';
+  | 'missing_method'
+  | 'sync_method'
+  | 'invalid_classify_module';
 
 export class AdapterContractError extends Error {
   public readonly code: AdapterContractViolationCode;
@@ -84,6 +86,10 @@ function clearRequireCache(modulePath: string): void {
   }
 }
 
+function isPromiseLike(v: any): boolean {
+  return !!v && (typeof v === 'object' || typeof v === 'function') && typeof v.then === 'function';
+}
+
 function assertAdapterShape(adapter: any, repoFullName: string, adapterPath: string): asserts adapter is RepoAdapter {
   const requiredMethods: Array<keyof RepoAdapter> = [
     'classifyModule',
@@ -102,6 +108,56 @@ function assertAdapterShape(adapter: any, repoFullName: string, adapterPath: str
         adapterPath,
       });
     }
+  }
+}
+
+async function assertAdapterMethodsReturnPromises(adapter: any, repoFullName: string, adapterPath: string): Promise<void> {
+  const dummyIssue = { number: 0, title: '', body: '', labels: [] };
+  const calls: Array<{ name: keyof RepoAdapter; args: any[] }> = [
+    { name: 'classifyModule', args: [dummyIssue] },
+    { name: 'getTestCommands', args: [] },
+    { name: 'getSandboxServices', args: [] },
+    { name: 'runCustomEval', args: [[]] },
+    { name: 'getPRMetadata', args: [[]] },
+  ];
+
+  for (const c of calls) {
+    let ret: any;
+    try {
+      ret = adapter[c.name](...c.args);
+    } catch {
+      ret = null;
+    }
+
+    if (!isPromiseLike(ret)) {
+      throw new AdapterContractError({
+        message: `Adapter method ${String(c.name)} must be async (return a Promise)`,
+        code: 'sync_method',
+        repoFullName,
+        adapterPath,
+      });
+    }
+  }
+}
+
+function assertClassifyModuleIsSafe(modulePath: string, repoFullName: string, adapterPath: string): void {
+  if (typeof modulePath !== 'string') {
+    throw new AdapterContractError({
+      message: `Invalid classifyModule return value (expected string): ${String(modulePath)}`,
+      code: 'invalid_classify_module',
+      repoFullName,
+      adapterPath,
+    });
+  }
+
+  const normalized = modulePath.replace(/\\/g, '/');
+  if (normalized.startsWith('/') || normalized.split('/').includes('..')) {
+    throw new AdapterContractError({
+      message: `Invalid classifyModule return value "${modulePath}": must be relative and cannot contain ".."`,
+      code: 'invalid_classify_module',
+      repoFullName,
+      adapterPath,
+    });
   }
 }
 
@@ -172,5 +228,16 @@ export async function loadAdapter(
   }
 
   assertAdapterShape(instance, repoFullName, adapterPath);
+  await assertAdapterMethodsReturnPromises(instance, repoFullName, adapterPath);
+
+  // Lightweight safety check on classifyModule output (full path existence check happens in triage).
+  try {
+    const modulePath = await instance.classifyModule({ number: 0, title: '', body: '', labels: [] });
+    assertClassifyModuleIsSafe(modulePath, repoFullName, adapterPath);
+  } catch (err) {
+    if (err instanceof AdapterContractError) throw err;
+    // Ignore errors from adapter logic; this check is best-effort.
+  }
+
   return instance;
 }
