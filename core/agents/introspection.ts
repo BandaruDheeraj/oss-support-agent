@@ -1,5 +1,8 @@
 /**
- * Introspection agent (US-104: repo signal gathering).
+ * Introspection agent.
+ *
+ * - US-104: repo signal gathering
+ * - US-105: draft adapter generator via OpenRouter
  */
 
 import * as fs from 'fs';
@@ -10,6 +13,7 @@ import { execFile } from 'child_process';
 import type {
   RepoCloner,
   RepoSignals,
+  DraftAdapter,
   CiWorkflowSignal,
   PackageManifestSignal,
   PackageManifestKind,
@@ -18,6 +22,9 @@ import type {
   ContributingDocSignal,
   ComposeServicesSignal,
 } from './introspection-types';
+
+import { LLMClient, type LLMUsage, type LLMMessage } from '../llm/client';
+import type { LLMClientLike } from '../llm/test-utils';
 
 function execFileAsync(file: string, args: string[], options: { cwd?: string } = {}): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -387,4 +394,162 @@ export async function gatherRepoSignals(repoFullName: string, options: GatherRep
   } finally {
     await fs.promises.rm(tempDir, { recursive: true, force: true });
   }
+}
+
+export interface GenerateDraftAdapterOptions {
+  llmClient?: LLMClientLike;
+  /** Optional override for reading the adapter contract source. */
+  adapterInterfacePath?: string;
+  /** Optional hook to forward token usage into cost guardrails. */
+  onUsage?: (usage: LLMUsage) => void;
+  /** Override for tests. Defaults to os.tmpdir(). */
+  tmpRoot?: string;
+}
+
+export class AdapterDraftValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AdapterDraftValidationError';
+  }
+}
+
+const DRAFT_ADAPTER_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['adapterTs', 'manifestYaml', 'rationale', 'openItems'],
+  properties: {
+    adapterTs: { type: 'string', minLength: 1 },
+    manifestYaml: { type: 'string', minLength: 1 },
+    rationale: {
+      type: 'object',
+      additionalProperties: { type: 'string' },
+    },
+    openItems: {
+      type: 'array',
+      items: { type: 'string' },
+    },
+  },
+} as const;
+
+function toPascalCase(input: string): string {
+  return input
+    .replace(/[^A-Za-z0-9]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+    .map((p) => p[0].toUpperCase() + p.slice(1))
+    .join('');
+}
+
+function parseRepoFullName(repoFullName: string): { owner: string; repo: string } {
+  const parts = repoFullName.split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new AdapterDraftValidationError(`Invalid repoFullName (expected owner/repo): ${repoFullName}`);
+  }
+  return { owner: parts[0], repo: parts[1] };
+}
+
+function findDefaultClassExport(adapterTs: string): { className: string } {
+  const m = /\bexport\s+default\s+class\s+([A-Za-z_][A-Za-z0-9_]*)\b/.exec(adapterTs);
+  if (!m) {
+    throw new AdapterDraftValidationError('Generated adapter.ts must contain `export default class <Name>`');
+  }
+  return { className: m[1] };
+}
+
+async function compileAdapterWithTsc(
+  owner: string,
+  repo: string,
+  adapterTs: string,
+  adapterInterfaceSource: string,
+  tmpRoot: string
+): Promise<void> {
+  const tempDir = await fs.promises.mkdtemp(path.join(tmpRoot, 'oss-agent-adapter-compile-'));
+  try {
+    const coreDir = path.join(tempDir, 'core');
+    const adapterDir = path.join(tempDir, 'configs', owner, repo);
+    await fs.promises.mkdir(coreDir, { recursive: true });
+    await fs.promises.mkdir(adapterDir, { recursive: true });
+
+    await fs.promises.writeFile(path.join(coreDir, 'adapter.interface.ts'), adapterInterfaceSource, 'utf-8');
+    await fs.promises.writeFile(path.join(adapterDir, 'adapter.ts'), adapterTs, 'utf-8');
+
+    const tsconfig = {
+      compilerOptions: {
+        target: 'ES2020',
+        module: 'CommonJS',
+        moduleResolution: 'Node',
+        strict: true,
+        esModuleInterop: true,
+        skipLibCheck: true,
+        rootDir: '.',
+        types: [],
+      },
+      include: ['core/**/*.ts', 'configs/**/*.ts'],
+    };
+
+    const tsconfigPath = path.join(tempDir, 'tsconfig.json');
+    await fs.promises.writeFile(tsconfigPath, JSON.stringify(tsconfig, null, 2), 'utf-8');
+
+    const tscJs = path.join(process.cwd(), 'node_modules', 'typescript', 'bin', 'tsc');
+    if (!(await safeExists(tscJs))) {
+      throw new AdapterDraftValidationError('TypeScript compiler not found at node_modules/typescript/bin/tsc. Run `npm install`.');
+    }
+
+    await execFileAsync(process.execPath, [tscJs, '--noEmit', '--pretty', 'false', '-p', tsconfigPath], { cwd: tempDir });
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Generate a per-repo adapter draft and manifest using gathered repo signals.
+ */
+export async function generateDraftAdapter(
+  signals: RepoSignals,
+  repoFullName: string,
+  options: GenerateDraftAdapterOptions = {}
+): Promise<DraftAdapter> {
+  const { owner, repo } = parseRepoFullName(repoFullName);
+
+  const adapterInterfacePath =
+    options.adapterInterfacePath ?? path.join(process.cwd(), 'core', 'adapter.interface.ts');
+  const adapterInterfaceSource = await fs.promises.readFile(adapterInterfacePath, 'utf-8');
+
+  const desiredClassName = `${toPascalCase(repo)}Adapter`;
+  const adapterImportPath = '../../../core/adapter.interface';
+
+  const prompt =
+    `You are generating a per-repo adapter for an OSS agent harness.\n\n` +
+    `The adapter will live at: configs/${owner}/${repo}/adapter.ts\n` +
+    `It MUST import the contract from: ${adapterImportPath}\n` +
+    `It MUST export a default class named: ${desiredClassName}\n\n` +
+    `Requirements:\n` +
+    `- Implement all five RepoAdapter interface methods.\n` +
+    `- Prefer CI workflow step commands for getTestCommands().\n` +
+    `- Prefer docker-compose services for getSandboxServices().\n` +
+    `- classifyModule(issue) should route to a reasonable module directory based on repo layout + keywords.\n` +
+    `- runCustomEval(output) should check exit codes and, when configured by test commands, also consider coverage output.\n` +
+    `- getPRMetadata should return repo-specific labels/body sections when appropriate.\n\n` +
+    `Return ONLY JSON with keys: adapterTs, manifestYaml, rationale, openItems.\n\n` +
+    `--- BEGIN core/adapter.interface.ts ---\n${adapterInterfaceSource}\n--- END core/adapter.interface.ts ---\n\n` +
+    `--- BEGIN repo signals (JSON) ---\n${JSON.stringify(signals, null, 2)}\n--- END repo signals ---\n`;
+
+  const messages: LLMMessage[] = [{ role: 'user', content: prompt }];
+
+  const client = options.llmClient ?? new LLMClient();
+  const { data } = await client.chatJson<DraftAdapter>(messages, DRAFT_ADAPTER_SCHEMA, {
+    agent: 'INTROSPECTION',
+    temperature: 0,
+    onUsage: options.onUsage,
+  });
+
+  // Validate the adapter export shape before it ever reaches email review.
+  findDefaultClassExport(data.adapterTs);
+
+  // Verify it compiles against the contract.
+  const tmpRoot = options.tmpRoot ?? os.tmpdir();
+  await compileAdapterWithTsc(owner, repo, data.adapterTs, adapterInterfaceSource, tmpRoot);
+
+  return data;
 }

@@ -111,8 +111,8 @@
         "Unit tests with a mocked LLMClient cover: monorepo with multiple packages, single-package repo, repo with only README signals, malformed JSON retry path, interface-mismatch failure path"
       ],
       "priority": 5,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented generateDraftAdapter() (core/agents/introspection.ts) using LLMClient.chatJson(agent=INTROSPECTION, temperature=0) with a strict JSON schema. Prompt inlines core/adapter.interface.ts source at runtime plus gathered signals. Added default-export validation (export default class ...) and a temp-project tsc --noEmit compile check against the contract before proceeding. Added unit tests covering prompt construction/options, successful compilation, missing default export, malformed JSON retry via LLMClient.chatJson, and interface-mismatch compile failure."
     },
     {
       "id": "US-106",

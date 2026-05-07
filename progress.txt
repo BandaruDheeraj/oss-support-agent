@@ -833,3 +833,14 @@ Project: OSS Autonomous Fix Loop
   - Added fixture-based unit tests in core/agents/introspection.test.ts covering Node monorepo, Python repo, Makefile-only, README-only, no-signals, and cleanup-on-error.
   Verified: npm test -- --runTestsByPath core/agents/introspection.test.ts
 ---
+
+2026-05-07: US-105 Draft adapter generator (LLM prompt via OpenRouter) — DONE
+  - Added generateDraftAdapter(signals, repoFullName) to core/agents/introspection.ts.
+    * Calls LLMClient.chatJson with agent=INTROSPECTION and temperature=0, using a strict JSON schema for {adapterTs, manifestYaml, rationale, openItems}.
+    * Prompt inlines the current core/adapter.interface.ts contract source at runtime plus the gathered repo signals.
+    * Validates the generated adapter contains `export default class ...` before proceeding.
+    * Verifies the adapter compiles against the contract by writing a temp core/ + configs/<org>/<repo>/ adapter.ts and running tsc --noEmit.
+    * Exposes an onUsage hook to forward token usage into cost guardrails.
+  - Added unit tests (core/agents/introspection-draft.test.ts) covering: prompt/options, compile pass, missing default export, malformed JSON retry via LLMClient.chatJson, and interface mismatch compile failure.
+  Note: npm/node commands are blocked in this environment (permission denied), so full repo test/lint runs could not be executed here.
+---

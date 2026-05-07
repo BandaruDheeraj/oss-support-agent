@@ -75,3 +75,11 @@ export interface RepoCloner {
    */
   clone(repoFullName: string, destDir: string): Promise<void>;
 }
+
+/** Draft output produced by generateDraftAdapter() (US-105). */
+export interface DraftAdapter {
+  adapterTs: string;
+  manifestYaml: string;
+  rationale: Record<string, string>;
+  openItems: string[];
+}
