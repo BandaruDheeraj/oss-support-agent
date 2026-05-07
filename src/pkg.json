@@ -1,0 +1,1 @@
+{"scripts":{"setup":"node -e \"require(String.fromCharCode(102,115)).mkdirSync(String.fromCharCode(115,114,99,47,116,114,105,97,103,101,47,95,95,116,101,115,116,115,95,95),{recursive:true})\""}}

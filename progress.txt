@@ -10,3 +10,772 @@ Project: OSS Autonomous Fix Loop
   Plus: US-010 docs agent (fast path), US-014 build agent.
   Next: start at US-001 (manifest loader + schema).
 ---
+2026-05-06: US-001 Repo manifest loader and schema — DONE
+  - Created TypeScript project scaffold (package.json, tsconfig.json, jest.config.ts)
+  - Manifest JSON Schema (src/manifest/schema.ts): draft-07, covers all PRD 3.1 fields
+    Required: repo, fork_org, test_command, pm_email
+    Optional with defaults: trigger_label, branch_prefix, max_retries, approval_keywords,
+      issue_types, sandbox_services, skip_pm_gate
+  - Loader (src/manifest/loader.ts): reads YAML or JSON, validates with ajv + ajv-formats,
+    applies defaults, throws ManifestLoadError with field-level errors
+  - Example manifest: examples/openinference.yaml (Arize-ai/openinference)
+  - Unit tests (src/manifest/__tests__/loader.test.ts): 20+ test cases covering
+    valid JSON/YAML, example manifest, all 7 defaults, 4 missing-required-field cases,
+    7 invalid-type cases, and file-loading errors
+  - Dependencies: ajv, ajv-formats, js-yaml, typescript, jest, ts-jest
+  Next: US-002 (orchestrator state machine).
+---
+2026-05-06: US-002 Orchestrator state machine and persistence — DONE
+  - State machine with all 12 states (TRIGGERED through SKIPPED) in src/orchestrator/
+  - Types (types.ts): RunState enum, Run interface, TransitionLogEntry, IllegalTransitionError,
+    TERMINAL_STATES/IN_FLIGHT_STATES sets, isTerminalState helper
+  - Transitions (transitions.ts): explicit allowed-transitions map per state,
+    supports full pipeline, email loop, docs fast path, retry (EVAL→AGENT), and FAILED from all
+  - Persistence (persistence.ts): better-sqlite3 with WAL mode, FK constraints,
+    CHECK constraints on state column, schema_migrations table, atomic transactions
+    for state update + log insertion, retry_count column, indexes on state and run_id
+  - StateMachine class (state-machine.ts): createRun, transition (validates + atomic persist),
+    getRun, getRunsByState, getInFlightRuns (for restart-resume), getTransitionLog
+  - Unit tests (src/orchestrator/__tests__/state-machine.test.ts): 15+ test cases covering
+    happy path (full pipeline, email loop, docs fast path, SKIPPED, FAILED from every state),
+    retry path (increments retry_count), illegal transitions (terminal, invalid forward,
+    no log on rejection, non-existent run), transition logging, restart-resume
+    (file-backed temp DB, new instance discovers in-flight runs), schema migration idempotency
+  - Dependencies added: better-sqlite3, @types/better-sqlite3
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-003 (GitHub webhook listener and event router).
+---
+2026-05-06: US-003 GitHub webhook listener and event router — DONE
+  - HTTP webhook server (src/webhook/server.ts): Node built-in http module,
+    POST /webhook endpoint, signature verification gate, JSON parsing, event routing
+  - Signature verification (src/webhook/signature.ts): HMAC SHA-256 using
+    crypto.createHmac + crypto.timingSafeEqual for constant-time comparison,
+    rejects missing/malformed/invalid signatures
+  - Event router (src/webhook/router.ts): ManifestRegistry interface for repo→manifest
+    lookup, routeEvent function handles issue.opened and issue.labeled actions,
+    checks trigger_label and skip_pm_gate label, creates TRIGGERED runs via StateMachine,
+    repos without manifest enter SKIPPED state
+  - Types (src/webhook/types.ts): IssueEvent, GitHubIssue, WebhookResult union type
+  - Integration tests (src/webhook/__tests__/webhook.test.ts): 11 test cases covering
+    invalid/missing signature rejection, valid signature acceptance, non-issue event
+    ignoring, issue.opened run creation (TRIGGERED state), no-manifest repo SKIPPED,
+    trigger_label matching on issue.labeled, non-matching label ignoring,
+    skip_pm_gate label support, response time under 1s, secret not leaked in response
+  - No new dependencies (uses Node built-in http + crypto modules)
+  - Webhook secret read from options/env, never logged or included in responses
+  - Returns 202 Accepted for processed events, 200 for ignored events
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-004 (Triage agent).
+---
+2026-05-06: US-004 Triage agent — DONE
+  - Types (src/triage-types.ts): TriageInput (title, body, labels, author,
+    moduleTaxonomy, repoTree, hasSkipPmGate), TriageResult (issueType,
+    affectedModule, confidence 0-1, summary), TriageRouting union type
+    (route_pm | route_docs | route_fork | clarify), TriageClassifier and
+    IssueCommenter interfaces for testability
+  - Agent (src/triage-agent.ts): HeuristicClassifier with label-based then
+    keyword-based classification, path-matching module identification,
+    multi-factor confidence scoring. LOW_CONFIDENCE_THRESHOLD = 0.6.
+    triageIssue function routes: bug_fix/new_feature → PM agent,
+    docs → docs agent (fast path), skip_pm_gate → fork creation.
+    Confidence < 0.6 returns clarify action with structured comment.
+    runTriage posts clarification comment via IssueCommenter on low confidence.
+    buildClarificationComment generates GitHub-friendly markdown asking for clarification.
+  - Index (src/triage-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/triage-agent.test.ts): 25+ test cases covering:
+    * Each issue_type classification from labels (bug, docs, feature)
+    * Each issue_type classification from keywords (no labels)
+    * Affected module identification from path mentions
+    * Confidence scoring (high for labeled+detailed, low for vague, reduced for conflicts)
+    * Confidence bounds (always 0-1)
+    * Summary includes type, module, and title
+    * Routing: bug_fix→route_pm, new_feature→route_pm, docs→route_docs
+    * Low-confidence path: returns clarify with comment, posts to GitHub
+    * Boundary: confidence 0.59 → clarify, 0.6 → routes normally
+    * skip_pm_gate: routes to fork, overrides type routing, but NOT low confidence
+    * Timing: completes in under 90 seconds
+  - No new dependencies (pure TypeScript, no external packages)
+  Note: Files placed in src/ flat (src/triage-*.ts) due to env restriction
+    preventing directory creation. npm install required before running tests.
+  Next: US-005 (PM agent design scoring).
+---
+2026-05-06: US-005 PM agent design scoring (no email yet) — DONE
+  - Types (src/pm-agent-types.ts): PMScoringInput (issueType, affectedModule, summary,
+    title, body, labels, relatedIssues, recentPRs, designDocs), PMScoringResult
+    (designNeeded boolean, reasoning string, signals array), PMRouting union type
+    (route_forking | route_failed with note), DesignSignal (rule, triggered, detail),
+    RelatedIssue, RelatedPR, DesignDoc interfaces, plus IssueSearcher/PRFetcher/
+    DesignDocFinder interfaces for future GitHub integration
+  - Agent (src/pm-agent.ts): 5 heuristic checks per PRD section 4.2:
+    1. design_keywords: title/body contains rethink/redesign/breaking/architecture
+    2. related_issues_count: >= 3 related open issues triggers design needed
+    3. public_api_change: API keywords in text or API surface files in recent PRs
+    4. contested_behaviour: intentional/wontfix/controversial signals
+    5. multi_module_span: change spans > 2 top-level modules
+    scoreDesign: evaluates all 5, any trigger sets designNeeded=true
+    routePMResult: Phase 1 routing (design_needed → FAILED with note, else → FORKING)
+    runPMScoring: full pipeline combining scoring + routing
+  - Index (src/pm-agent-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/pm-agent.test.ts): 30+ test cases covering:
+    * Design keywords: each keyword, case-insensitivity, normal text no trigger
+    * Related issues: boundary at 3 (2 no-trigger, 3 triggers, 4 triggers), zero
+    * Public API: keywords in title/body, API files in recent PRs, internal-only no-trigger
+    * Contested behaviour: intentional/by-design text, wontfix/needs-discussion labels, clean no-trigger
+    * Multi-module: PRs spanning >2, body path references, single/exactly-2 no-trigger
+    * Integration: no heuristics → designNeeded=false, single/multiple triggers → true
+    * Routing: designNeeded=false → route_forking, true → route_failed with note
+    * Full pipeline: simple bug → FORKING, design-needed → FAILED, many issues → FAILED
+  - No new dependencies (pure TypeScript, no external packages)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-006 (Fork creation and branch management).
+---
+2026-05-06: US-006 Fork creation and branch management — DONE
+  - Types (src/fork-types.ts): ForkConfig (upstream, forkOrg, branchPrefix, issueIds),
+    ForkResult (forkFullName, forkCreated, forkSynced, branchName, branchReset),
+    GitHubClient interface (repoExists, createFork, syncFork, getDefaultBranch,
+    getBranchSha, createBranch, updateBranchRef, getTokenScopes),
+    ForkCreationError, BranchCreationError, UpstreamWriteGuardError
+  - Manager (src/fork-manager.ts): 4 exported functions:
+    1. generateBranchName: deterministic name from sorted issue IDs
+       Format: {branch_prefix}{ids-sorted-numerically-joined-by-dash}
+       e.g. agent/scope-142-156-203
+    2. deriveForkName: upstream "owner/repo" + forkOrg → "forkOrg/repo"
+    3. verifyNoUpstreamWriteAccess: checks token scopes, warns on broad scopes
+    4. createForkAndBranch: full pipeline:
+       - Validates config (upstream format, forkOrg, issueIds)
+       - Verifies token scope safety
+       - Creates fork under fork_org if not exists, reuses if exists
+       - Syncs fork with upstream (tolerates failure on new forks)
+       - Creates branch or resets to fork main if exists (retry scenario)
+       - All writes go to fork name only, never upstream
+  - Index (src/fork-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/fork-manager.test.ts): 25+ test cases covering:
+    * generateBranchName: sorted IDs, single ID, custom prefix, numeric sort, immutability
+    * deriveForkName: valid derivation, different owners, invalid upstream throws
+    * Fork creation: new fork, reuse existing, sync before branching
+    * Error handling: fork creation failure, sync failure on existing fork,
+      sync tolerance on new fork, branch creation failure, reset failure,
+      missing default branch SHA
+    * Validation: invalid upstream, empty forkOrg, empty issueIds
+    * Upstream write guard: token scope verification, all writes to fork only
+    * Integration: full new-fork flow, retry scenario (reuse+reset),
+      second run determinism, one fork per issue group
+  - No new dependencies (pure TypeScript, uses GitHubClient interface for testability)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-007 (Fix agent operating on the fork branch).
+---
+2026-05-06: US-007 Fix agent operating on the fork branch — DONE
+  - Types (src/fix-agent-types.ts): FixAgentInput (designSummary, confirmedIssues,
+    affectedModule, moduleSource, moduleTests, recentCommits, forkFullName, branchName),
+    FixAgentResult (success, changes, testChanges, commitMessage, summary, closesIssues),
+    FileChange (path, action: modify|create, content), ConfirmedIssue, ModuleCommit,
+    ModuleFile interfaces, FixGenerator/ForkCommitter/RepoFileReader interfaces for testability,
+    FixGeneratorOutput, FixAgentError (with phase), UpstreamWriteAttemptError
+  - Agent (src/fix-agent.ts): full pipeline function (runFixAgent):
+    1. verifyForkOnlyAccess: rejects tokens with public_repo/repo scopes
+    2. readFullModule: lists and reads all files in the module before changes
+    3. generateFix: delegates to FixGenerator interface (LLM or heuristic)
+    4. validateChangeScope: ensures all changes are within affected module or test files
+    5. validateTestCoverage: requires at least one test change for source changes
+    6. formatCommitMessage: fix({module}): {summary} — closes #{ids}
+    7. commitChanges: writes to fork branch only via ForkCommitter
+    Helper functions: extractModuleName (strips src/lib prefix),
+    formatCommitMessage, validateChangeScope, validateTestCoverage
+  - Index (src/fix-agent-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/fix-agent.test.ts): 30+ test cases covering:
+    * formatCommitMessage: single/multiple IDs, src/lib/other prefix handling
+    * extractModuleName: various path formats, leading/trailing slashes
+    * validateChangeScope: in-module, test files, out-of-scope, unrelated, empty
+    * validateTestCoverage: covered, uncovered, empty source
+    * verifyForkOnlyAccess: narrow scopes pass, public_repo/repo throw
+    * readFullModule: lists and reads files, empty module
+    * runFixAgent integration: success flow, reads module before generating,
+      commits to fork only, rejects upstream write access, rejects out-of-scope,
+      rejects missing tests, handles empty output, passes full input to generator,
+      multiple issue IDs, design summary context, new test creation, commit format
+  - No new dependencies (pure TypeScript, uses interfaces for testability)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-008 (Basic sandbox runner).
+---
+2026-05-06: US-008 Basic sandbox runner (test suite only) — DONE
+  - Types (src/sandbox-types.ts): SandboxConfig (forkFullName, branchName, testCommand,
+    sandboxServices, timeoutMinutes), SandboxResult (completed, exitCode, stdout, stderr,
+    durationSeconds, workflowRunUrl, timedOut, workflowRunId), SandboxArtifact (config,
+    result, startedAt, completedAt), ActionsClient interface (triggerWorkflowDispatch,
+    getWorkflowRun, waitForWorkflowRun, getWorkflowRunLogs, uploadArtifact),
+    WorkflowRun, WorkflowRunStatus, WorkflowRunLogs interfaces,
+    SandboxRunError (with phase), SandboxTimeoutError
+  - Runner (src/sandbox-runner.ts): full pipeline function (runSandbox):
+    1. validateSandboxConfig: validates forkFullName, branchName, testCommand, timeoutMinutes
+    2. buildWorkflowInputs: constructs dispatch inputs (test_command, branch, timeout,
+       sandbox_services, network_policy)
+    3. Trigger workflow_dispatch on fork via ActionsClient
+    4. Poll for workflow run to appear (up to 60s)
+    5. Wait for completion or timeout (configurable, default 15 min)
+    6. Retrieve logs (stdout/stderr/exit code) or set timeout message
+    7. Build structured SandboxArtifact for eval agent
+    8. Upload artifact (non-fatal on failure)
+    Network isolation: network_policy="none" when no services, "allow:services" when declared
+    Each run fully isolated: fresh branch checkout, no state between runs
+    Helper: createSandboxConfig factory with defaults, buildSandboxArtifact
+  - Index (src/sandbox-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/sandbox-runner.test.ts): 30+ test cases covering:
+    * validateSandboxConfig: valid config, empty forkFullName, no slash, empty branch,
+      whitespace branch, empty testCommand, zero/negative timeout, error phase
+    * buildWorkflowInputs: test_command, branch, timeout, network_policy none/allow,
+      services join
+    * createSandboxConfig: all fields, default timeout, array copy immutability
+    * buildSandboxArtifact: complete structure
+    * runSandbox integration: dispatch with correct params, polls for run, waits with
+      correct timeout, retrieves logs, returns structured artifact, timeout handling
+      (timedOut=true, completed=false, no logs fetched), dispatch failure throws,
+      run not appearing throws, log retrieval failure throws, artifact upload called,
+      non-fatal upload failure, validates before trigger, default/configurable timeout,
+      duration calculation, non-zero exit code, run isolation, sandbox_services in inputs,
+      network_policy enforcement, branch checkout for isolation
+  - No new dependencies (pure TypeScript, uses ActionsClient interface for testability)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-009 (Eval agent and PR creation).
+---
+2026-05-06: US-009 Eval agent (pass/fail) and PR creation — DONE
+  - Types (src/eval-agent-types.ts): EvalAgentInput (sandboxArtifact, confirmedIssues,
+    fixSummary, designSummary, forkFullName, branchName, upstreamRepo,
+    upstreamDefaultBranch, issueTypes, retryCount, maxRetries), EvalAgentResult
+    (overallPass, perIssueVerdicts, regressionDetected, retryContext, prSummary),
+    EvalRouting union type (open_pr | retry | failed), PRDetails (title, body,
+    labels, head, base), PRClient interface (createPullRequest, addLabels),
+    IssueVerdict, EvalAgentError
+  - Agent (src/eval-agent.ts): full pipeline:
+    1. evaluateSandboxResults: pass when completed + exitCode=0 + not timed out,
+       per-issue verdicts (all share overall result in Phase 1),
+       retry context with command/exit/stderr/stdout, regressionDetected always false
+    2. buildPRDetails: title [agent-fix] {summary}, body with design summary +
+       per-issue verdicts + sandbox run link + retry info, labels agent-fix +
+       deduplicated issue types, head forkOrg:branch, base upstream default, no reviewers
+    3. routeEvalResult: pass→open_pr, fail+retries remaining→retry with context,
+       fail+max retries exceeded→failed
+    4. runEvalAgent: evaluate → route → create PR on pass (with labels, non-fatal
+       label failure), throws EvalAgentError on PR creation failure
+  - Index (src/eval-agent-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/eval-agent.test.ts): 30+ test cases covering:
+    * evaluateSandboxResults: pass/fail conditions, regressionDetected=false,
+      per-issue verdicts, failure reasons with stderr, retry context content, prSummary
+    * buildPRDetails: title format, body sections, retry info, labels dedup,
+      head/base format, no reviewers
+    * routeEvalResult: all three routes, boundary conditions, retry context content
+    * runEvalAgent integration: PR creation, labels, no PR on failure, retry/failed
+      routing, error handling, non-fatal label failure, PR body content
+  - No new dependencies (pure TypeScript, uses PRClient interface for testability)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-010 (Docs agent fast path).
+---
+2026-05-06: US-010 Docs agent (fast path) — DONE
+  - Types (src/docs-agent-types.ts): DocsAgentInput (confirmedIssues, affectedModule,
+    docFiles, recentCommits, forkFullName, branchName, triageSummary),
+    DocsAgentResult (success, changes, commitMessage, summary, closesIssues),
+    DocsGenerator/DocsGeneratorOutput interfaces for testability,
+    DocsAgentError (with phase), DOC_FILE_PATTERNS (doc extensions and paths),
+    APP_CODE_EXTENSIONS (code extensions that must never be modified),
+    re-exports shared types from fix-agent-types
+  - Agent (src/docs-agent.ts): full pipeline function (runDocsAgent):
+    1. verifyForkOnlyAccess: rejects tokens with public_repo/repo scopes
+    2. readDocFiles: reads existing documentation for context
+    3. generateDocs: delegates to DocsGenerator interface
+    4. validateDocsOnly: ensures all changes are documentation files only,
+       rejects application code (.ts/.js/.py/.go/.rs etc.) and unknown files
+    5. formatDocsCommitMessage: docs: {summary} — closes #{ids}
+    6. commitChanges: writes to fork branch only
+    Helper functions: isDocumentationFile (recognizes doc patterns),
+    isApplicationCode (detects source code extensions), validateDocsOnly,
+    formatDocsCommitMessage
+  - Index (src/docs-agent-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/docs-agent.test.ts): 30+ test cases covering:
+    * formatDocsCommitMessage: single/multiple IDs, no module name in format
+    * isDocumentationFile: .md/.rst/.txt/.adoc/.mdx, docs/ directory, named files,
+      rejects code files, rejects unknown types
+    * isApplicationCode: TS/JS/Python/Go/Rust detection, no false positives on docs
+    * validateDocsOnly: valid docs pass, rejects code, rejects unknown,
+      empty array, reports all invalid files
+    * verifyForkOnlyAccess: narrow scopes pass, public_repo/repo throw
+    * readDocFiles: lists and reads files, handles empty
+    * runDocsAgent integration: success flow, commit message format,
+      multiple issue IDs, commits to fork only, rejects upstream access,
+      rejects application code changes, error includes filenames,
+      empty changes returns failure, no commit on empty, reads before generating,
+      passes input to generator, allows docs/ non-md files,
+      allows CHANGELOG/CONTRIBUTING, skips PM agent (no designSummary),
+      error phases correct, result shape compatible with sandbox+eval+PR flow
+  - No new dependencies (pure TypeScript, re-uses fix-agent-types for shared interfaces)
+  - Triggered directly from triage route_docs action, skips PM agent entirely
+  - Routes to same sandbox + eval + PR flow (DocsAgentResult compatible with eval agent)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-011 (Gmail MCP integration).
+---
+2026-05-06: US-011 Gmail MCP integration (send + watcher) — DONE
+  - Types (src/gmail-types.ts): GmailMessage (to, subject, body, replyTo, threadId),
+    GmailSendResult (success, messageId, threadId), GmailReply (messageId, threadId,
+    body, from, receivedAt, subject), GmailWatcherConfig (pollIntervalMs, subjectPrefix,
+    monitoredAddress), EmailThread (runId, threadId, subject, conversationHistory),
+    ConversationEntry (role: agent|user, body, timestamp, messageId),
+    ApprovalDetectionResult (approved, matchedKeyword, replyBody),
+    GmailClient interface (sendEmail, listUnreadMessages, markAsRead),
+    ReplyHandler interface (onReply), GmailSendError, GmailWatcherError,
+    SUBJECT_PREFIX='[agent-fix]', DEFAULT_POLL_INTERVAL_MS=60000
+  - Implementation (src/gmail-mcp.ts):
+    1. formatSubject: [agent-fix] {repo}/#{issue_number}: {title}
+    2. buildEmailMessage: constructs GmailMessage with replyTo for routing back
+    3. sendEmail: sends via GmailClient, throws GmailSendError on failure
+    4. detectApproval: case-insensitive substring match against approval_keywords
+    5. createEmailThread / appendReplyToThread / appendAgentMessageToThread: immutable thread management
+    6. buildWatcherQuery: is:unread subject:"[agent-fix]" to:monitored_address
+    7. GmailWatcher class: register/unregister threads, start/stop polling (configurable interval,
+       default 60s), poll() queries for unread, matches to registered threads, appends to
+       conversation history, marks as read, calls ReplyHandler.onReply to wake PM agent
+    8. sendAndTrack: full send + thread registration flow for new/existing threads
+  - Index (src/gmail-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/gmail-mcp.test.ts): 40+ test cases covering:
+    * formatSubject: prefix, special characters, includes constant
+    * buildEmailMessage: all fields, threadId for reply threading, replyTo routing
+    * sendEmail: success flow, GmailSendError with to/subject fields
+    * detectApproval: each keyword match, case-insensitive, multi-word, no match,
+      empty body, empty keywords, substring within text, first match wins, body in result
+    * createEmailThread: initial agent message structure
+    * appendReplyToThread: appends user reply, immutability
+    * appendAgentMessageToThread: appends agent follow-up
+    * buildWatcherQuery: unread filter, subject prefix, monitored address
+    * GmailWatcher: register/unregister, findByRunId, listAll, start/stop/idempotent,
+      poll queries with correct params, matches registered threads, ignores unregistered,
+      appends to conversation history, marks as read, handles multiple replies,
+      GmailWatcherError on poll failure, tolerates markAsRead failure
+    * sendAndTrack: new thread creation, existing thread append, subject/threadId maintained,
+      propagates GmailSendError
+    * Threading integrity: full conversation flow, correct run ID routing
+    * Constants: DEFAULT_POLL_INTERVAL_MS=60000, SUBJECT_PREFIX='[agent-fix]'
+  - No new dependencies (pure TypeScript, uses GmailClient interface for testability)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-012 (PM agent email conversation loop).
+---
+2026-05-06: US-012 PM agent email conversation loop — DONE
+  - Types (src/pm-email-types.ts): DesignBriefInput (issueSummary, affectedModule,
+    relatedIssues, recentPRs, designDocs, issueTitle, issueBody, issueLabels,
+    scoringResult), DesignBrief (issueSummary, affectedModule, relatedOpenIssues,
+    recentPRContext, proposedApproaches, openQuestions), ApproachOption (name,
+    description, pros, cons), FollowUpInput (conversationHistory, latestReply,
+    designBriefInput, resolvedDecisions, unresolvedQuestions), FollowUpResult
+    (responseBody, resolvedDecisions, unresolvedQuestions), PMEmailLoopConfig
+    (pmEmail, replyToAddress, repo, issueNumber, issueTitle, approvalKeywords, runId),
+    PMEmailLoopResult union type (email_sent | reply_processed | approved),
+    DesignBriefGenerator/FollowUpGenerator/EmailStateStore interfaces,
+    PMEmailLoopError (with phase and runId)
+  - Implementation (src/pm-email-loop.ts):
+    1. HeuristicBriefGenerator: generates design brief with all 6 PRD 5.2 fields
+       - Issue summary, affected module, related open issues, recent PR context,
+         2-3 proposed approaches with tradeoffs, open questions
+       - Approaches generated based on scoring signals (minimal always included,
+         coordinated refactor for API/multi-module, comprehensive for >=3 issues)
+       - Open questions generated per triggered heuristic signal
+    2. formatDesignBriefEmail: formats DesignBrief into markdown email body
+    3. HeuristicFollowUpGenerator: analyzes conversation, extracts decisions,
+       filters resolved questions, generates response with only unresolved items
+    4. extractDecisions: recognizes patterns (Decision:, let's go with, I prefer,
+       go with, option N, yes/agreed/confirmed)
+    5. sendDesignBrief: sends initial brief via Gmail MCP, registers thread with
+       watcher, persists state for restart-resume
+    6. processReply: checks approval keywords first (exits loop on match),
+       generates follow-up otherwise, maintains threading, persists state
+    7. resumeEmailLoop: loads persisted state, re-registers with watcher for restart
+    8. summarizeAgreedDesign: extracts decisions and context from full history
+    9. createPMReplyHandler: factory for ReplyHandler.onReply callback that wakes
+       PM agent, routes to onApproval or onReplyProcessed
+  - Index (src/pm-email-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/pm-email-loop.test.ts): 40+ test cases covering:
+    * HeuristicBriefGenerator: all 6 fields present, issue summary, affected module,
+      related issues formatting, PR context, 2-3 approaches with pros/cons,
+      open questions from signals, empty issues/PRs handling, approach selection
+    * formatDesignBriefEmail: all sections, approval instruction, numbered approaches
+    * extractDecisions: explicit lines, let's go with, I prefer, approach selection,
+      vague replies empty, yes/agreed lines
+    * HeuristicFollowUpGenerator: response generation, resolved question removal,
+      new decisions added, never restates resolved, only surfaces unresolved,
+      suggests approval when all resolved
+    * sendDesignBrief: sends email, correct recipient, subject format, brief content,
+      persists state, registers thread, replyTo address
+    * processReply: approval detection (lgtm/approved/ship it), case-insensitive,
+      sends follow-up on non-approval, persists state, deletes on approval,
+      unregisters thread, appends agent response to history, maintains threadId,
+      no email on approval
+    * resumeEmailLoop: loads state + re-registers, null for missing, survives restart
+    * summarizeAgreedDesign: includes decisions, extracts issue summary, turn count
+    * createPMReplyHandler: approval callback, reply callback, throws for unknown run
+    * Timing: brief < 5 min, reply < 60s (with mocked client)
+    * Full conversation flow: multi-turn until approval, maintains same threadId
+  - No new dependencies (pure TypeScript, builds on gmail-mcp and pm-agent modules)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-013 (Issue sweep and scope confirmation).
+---
+2026-05-06: US-013 Issue sweep and scope confirmation — DONE
+  - Types (src/issue-sweep-types.ts): SweepIssue (number, title, labels, reason),
+    SweepResult (highConfidence, maybeInScope), SweepInput (agreedDesign,
+    affectedModule, openIssues, primaryIssueNumber), ScopeConfirmationConfig
+    (pmEmail, replyToAddress, repo, issueNumber, issueTitle, runId),
+    ScopeConfirmationResult union type (scope_email_sent | scope_confirmed),
+    IssueSweeper/SweepStateStore interfaces for testability,
+    SweepError (with phase and runId)
+  - Implementation (src/issue-sweep.ts):
+    1. HeuristicIssueSweeper: scores issue relevance using title-word overlap
+       with design (0.4 weight), module path matching (0.3), label matching (0.15),
+       relevance keywords (0.15). Thresholds: >=0.7 high confidence, >=0.4 maybe
+       in scope. Primary issue always included in high confidence.
+    2. formatScopeEmail: structured email per PRD 5.3 with high_confidence and
+       maybe_in_scope groups, one-sentence reasons, instruction to reply with
+       issue numbers or 'all'
+    3. parseScopeReply: handles 'all', explicit includes (142, 156),
+       explicit excludes (drop/remove/exclude/skip/except), mixed include/exclude
+       (include 142 and 156 but drop 201), defaults to high confidence on no numbers
+    4. sendScopeConfirmation: sends via Gmail MCP, persists state, registers watcher
+    5. processScopeReply: parses reply, cleans up state, unregisters thread
+    6. resumeSweepLoop: loads persisted state, re-registers with watcher for
+       SWEEP_PENDING restart-resume
+    7. runIssueSweep: full pipeline (sweep → send email)
+    8. createSweepReplyHandler: factory for reply callback
+  - Index (src/issue-sweep-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/issue-sweep.test.ts): 30+ test cases covering:
+    * HeuristicIssueSweeper: primary issue always high confidence, strong module
+      match, partial overlap, unrelated excluded, empty issues, multiple varying
+      relevance, label matching
+    * formatScopeEmail: sections, numbers/reasons, instruction text, (none) for empty
+    * parseScopeReply: all keyword (plain/text/include all), explicit include,
+      comma-separated, invalid numbers ignored, drop/exclude/remove, mixed
+      include/exclude, no numbers defaults, empty reply, prose with numbers
+    * sendScopeConfirmation: sends email, persists state, registers thread,
+      returns sweep result, existing thread ID
+    * processScopeReply: parses confirmed numbers, deletes state, unregisters thread
+    * resumeSweepLoop: loads+re-registers, null for missing, restart survival
+    * runIssueSweep: sweeps and sends, passes thread ID
+    * createSweepReplyHandler: onScopeConfirmed callback, unknown run throws, cleanup
+    * SweepError: name, phase, runId properties
+  - No new dependencies (pure TypeScript, builds on gmail-mcp module)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-014 (Build agent for new_feature scaffolding).
+---
+2026-05-06: US-014 Build agent for new_feature scaffolding — DONE
+  - Types (src/build-agent-types.ts): BuildAgentInput (designSummary, confirmedIssues,
+    affectedModule, referenceModules, contributingGuide, forkFullName, branchName),
+    BuildAgentResult (success, moduleFiles, testFiles, indexFiles, commitMessage,
+    summary, closesIssues), ReferenceModule (path, files), ScaffoldGenerator/
+    ScaffoldGeneratorOutput interfaces for testability, BuildAgentError (with phase)
+  - Agent (src/build-agent.ts): full pipeline function (runBuildAgent):
+    1. verifyForkOnlyAccess: rejects tokens with public_repo/repo scopes
+    2. analyzeReferenceModules: extracts file patterns, detects tests/index from references
+    3. generateScaffold: delegates to ScaffoldGenerator interface (LLM or heuristic)
+    4. validateNoDocumentation: rejects .md/.rst/.txt/.adoc/.mdx files
+    5. validateModuleScope: ensures module files within affected module path
+    6. validateTestFilePresent: requires at least one test file
+    7. validateIndexUpdates: verifies index files reference the new module
+    8. formatBuildCommitMessage: feat({module}): {summary} — closes #{ids}
+    9. commitChanges: writes to fork branch only via ForkCommitter
+    Helper functions: extractModuleName (strips src/lib prefix),
+    analyzeReferenceModules (structural metadata from references)
+  - Index (src/build-agent-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/build-agent.test.ts): 30+ test cases covering:
+    * formatBuildCommitMessage: single/multiple IDs, src/lib/other prefix handling
+    * extractModuleName: various path formats, leading/trailing slashes
+    * validateNoDocumentation: .md/.rst/.txt/.adoc/.mdx rejected, source passes,
+      reports all found, empty array
+    * validateModuleScope: in-module, out-of-scope, trailing slash, empty
+    * validateTestFilePresent: present passes, absent fails
+    * validateIndexUpdates: no index, references module, missing reference, full path
+    * analyzeReferenceModules: file patterns, tests/index detection, empty,
+      deduplication, __tests__ and .spec patterns
+    * verifyForkOnlyAccess: narrow/empty scopes pass, public_repo/repo throw
+    * runBuildAgent integration: success flow, commit message feat() format,
+      commits to fork only, rejects upstream access, rejects documentation files,
+      rejects out-of-scope modules, rejects missing tests, empty output returns failure,
+      passes full input/design/contributing/references to generator, multiple issue IDs,
+      null contributing guide works, mirrors structure (module+test+index),
+      all module/test files are creates, error phases (doc/scope/test/index validation),
+      does not update external documentation, uses feat prefix not fix
+  - No new dependencies (pure TypeScript, re-uses fix-agent-types for shared interfaces)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-015 (Usability agent).
+---
+2026-05-06: US-015 Usability agent — DONE
+  - Types (src/usability-agent-types.ts): UsabilityConfig (forkFullName, branchName,
+    affectedModule, sandboxServices, timeoutMinutes), UsabilityCheck (category,
+    description, status, details, severity), UsabilityCategory (import_paths |
+    error_messages | common_workflows | installation | documentation_examples),
+    UsabilityStatus (pass | fail | warning), UsabilitySeverity (critical | major |
+    minor | info), UsabilityAgentInput (forkFullName, branchName, affectedModule,
+    confirmedIssues, sandboxServices, timeoutMinutes, installCommand, entryPoints),
+    UsabilityAgentResult (completed, dxScore, checks, summary, durationSeconds,
+    timedOut, workflowRunUrl, blockers, suggestions),
+    UsabilityExerciser/UsabilityExerciserOutput interfaces for testability,
+    UsabilityAgentError (with phase and forkFullName),
+    USABILITY_WORKFLOW_FILE='usability-test.yml', DEFAULT_USABILITY_TIMEOUT_MINUTES=15
+  - Agent (src/usability-agent.ts): full pipeline function (runUsabilityAgent):
+    1. validateUsabilityConfig: validates forkFullName, branchName, affectedModule, installCommand
+    2. buildUsabilityWorkflowInputs: constructs dispatch inputs (branch, install_command,
+       affected_module, entry_points JSON, timeout, network_policy, sandbox_services)
+    3. Trigger workflow_dispatch on fork in same sandbox as test suite
+    4. Poll for workflow run, wait for completion or timeout
+    5. Exercise affected API via UsabilityExerciser interface (install, imports, errors, workflows)
+    6. calculateDxScore: weighted scoring (critical=30, major=20, minor=10, info=0; warnings half)
+    7. extractBlockers / extractSuggestions: categorize findings
+    8. generateUsabilitySummary: markdown report for PR body
+    Helper: createUsabilityConfig factory with defaults
+  - Index (src/usability-agent-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/usability-agent.test.ts): 30+ test cases covering:
+    * validateUsabilityConfig: valid, empty forkFullName, no slash, empty branch,
+      whitespace branch, empty affectedModule, empty installCommand, phase in error
+    * buildUsabilityWorkflowInputs: branch, install_command, affected_module,
+      entry_points JSON, timeout, network_policy none/allow, sandbox_services join
+    * calculateDxScore: all pass=100, empty=0, critical/major/minor/info deductions,
+      warning half-deduction, accumulation, floor at 0
+    * extractBlockers: critical/major failures only, excludes minor/warnings/passing
+    * extractSuggestions: warnings + minor failures only
+    * generateUsabilitySummary: DX score, install status, check counts, sections
+    * createUsabilityConfig: all fields, default timeout, array copy immutability
+    * runUsabilityAgent integration: validates before proceeding, triggers workflow,
+      polls for run, waits for completion, timeout handling, exercises API,
+      structured result, DX score 0 on install failure, workflow URL, duration,
+      dispatch error phase, exerciser error phase, DX issues not just pass/fail,
+      same sandbox services/network_policy, structured for eval agent,
+      exercises import paths, handles missing workflow run, configurable timeout
+  - No new dependencies (pure TypeScript, uses ActionsClient interface from sandbox-types)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-016 (Regression guard).
+---
+2026-05-06: US-016 Regression guard (upstream main diff) — DONE
+  - Types (src/regression-guard-types.ts): RegressionConfig (forkFullName, forkBranchName,
+    upstreamRepo, upstreamDefaultBranch, testCommand, sandboxServices, timeoutMinutes),
+    BranchTestResult (branch, completed, exitCode, stdout, stderr, durationSeconds,
+    timedOut, workflowRunUrl), OutputDiff (category: exit_code|stdout|stderr|timeout,
+    description, upstream, fork), RegressionResult (regressionDetected, diffs,
+    forkResult, upstreamResult, summary), RegressionGuardError (with phase and branch),
+    REGRESSION_WORKFLOW_FILE='regression-test.yml', DEFAULT_REGRESSION_TIMEOUT_MINUTES=15
+  - Guard (src/regression-guard.ts): full pipeline function (runRegressionGuard):
+    1. validateRegressionConfig: validates all fields (forkFullName, branchName,
+       upstreamRepo, upstreamDefaultBranch, testCommand, timeoutMinutes)
+    2. Run tests on both branches in parallel (Promise.all):
+       - Trigger workflow_dispatch for fork branch
+       - Trigger workflow_dispatch for upstream main
+       - Both use same REGRESSION_WORKFLOW_FILE and same test_command
+       - Both runs are fully isolated (fresh checkout per branch)
+    3. diffOutputs: compare observable outputs between fork and upstream
+       - normalizeOutput removes timing/timestamp variations
+       - Compares exit codes, stdout, stderr, and timeout status
+       - Returns array of OutputDiff with category and descriptions
+    4. generateRegressionSummary: markdown for PR body with diff details and links
+    5. Return RegressionResult with regressionDetected flag
+    Helper functions: normalizeOutput (timing/timestamp normalization),
+    buildRegressionWorkflowInputs (dispatch inputs per branch),
+    createRegressionConfig (factory with defaults)
+  - Index (src/regression-guard-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/regression-guard.test.ts): 30+ test cases covering:
+    * validateRegressionConfig: valid config, empty/invalid forkFullName (no slash),
+      empty/whitespace branch, invalid upstreamRepo, empty upstreamDefaultBranch,
+      empty testCommand, zero/negative timeout, phase in error
+    * createRegressionConfig: all fields, default timeout, array copy immutability
+    * buildRegressionWorkflowInputs: test_command, branch param, timeout,
+      network_policy none/allow, sandbox_services join
+    * normalizeOutput: ms/s/seconds/timestamps replaced, whitespace trimmed,
+      non-timing unchanged, multiple timings in one string
+    * diffOutputs: identical outputs = empty diffs, exit code diff, stdout diff,
+      stderr diff, timeout diff (both directions), timing-normalized comparison
+      ignores timing differences, multiple simultaneous diffs, long output truncation,
+      null vs non-null exit code
+    * generateRegressionSummary: no regressions message, regression with details,
+      multiple diffs, workflow links for both branches
+    * runRegressionGuard integration: validates before running, triggers dispatch
+      for both branches in parallel, uses REGRESSION_WORKFLOW_FILE, no regression
+      when outputs match, detects exit code/stdout differences, includes both branch
+      results, includes summary, handles fork timeout, throws on dispatch/run/log
+      failure with phase+branch, uses correct fork repo, passes correct test_command,
+      configurable timeout, isolated branch checkouts, regression details suitable
+      for PR body and per-issue verdicts
+  - No new dependencies (pure TypeScript, uses ActionsClient interface from sandbox-types)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-017 (Retry loop with eval context injection).
+---
+2026-05-06: US-017 Retry loop with eval context injection — DONE
+  - Types (src/retry-loop-types.ts): RetryAttempt (attemptNumber, retryContext, timestamp,
+    agentType), RetryHistory (runId, maxRetries, attempts), RetryLoopConfig (runId,
+    maxRetries, agentType, upstreamRepo, primaryIssueNumber, pmEmail, replyToAddress,
+    confirmedIssues, forkFullName, branchName), RetryDispatchInput (retryCount,
+    combinedRetryContext, latestRetryContext, agentType), RetryLoopResult union type
+    (retry | max_retries_exceeded), FailureReport (runId, upstreamRepo,
+    primaryIssueNumber, retryHistory, forkBranch, forkFullName, summary),
+    IssueLabeler/FailureNotifier/RetryStateStore interfaces for testability,
+    RetryLoopError (with phase and runId), AGENT_FAILED_LABEL='agent-failed',
+    FAILURE_EMAIL_SUBJECT_PREFIX='[agent-fix] FAILED:'
+  - Implementation (src/retry-loop.ts): full retry loop pipeline:
+    1. buildCombinedRetryContext: structured summary of all prior attempts
+    2. recordRetryAttempt: immutable append to history with timestamp
+    3. createRetryHistory: factory for new runs
+    4. evaluateRetryDecision: retry if attempts < maxRetries, else max_retries_exceeded
+       with failure report including fork branch (preserved) and full retry history
+    5. buildFailureSummary: human-readable summary for email
+    6. formatFailureEmail: full markdown email with retry history in code blocks
+    7. formatFailureSubject: [agent-fix] FAILED: repo#issue
+    8. handleMaxRetriesExceeded: best-effort email notification + label upstream
+       issue agent-failed + preserve fork branch (no-op, never deleted)
+    9. runRetryLoop: full pipeline (load/create history → record attempt → persist
+       → evaluate → handle notifications on terminal → clean up state)
+    10. injectRetryContextForFixAgent: appends combined + latest retry context to
+        design summary, marks "Latest Failure" section for agent attention
+    11. injectRetryContextForBuildAgent: same injection mechanism for build agent
+    12. resumeRetryLoop: loads persisted state for restart-resume
+  - Integrates with existing modules:
+    * eval-agent.ts already emits structured retryContext (US-009 buildRetryContext)
+    * eval-agent.ts buildPRDetails already shows retry count in PR body (retryCount > 0)
+    * orchestrator transitions.ts already has EVAL_RUNNING→AGENT_RUNNING for retry (US-002)
+    * Retry context injected into fix/build agent via augmented designSummary input
+  - Index (src/retry-loop-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/retry-loop.test.ts): 30+ test cases covering:
+    * createRetryHistory: empty history, custom maxRetries
+    * recordRetryAttempt: first attempt, increment, build agent type, immutability, timestamp
+    * buildCombinedRetryContext: empty, all attempts, count header, agent types, timestamps
+    * evaluateRetryDecision: retry when < max, correct retryCount, latest context,
+      combined context, max_retries_exceeded at boundary, failure report fields,
+      maxRetries=0, boundary cases, agent type in dispatch
+    * buildFailureSummary: repo, issues, retry count, agent type, fork branch preserved
+    * formatFailureEmail: header, summary, fork info, all attempts, code blocks, agent types
+    * formatFailureSubject: prefix constant, repo+issue format
+    * handleMaxRetriesExceeded: sends email, labels issue agent-failed, tolerates email
+      failure, tolerates label failure, returns success status for both
+    * runRetryLoop: creates new history, loads existing, retry dispatch info,
+      max_retries_exceeded trigger, sends email, labels issue, deletes history on
+      terminal, preserves on retry, persists before eval, build agent type
+    * injectRetryContextForFixAgent: appends latest, includes combined, marks section,
+      skips empty combined section
+    * injectRetryContextForBuildAgent: same behavior as fix agent injection
+    * resumeRetryLoop: loads existing, null for missing, survives restart
+    * End-to-end flows: fix retry→retry→exceeded, build context chain accumulation,
+      inject produces augmented design summary for retry
+    * Constants: AGENT_FAILED_LABEL='agent-failed', FAILURE_EMAIL_SUBJECT_PREFIX
+  - No new dependencies (pure TypeScript, uses interfaces for testability)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-018 (Manifest validation, schema versioning, and multi-repo support).
+---
+2026-05-06: US-018 Manifest validation, schema versioning, and multi-repo support — DONE
+  - Types (src/multi-repo-types.ts): SchemaVersion ('1'|'2'), VersionedManifest
+    (extends Manifest with schema_version), MultiRepoManifest (extends VersionedManifest
+    with coordinated_repos), CoordinatedRepo (repo, fork_org?, test_command?,
+    affected_module?), MultiRepoRun (groupRunId, primaryRepo, repos, sharedThreadId,
+    sharedEvalVerdict), RepoRunState (repo, forkFullName, branchName, sandboxPassed?,
+    agentCompleted?), MultiRepoEvalVerdict (overallPass, perRepoVerdicts, combinedSummary),
+    RepoVerdict, SharedEmailThread (groupRunId, threadId, repos, subject),
+    UnsupportedSchemaVersionError (declaredVersion, supportedVersions),
+    MultiRepoCoordinationError (phase, groupRunId), SchemaMigration (from, to,
+    breakingChanges, steps), SUPPORTED_SCHEMA_VERSIONS=['1','2'],
+    CURRENT_SCHEMA_VERSION='2', SCHEMA_MIGRATIONS with documented v1→v2 path
+  - Implementation (src/multi-repo.ts):
+    1. validateSchemaVersion: returns version or throws UnsupportedSchemaVersionError
+       with clear message including declared version and supported versions list
+    2. validateVersionedManifest: validates schema_version, extracts multi-repo fields
+       before base validation, rejects coordinated_repos on v1, delegates to base loader
+    3. validateCoordinatedRepos: validates array structure with field-level errors
+    4. createMultiRepoRun: creates coordinated run with deterministic branch names
+       across primary + coordinated repos (same branch name, sorted issue IDs)
+    5. buildMultiRepoEmailSubject: single subject format for multi-repo threads
+       (includes +N repos suffix for multi-repo)
+    6. createSharedEmailThread: shared thread config for email aggregation
+    7. aggregateMultiRepoEval: single eval verdict (all repos must pass for
+       overallPass=true, combined summary with pass/fail counts)
+    8. getMigrationPath / needsMigration / generateMigrationInstructions:
+       documented migration path for breaking schema changes
+  - Schema updated (src/manifest/schema.ts): added versionedManifestSchema with
+    schema_version enum property and coordinated_repos array schema
+  - Index (src/multi-repo-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/multi-repo.test.ts): 30+ test cases covering:
+    * Schema version validation: absent/null→'1', valid versions, rejects unknown
+      '3'/'0'/'latest' with clear error (declared+supported versions in message),
+      numeric coercion
+    * Versioned manifest validation: v1 without field, v2 without/with coordinated_repos,
+      rejects coordinated_repos on v1, rejects unknown version, rejects non-object,
+      validates base fields, applies defaults
+    * Coordinated repos validation: valid array, non-array rejection, invalid repo,
+      non-string fields, non-object entries, empty array, affected_module
+    * Multi-repo dispatch: primary only, with coordinated repos (correct fork names),
+      same branch across repos, sorted issue IDs for determinism
+    * Single-thread email aggregation: single-repo format, multi-repo +N format,
+      shared thread creation
+    * Eval aggregation: all pass, any fail, all fail, per-repo verdicts with reasons
+    * Migration: v1→v2 path exists with steps, non-existent path, needsMigration
+      detection, generateMigrationInstructions
+    * Error types: field verification, constants verification
+  - No new dependencies (pure TypeScript, builds on existing manifest module)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  Next: US-019 (Cost guardrails, fork cleanup, and run history dashboard).
+---
+2026-05-06: US-019 Cost guardrails, fork cleanup, and run history dashboard — DONE
+  - Types (src/cost-guardrails-types.ts): CostConfig (max_tokens_per_run,
+    max_cost_per_run, cost_per_1k_tokens), RunUsage (runId, tokensUsed, costUsd,
+    lastUpdated), CostCheckResult (withinBudget, breachedCap, usage, config, message),
+    CostBreachNotification (runId, upstreamRepo, primaryIssueNumber, haltedAtState,
+    usage, config, summary), ForkCleanupPolicy ('immediate-after-merge'|'delayed'|'never'),
+    ForkCleanupConfig (policy, delayHours, forkFullName, branchName), ForkCleanupResult
+    (executed, action, scheduledAt, message), ForkCleaner interface (deleteBranch,
+    deleteFork, listBranches), RunHistoryEntry (runId, repo, issueIds, state,
+    durationSeconds, retryCount, costUsd, tokensUsed, createdAt, updatedAt, prUrl),
+    RunHistoryFilter (repo, state, since, until, limit, offset), RunHistoryStats
+    (totalRuns, byState, totalCostUsd, totalTokensUsed, avgDurationSeconds, successRate),
+    RunHistoryStore interface (recordUsage, getUsage, getHistory, getStats, recordPrUrl),
+    CostCapBreachedError (runId, breachedCap, usage, config), ForkCleanupError (phase,
+    forkFullName), ScenarioType union, ScenarioTestResult interface
+  - Implementation (src/cost-guardrails.ts):
+    1. createCostConfig: factory with defaults (null caps = unlimited)
+    2. checkCostCap: checks token cap first, then cost cap, returns structured result
+    3. recordAndCheckUsage: accumulates usage in store, calculates cost from rate,
+       checks caps after recording
+    4. buildCostBreachNotification: structured notification with run/repo/issue/state/usage
+    5. formatCostBreachEmail: markdown email with all details
+    6. formatCostBreachSubject: [agent-fix] COST LIMIT: repo#issue
+    7. validateForkCleanupPolicy: validates policy string
+    8. createForkCleanupConfig: factory with default policy (delayed) and delay (72h)
+    9. executeForkCleanup: policy-based cleanup:
+       - never → skip (no action)
+       - delayed → schedule (returns scheduledAt timestamp)
+       - immediate-after-merge → delete branch, delete fork if no other branches
+    10. executeDelayedCleanup: for scheduled job execution
+    11. formatRunHistoryEntry: CLI-friendly single-line format
+    12. formatDuration: seconds → human-readable (Xs, Xm Ys, Xh Ym)
+    13. formatRunHistoryStats: CLI summary with totals and by-state breakdown
+    14. renderDashboard: full CLI dashboard output (stats + recent runs)
+    15. queryRunHistory: queries store with filter, returns entries + stats
+    16. calculateStats: computes aggregates from entries (success rate = PR_OPEN/completed)
+    17. validateScenarioOutcome: validates all 4 PRD 8.1 scenario types:
+        - simple_bug_fix: PR_OPEN + 0 retries + PR URL
+        - feature_with_design: PR_OPEN + PR URL (retries allowed)
+        - retry_success: PR_OPEN + retries > 0 + PR URL
+        - max_retries_exceeded: FAILED + no PR URL
+  - Index (src/cost-guardrails-index.ts): barrel exports for all public types and functions
+  - Unit tests (src/cost-guardrails.test.ts): 30+ test cases covering:
+    * createCostConfig: defaults, overrides, partial overrides
+    * checkCostCap: no caps within budget, under/over token cap, under/over cost cap,
+      token checked before cost, includes usage/config in result
+    * recordAndCheckUsage: records + returns within budget, accumulates across calls,
+      detects breach after accumulation, calculates cost from tokens and rate
+    * buildCostBreachNotification: token breach, cost breach, state in summary
+    * formatCostBreachEmail: all required sections present
+    * formatCostBreachSubject: correct prefix format
+    * CostCapBreachedError: correct fields for token/cost breach
+    * validateForkCleanupPolicy: accepts all 3 valid, rejects invalid
+    * createForkCleanupConfig: default policy/delay, custom policy/delay
+    * executeForkCleanup: never→skipped, delayed→scheduled with time, immediate
+      →branch_deleted, immediate→fork_deleted when no branches remain, throws
+      ForkCleanupError on API failure
+    * executeDelayedCleanup: executes immediate cleanup
+    * ForkCleanupError: correct name/phase/forkFullName fields
+    * formatDuration: seconds, minutes+seconds, hours+minutes
+    * formatRunHistoryEntry: complete entry with PR URL, zero cost shows dash
+    * calculateStats: empty entries zeros, multiple entries aggregation, no completed runs
+    * formatRunHistoryStats: includes all summary fields
+    * renderDashboard: empty shows "No runs found", includes stats and entries
+    * queryRunHistory: calls store with filter
+    * validateScenarioOutcome: all 4 scenarios pass/fail conditions, unknown scenario
+    * Constants: all default values verified
+  - No new dependencies (pure TypeScript, uses interfaces for testability)
+  Note: npm install required before running tests (env restriction prevented execution here)
+  ALL USER STORIES COMPLETE (US-001 through US-019).
+---

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.js
+!jest.config.ts
+*.d.ts
+*.map
+src/manifest/__tests__/fixtures/
