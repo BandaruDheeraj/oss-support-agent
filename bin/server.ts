@@ -27,6 +27,7 @@ import { loadAdapter } from '../core/adapter-loader';
 
 import { FsManifestRegistry } from './clients/manifest-registry';
 import { runPipeline, defaultWorkspaceRoot } from './run-pipeline';
+import { buildLiveDeps, defaultStateRoot, type LiveDeps } from './clients/live-deps';
 
 interface RequiredEnv {
   GITHUB_TOKEN: string;
@@ -39,6 +40,7 @@ interface OptionalEnv {
   OPENROUTER_API_KEY: string | undefined;
   REPO_ROOT: string;
   WORKSPACE_ROOT: string;
+  STATE_ROOT: string;
   GIT_AUTHOR_NAME: string;
   GIT_AUTHOR_EMAIL: string;
 }
@@ -68,6 +70,7 @@ function loadEnv(): RequiredEnv & OptionalEnv {
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
     REPO_ROOT: process.env.REPO_ROOT ?? process.cwd(),
     WORKSPACE_ROOT: process.env.WORKSPACE_ROOT ?? defaultWorkspaceRoot(),
+    STATE_ROOT: process.env.STATE_ROOT ?? defaultStateRoot(),
     GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? 'oss-support-agent',
     GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? 'agent@users.noreply.github.com',
   };
@@ -85,7 +88,8 @@ async function processIssueEvent(
   payload: IssueEvent,
   eventType: string,
   registry: FsManifestRegistry,
-  env: ReturnType<typeof loadEnv>
+  env: ReturnType<typeof loadEnv>,
+  live: LiveDeps | null
 ): Promise<{ status: number; body: any }> {
   if (eventType !== 'issues') {
     return { status: 200, body: { status: 'ignored', reason: `event=${eventType}` } };
@@ -103,16 +107,16 @@ async function processIssueEvent(
   }
 
   const manifest = registry.getManifest(repoFullName);
-  if (!manifest) {
+  if (!manifest && !live) {
     log(`[skip] no manifest at configs/${repoFullName}/manifest.yaml`);
-    log('       run introspection offline before live mode can process this repo');
+    log('       set Gmail env vars to enable live introspection auto-onboarding');
     return {
       status: 202,
-      body: { status: 'skipped', reason: 'manifest-not-found-introspection-not-wired' },
+      body: { status: 'skipped', reason: 'manifest-not-found-and-introspection-deps-missing' },
     };
   }
 
-  if (action === 'labeled') {
+  if (manifest && action === 'labeled') {
     const labelName = (payload as any).label?.name;
     if (
       labelName !== manifest.trigger_label &&
@@ -131,22 +135,31 @@ async function processIssueEvent(
   try {
     adapter = await loadAdapter(repoFullName, {
       repoRoot: env.REPO_ROOT,
-      runIntrospection: async () => {
-        throw new Error(
-          `Live mode does not run introspection. Run it offline for ${repoFullName} first.`
-        );
-      },
+      runIntrospection: live
+        ? (async (repo, pmEmail, forkOrg, opts) => {
+            log(`[introspection] starting auto-onboarding for ${repo}`);
+            return live.runIntrospection(repo, pmEmail, forkOrg, opts);
+          })
+        : (async () => {
+            throw new Error(
+              `No manifest for ${repoFullName} and Gmail/introspection deps not configured.`
+            );
+          }),
     });
   } catch (err: any) {
     log(`[error] adapter load failed: ${err?.message ?? err}`);
     return { status: 500, body: { status: 'error', reason: 'adapter-load-failed' } };
   }
 
-  // Fire-and-log the pipeline. We respond 202 immediately so GitHub doesn't time out
-  // the webhook delivery; the actual run continues in the background.
+  const finalManifest = registry.getManifest(repoFullName);
+  if (!finalManifest) {
+    log(`[error] manifest still missing after adapter load`);
+    return { status: 500, body: { status: 'error', reason: 'manifest-missing-post-onboarding' } };
+  }
+
   void runPipeline({
     payload,
-    manifest,
+    manifest: finalManifest,
     adapter,
     deps: {
       token: env.GITHUB_TOKEN,
@@ -155,6 +168,7 @@ async function processIssueEvent(
       authorName: env.GIT_AUTHOR_NAME,
       authorEmail: env.GIT_AUTHOR_EMAIL,
       log,
+      live: live ?? undefined,
     },
   })
     .then((result) => {
@@ -175,10 +189,28 @@ function startServer(): void {
   const env = loadEnv();
   const registry = new FsManifestRegistry(env.REPO_ROOT);
 
+  const baseLog = (msg: string) => {
+    const ts = new Date().toISOString();
+    // eslint-disable-next-line no-console
+    console.log(`${ts} [server] ${msg}`);
+  };
+
+  const live = buildLiveDeps(process.env, {
+    token: env.GITHUB_TOKEN,
+    stateRoot: env.STATE_ROOT,
+    log: baseLog,
+    repoRoot: env.REPO_ROOT,
+  });
+
+  if (live) {
+    live.watcher.start();
+    baseLog(`Gmail watcher started; polling for replies as ${live.monitoredEmail}`);
+  }
+
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok' }));
+      res.end(JSON.stringify({ status: 'ok', live: !!live }));
       return;
     }
 
@@ -211,7 +243,7 @@ function startServer(): void {
       }
 
       try {
-        const result = await processIssueEvent(payload, eventType, registry, env);
+        const result = await processIssueEvent(payload, eventType, registry, env, live);
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.body));
       } catch (err: any) {
@@ -231,10 +263,16 @@ function startServer(): void {
     // eslint-disable-next-line no-console
     console.log(`[server] workspace root: ${path.resolve(env.WORKSPACE_ROOT)}`);
     // eslint-disable-next-line no-console
+    console.log(`[server] state root: ${path.resolve(env.STATE_ROOT)}`);
+    // eslint-disable-next-line no-console
     console.log(`[server] fork org: ${env.DEFAULT_FORK_ORG}`);
     // eslint-disable-next-line no-console
     console.log(
       `[server] LLM: ${env.OPENROUTER_API_KEY ? 'OpenRouter (real)' : 'heuristic (no OPENROUTER_API_KEY)'}`
+    );
+    // eslint-disable-next-line no-console
+    console.log(
+      `[server] live deps: ${live ? `enabled (Gmail=${live.monitoredEmail})` : 'disabled (skip-PM-gate path only)'}`
     );
   });
 }
