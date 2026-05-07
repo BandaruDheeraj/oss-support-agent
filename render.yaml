@@ -2,7 +2,7 @@ services:
   - type: web
     name: oss-support-agent
     runtime: node
-    plan: starter
+    plan: free
     region: oregon
     branch: main
     autoDeploy: true
@@ -16,18 +16,21 @@ services:
     # dual replicas would race / double-process replies.
     numInstances: 1
 
-    disk:
-      name: state
-      mountPath: /var/data
-      sizeGB: 1
+    # NOTE: Free plan has no persistent disk and sleeps after 15 min idle.
+    # State will reset on restart and Gmail watcher pauses while asleep.
+    # Upgrade to "starter" + uncomment the disk block below for production.
+    # disk:
+    #   name: state
+    #   mountPath: /var/data
+    #   sizeGB: 1
 
     envVars:
       - key: NODE_ENV
         value: production
       - key: STATE_ROOT
-        value: /var/data/state
+        value: /tmp/oss-agent/state
       - key: WORKSPACE_ROOT
-        value: /var/data/workspaces
+        value: /tmp/oss-agent/workspaces
 
       # Required — set these in the Render dashboard (mark as secret)
       - key: GITHUB_TOKEN
