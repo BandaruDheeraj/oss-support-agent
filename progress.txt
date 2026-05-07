@@ -869,3 +869,17 @@ Project: OSS Autonomous Fix Loop
   - Added unit tests core/adapter-loader.test.ts covering: existing adapter, missing adapter introspection, missing default export, missing env vars, missing method.
   Note: shell command execution is blocked in this environment, so npm/jest could not be executed here.
 ---
+
+---
+2026-05-07: US-109 Wire adapter into core agents — DONE
+  - Triage now keeps only issue-type classification and delegates module routing to adapter.classifyModule(issue), validating returned directories with AdapterContractError.
+  - Sandbox config now comes from adapter.getTestCommands()/getSandboxServices(); SandboxArtifact includes authoritative commands output with single-command migration fallback.
+  - Eval calls adapter.runCustomEval(commands); PR creation merges adapter.getPRMetadata labels/body sections.
+  - Multi-repo coordinated entries no longer carry per-repo test_command; manifest schema rejects adapter-owned sandbox fields.
+  - Migrated affected tests with fake adapters and verified 199 affected tests pass.
+---
+2026-05-07: US-110 Parameterised shared sandbox workflow — DONE
+  - Sandbox runner now downloads and parses the workflow-emitted sandbox-output artifact as the authoritative SandboxArtifact.commands (per-command {command, exitCode, stdout, stderr}).
+  - Timeout now triggers SandboxTimeoutError and performs best-effort workflow cancellation via ActionsClient.cancelWorkflowRun?.
+  - Updated sandbox unit tests to cover artifact preference and timeout behavior.
+  Note: Shell command execution is blocked in this environment, so npm/jest could not be executed here.

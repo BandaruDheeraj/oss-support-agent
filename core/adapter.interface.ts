@@ -5,6 +5,14 @@
  * Per-repo adapters live outside core and implement these methods.
  */
 
+/**
+ * Contract version.
+ *
+ * Bump this number when you make any breaking change to RepoAdapter or its supporting types.
+ */
+export const ADAPTER_INTERFACE_VERSION = 1;
+
+
 /** A GitHub issue (or issue-like) input used for routing decisions. */
 export interface Issue {
   /** Issue number within the repository. */

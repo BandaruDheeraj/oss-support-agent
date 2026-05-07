@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "test": "jest --no-coverage",
-    "lint": "tsc --noEmit && ts-node scripts/check-core-imports.ts"
+    "lint": "tsc --noEmit && ts-node scripts/check-core-imports.ts && ts-node scripts/check-config-adapters.ts && ts-node scripts/check-adapter-contract.ts"
   },
   "keywords": [],
   "license": "MIT",
