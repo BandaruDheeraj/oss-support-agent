@@ -1,19 +1,12 @@
-# Example manifest for Arize-ai/openinference (from PRD section 3.2)
 repo: "Arize-ai/openinference"
 trigger_label: "agent-fix"
+skip_pm_gate_label: "trivial-fix"
 fork_org: "oss-fix-bot"
 branch_prefix: "agent/scope-"
-test_command: "python -m pytest tests/ -x --timeout=300"
 approval_keywords:
   - "approved"
   - "lgtm"
   - "ship it"
 pm_email: "pm@example.com"
-issue_types:
-  - "bug_fix"
-  - "new_feature"
-  - "docs"
-sandbox_services:
-  - "pypi.org"
 max_retries: 3
-skip_pm_gate: false
+sandbox_timeout_mins: 15
