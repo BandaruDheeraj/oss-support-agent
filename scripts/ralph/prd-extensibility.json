@@ -55,8 +55,8 @@
         "All existing unit tests (manifest, orchestrator, webhook, every agent, retry-loop, sandbox-runner, multi-repo, cost-guardrails, fork-manager, gmail-mcp, pm-email-loop, issue-sweep) pass after the restructure with no test logic changes other than import paths"
       ],
       "priority": 2,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Restructured repo into core/ + configs/ (moved src/manifest, src/orchestrator, src/webhook, and all src/*.ts modules into core/, with agents under core/agents and LLM under core/llm). Added configs/arize-ai/openinference/ (moved manifest.yaml from examples/) and a placeholder adapter.ts. Added .github/workflows/sandbox.yml. Updated tsconfig include + jest roots + README. Enforced one-way dependency core→configs via scripts/check-core-imports.ts wired into npm run lint. Verified: npm run lint, npm test."
     },
     {
       "id": "US-103",

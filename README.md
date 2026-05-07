@@ -32,3 +32,13 @@ OpenRouter recommends sending:
 - `OPENROUTER_X_TITLE` (sent as `X-Title`)
 
 These are included on all OpenRouter requests.
+
+## Directory layout (US-102)
+
+- `core/`: repo-agnostic harness code (orchestrator, agents, sandbox runner, etc.)
+- `configs/`: per-repo configuration and adapters (`configs/<org>/<repo>/`)
+
+### One-way dependency rule
+
+`core/` must never import from `configs/`. This is enforced by `npm run lint`.
+`configs/` may import from `core/` (typically from `core/adapter.interface.ts`).

@@ -802,3 +802,13 @@ Project: OSS Autonomous Fix Loop
   - Updated tsconfig.json to include both src/ and core/ (rootDir set to repo root).
   - Verified: npm test -- src/adapter.interface.test.ts
 ---
+
+2026-05-06: US-102 Harness directory restructure with one-way dependency — DONE
+  - Moved all src/*.ts into core/ (agents → core/agents, infra → core/, manifest/orchestrator/webhook → core/{manifest,orchestrator,webhook}).
+  - Moved examples/openinference.yaml → configs/arize-ai/openinference/manifest.yaml and added placeholder configs/arize-ai/openinference/adapter.ts.
+  - Added .github/workflows/sandbox.yml.
+  - Added core/orchestrator.ts, core/email.ts, core/github.ts convenience entrypoints and core/agents/introspection.ts placeholder.
+  - Updated tsconfig include (core+configs+src shims) and jest roots.
+  - Enforced one-way dependency: scripts/check-core-imports.ts wired into npm run lint.
+  - Verified: npm run lint, npm test.
+---

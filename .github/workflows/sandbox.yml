@@ -1,0 +1,45 @@
+name: sandbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to test
+        required: true
+        type: string
+      test_command:
+        description: Command to run
+        required: true
+        type: string
+      timeout_minutes:
+        description: Timeout in minutes
+        required: true
+        type: string
+      sandbox_services:
+        description: Comma-separated service allowlist (informational in v1)
+        required: false
+        type: string
+        default: ""
+      network_policy:
+        description: Network policy string (informational in v1)
+        required: false
+        type: string
+        default: "none"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+
+      - name: Run test command
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "network_policy=${{ inputs.network_policy }}"
+          echo "sandbox_services=${{ inputs.sandbox_services }}"
+          echo "Running: ${{ inputs.test_command }}"
+          bash -lc "${{ inputs.test_command }}"

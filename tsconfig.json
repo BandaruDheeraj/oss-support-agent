@@ -12,6 +12,6 @@
     "resolveJsonModule": true,
     "declaration": true
   },
-  "include": ["src/**/*", "core/**/*"],
+  "include": ["core/**/*", "configs/**/*", "src/**/*"],
   "exclude": ["node_modules", "dist"]
 }
