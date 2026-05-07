@@ -121,7 +121,7 @@ for ($i = 1; $i -le $Iterations; $i++) {
     @"
 # Ralph Iteration $i Context
 
-## PRD ($([System.IO.Path]::GetRelativePath($ProjectRoot, $PrdFile) -replace '\\','/'))
+## PRD ($(($PrdFile.Substring($ProjectRoot.Length).TrimStart('\','/')) -replace '\\','/'))
 ``````json
 $prdContent
 ``````
