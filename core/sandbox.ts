@@ -1,6 +1,6 @@
 /**
  * Basic sandbox runner (US-008).
- * Executes the manifest test_command on the fork branch via GitHub Actions
+ * Executes adapter-provided commands on the fork branch via GitHub Actions
  * workflow_dispatch and captures stdout/stderr/exit code.
  */
 
@@ -17,11 +17,19 @@ import {
   SandboxRunError,
   SandboxTimeoutError,
 } from './sandbox-types';
+import type { RepoAdapter, SandboxCommandResult } from './adapter.interface';
 
 /**
  * Validates sandbox configuration.
  */
 export function validateSandboxConfig(config: SandboxConfig): void {
+  if (!config.repoFullName || !config.repoFullName.includes('/')) {
+    throw new SandboxRunError(
+      `Invalid repoFullName: "${config.repoFullName}" (must be "owner/repo" format)`,
+      'validation',
+      config.repoFullName || ''
+    );
+  }
   if (!config.forkFullName || !config.forkFullName.includes('/')) {
     throw new SandboxRunError(
       `Invalid forkFullName: "${config.forkFullName}" (must be "org/repo" format)`,
@@ -29,16 +37,16 @@ export function validateSandboxConfig(config: SandboxConfig): void {
       config.forkFullName || ''
     );
   }
+  if (!config.workflowRepoFullName || !config.workflowRepoFullName.includes('/')) {
+    throw new SandboxRunError(
+      `Invalid workflowRepoFullName: "${config.workflowRepoFullName}" (must be "owner/repo" format)`,
+      'validation',
+      config.workflowRepoFullName || ''
+    );
+  }
   if (!config.branchName || config.branchName.trim() === '') {
     throw new SandboxRunError(
       'branchName is required',
-      'validation',
-      config.forkFullName
-    );
-  }
-  if (!config.testCommand || config.testCommand.trim() === '') {
-    throw new SandboxRunError(
-      'testCommand is required',
       'validation',
       config.forkFullName
     );
@@ -58,35 +66,136 @@ export function validateSandboxConfig(config: SandboxConfig): void {
  * the test run environment.
  */
 export function buildWorkflowInputs(config: SandboxConfig): Record<string, string> {
+  const configuredCommands = config.testCommands ?? [];
+  const commands = configuredCommands.length > 0
+    ? configuredCommands
+    : config.testCommand
+    ? [config.testCommand]
+    : [];
+
+  const services = config.sandboxServices.map((s) => (typeof s === 'string'
+    ? { name: s, image: s, ports: [] }
+    : s));
+
+  const testCommandsB64 = Buffer.from(JSON.stringify(commands), 'utf8').toString('base64');
+  const servicesB64 = Buffer.from(JSON.stringify(services), 'utf8').toString('base64');
+
+  const forkCloneUrl = config.forkCloneUrl ?? `https://github.com/${config.forkFullName}.git`;
+
   return {
-    test_command: config.testCommand,
-    branch: config.branchName,
-    timeout_minutes: String(config.timeoutMinutes),
-    sandbox_services: config.sandboxServices.join(','),
-    // Network isolation: only declared services are accessible
-    network_policy: config.sandboxServices.length === 0
-      ? 'none'
-      : `allow:${config.sandboxServices.join(',')}`,
+    repo_full_name: config.repoFullName,
+    fork_clone_url: forkCloneUrl,
+    branch_name: config.branchName,
+    test_commands_b64: testCommandsB64,
+    services_b64: servicesB64,
   };
 }
 
 /**
- * Creates a SandboxConfig from manifest fields and fork context.
+ * Creates a SandboxConfig from adapter fields and fork context.
  */
+export function createSandboxConfig(
+  repoFullName: string,
+  forkFullName: string,
+  branchName: string,
+  adapter: RepoAdapter,
+  timeoutMinutes?: number,
+  workflowRepoFullName?: string
+): Promise<SandboxConfig>;
+export function createSandboxConfig(
+  repoFullName: string,
+  forkFullName: string,
+  branchName: string,
+  testCommand: string,
+  sandboxServices: string[],
+  timeoutMinutes?: number,
+  workflowRepoFullName?: string
+): SandboxConfig;
+
+// Back-compat overload: treat the provided repo as both upstream + fork.
+export function createSandboxConfig(
+  forkFullName: string,
+  branchName: string,
+  adapter: RepoAdapter,
+  timeoutMinutes?: number,
+  workflowRepoFullName?: string
+): Promise<SandboxConfig>;
 export function createSandboxConfig(
   forkFullName: string,
   branchName: string,
   testCommand: string,
   sandboxServices: string[],
-  timeoutMinutes?: number
-): SandboxConfig {
-  return {
+  timeoutMinutes?: number,
+  workflowRepoFullName?: string
+): SandboxConfig;
+
+export function createSandboxConfig(...args: any[]): SandboxConfig | Promise<SandboxConfig> {
+  const inferredWorkflowRepo =
+    args[args.length - 1] ??
+    process.env.HARNESS_REPO_FULL_NAME ??
+    process.env.GITHUB_REPOSITORY;
+
+  const makeBase = (repoFullName: string, forkFullName: string, branchName: string) => ({
+    repoFullName,
     forkFullName,
     branchName,
-    testCommand,
-    sandboxServices: [...sandboxServices],
-    timeoutMinutes: timeoutMinutes ?? DEFAULT_TIMEOUT_MINUTES,
-  };
+    workflowRepoFullName: inferredWorkflowRepo ?? repoFullName,
+  });
+
+  // New signature: repoFullName, forkFullName, branchName, <adapterOrCommand>, ...
+  if (args.length >= 4 && typeof args[2] === 'string' && typeof args[1] === 'string' && typeof args[0] === 'string' && typeof args[3] !== 'undefined' && (typeof args[3] === 'string' || typeof args[3] === 'object')) {
+    const [repoFullName, forkFullName, branchName, adapterOrCommand, maybeServices, maybeTimeout] = args;
+
+    if (typeof adapterOrCommand === 'string') {
+      return {
+        ...makeBase(repoFullName, forkFullName, branchName),
+        testCommands: [adapterOrCommand],
+        testCommand: adapterOrCommand,
+        sandboxServices: Array.isArray(maybeServices) ? [...maybeServices] : [],
+        timeoutMinutes: typeof maybeTimeout === 'number' ? maybeTimeout : DEFAULT_TIMEOUT_MINUTES,
+      };
+    }
+
+    const adapter = adapterOrCommand as RepoAdapter;
+    const timeoutMinutes = typeof maybeServices === 'number' ? maybeServices : DEFAULT_TIMEOUT_MINUTES;
+
+    return Promise.all([adapter.getTestCommands(), adapter.getSandboxServices()]).then(
+      ([testCommands, sandboxServices]) => ({
+        ...makeBase(repoFullName, forkFullName, branchName),
+        testCommands: [...testCommands],
+        testCommand: testCommands[0],
+        sandboxServices: sandboxServices.map((s) => ({ ...s, ports: [...s.ports] })),
+        timeoutMinutes,
+      })
+    );
+  }
+
+  // Legacy signature: forkFullName, branchName, <adapterOrCommand>, ...
+  const [forkFullName, branchName, adapterOrCommand, maybeServices, maybeTimeout] = args;
+  const repoFullName = forkFullName;
+
+  if (typeof adapterOrCommand === 'string') {
+    return {
+      ...makeBase(repoFullName, forkFullName, branchName),
+      testCommands: [adapterOrCommand],
+      testCommand: adapterOrCommand,
+      sandboxServices: Array.isArray(maybeServices) ? [...maybeServices] : [],
+      timeoutMinutes: typeof maybeTimeout === 'number' ? maybeTimeout : DEFAULT_TIMEOUT_MINUTES,
+    };
+  }
+
+  const adapter = adapterOrCommand as RepoAdapter;
+  const timeoutMinutes = typeof maybeServices === 'number' ? maybeServices : DEFAULT_TIMEOUT_MINUTES;
+
+  return Promise.all([adapter.getTestCommands(), adapter.getSandboxServices()]).then(
+    ([testCommands, sandboxServices]) => ({
+      ...makeBase(repoFullName, forkFullName, branchName),
+      testCommands: [...testCommands],
+      testCommand: testCommands[0],
+      sandboxServices: sandboxServices.map((s) => ({ ...s, ports: [...s.ports] })),
+      timeoutMinutes,
+    })
+  );
 }
 
 /**
@@ -96,11 +205,21 @@ export function buildSandboxArtifact(
   config: SandboxConfig,
   result: SandboxResult,
   startedAt: string,
-  completedAt: string
+  completedAt: string,
+  commands?: SandboxCommandResult[]
 ): SandboxArtifact {
+  const synthesizedCommands = commands && commands.length > 0
+    ? commands
+    : [{
+        command: config.testCommands?.[0] ?? config.testCommand ?? '',
+        exitCode: result.exitCode ?? 1,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      }];
   return {
     config,
     result,
+    commands: synthesizedCommands,
     startedAt,
     completedAt,
   };
@@ -119,22 +238,62 @@ export function buildSandboxArtifact(
  */
 export async function runSandbox(
   config: SandboxConfig,
+  adapter: RepoAdapter,
   client: ActionsClient,
   pollIntervalMs?: number
+): Promise<SandboxArtifact>;
+export async function runSandbox(
+  config: SandboxConfig,
+  client: ActionsClient,
+  pollIntervalMs?: number
+): Promise<SandboxArtifact>;
+export async function runSandbox(
+  config: SandboxConfig,
+  adapterOrClient: RepoAdapter | ActionsClient,
+  clientOrPoll?: ActionsClient | number,
+  maybePollIntervalMs?: number
 ): Promise<SandboxArtifact> {
+  const usingLegacyClient = 'triggerWorkflowDispatch' in adapterOrClient;
+  const adapter: RepoAdapter = usingLegacyClient
+    ? legacyAdapterFromConfig(config)
+    : adapterOrClient;
+  const client = usingLegacyClient ? adapterOrClient : clientOrPoll as ActionsClient;
+  const pollIntervalMs = usingLegacyClient ? clientOrPoll as number | undefined : maybePollIntervalMs;
+
+  const inferredWorkflowRepo =
+    config.workflowRepoFullName ??
+    process.env.HARNESS_REPO_FULL_NAME ??
+    process.env.GITHUB_REPOSITORY ??
+    config.forkFullName;
+
+  const [testCommands, sandboxServices] = await Promise.all([
+    adapter.getTestCommands(),
+    adapter.getSandboxServices(),
+  ]);
+
+  const refreshedConfig: SandboxConfig = {
+    ...config,
+    repoFullName: config.repoFullName ?? config.forkFullName,
+    workflowRepoFullName: inferredWorkflowRepo,
+    forkCloneUrl: config.forkCloneUrl,
+    testCommands: [...testCommands],
+    testCommand: testCommands[0],
+    sandboxServices: sandboxServices.map((service) => ({ ...service, ports: [...service.ports] })),
+  };
+
   // 1. Validate
-  validateSandboxConfig(config);
+  validateSandboxConfig(refreshedConfig);
 
   const startedAt = new Date().toISOString();
   const interval = pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
 
   // 2. Trigger workflow_dispatch
-  const inputs = buildWorkflowInputs(config);
+  const inputs = buildWorkflowInputs(refreshedConfig);
   try {
     await client.triggerWorkflowDispatch(
-      config.forkFullName,
+      refreshedConfig.workflowRepoFullName,
       SANDBOX_WORKFLOW_FILE,
-      config.branchName,
+      refreshedConfig.branchName,
       inputs
     );
   } catch (err: unknown) {
@@ -142,7 +301,7 @@ export async function runSandbox(
     throw new SandboxRunError(
       `Failed to trigger workflow dispatch: ${message}`,
       'trigger',
-      config.forkFullName
+      refreshedConfig.forkFullName
     );
   }
 
@@ -153,15 +312,15 @@ export async function runSandbox(
   // This keeps unit tests (which pass interval=0/1) fast while preserving a reasonable
   // default when interval is large.
   const maxWaitForRunMs = runPollInterval === 0
-    ? 1
+    ? 50
     : Math.min(60_000, runPollInterval * 12);
   const runPollStart = Date.now();
 
   while (Date.now() - runPollStart < maxWaitForRunMs) {
     workflowRun = await client.getWorkflowRun(
-      config.forkFullName,
+      refreshedConfig.workflowRepoFullName,
       SANDBOX_WORKFLOW_FILE,
-      config.branchName,
+      refreshedConfig.branchName,
       startedAt
     );
     if (workflowRun) break;
@@ -172,34 +331,63 @@ export async function runSandbox(
     throw new SandboxRunError(
       `Workflow run did not appear within ${maxWaitForRunMs}ms after dispatch`,
       'wait_for_run',
-      config.forkFullName
+      refreshedConfig.forkFullName
     );
   }
 
   // 4. Poll until complete or timeout
-  const timeoutMs = config.timeoutMinutes * 60 * 1000;
+  const timeoutMs = refreshedConfig.timeoutMinutes * 60 * 1000;
   const runStatus = await client.waitForWorkflowRun(
-    config.forkFullName,
+    refreshedConfig.workflowRepoFullName,
     workflowRun.id,
     timeoutMs,
     interval
   );
 
-  // 5. Retrieve logs
-  let logs: WorkflowRunLogs;
+  // 5. Retrieve logs + the structured SandboxOutput artifact
   if (runStatus.timedOut) {
-    logs = { stdout: '', stderr: 'Sandbox run timed out', exitCode: null };
-  } else {
     try {
-      logs = await client.getWorkflowRunLogs(config.forkFullName, workflowRun.id);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new SandboxRunError(
-        `Failed to retrieve workflow logs: ${message}`,
-        'logs',
-        config.forkFullName
-      );
+      await client.cancelWorkflowRun?.(refreshedConfig.workflowRepoFullName, workflowRun.id);
+    } catch {
+      // Best-effort cancel; still surface the timeout.
     }
+
+    throw new SandboxTimeoutError(
+      `Sandbox run timed out after ${refreshedConfig.timeoutMinutes} minutes`,
+      refreshedConfig.timeoutMinutes,
+      workflowRun.id
+    );
+  }
+
+  let logs: WorkflowRunLogs;
+  try {
+    logs = await client.getWorkflowRunLogs(refreshedConfig.workflowRepoFullName, workflowRun.id);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new SandboxRunError(
+      `Failed to retrieve workflow logs: ${message}`,
+      'logs',
+      refreshedConfig.workflowRepoFullName
+    );
+  }
+
+  let commands: SandboxCommandResult[] | undefined;
+  if (client.downloadWorkflowRunArtifact) {
+    try {
+      const raw = await client.downloadWorkflowRunArtifact(
+        refreshedConfig.workflowRepoFullName,
+        workflowRun.id,
+        'sandbox-output'
+      );
+      commands = raw ? parseSandboxOutputArtifact(raw) : undefined;
+    } catch {
+      // Non-fatal; fall back to synthesized outputs.
+    }
+  }
+
+  // Fallback for older clients that only provide logs.
+  if (!commands || commands.length === 0) {
+    commands = logs.commands;
   }
 
   const completedAt = new Date().toISOString();
@@ -209,22 +397,22 @@ export async function runSandbox(
 
   // 6. Build result
   const result: SandboxResult = {
-    completed: runStatus.completed && !runStatus.timedOut,
+    completed: runStatus.completed,
     exitCode: logs.exitCode,
     stdout: logs.stdout,
     stderr: logs.stderr,
     durationSeconds,
     workflowRunUrl: workflowRun.html_url,
-    timedOut: runStatus.timedOut,
+    timedOut: false,
     workflowRunId: workflowRun.id,
   };
 
   // Build and upload artifact
-  const artifact = buildSandboxArtifact(config, result, startedAt, completedAt);
+  const artifact = buildSandboxArtifact(refreshedConfig, result, startedAt, completedAt, commands);
 
   try {
     await client.uploadArtifact(
-      config.forkFullName,
+      refreshedConfig.workflowRepoFullName,
       workflowRun.id,
       'sandbox-result',
       JSON.stringify(artifact, null, 2)
@@ -239,6 +427,51 @@ export async function runSandbox(
 /**
  * Sleep utility for polling.
  */
+function legacyAdapterFromConfig(config: SandboxConfig): RepoAdapter {
+  return {
+    async classifyModule() { return '.'; },
+    async getTestCommands() { return config.testCommands ?? (config.testCommand ? [config.testCommand] : []); },
+    async getSandboxServices() {
+      return config.sandboxServices.map((service) => typeof service === 'string'
+        ? { name: service, image: service, ports: [] }
+        : service);
+    },
+    async runCustomEval() { return { passed: true, summary: '', retryContext: [] }; },
+    async getPRMetadata() { return { extraLabels: [], extraBodySections: [] }; },
+  };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+function parseSandboxOutputArtifact(raw: string): SandboxCommandResult[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+
+  if (!Array.isArray(parsed)) return undefined;
+
+  const results: SandboxCommandResult[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') return undefined;
+    const r = item as Record<string, unknown>;
+    if (typeof r.command !== 'string') return undefined;
+    if (typeof r.exitCode !== 'number') return undefined;
+    if (typeof r.stdout !== 'string') return undefined;
+    if (typeof r.stderr !== 'string') return undefined;
+
+    results.push({
+      command: r.command,
+      exitCode: r.exitCode,
+      stdout: r.stdout,
+      stderr: r.stderr,
+    });
+  }
+
+  return results;
+}
+

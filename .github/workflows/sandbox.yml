@@ -3,43 +3,82 @@ name: sandbox
 on:
   workflow_dispatch:
     inputs:
-      branch:
-        description: Branch to test
+      repo_full_name:
+        description: Upstream repo full name (owner/repo) used for namespacing secrets
         required: true
         type: string
-      test_command:
-        description: Command to run
+      fork_clone_url:
+        description: Clone URL of the fork to test (e.g. https://github.com/<org>/<repo>.git)
         required: true
         type: string
-      timeout_minutes:
-        description: Timeout in minutes
+      branch_name:
+        description: Branch name in the fork to test
         required: true
         type: string
-      sandbox_services:
-        description: Comma-separated service allowlist (informational in v1)
-        required: false
+      test_commands_b64:
+        description: Base64-encoded JSON string[] of test commands
+        required: true
         type: string
-        default: ""
-      network_policy:
-        description: Network policy string (informational in v1)
-        required: false
+      services_b64:
+        description: Base64-encoded JSON ServiceConfig[] of docker services to start
+        required: true
         type: string
-        default: "none"
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout harness (scripts)
         uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.branch }}
 
-      - name: Run test command
+      - name: Clone fork branch
         shell: bash
         run: |
           set -euo pipefail
-          echo "network_policy=${{ inputs.network_policy }}"
-          echo "sandbox_services=${{ inputs.sandbox_services }}"
-          echo "Running: ${{ inputs.test_command }}"
-          bash -lc "${{ inputs.test_command }}"
+          echo "Cloning ${{ inputs.fork_clone_url }} @ ${{ inputs.branch_name }}"
+          git clone --depth 1 --branch "${{ inputs.branch_name }}" "${{ inputs.fork_clone_url }}" target
+
+      - name: Decode services
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ inputs.services_b64 }}" | base64 -d > services.json
+
+      - name: Start declared services
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/start-services.js services.json
+
+      - name: Decode commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ inputs.test_commands_b64 }}" | base64 -d > commands.json
+
+      - name: Run commands
+        id: run
+        shell: bash
+        working-directory: target
+        run: |
+          set +e
+          node ../scripts/run-commands.js ../commands.json sandbox-output.json
+          code=$?
+          echo "exit_code=$code" >> $GITHUB_OUTPUT
+          exit 0
+
+      - name: Upload sandbox output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-output
+          path: target/sandbox-output.json
+
+      - name: Fail job if commands failed
+        shell: bash
+        run: |
+          set -euo pipefail
+          code="${{ steps.run.outputs.exit_code }}"
+          echo "Sandbox exit code: $code"
+          if [ "$code" != "0" ]; then
+            exit "$code"
+          fi

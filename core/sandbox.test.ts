@@ -8,6 +8,7 @@ import {
   WorkflowRunStatus,
   WorkflowRunLogs,
   SandboxRunError,
+  SandboxTimeoutError,
   SANDBOX_WORKFLOW_FILE,
   DEFAULT_TIMEOUT_MINUTES,
 } from './sandbox-types';
@@ -23,8 +24,10 @@ import {
 // --- Helper: create a valid config ---
 function validConfig(overrides: Partial<SandboxConfig> = {}): SandboxConfig {
   return {
+    repoFullName: 'upstream-org/upstream-repo',
     forkFullName: 'my-org/my-repo',
     branchName: 'agent/scope-42-56',
+    workflowRepoFullName: 'harness-org/harness-repo',
     testCommand: 'npm test',
     sandboxServices: [],
     timeoutMinutes: 15,
@@ -90,10 +93,10 @@ describe('validateSandboxConfig', () => {
     ).toThrow(/branchName is required/);
   });
 
-  it('rejects empty testCommand', () => {
+  it('allows empty testCommand because commands come from the adapter', () => {
     expect(() =>
       validateSandboxConfig(validConfig({ testCommand: '' }))
-    ).toThrow(/testCommand is required/);
+    ).not.toThrow();
   });
 
   it('rejects zero timeoutMinutes', () => {
@@ -121,39 +124,39 @@ describe('validateSandboxConfig', () => {
 // buildWorkflowInputs
 // ============================================================
 describe('buildWorkflowInputs', () => {
-  it('includes test_command from config', () => {
+  it('base64-encodes test commands JSON', () => {
     const inputs = buildWorkflowInputs(validConfig({ testCommand: 'pytest -v' }));
-    expect(inputs.test_command).toBe('pytest -v');
+    const decoded = JSON.parse(Buffer.from(inputs.test_commands_b64, 'base64').toString('utf8'));
+    expect(decoded).toEqual(['pytest -v']);
   });
 
-  it('includes branch from config', () => {
+  it('includes branch_name from config', () => {
     const inputs = buildWorkflowInputs(validConfig({ branchName: 'agent/scope-1-2' }));
-    expect(inputs.branch).toBe('agent/scope-1-2');
+    expect(inputs.branch_name).toBe('agent/scope-1-2');
   });
 
-  it('includes timeout_minutes as string', () => {
-    const inputs = buildWorkflowInputs(validConfig({ timeoutMinutes: 10 }));
-    expect(inputs.timeout_minutes).toBe('10');
+  it('includes repo_full_name from config', () => {
+    const inputs = buildWorkflowInputs(validConfig({ repoFullName: 'a/b' }));
+    expect(inputs.repo_full_name).toBe('a/b');
   });
 
-  it('sets network_policy to "none" when no sandbox_services', () => {
-    const inputs = buildWorkflowInputs(validConfig({ sandboxServices: [] }));
-    expect(inputs.network_policy).toBe('none');
+  it('base64-encodes services JSON', () => {
+    const inputs = buildWorkflowInputs(validConfig({ sandboxServices: ['postgres', 'redis'] }));
+    const decoded = JSON.parse(Buffer.from(inputs.services_b64, 'base64').toString('utf8'));
+    expect(decoded).toEqual([
+      { name: 'postgres', image: 'postgres', ports: [] },
+      { name: 'redis', image: 'redis', ports: [] },
+    ]);
   });
 
-  it('sets network_policy with allow list when sandbox_services present', () => {
-    const inputs = buildWorkflowInputs(
-      validConfig({ sandboxServices: ['postgres', 'redis'] })
-    );
-    expect(inputs.network_policy).toBe('allow:postgres,redis');
-    expect(inputs.sandbox_services).toBe('postgres,redis');
+  it('uses default fork clone URL when none provided', () => {
+    const inputs = buildWorkflowInputs(validConfig({ forkFullName: 'x/y', forkCloneUrl: undefined } as any));
+    expect(inputs.fork_clone_url).toBe('https://github.com/x/y.git');
   });
 
-  it('joins sandbox_services with commas', () => {
-    const inputs = buildWorkflowInputs(
-      validConfig({ sandboxServices: ['a', 'b', 'c'] })
-    );
-    expect(inputs.sandbox_services).toBe('a,b,c');
+  it('uses explicit forkCloneUrl when provided', () => {
+    const inputs = buildWorkflowInputs(validConfig({ forkCloneUrl: 'https://example.com/fork.git' }));
+    expect(inputs.fork_clone_url).toBe('https://example.com/fork.git');
   });
 });
 
@@ -164,26 +167,30 @@ describe('createSandboxConfig', () => {
   it('creates config with all fields', () => {
     const config = createSandboxConfig(
       'org/repo',
+      'org/repo',
       'branch-1',
       'npm test',
       ['postgres'],
-      10
+      10,
+      'harness-org/harness-repo'
     );
+    expect(config.repoFullName).toBe('org/repo');
     expect(config.forkFullName).toBe('org/repo');
     expect(config.branchName).toBe('branch-1');
+    expect(config.workflowRepoFullName).toBe('harness-org/harness-repo');
     expect(config.testCommand).toBe('npm test');
     expect(config.sandboxServices).toEqual(['postgres']);
     expect(config.timeoutMinutes).toBe(10);
   });
 
   it('uses DEFAULT_TIMEOUT_MINUTES when not specified', () => {
-    const config = createSandboxConfig('org/repo', 'branch', 'test', []);
+    const config = createSandboxConfig('org/repo', 'org/repo', 'branch', 'test', []);
     expect(config.timeoutMinutes).toBe(DEFAULT_TIMEOUT_MINUTES);
   });
 
   it('copies sandboxServices array (no shared reference)', () => {
     const services = ['redis'];
-    const config = createSandboxConfig('org/repo', 'branch', 'test', services);
+    const config = createSandboxConfig('org/repo', 'org/repo', 'branch', 'test', services);
     services.push('postgres');
     expect(config.sandboxServices).toEqual(['redis']);
   });
@@ -228,10 +235,10 @@ describe('runSandbox', () => {
     await runSandbox(config, client, 0);
 
     expect(client.triggerWorkflowDispatch).toHaveBeenCalledWith(
-      'my-org/my-repo',
+      'harness-org/harness-repo',
       SANDBOX_WORKFLOW_FILE,
       'agent/scope-42-56',
-      expect.objectContaining({ test_command: 'make test' })
+      expect.objectContaining({ branch_name: 'agent/scope-42-56' })
     );
   });
 
@@ -240,7 +247,7 @@ describe('runSandbox', () => {
     await runSandbox(validConfig(), client, 0);
 
     expect(client.getWorkflowRun).toHaveBeenCalledWith(
-      'my-org/my-repo',
+      'harness-org/harness-repo',
       SANDBOX_WORKFLOW_FILE,
       'agent/scope-42-56',
       expect.any(String)
@@ -253,7 +260,7 @@ describe('runSandbox', () => {
     await runSandbox(config, client, 0);
 
     expect(client.waitForWorkflowRun).toHaveBeenCalledWith(
-      'my-org/my-repo',
+      'harness-org/harness-repo',
       12345,
       10 * 60 * 1000, // 10 minutes in ms
       0
@@ -264,14 +271,37 @@ describe('runSandbox', () => {
     const client = mockClient();
     await runSandbox(validConfig(), client, 0);
 
-    expect(client.getWorkflowRunLogs).toHaveBeenCalledWith('my-org/my-repo', 12345);
+    expect(client.getWorkflowRunLogs).toHaveBeenCalledWith('harness-org/harness-repo', 12345);
+  });
+
+  it('prefers the emitted sandbox-output artifact for per-command results when available', async () => {
+    const downloadWorkflowRunArtifact = jest.fn().mockResolvedValue(
+      JSON.stringify([
+        { command: 'npm test', exitCode: 0, stdout: 'ok\n', stderr: '' },
+        { command: 'npm run lint', exitCode: 0, stdout: 'lint ok\n', stderr: '' },
+      ])
+    );
+
+    const client = mockClient({ downloadWorkflowRunArtifact });
+    const artifact = await runSandbox(validConfig(), client, 0);
+
+    expect(downloadWorkflowRunArtifact).toHaveBeenCalledWith(
+      'harness-org/harness-repo',
+      12345,
+      'sandbox-output'
+    );
+
+    expect(artifact.commands).toEqual([
+      { command: 'npm test', exitCode: 0, stdout: 'ok\n', stderr: '' },
+      { command: 'npm run lint', exitCode: 0, stdout: 'lint ok\n', stderr: '' },
+    ]);
   });
 
   it('returns structured artifact with all fields on success', async () => {
     const client = mockClient();
     const artifact = await runSandbox(validConfig(), client, 0);
 
-    expect(artifact.config).toEqual(validConfig());
+    expect(artifact.config).toEqual({ ...validConfig(), testCommands: ['npm test'] });
     expect(artifact.result.completed).toBe(true);
     expect(artifact.result.exitCode).toBe(0);
     expect(artifact.result.stdout).toBe('All tests passed\n');
@@ -285,33 +315,33 @@ describe('runSandbox', () => {
     expect(artifact.completedAt).toBeDefined();
   });
 
-  it('handles timeout: sets timedOut=true and completed=false', async () => {
+  it('throws SandboxTimeoutError on timeout and cancels the workflow run (best-effort)', async () => {
+    const cancelWorkflowRun = jest.fn().mockResolvedValue(undefined);
     const client = mockClient({
       waitForWorkflowRun: jest.fn().mockResolvedValue({
         completed: false,
         conclusion: null,
         timedOut: true,
       } as WorkflowRunStatus),
+      cancelWorkflowRun,
     });
 
-    const artifact = await runSandbox(validConfig(), client, 0);
-
-    expect(artifact.result.timedOut).toBe(true);
-    expect(artifact.result.completed).toBe(false);
-    expect(artifact.result.exitCode).toBeNull();
-    expect(artifact.result.stderr).toBe('Sandbox run timed out');
+    await expect(runSandbox(validConfig(), client, 0)).rejects.toThrow(SandboxTimeoutError);
+    expect(cancelWorkflowRun).toHaveBeenCalledWith('harness-org/harness-repo', 12345);
   });
 
   it('does not retrieve logs on timeout', async () => {
+    const cancelWorkflowRun = jest.fn().mockResolvedValue(undefined);
     const client = mockClient({
       waitForWorkflowRun: jest.fn().mockResolvedValue({
         completed: false,
         conclusion: null,
         timedOut: true,
       } as WorkflowRunStatus),
+      cancelWorkflowRun,
     });
 
-    await runSandbox(validConfig(), client, 0);
+    await expect(runSandbox(validConfig(), client, 0)).rejects.toThrow(SandboxTimeoutError);
     expect(client.getWorkflowRunLogs).not.toHaveBeenCalled();
   });
 
@@ -351,7 +381,7 @@ describe('runSandbox', () => {
     await runSandbox(validConfig(), client, 0);
 
     expect(client.uploadArtifact).toHaveBeenCalledWith(
-      'my-org/my-repo',
+      'harness-org/harness-repo',
       12345,
       'sandbox-result',
       expect.any(String)
@@ -453,8 +483,8 @@ describe('runSandbox', () => {
 
     const callArgs = (client.triggerWorkflowDispatch as jest.Mock).mock.calls[0];
     const inputs = callArgs[3];
-    expect(inputs.sandbox_services).toBe('postgres,redis');
-    expect(inputs.network_policy).toBe('allow:postgres,redis');
+    expect(typeof inputs.services_b64).toBe('string');
+    expect(JSON.parse(Buffer.from(inputs.services_b64, 'base64').toString('utf8')).length).toBe(2);
   });
 
   it('sets network_policy to none when no services declared', async () => {
@@ -464,7 +494,7 @@ describe('runSandbox', () => {
 
     const callArgs = (client.triggerWorkflowDispatch as jest.Mock).mock.calls[0];
     const inputs = callArgs[3];
-    expect(inputs.network_policy).toBe('none');
+    expect(JSON.parse(Buffer.from(inputs.services_b64, 'base64').toString('utf8'))).toEqual([]);
   });
 
   it('uses fork branch for checkout (fresh checkout each run)', async () => {
@@ -474,6 +504,52 @@ describe('runSandbox', () => {
 
     const callArgs = (client.triggerWorkflowDispatch as jest.Mock).mock.calls[0];
     expect(callArgs[2]).toBe('agent/scope-100-200'); // branch parameter
-    expect(callArgs[3].branch).toBe('agent/scope-100-200'); // also in inputs
+    expect(callArgs[3].branch_name).toBe('agent/scope-100-200'); // also in inputs
+  });
+});
+
+describe('adapter-backed sandbox config', () => {
+  function adapter() {
+    return {
+      classifyModule: jest.fn().mockResolvedValue('.'),
+      getTestCommands: jest.fn().mockResolvedValue(['npm test', 'npm run lint']),
+      getSandboxServices: jest.fn().mockResolvedValue([{ name: 'redis', image: 'redis:7', ports: [] }]),
+      runCustomEval: jest.fn(),
+      getPRMetadata: jest.fn(),
+    };
+  }
+
+  it('createSandboxConfig calls adapter.getTestCommands and getSandboxServices', async () => {
+    const repoAdapter = adapter();
+    const config = await createSandboxConfig('org/repo', 'org/repo', 'branch', repoAdapter, 9, 'harness-org/harness-repo');
+    expect(repoAdapter.getTestCommands).toHaveBeenCalledWith();
+    expect(repoAdapter.getSandboxServices).toHaveBeenCalledWith();
+    expect(config.testCommands).toEqual(['npm test', 'npm run lint']);
+    expect(config.sandboxServices).toEqual([{ name: 'redis', image: 'redis:7', ports: [] }]);
+    expect(config.workflowRepoFullName).toBe('harness-org/harness-repo');
+  });
+
+  it('buildWorkflowInputs serializes all adapter commands', async () => {
+    const config = await createSandboxConfig('org/repo', 'org/repo', 'branch', adapter(), 9, 'harness-org/harness-repo');
+    const inputs = buildWorkflowInputs(config);
+    expect(JSON.parse(Buffer.from(inputs.test_commands_b64, 'base64').toString('utf8'))).toEqual(['npm test', 'npm run lint']);
+  });
+
+  it('buildWorkflowInputs uses adapter service names for network policy', async () => {
+    const config = await createSandboxConfig('org/repo', 'org/repo', 'branch', adapter(), 9, 'harness-org/harness-repo');
+    const inputs = buildWorkflowInputs(config);
+    const decoded = JSON.parse(Buffer.from(inputs.services_b64, 'base64').toString('utf8'));
+    expect(decoded).toEqual([{ name: 'redis', image: 'redis:7', ports: [] }]);
+  });
+
+  it('runSandbox refreshes commands and services from the adapter', async () => {
+    const repoAdapter = adapter();
+    const client = mockClient();
+    await runSandbox(validConfig({ testCommand: 'old command' }), repoAdapter, client, 0);
+    const inputs = (client.triggerWorkflowDispatch as jest.Mock).mock.calls[0][3];
+    expect(repoAdapter.getTestCommands).toHaveBeenCalledWith();
+    expect(repoAdapter.getSandboxServices).toHaveBeenCalledWith();
+    expect(JSON.parse(Buffer.from(inputs.test_commands_b64, 'base64').toString('utf8'))).toEqual(['npm test', 'npm run lint']);
+    expect(JSON.parse(Buffer.from(inputs.services_b64, 'base64').toString('utf8'))).toEqual([{ name: 'redis', image: 'redis:7', ports: [] }]);
   });
 });
