@@ -5,6 +5,8 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "start": "node dist/bin/server.js",
+    "start:dev": "ts-node bin/server.ts",
     "test": "jest --no-coverage",
     "lint": "tsc --noEmit && ts-node scripts/check-core-imports.ts && ts-node scripts/check-config-adapters.ts && ts-node scripts/check-adapter-contract.ts"
   },
