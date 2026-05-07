@@ -80,7 +80,7 @@ DENY_ALWAYS=( "shell(rm)" "shell(git push)" )
 
 case "$ALLOW_PROFILE" in
     safe)
-        ALLOW=( "write" "shell(git*)" "shell(npm*)" "shell(node*)" "shell(python*)" "shell(bash*)" )
+        ALLOW=( "write" "shell(git:*)" "shell(npm:*)" "shell(node:*)" "shell(python:*)" "shell(bash:*)" )
         DENY=( "${DENY_ALWAYS[@]}" )
         ;;
     dev)

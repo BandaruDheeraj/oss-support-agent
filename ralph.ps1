@@ -82,7 +82,7 @@ $denyAlways = @('shell(rm)', 'shell(git push)')
 
 switch ($AllowProfile) {
     "safe" {
-        $allow = @('write', 'shell(git*)', 'shell(npm*)', 'shell(node*)', 'shell(python*)', 'shell(pwsh*)')
+        $allow = @('write', 'shell(git:*)', 'shell(npm:*)', 'shell(node:*)', 'shell(python:*)', 'shell(pwsh:*)')
         $deny  = $denyAlways
     }
     "dev" {
