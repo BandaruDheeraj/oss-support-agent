@@ -1,21 +1,35 @@
 /**
  * Types for the basic sandbox runner (US-008).
- * The sandbox runner executes the manifest test_command on the fork branch
+ * The sandbox runner executes adapter-provided commands on the fork branch
  * via GitHub Actions workflow_dispatch and captures stdout/stderr/exit code.
  */
 
+import type { SandboxCommandResult, ServiceConfig } from './adapter.interface';
+
 /**
- * Configuration for a sandbox run, derived from the manifest and fork context.
+ * Configuration for a sandbox run.
+ *
+ * - repoFullName: upstream repo identity (used for namespacing secrets in the shared workflow)
+ * - forkFullName/branchName: fork location that will be cloned and tested
+ * - workflowRepoFullName: repo that hosts the shared sandbox workflow
  */
 export interface SandboxConfig {
-  /** Fork full name (org/repo) where the workflow runs */
+  /** Upstream repo full name (owner/repo) that the run is for */
+  repoFullName: string;
+  /** Fork full name (org/repo) that contains the branch under test */
   forkFullName: string;
   /** Branch to check out in the sandbox */
   branchName: string;
-  /** Test command from the manifest */
-  testCommand: string;
-  /** Allowed external services (e.g. ["postgres", "redis"]) */
-  sandboxServices: string[];
+  /** Repo hosting the shared sandbox workflow (defaults to HARNESS_REPO_FULL_NAME/GITHUB_REPOSITORY) */
+  workflowRepoFullName: string;
+  /** Optional explicit clone URL for the fork (defaults to https://github.com/<forkFullName>.git) */
+  forkCloneUrl?: string;
+  /** Test commands from the repo adapter */
+  testCommands?: string[];
+  /** Deprecated single command view kept for migration compatibility */
+  testCommand?: string;
+  /** Services required for sandbox runs */
+  sandboxServices: Array<ServiceConfig | string>;
   /** Maximum run duration in minutes (default 15) */
   timeoutMinutes: number;
 }
@@ -50,6 +64,8 @@ export interface SandboxArtifact {
   config: SandboxConfig;
   /** The sandbox result */
   result: SandboxResult;
+  /** Per-command sandbox outputs; this is the authoritative eval input. */
+  commands: SandboxCommandResult[];
   /** Timestamp when the run started */
   startedAt: string;
   /** Timestamp when the run completed */
@@ -83,6 +99,23 @@ export interface ActionsClient {
     timeoutMs: number,
     pollIntervalMs?: number
   ): Promise<WorkflowRunStatus>;
+
+  /**
+   * Best-effort cancellation for a workflow run.
+   * Optional so minimal clients and unit test fakes don't need to implement it.
+   */
+  cancelWorkflowRun?(forkFullName: string, runId: number): Promise<void>;
+
+  /**
+   * Download the raw content of a named workflow-run artifact.
+   * For the shared sandbox workflow, this is used to fetch the emitted SandboxOutput JSON.
+   * Returns null when the artifact doesn't exist.
+   */
+  downloadWorkflowRunArtifact?(
+    forkFullName: string,
+    runId: number,
+    artifactName: string
+  ): Promise<string | null>;
 
   /** Download workflow run logs (stdout + stderr) */
   getWorkflowRunLogs(
@@ -126,12 +159,14 @@ export interface WorkflowRunLogs {
   stdout: string;
   stderr: string;
   exitCode: number | null;
+  /** Optional structured command output emitted by newer sandbox workflows */
+  commands?: SandboxCommandResult[];
 }
 
 /**
- * Workflow file ID for the sandbox workflow.
+ * Workflow file ID for the shared sandbox workflow.
  */
-export const SANDBOX_WORKFLOW_FILE = 'sandbox-test.yml';
+export const SANDBOX_WORKFLOW_FILE = 'sandbox.yml';
 
 /**
  * Default timeout in minutes if not specified.

@@ -4,7 +4,7 @@
  * against upstream main to flag any behavioural change before the PR is opened.
  */
 
-import { ActionsClient, SandboxConfig, SandboxResult } from '../sandbox-types';
+import { ActionsClient } from '../sandbox-types';
 
 /**
  * Configuration for a regression guard run.

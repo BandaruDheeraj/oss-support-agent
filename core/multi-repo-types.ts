@@ -40,8 +40,6 @@ export interface CoordinatedRepo {
   repo: string;
   /** Fork org for this repo (defaults to parent manifest's fork_org) */
   fork_org?: string;
-  /** Test command for this specific repo (defaults to parent manifest's test_command) */
-  test_command?: string;
   /** Affected module path in this repo */
   affected_module?: string;
 }

@@ -7,7 +7,7 @@ export const manifestSchema = {
   $schema: 'http://json-schema.org/draft-07/schema#',
   title: 'OSS Fix Loop Manifest',
   type: 'object',
-  required: ['repo', 'fork_org', 'test_command', 'pm_email'],
+  required: ['repo', 'fork_org', 'pm_email'],
   properties: {
     repo: {
       type: 'string',
@@ -19,6 +19,11 @@ export const manifestSchema = {
       description: 'Label that triggers the agent pipeline',
       default: 'agent-fix',
     },
+    skip_pm_gate_label: {
+      type: 'string',
+      description: 'Label on an issue that skips PM gate for trivial fixes',
+      default: 'trivial-fix',
+    },
     fork_org: {
       type: 'string',
       description: 'GitHub org/user where forks are created',
@@ -27,10 +32,6 @@ export const manifestSchema = {
       type: 'string',
       description: 'Prefix for agent branches on the fork',
       default: 'agent/scope-',
-    },
-    test_command: {
-      type: 'string',
-      description: 'Command to run in the sandbox to verify fixes',
     },
     approval_keywords: {
       type: 'array',
@@ -43,31 +44,17 @@ export const manifestSchema = {
       format: 'email',
       description: 'Email address of the PM / design reviewer',
     },
-    issue_types: {
-      type: 'array',
-      items: {
-        type: 'string',
-        enum: ['bug_fix', 'new_feature', 'docs'],
-      },
-      description: 'Issue types this manifest handles',
-      default: ['bug_fix', 'new_feature', 'docs'],
-    },
-    sandbox_services: {
-      type: 'array',
-      items: { type: 'string' },
-      description: 'External services the sandbox is allowed to reach',
-      default: [],
-    },
     max_retries: {
       type: 'integer',
       minimum: 0,
       description: 'Max retry attempts for fix/build agent',
       default: 3,
     },
-    skip_pm_gate: {
-      type: 'boolean',
-      description: 'If true, skip PM design review entirely',
-      default: false,
+    sandbox_timeout_mins: {
+      type: 'integer',
+      minimum: 1,
+      description: 'Sandbox wall-time cap (minutes)',
+      default: 15,
     },
   },
   additionalProperties: false,
@@ -81,7 +68,7 @@ export const versionedManifestSchema = {
   $schema: 'http://json-schema.org/draft-07/schema#',
   title: 'OSS Fix Loop Manifest (Versioned)',
   type: 'object',
-  required: ['repo', 'fork_org', 'test_command', 'pm_email'],
+  required: ['repo', 'fork_org', 'pm_email'],
   properties: {
     ...manifestSchema.properties,
     schema_version: {
@@ -104,10 +91,6 @@ export const versionedManifestSchema = {
           fork_org: {
             type: 'string',
             description: 'Fork org for this repo (defaults to parent fork_org)',
-          },
-          test_command: {
-            type: 'string',
-            description: 'Test command for this repo (defaults to parent test_command)',
           },
           affected_module: {
             type: 'string',

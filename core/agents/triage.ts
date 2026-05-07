@@ -5,11 +5,16 @@
  * emits confidence scores, and routes to the appropriate downstream agent.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+
+import type { Issue, RepoAdapter } from '../adapter.interface';
+import { AdapterContractError } from '../adapter-loader';
 import {
   TriageInput,
   TriageResult,
   TriageRouting,
-  TriageClassifier,
+  TriageTypeClassifier,
   IssueCommenter,
   IssueType,
 } from './triage-types';
@@ -17,167 +22,121 @@ import {
 /** Confidence threshold below which a clarification comment is posted. */
 export const LOW_CONFIDENCE_THRESHOLD = 0.6;
 
-/**
- * Default LLM-based classifier implementation.
- * Uses heuristics and keyword matching as a deterministic fallback
- * when no LLM provider is configured.
- */
-export class HeuristicClassifier implements TriageClassifier {
-  async classify(input: TriageInput): Promise<TriageResult> {
-    const text = `${input.title} ${input.body ?? ''}`.toLowerCase();
-    const labels = input.labels.map((l) => l.toLowerCase());
+/** Core issue-type classifier. Module routing is intentionally adapter-owned. */
+export class DefaultIssueTypeClassifier implements TriageTypeClassifier {
+  async classifyIssueType(input: TriageInput): Promise<IssueType> {
+    return classifyIssueType(input);
+  }
+}
 
-    const issueType = this.classifyType(text, labels, input.moduleTaxonomy);
-    const affectedModule = this.identifyModule(text, input.repoTree);
-    const confidence = this.computeConfidence(text, labels, issueType, affectedModule, input);
-    const summary = this.generateSummary(input.title, issueType, affectedModule);
+/** Classifies only the issue type (bug/feature/docs), never the module path. */
+export function classifyIssueType(input: TriageInput): IssueType {
+  const text = `${input.title} ${input.body ?? ''}`.toLowerCase();
+  const labels = input.labels.map((l) => l.toLowerCase());
+  const taxonomy = input.moduleTaxonomy ?? ['bug_fix', 'new_feature', 'docs'];
 
-    return { issueType, affectedModule, confidence, summary };
+  if (labels.some((l) => l.includes('doc') || l.includes('documentation') || l.includes('typo'))) {
+    if (taxonomy.includes('docs')) return 'docs';
+  }
+  if (labels.some((l) => l.includes('bug') || l.includes('fix') || l.includes('defect'))) {
+    if (taxonomy.includes('bug_fix')) return 'bug_fix';
+  }
+  if (labels.some((l) => l.includes('feature') || l.includes('enhancement') || l.includes('request'))) {
+    if (taxonomy.includes('new_feature')) return 'new_feature';
   }
 
-  private classifyType(
-    text: string,
-    labels: string[],
-    taxonomy: IssueType[]
-  ): IssueType {
-    // Label-based classification takes priority
-    if (labels.some((l) => l.includes('doc') || l.includes('documentation') || l.includes('typo'))) {
-      if (taxonomy.includes('docs')) return 'docs';
-    }
-    if (labels.some((l) => l.includes('bug') || l.includes('fix') || l.includes('defect'))) {
-      if (taxonomy.includes('bug_fix')) return 'bug_fix';
-    }
-    if (labels.some((l) => l.includes('feature') || l.includes('enhancement') || l.includes('request'))) {
-      if (taxonomy.includes('new_feature')) return 'new_feature';
-    }
+  const docsKeywords = ['readme', 'documentation', 'typo', 'spelling', 'docs', 'javadoc', 'docstring', 'comment', 'changelog'];
+  const bugKeywords = ['bug', 'error', 'fix', 'crash', 'broken', 'failing', 'regression', 'not working', 'unexpected', 'traceback', 'exception', 'stack trace', 'segfault', 'panic'];
+  const featureKeywords = ['feature', 'add support', 'new api', 'implement', 'enhancement', 'proposal', 'rfc', 'request'];
 
-    // Keyword-based classification
-    const docsKeywords = [
-      'readme', 'documentation', 'typo', 'spelling', 'docs',
-      'javadoc', 'docstring', 'comment', 'changelog',
-    ];
-    const bugKeywords = [
-      'bug', 'error', 'fix', 'crash', 'broken', 'failing',
-      'regression', 'not working', 'unexpected', 'traceback',
-      'exception', 'stack trace', 'segfault', 'panic',
-    ];
-    const featureKeywords = [
-      'feature', 'add support', 'new api', 'implement',
-      'enhancement', 'proposal', 'rfc', 'request',
-    ];
+  const docsScore = docsKeywords.filter((k) => text.includes(k)).length;
+  const bugScore = bugKeywords.filter((k) => text.includes(k)).length;
+  const featureScore = featureKeywords.filter((k) => text.includes(k)).length;
 
-    const docsScore = docsKeywords.filter((k) => text.includes(k)).length;
-    const bugScore = bugKeywords.filter((k) => text.includes(k)).length;
-    const featureScore = featureKeywords.filter((k) => text.includes(k)).length;
+  if (docsScore > bugScore && docsScore > featureScore && taxonomy.includes('docs')) return 'docs';
+  if (bugScore >= featureScore && taxonomy.includes('bug_fix')) return 'bug_fix';
+  if (taxonomy.includes('new_feature')) return 'new_feature';
+  return taxonomy[0] ?? 'bug_fix';
+}
 
-    if (docsScore > bugScore && docsScore > featureScore && taxonomy.includes('docs')) {
-      return 'docs';
-    }
-    if (bugScore >= featureScore && taxonomy.includes('bug_fix')) {
-      return 'bug_fix';
-    }
-    if (taxonomy.includes('new_feature')) {
-      return 'new_feature';
-    }
-    // Fallback to first available type
-    return taxonomy[0] ?? 'bug_fix';
+/** Validates adapter module routing before downstream agents use it. */
+export function validateClassifiedModulePath(
+  modulePath: string,
+  repoRoot: string,
+  repoFullName = 'unknown/unknown',
+  adapterPath = 'adapter.classifyModule'
+): string {
+  const normalized = modulePath.replace(/\\/g, '/').replace(/\/+$/g, '');
+  const candidate = normalized === '' ? '.' : normalized;
+
+  if (path.isAbsolute(candidate) || candidate.startsWith('/') || candidate.split('/').includes('..')) {
+    throwInvalidModule(candidate, repoFullName, adapterPath, 'Path must be relative and cannot contain ".."');
   }
 
-  private identifyModule(text: string, repoTree: string[]): string {
-    // Try to match repo tree paths mentioned in the issue text
-    const normalizedText = text.replace(/\\/g, '/');
-
-    // Score each tree path by how well it matches mentions in the text
-    let bestMatch = '';
-    let bestScore = 0;
-
-    for (const path of repoTree) {
-      const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
-      let score = 0;
-
-      // Check if the full path or parts are mentioned
-      if (normalizedText.includes(path.replace(/\\/g, '/'))) {
-        score = parts.length * 3;
-      } else {
-        for (const part of parts) {
-          if (part.length > 2 && normalizedText.includes(part.toLowerCase())) {
-            score += 1;
-          }
-        }
-      }
-
-      if (score > bestScore) {
-        bestScore = score;
-        bestMatch = path;
-      }
-    }
-
-    // If no match found, return the root or first directory
-    if (!bestMatch) {
-      const dirs = repoTree.filter((p) => !p.includes('.') || p.includes('/'));
-      return dirs[0] ?? '/';
-    }
-
-    return bestMatch;
+  const root = path.resolve(repoRoot);
+  const resolved = path.resolve(root, candidate);
+  const relative = path.relative(root, resolved);
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throwInvalidModule(candidate, repoFullName, adapterPath, 'Path resolves outside the repository root');
   }
 
-  private computeConfidence(
-    text: string,
-    labels: string[],
-    issueType: IssueType,
-    affectedModule: string,
-    input: TriageInput
-  ): number {
-    let confidence = 0.5;
-
-    // Labels boost confidence significantly
-    const hasRelevantLabel = labels.some(
-      (l) =>
-        l.includes('bug') ||
-        l.includes('doc') ||
-        l.includes('feature') ||
-        l.includes('enhancement')
-    );
-    if (hasRelevantLabel) confidence += 0.2;
-
-    // Body presence boosts confidence
-    if (input.body && input.body.length > 50) confidence += 0.1;
-
-    // Module identification boosts confidence
-    if (affectedModule !== '/' && affectedModule !== '') confidence += 0.1;
-
-    // Very short/vague issues reduce confidence
-    if (!input.body || input.body.length < 20) confidence -= 0.2;
-    if (input.title.split(' ').length < 3) confidence -= 0.1;
-
-    // Multiple type signals conflicting reduce confidence
-    const bugSignals = ['bug', 'fix', 'error', 'crash'].filter((k) => text.includes(k)).length;
-    const featureSignals = ['feature', 'add', 'new', 'implement'].filter((k) => text.includes(k)).length;
-    const docsSignals = ['doc', 'readme', 'typo'].filter((k) => text.includes(k)).length;
-
-    const maxSignal = Math.max(bugSignals, featureSignals, docsSignals);
-    const secondMax = [bugSignals, featureSignals, docsSignals]
-      .sort((a, b) => b - a)[1];
-    if (maxSignal > 0 && secondMax > 0 && maxSignal - secondMax <= 1) {
-      confidence -= 0.15;
-    }
-
-    return Math.max(0, Math.min(1, confidence));
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(resolved);
+  } catch {
+    throwInvalidModule(candidate, repoFullName, adapterPath, 'Path does not exist in the cloned fork');
+  }
+  if (!stat.isDirectory()) {
+    throwInvalidModule(candidate, repoFullName, adapterPath, 'Path must resolve to a directory');
   }
 
-  private generateSummary(
-    title: string,
-    issueType: IssueType,
-    affectedModule: string
-  ): string {
-    const typeLabel =
-      issueType === 'bug_fix'
-        ? 'Bug fix'
-        : issueType === 'new_feature'
-        ? 'New feature'
-        : 'Documentation update';
-    return `${typeLabel} in ${affectedModule}: ${title}`;
-  }
+  return candidate;
+}
+
+function throwInvalidModule(modulePath: string, repoFullName: string, adapterPath: string, reason: string): never {
+  throw new AdapterContractError({
+    message: `Invalid classifyModule return value "${modulePath}": ${reason}`,
+    code: 'invalid_classify_module',
+    repoFullName,
+    adapterPath,
+  });
+}
+
+function buildAdapterIssue(input: TriageInput, issueNumber: number): Issue {
+  return {
+    number: input.number ?? issueNumber,
+    title: input.title,
+    body: input.body ?? '',
+    labels: [...input.labels],
+    url: input.url,
+  };
+}
+
+function computeConfidence(input: TriageInput, affectedModule: string): number {
+  const text = `${input.title} ${input.body ?? ''}`.toLowerCase();
+  const labels = input.labels.map((l) => l.toLowerCase());
+  let confidence = 0.5;
+
+  const hasRelevantLabel = labels.some((l) => l.includes('bug') || l.includes('doc') || l.includes('feature') || l.includes('enhancement'));
+  if (hasRelevantLabel) confidence += 0.2;
+  if (input.body && input.body.length > 50) confidence += 0.1;
+  if (affectedModule !== '.' && affectedModule !== '') confidence += 0.1;
+  if (!input.body || input.body.length < 20) confidence -= 0.2;
+  if (input.title.split(' ').length < 3) confidence -= 0.1;
+
+  const bugSignals = ['bug', 'fix', 'error', 'crash'].filter((k) => text.includes(k)).length;
+  const featureSignals = ['feature', 'add', 'new', 'implement'].filter((k) => text.includes(k)).length;
+  const docsSignals = ['doc', 'readme', 'typo'].filter((k) => text.includes(k)).length;
+  const maxSignal = Math.max(bugSignals, featureSignals, docsSignals);
+  const secondMax = [bugSignals, featureSignals, docsSignals].sort((a, b) => b - a)[1];
+  if (maxSignal > 0 && secondMax > 0 && maxSignal - secondMax <= 1) confidence -= 0.15;
+
+  return Math.max(0, Math.min(1, confidence));
+}
+
+function generateSummary(title: string, issueType: IssueType, affectedModule: string): string {
+  const typeLabel = issueType === 'bug_fix' ? 'Bug fix' : issueType === 'new_feature' ? 'New feature' : 'Documentation update';
+  return `${typeLabel} in ${affectedModule}: ${title}`;
 }
 
 /**
@@ -198,63 +157,74 @@ export function buildClarificationComment(result: TriageResult): string {
   );
 }
 
-/**
- * Core triage function: classifies an issue and determines routing.
- *
- * @param input - Triage input with issue details and repo context
- * @param classifier - LLM/heuristic classifier implementation
- * @returns Routing decision with triage result
- */
+export interface TriageOptions {
+  issueNumber?: number;
+  clonedRepoRoot?: string;
+  repoFullName?: string;
+  adapterPath?: string;
+  typeClassifier?: TriageTypeClassifier;
+}
+
+/** Core triage function: classifies issue type, asks adapter for module, and routes. */
 export async function triageIssue(
   input: TriageInput,
-  classifier: TriageClassifier
+  adapter: RepoAdapter,
+  options: TriageOptions = {}
 ): Promise<TriageRouting> {
-  const result = await classifier.classify(input);
+  const issueNumber = options.issueNumber ?? input.number ?? 0;
+  const repoRoot = options.clonedRepoRoot ?? input.clonedRepoRoot ?? process.cwd();
+  const typeClassifier = options.typeClassifier ?? new DefaultIssueTypeClassifier();
 
-  // Low confidence: post clarification comment and halt
+  const issueType = await typeClassifier.classifyIssueType(input);
+  const rawModule = await adapter.classifyModule(buildAdapterIssue(input, issueNumber));
+  const affectedModule = validateClassifiedModulePath(
+    rawModule,
+    repoRoot,
+    options.repoFullName,
+    options.adapterPath
+  );
+  const confidence = computeConfidence(input, affectedModule);
+  const result: TriageResult = {
+    issueType,
+    affectedModule,
+    confidence,
+    summary: generateSummary(input.title, issueType, affectedModule),
+  };
+
   if (result.confidence < LOW_CONFIDENCE_THRESHOLD) {
     const comment = buildClarificationComment(result);
     return { action: 'clarify', result, comment };
   }
 
-  // skip_pm_gate: route directly to fork creation regardless of type
   if (input.hasSkipPmGate) {
     return { action: 'route_fork', result };
   }
 
-  // Route based on issue type
   switch (result.issueType) {
     case 'docs':
       return { action: 'route_docs', result };
     case 'bug_fix':
     case 'new_feature':
-      return { action: 'route_pm', result };
     default:
       return { action: 'route_pm', result };
   }
 }
 
-/**
- * Full triage pipeline: classifies, routes, and performs side effects
- * (posting comments on low confidence).
- *
- * @param repo - Repository full name (owner/repo)
- * @param issueNumber - Issue number
- * @param input - Triage input
- * @param classifier - LLM/heuristic classifier
- * @param commenter - GitHub issue commenter
- * @returns Routing decision
- */
+/** Full triage pipeline including low-confidence comment side effects. */
 export async function runTriage(
   repo: string,
   issueNumber: number,
   input: TriageInput,
-  classifier: TriageClassifier,
-  commenter: IssueCommenter
+  adapter: RepoAdapter,
+  commenter: IssueCommenter,
+  options: Omit<TriageOptions, 'issueNumber' | 'repoFullName'> = {}
 ): Promise<TriageRouting> {
-  const routing = await triageIssue(input, classifier);
+  const routing = await triageIssue(input, adapter, {
+    ...options,
+    issueNumber,
+    repoFullName: repo,
+  });
 
-  // Post clarification comment on low confidence
   if (routing.action === 'clarify') {
     await commenter.postComment(repo, issueNumber, routing.comment);
   }

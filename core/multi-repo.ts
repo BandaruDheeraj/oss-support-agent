@@ -123,8 +123,8 @@ export function validateCoordinatedRepos(data: unknown): CoordinatedRepo[] {
       continue;
     }
 
-    if (entry.test_command !== undefined && typeof entry.test_command !== 'string') {
-      errors.push({ field: `coordinated_repos[${i}].test_command`, message: 'test_command must be a string' });
+    if (entry.test_command !== undefined) {
+      errors.push({ field: `coordinated_repos[${i}].test_command`, message: 'test_command is adapter-owned and no longer allowed' });
       continue;
     }
 
@@ -136,7 +136,6 @@ export function validateCoordinatedRepos(data: unknown): CoordinatedRepo[] {
     repos.push({
       repo: entry.repo,
       fork_org: entry.fork_org as string | undefined,
-      test_command: entry.test_command as string | undefined,
       affected_module: entry.affected_module as string | undefined,
     });
   }

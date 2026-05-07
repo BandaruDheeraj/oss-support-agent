@@ -1,39 +1,36 @@
 /**
  * OpenRouter-backed triage classifier (US-100).
  *
- * Falls back to the deterministic HeuristicClassifier when OPENROUTER_API_KEY is not set.
+ * Falls back to the deterministic issue-type classifier when OPENROUTER_API_KEY is not set.
  */
 
-import type { TriageClassifier, TriageInput, TriageResult } from '../agents/triage-types';
-import { HeuristicClassifier } from '../agents/triage';
+import type { IssueType, TriageTypeClassifier, TriageInput } from '../agents/triage-types';
+import { DefaultIssueTypeClassifier } from '../agents/triage';
 import { LLMClient, type LLMMessage } from './client';
 
 const TRIAGE_RESULT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['issueType', 'affectedModule', 'confidence', 'summary'],
+  required: ['issueType'],
   properties: {
     issueType: { type: 'string', enum: ['bug_fix', 'new_feature', 'docs'] },
-    affectedModule: { type: 'string', minLength: 1 },
-    confidence: { type: 'number', minimum: 0, maximum: 1 },
-    summary: { type: 'string', minLength: 1 },
   },
 } as const;
 
-export class OpenRouterTriageClassifier implements TriageClassifier {
+export class OpenRouterTriageClassifier implements TriageTypeClassifier {
   private readonly client: LLMClient;
 
   constructor(client?: LLMClient) {
     this.client = client ?? new LLMClient();
   }
 
-  async classify(input: TriageInput): Promise<TriageResult> {
+  async classifyIssueType(input: TriageInput): Promise<IssueType> {
     const messages: LLMMessage[] = [
       {
         role: 'system',
         content:
           'You are a triage classifier for an OSS agent harness. ' +
-          'Classify the issue type and identify an affected module path. ' +
+          'Classify only the issue type; module routing is handled by the repo adapter. ' +
           'Output strictly JSON matching the schema.',
       },
       {
@@ -54,12 +51,12 @@ export class OpenRouterTriageClassifier implements TriageClassifier {
       },
     ];
 
-    const { data } = await this.client.chatJson<TriageResult>(messages, TRIAGE_RESULT_SCHEMA, {
+    const { data } = await this.client.chatJson<{ issueType: IssueType }>(messages, TRIAGE_RESULT_SCHEMA, {
       agent: 'TRIAGE',
       temperature: 0,
     });
 
-    return data;
+    return data.issueType;
   }
 }
 
@@ -68,9 +65,9 @@ export class OpenRouterTriageClassifier implements TriageClassifier {
  * - If OPENROUTER_API_KEY is set, use OpenRouter.
  * - Otherwise, use the deterministic heuristic implementation.
  */
-export function createDefaultTriageClassifier(): TriageClassifier {
+export function createDefaultTriageClassifier(): TriageTypeClassifier {
   if (!process.env.OPENROUTER_API_KEY) {
-    return new HeuristicClassifier();
+    return new DefaultIssueTypeClassifier();
   }
   return new OpenRouterTriageClassifier();
 }

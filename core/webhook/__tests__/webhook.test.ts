@@ -13,15 +13,13 @@ const TEST_SECRET = 'test-webhook-secret-do-not-use';
 const SAMPLE_MANIFEST: Manifest = {
   repo: 'test-org/test-repo',
   trigger_label: 'agent-fix',
+  skip_pm_gate_label: 'trivial-fix',
   fork_org: 'test-fork-org',
   branch_prefix: 'agent/scope-',
-  test_command: 'npm test',
   approval_keywords: ['approved', 'lgtm'],
   pm_email: 'pm@test.com',
-  issue_types: ['bug_fix', 'new_feature', 'docs'],
-  sandbox_services: [],
   max_retries: 3,
-  skip_pm_gate: false,
+  sandbox_timeout_mins: 15,
 };
 
 function makeRegistry(manifests: Record<string, Manifest>): ManifestRegistry {
@@ -317,34 +315,10 @@ describe('Webhook Server Integration', () => {
     });
   });
 
-  describe('skip_pm_gate label handling', () => {
-    let serverWithSkipPm: http.Server;
-    let smWithSkipPm: StateMachine;
-    let dbPath2: string;
-
-    beforeEach((done) => {
-      dbPath2 = makeTempDbPath();
-      smWithSkipPm = new StateMachine(dbPath2);
-      const manifest: Manifest = { ...SAMPLE_MANIFEST, skip_pm_gate: true };
-      const registry = makeRegistry({ 'test-org/test-repo': manifest });
-
-      serverWithSkipPm = createWebhookServer({
-        port: 0,
-        secret: TEST_SECRET,
-        registry,
-        stateMachine: smWithSkipPm,
-      });
-      serverWithSkipPm.listen(0, '127.0.0.1', done);
-    });
-
-    afterEach((done) => {
-      smWithSkipPm.close();
-      serverWithSkipPm.close(done);
-    });
-
-    it('accepts issue.labeled with skip-pm-gate label when skip_pm_gate=true', async () => {
-      const body = makeIssueLabeledPayload('test-org/test-repo', 77, 'skip-pm-gate');
-      const res = await sendRequest(serverWithSkipPm, {
+  describe('skip_pm_gate_label handling', () => {
+    it('accepts issue.labeled with skip_pm_gate_label', async () => {
+      const body = makeIssueLabeledPayload('test-org/test-repo', 77, 'trivial-fix');
+      const res = await sendRequest(server, {
         body,
         secret: TEST_SECRET,
         eventType: 'issues',

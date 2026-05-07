@@ -29,7 +29,6 @@ import { ManifestLoadError } from './manifest/types';
 const VALID_BASE = {
   repo: 'Arize-ai/openinference',
   fork_org: 'oss-fix-bot',
-  test_command: 'pytest tests/',
   pm_email: 'pm@example.com',
 };
 
@@ -42,7 +41,7 @@ const VALID_MULTI_REPO_MANIFEST = {
   ...VALID_BASE,
   schema_version: '2',
   coordinated_repos: [
-    { repo: 'Arize-ai/phoenix', test_command: 'pytest tests/' },
+    { repo: 'Arize-ai/phoenix' },
     { repo: 'Arize-ai/arize-otel', fork_org: 'custom-org' },
   ],
 };
@@ -175,7 +174,7 @@ describe('US-018: Manifest schema versioning and multi-repo support', () => {
     it('validates a valid array of repos', () => {
       const repos = validateCoordinatedRepos([
         { repo: 'org/repo1' },
-        { repo: 'org/repo2', fork_org: 'custom-org', test_command: 'npm test' },
+        { repo: 'org/repo2', fork_org: 'custom-org' }
       ]);
       expect(repos).toHaveLength(2);
       expect(repos[0].repo).toBe('org/repo1');
@@ -223,12 +222,11 @@ describe('US-018: Manifest schema versioning and multi-repo support', () => {
         ...VALID_BASE,
         schema_version: '2' as const,
         trigger_label: 'agent-fix',
+        skip_pm_gate_label: 'trivial-fix',
         branch_prefix: 'agent/scope-',
         approval_keywords: ['approved'],
-        issue_types: ['bug_fix' as const],
-        sandbox_services: [] as string[],
         max_retries: 3,
-        skip_pm_gate: false,
+        sandbox_timeout_mins: 15,
       };
       const run = createMultiRepoRun('run-1', manifest, [42, 10], 'agent/scope-');
       expect(run.groupRunId).toBe('run-1');
@@ -242,12 +240,11 @@ describe('US-018: Manifest schema versioning and multi-repo support', () => {
         ...VALID_BASE,
         schema_version: '2' as const,
         trigger_label: 'agent-fix',
+        skip_pm_gate_label: 'trivial-fix',
         branch_prefix: 'agent/scope-',
         approval_keywords: ['approved'],
-        issue_types: ['bug_fix' as const],
-        sandbox_services: [] as string[],
         max_retries: 3,
-        skip_pm_gate: false,
+        sandbox_timeout_mins: 15,
         coordinated_repos: [
           { repo: 'Arize-ai/phoenix' },
           { repo: 'Arize-ai/arize-otel', fork_org: 'custom-org' },
@@ -268,12 +265,11 @@ describe('US-018: Manifest schema versioning and multi-repo support', () => {
         ...VALID_BASE,
         schema_version: '2' as const,
         trigger_label: 'agent-fix',
+        skip_pm_gate_label: 'trivial-fix',
         branch_prefix: 'agent/scope-',
         approval_keywords: ['approved'],
-        issue_types: ['bug_fix' as const],
-        sandbox_services: [] as string[],
         max_retries: 3,
-        skip_pm_gate: false,
+        sandbox_timeout_mins: 15,
         coordinated_repos: [{ repo: 'org/other' }],
       };
       const run = createMultiRepoRun('run-3', manifest, [5, 3, 9], 'agent/scope-');
@@ -287,12 +283,11 @@ describe('US-018: Manifest schema versioning and multi-repo support', () => {
         ...VALID_BASE,
         schema_version: '2' as const,
         trigger_label: 'agent-fix',
+        skip_pm_gate_label: 'trivial-fix',
         branch_prefix: 'agent/scope-',
         approval_keywords: ['approved'],
-        issue_types: ['bug_fix' as const],
-        sandbox_services: [] as string[],
         max_retries: 3,
-        skip_pm_gate: false,
+        sandbox_timeout_mins: 15,
       };
       const run = createMultiRepoRun('run-4', manifest, [200, 10, 3], 'agent/scope-');
       expect(run.repos[0].branchName).toBe('agent/scope-3-10-200');

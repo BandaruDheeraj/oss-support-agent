@@ -4,7 +4,7 @@
  * surfacing developer-experience problems that tests miss.
  */
 
-import { SandboxConfig, ActionsClient, SandboxResult } from '../sandbox-types';
+import { ActionsClient } from '../sandbox-types';
 import { ConfirmedIssue } from './fix-types';
 
 /**

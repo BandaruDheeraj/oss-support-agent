@@ -6,6 +6,7 @@
 
 import { SandboxArtifact } from '../sandbox-types';
 import { ConfirmedIssue } from './fix-types';
+import type { RepoAdapter } from '../adapter.interface';
 
 /**
  * Per-issue verdict: whether the fix for this issue passed or failed.
@@ -42,6 +43,8 @@ export interface EvalAgentInput {
   retryCount: number;
   /** Max retries from manifest */
   maxRetries: number;
+  /** Repo adapter for custom eval and PR metadata */
+  adapter?: RepoAdapter;
 }
 
 /**

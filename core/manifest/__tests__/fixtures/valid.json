@@ -1,1 +1,1 @@
-{"repo":"Arize-ai/openinference","fork_org":"oss-fix-bot","test_command":"python -m pytest tests/ -x --timeout=300","pm_email":"pm@example.com"}
+{"repo":"Arize-ai/openinference","fork_org":"oss-fix-bot","pm_email":"pm@example.com"}

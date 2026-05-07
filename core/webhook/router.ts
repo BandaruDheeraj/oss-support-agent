@@ -16,7 +16,7 @@ export interface ManifestRegistry {
  *
  * - Looks up the manifest for the repo; if none, enters SKIPPED.
  * - For issue.opened: creates a run in TRIGGERED state.
- * - For issue.labeled: checks trigger_label (or skip_pm_gate label) before creating a run.
+ * - For issue.labeled: checks trigger_label (or skip_pm_gate_label) before creating a run.
  * - Other events/actions are ignored.
  */
 export function routeEvent(
@@ -48,7 +48,7 @@ export function routeEvent(
     return { status: 'skipped', reason: `No manifest found for repo: ${repo}` };
   }
 
-  // For issue.labeled, check if the label matches trigger_label or skip_pm_gate
+  // For issue.labeled, check if the label matches trigger_label or skip_pm_gate_label
   if (event.action === 'labeled') {
     const labelName = event.label?.name;
     if (!labelName) {
@@ -56,7 +56,7 @@ export function routeEvent(
     }
 
     const isTriggerLabel = labelName === manifest.trigger_label;
-    const isSkipPmGateLabel = manifest.skip_pm_gate && labelName === 'skip-pm-gate';
+    const isSkipPmGateLabel = labelName === manifest.skip_pm_gate_label;
 
     if (!isTriggerLabel && !isSkipPmGateLabel) {
       return {

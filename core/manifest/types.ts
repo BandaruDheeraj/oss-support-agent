@@ -1,18 +1,27 @@
 /**
  * Manifest types for the OSS Autonomous Fix Loop.
+ *
+ * The manifest is config-only. Repo-specific executable logic lives in the adapter.
  */
 export interface Manifest {
+  /** Upstream repo in owner/name format */
   repo: string;
+  /** Label that triggers runs when applied to an issue */
   trigger_label: string;
+  /** Label that skips PM gate when present on the issue */
+  skip_pm_gate_label: string;
+  /** GitHub org/user where forks are created */
   fork_org: string;
+  /** Prefix for agent branches on forks */
   branch_prefix: string;
-  test_command: string;
+  /** Keywords that count as approval in PM/introspection email replies */
   approval_keywords: string[];
+  /** Email address of the PM / design reviewer */
   pm_email: string;
-  issue_types: Array<'bug_fix' | 'new_feature' | 'docs'>;
-  sandbox_services: string[];
+  /** Max retry attempts for fix/build agent */
   max_retries: number;
-  skip_pm_gate: boolean;
+  /** Sandbox wall-time cap (minutes) */
+  sandbox_timeout_mins: number;
 }
 
 export interface ManifestValidationError {

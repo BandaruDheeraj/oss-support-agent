@@ -20,7 +20,6 @@ function writeFixture(name: string, content: string): string {
 const VALID_MANIFEST = {
   repo: 'Arize-ai/openinference',
   fork_org: 'oss-fix-bot',
-  test_command: 'python -m pytest tests/ -x --timeout=300',
   pm_email: 'pm@example.com',
 };
 
@@ -32,7 +31,6 @@ describe('Manifest Loader', () => {
 
       expect(manifest.repo).toBe('Arize-ai/openinference');
       expect(manifest.fork_org).toBe('oss-fix-bot');
-      expect(manifest.test_command).toBe('python -m pytest tests/ -x --timeout=300');
       expect(manifest.pm_email).toBe('pm@example.com');
     });
 
@@ -40,7 +38,6 @@ describe('Manifest Loader', () => {
       const yamlContent = `
 repo: "Arize-ai/openinference"
 fork_org: "oss-fix-bot"
-test_command: "python -m pytest tests/ -x --timeout=300"
 pm_email: "pm@example.com"
 `;
       const filePath = writeFixture('valid.yaml', yamlContent);
@@ -50,7 +47,7 @@ pm_email: "pm@example.com"
       expect(manifest.fork_org).toBe('oss-fix-bot');
     });
 
-    it('loads the example openinference manifest', () => {
+    it('loads the OpenInference manifest fixture from configs/', () => {
       const examplePath = path.join(
         __dirname,
         '..',
@@ -62,18 +59,7 @@ pm_email: "pm@example.com"
         'manifest.yaml'
       );
       const manifest = loadManifest(examplePath);
-
       expect(manifest.repo).toBe('Arize-ai/openinference');
-      expect(manifest.fork_org).toBe('oss-fix-bot');
-      expect(manifest.trigger_label).toBe('agent-fix');
-      expect(manifest.branch_prefix).toBe('agent/scope-');
-      expect(manifest.test_command).toBe('python -m pytest tests/ -x --timeout=300');
-      expect(manifest.approval_keywords).toEqual(['approved', 'lgtm', 'ship it']);
-      expect(manifest.pm_email).toBe('pm@example.com');
-      expect(manifest.issue_types).toEqual(['bug_fix', 'new_feature', 'docs']);
-      expect(manifest.sandbox_services).toEqual(['pypi.org']);
-      expect(manifest.max_retries).toBe(3);
-      expect(manifest.skip_pm_gate).toBe(false);
     });
   });
 
@@ -98,19 +84,14 @@ pm_email: "pm@example.com"
       expect(manifest.approval_keywords).toEqual(['approved', 'lgtm', 'ship it']);
     });
 
-    it('applies default issue_types when omitted', () => {
+    it('applies default skip_pm_gate_label when omitted', () => {
       const manifest = validateManifest(VALID_MANIFEST);
-      expect(manifest.issue_types).toEqual(['bug_fix', 'new_feature', 'docs']);
+      expect(manifest.skip_pm_gate_label).toBe('trivial-fix');
     });
 
-    it('applies default sandbox_services when omitted', () => {
+    it('applies default sandbox_timeout_mins when omitted', () => {
       const manifest = validateManifest(VALID_MANIFEST);
-      expect(manifest.sandbox_services).toEqual([]);
-    });
-
-    it('applies default skip_pm_gate when omitted', () => {
-      const manifest = validateManifest(VALID_MANIFEST);
-      expect(manifest.skip_pm_gate).toBe(false);
+      expect(manifest.sandbox_timeout_mins).toBe(15);
     });
 
     it('does not override explicitly provided values with defaults', () => {
@@ -142,14 +123,9 @@ pm_email: "pm@example.com"
       }
     });
 
-    it('fails when test_command is missing', () => {
-      const { test_command, ...noTestCmd } = VALID_MANIFEST;
-      expect(() => validateManifest(noTestCmd)).toThrow(ManifestLoadError);
-      try {
-        validateManifest(noTestCmd);
-      } catch (e: any) {
-        expect(e.errors.some((err: any) => err.field === 'test_command')).toBe(true);
-      }
+    it('rejects adapter-owned sandbox fields', () => {
+      expect(() => validateManifest({ ...VALID_MANIFEST, test_command: 'npm test' })).toThrow(ManifestLoadError);
+      expect(() => validateManifest({ ...VALID_MANIFEST, sandbox_services: [] })).toThrow(ManifestLoadError);
     });
 
     it('fails when pm_email is missing', () => {
@@ -176,16 +152,16 @@ pm_email: "pm@example.com"
       expect(() => validateManifest({ ...VALID_MANIFEST, max_retries: 'three' })).toThrow(ManifestLoadError);
     });
 
-    it('fails when issue_types contains invalid values', () => {
-      expect(() => validateManifest({ ...VALID_MANIFEST, issue_types: ['invalid_type'] })).toThrow(ManifestLoadError);
-    });
-
     it('fails when pm_email is not a valid email', () => {
       expect(() => validateManifest({ ...VALID_MANIFEST, pm_email: 'not-an-email' })).toThrow(ManifestLoadError);
     });
 
-    it('fails when skip_pm_gate is not a boolean', () => {
-      expect(() => validateManifest({ ...VALID_MANIFEST, skip_pm_gate: 'yes' })).toThrow(ManifestLoadError);
+    it('fails when sandbox_timeout_mins is not an integer', () => {
+      expect(() => validateManifest({ ...VALID_MANIFEST, sandbox_timeout_mins: 'fifteen' })).toThrow(ManifestLoadError);
+    });
+
+    it('fails when skip_pm_gate_label is not a string', () => {
+      expect(() => validateManifest({ ...VALID_MANIFEST, skip_pm_gate_label: 123 })).toThrow(ManifestLoadError);
     });
 
     it('fails with additional unknown properties', () => {

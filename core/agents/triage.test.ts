@@ -1,85 +1,44 @@
-/**
- * Unit tests for the triage agent.
- *
- * Covers each issue_type classification, low-confidence path,
- * skip_pm_gate path, routing decisions, and clarification comments.
- */
+/** Unit tests for adapter-backed triage. */
 
+import { BaseRepoAdapter, Issue } from '../adapter.interface';
+import { AdapterContractError } from '../adapter-loader';
 import {
-  TriageInput,
-  TriageResult,
-  TriageClassifier,
-  IssueCommenter,
-  IssueType,
-} from './triage-types';
-import {
-  HeuristicClassifier,
+  DefaultIssueTypeClassifier,
+  classifyIssueType,
   triageIssue,
   runTriage,
   buildClarificationComment,
+  validateClassifiedModulePath,
   LOW_CONFIDENCE_THRESHOLD,
 } from './triage';
+import { IssueCommenter, TriageInput, TriageResult } from './triage-types';
 
-// --- Test Fixtures ---
+const repoRoot = process.cwd();
 
 const baseInput: TriageInput = {
+  number: 42,
   title: 'Fix null pointer in UserService',
-  body: 'The UserService crashes with a null pointer exception when the user has no email configured. Stack trace attached showing the error in src/services/user.ts line 42.',
+  body: 'The UserService crashes with a null pointer exception when the user has no email configured.',
   labels: ['bug'],
   author: 'testuser',
   moduleTaxonomy: ['bug_fix', 'new_feature', 'docs'],
-  repoTree: ['src/', 'src/services/', 'src/utils/', 'docs/', 'tests/', 'README.md'],
+  repoTree: ['core/', 'docs/'],
   hasSkipPmGate: false,
+  clonedRepoRoot: repoRoot,
 };
 
-const docsInput: TriageInput = {
-  ...baseInput,
-  title: 'Fix typo in README installation instructions',
-  body: 'The README.md has a typo in the installation section. "npm instal" should be "npm install".',
-  labels: ['documentation'],
-};
+class FakeAdapter extends BaseRepoAdapter {
+  public issues: Issue[] = [];
 
-const featureInput: TriageInput = {
-  ...baseInput,
-  title: 'Add support for GraphQL subscriptions',
-  body: 'We need to implement GraphQL subscription support in the API module. This would allow real-time updates for connected clients.',
-  labels: ['enhancement'],
-};
-
-const vagueInput: TriageInput = {
-  ...baseInput,
-  title: 'Something is wrong',
-  body: '',
-  labels: [],
-};
-
-const skipPmGateInput: TriageInput = {
-  ...baseInput,
-  hasSkipPmGate: true,
-};
-
-const conflictingInput: TriageInput = {
-  ...baseInput,
-  title: 'Add feature to fix the documentation bug',
-  body: 'Need to add a new feature and also fix the documentation error. This is an enhancement that also fixes a bug in docs.',
-  labels: [],
-};
-
-// --- Mock Classifier ---
-
-class MockClassifier implements TriageClassifier {
-  public result: TriageResult;
-
-  constructor(result: TriageResult) {
-    this.result = result;
+  constructor(private readonly modulePath = 'core') {
+    super();
   }
 
-  async classify(_input: TriageInput): Promise<TriageResult> {
-    return this.result;
+  async classifyModule(issue: Issue): Promise<string> {
+    this.issues.push(issue);
+    return this.modulePath;
   }
 }
-
-// --- Mock Commenter ---
 
 class MockCommenter implements IssueCommenter {
   public comments: Array<{ repo: string; issueNumber: number; comment: string }> = [];
@@ -89,379 +48,156 @@ class MockCommenter implements IssueCommenter {
   }
 }
 
-// --- Tests ---
-
-describe('HeuristicClassifier', () => {
-  const classifier = new HeuristicClassifier();
-
-  describe('issue type classification', () => {
-    it('classifies bug_fix issues from labels', async () => {
-      const result = await classifier.classify(baseInput);
-      expect(result.issueType).toBe('bug_fix');
-    });
-
-    it('classifies docs issues from labels', async () => {
-      const result = await classifier.classify(docsInput);
-      expect(result.issueType).toBe('docs');
-    });
-
-    it('classifies new_feature issues from labels', async () => {
-      const result = await classifier.classify(featureInput);
-      expect(result.issueType).toBe('new_feature');
-    });
-
-    it('classifies bug_fix from keywords when no labels present', async () => {
-      const input: TriageInput = {
-        ...baseInput,
-        labels: [],
-        title: 'Error in authentication module causes crash',
-        body: 'Getting a traceback when logging in. The error is a regression from last release.',
-      };
-      const result = await classifier.classify(input);
-      expect(result.issueType).toBe('bug_fix');
-    });
-
-    it('classifies docs from keywords when no labels present', async () => {
-      const input: TriageInput = {
-        ...baseInput,
-        labels: [],
-        title: 'Update readme with new installation steps',
-        body: 'The documentation is outdated. Need to update docs for the new CLI.',
-      };
-      const result = await classifier.classify(input);
-      expect(result.issueType).toBe('docs');
-    });
-
-    it('classifies new_feature from keywords when no labels present', async () => {
-      const input: TriageInput = {
-        ...baseInput,
-        labels: [],
-        title: 'Proposal: Add support for OAuth2 PKCE flow',
-        body: 'RFC for implementing a new API endpoint for PKCE-based authentication.',
-      };
-      const result = await classifier.classify(input);
-      expect(result.issueType).toBe('new_feature');
-    });
-
-    it('falls back to first taxonomy type when ambiguous', async () => {
-      const input: TriageInput = {
-        ...baseInput,
-        labels: [],
-        title: 'Hello world',
-        body: null,
-        moduleTaxonomy: ['new_feature', 'docs'],
-      };
-      const result = await classifier.classify(input);
-      expect(['new_feature', 'docs']).toContain(result.issueType);
-    });
+describe('classifyIssueType', () => {
+  it('classifies bug_fix issues from labels', () => {
+    expect(classifyIssueType(baseInput)).toBe('bug_fix');
   });
 
-  describe('affected module identification', () => {
-    it('identifies module from path mentions in issue text', async () => {
-      const result = await classifier.classify(baseInput);
-      // Issue mentions src/services/user.ts, should match src/services/
-      expect(result.affectedModule).toContain('src/services');
-    });
-
-    it('identifies docs module for documentation issues', async () => {
-      const input: TriageInput = {
-        ...docsInput,
-        repoTree: ['src/', 'src/services/', 'docs/', 'docs/api/', 'README.md'],
-      };
-      const result = await classifier.classify(input);
-      // README is mentioned in the issue
-      expect(result.affectedModule).toBe('README.md');
-    });
-
-    it('returns first directory when no module match found', async () => {
-      const input: TriageInput = {
-        ...baseInput,
-        title: 'Generic issue title',
-        body: 'No file paths mentioned here at all.',
-        labels: ['bug'],
-        repoTree: ['lib/', 'lib/core/', 'lib/utils/'],
-      };
-      const result = await classifier.classify(input);
-      expect(result.affectedModule).toBeTruthy();
-    });
+  it('classifies docs issues from labels', () => {
+    expect(classifyIssueType({ ...baseInput, labels: ['documentation'] })).toBe('docs');
   });
 
-  describe('confidence scoring', () => {
-    it('gives high confidence to well-labeled issues with detailed body', async () => {
-      const result = await classifier.classify(baseInput);
-      expect(result.confidence).toBeGreaterThanOrEqual(LOW_CONFIDENCE_THRESHOLD);
-    });
-
-    it('gives low confidence to vague issues without labels', async () => {
-      const result = await classifier.classify(vagueInput);
-      expect(result.confidence).toBeLessThan(LOW_CONFIDENCE_THRESHOLD);
-    });
-
-    it('reduces confidence when multiple type signals conflict', async () => {
-      const result = await classifier.classify(conflictingInput);
-      // Conflicting signals should reduce confidence
-      const clearResult = await classifier.classify(baseInput);
-      expect(result.confidence).toBeLessThanOrEqual(clearResult.confidence);
-    });
-
-    it('confidence is always between 0 and 1', async () => {
-      const inputs = [baseInput, docsInput, featureInput, vagueInput, conflictingInput];
-      for (const input of inputs) {
-        const result = await classifier.classify(input);
-        expect(result.confidence).toBeGreaterThanOrEqual(0);
-        expect(result.confidence).toBeLessThanOrEqual(1);
-      }
-    });
+  it('classifies new_feature issues from labels', () => {
+    expect(classifyIssueType({ ...baseInput, labels: ['enhancement'] })).toBe('new_feature');
   });
 
-  describe('summary generation', () => {
-    it('includes issue type in summary', async () => {
-      const result = await classifier.classify(baseInput);
-      expect(result.summary).toContain('Bug fix');
-    });
+  it('classifies bug_fix from keywords when no labels exist', () => {
+    expect(classifyIssueType({ ...baseInput, labels: [], title: 'Crash on login', body: 'traceback regression' })).toBe('bug_fix');
+  });
 
-    it('includes affected module in summary', async () => {
-      const result = await classifier.classify(baseInput);
-      expect(result.summary).toContain(result.affectedModule);
-    });
+  it('classifies docs from keywords when no labels exist', () => {
+    expect(classifyIssueType({ ...baseInput, labels: [], title: 'Update README', body: 'documentation typo' })).toBe('docs');
+  });
 
-    it('includes issue title in summary', async () => {
-      const result = await classifier.classify(baseInput);
-      expect(result.summary).toContain(baseInput.title);
-    });
+  it('classifies new_feature from keywords when no labels exist', () => {
+    expect(classifyIssueType({ ...baseInput, labels: [], title: 'Proposal add support', body: 'implement new API' })).toBe('new_feature');
+  });
+
+  it('falls back to the first taxonomy value', () => {
+    expect(classifyIssueType({ ...baseInput, labels: [], title: 'Hello', body: null, moduleTaxonomy: ['docs'] })).toBe('docs');
+  });
+
+  it('DefaultIssueTypeClassifier delegates to classifyIssueType', async () => {
+    await expect(new DefaultIssueTypeClassifier().classifyIssueType(baseInput)).resolves.toBe('bug_fix');
+  });
+});
+
+describe('validateClassifiedModulePath', () => {
+  it('accepts an existing relative directory', () => {
+    expect(validateClassifiedModulePath('core', repoRoot)).toBe('core');
+  });
+
+  it('accepts the repository root dot path', () => {
+    expect(validateClassifiedModulePath('.', repoRoot)).toBe('.');
+  });
+
+  it('rejects leading slash paths', () => {
+    expect(() => validateClassifiedModulePath('/core', repoRoot)).toThrow(AdapterContractError);
+  });
+
+  it('rejects parent traversal', () => {
+    expect(() => validateClassifiedModulePath('../core', repoRoot)).toThrow(AdapterContractError);
+  });
+
+  it('rejects non-existent directories', () => {
+    expect(() => validateClassifiedModulePath('does-not-exist', repoRoot)).toThrow(AdapterContractError);
+  });
+
+  it('rejects files because downstream agents require a directory', () => {
+    expect(() => validateClassifiedModulePath('package.json', repoRoot)).toThrow(AdapterContractError);
   });
 });
 
 describe('triageIssue', () => {
-  describe('routing for bug_fix', () => {
-    it('routes bug_fix to PM agent', async () => {
-      const classifier = new MockClassifier({
-        issueType: 'bug_fix',
-        affectedModule: 'src/services/',
-        confidence: 0.85,
-        summary: 'Bug fix in src/services/: Fix null pointer',
-      });
-      const routing = await triageIssue(baseInput, classifier);
-      expect(routing.action).toBe('route_pm');
-      expect(routing.result.issueType).toBe('bug_fix');
-    });
+  it('calls adapter.classifyModule with documented issue fields', async () => {
+    const adapter = new FakeAdapter('core');
+    await triageIssue(baseInput, adapter);
+    expect(adapter.issues).toEqual([{ number: 42, title: baseInput.title, body: baseInput.body, labels: baseInput.labels, url: undefined }]);
   });
 
-  describe('routing for new_feature', () => {
-    it('routes new_feature to PM agent', async () => {
-      const classifier = new MockClassifier({
-        issueType: 'new_feature',
-        affectedModule: 'src/api/',
-        confidence: 0.9,
-        summary: 'New feature in src/api/: Add GraphQL support',
-      });
-      const routing = await triageIssue(featureInput, classifier);
-      expect(routing.action).toBe('route_pm');
-      expect(routing.result.issueType).toBe('new_feature');
-    });
+  it('uses the adapter module as affectedModule', async () => {
+    const routing = await triageIssue(baseInput, new FakeAdapter('core/agents'));
+    expect(routing.result.affectedModule).toBe('core/agents');
   });
 
-  describe('routing for docs (fast path)', () => {
-    it('routes docs directly to docs agent (skips PM)', async () => {
-      const classifier = new MockClassifier({
-        issueType: 'docs',
-        affectedModule: 'README.md',
-        confidence: 0.95,
-        summary: 'Documentation update in README.md: Fix typo',
-      });
-      const routing = await triageIssue(docsInput, classifier);
-      expect(routing.action).toBe('route_docs');
-      expect(routing.result.issueType).toBe('docs');
-    });
+  it('routes bug_fix to PM', async () => {
+    const routing = await triageIssue(baseInput, new FakeAdapter('core'));
+    expect(routing.action).toBe('route_pm');
   });
 
-  describe('low-confidence path', () => {
-    it('returns clarify action when confidence is below threshold', async () => {
-      const classifier = new MockClassifier({
-        issueType: 'bug_fix',
-        affectedModule: '/',
-        confidence: 0.4,
-        summary: 'Bug fix in /: Something is wrong',
-      });
-      const routing = await triageIssue(vagueInput, classifier);
-      expect(routing.action).toBe('clarify');
-      if (routing.action === 'clarify') {
-        expect(routing.comment).toContain('not fully confident');
-        expect(routing.comment).toContain('bug_fix');
-        expect(routing.comment).toContain('40%');
-      }
-    });
-
-    it('returns clarify when confidence is exactly at threshold boundary', async () => {
-      const classifier = new MockClassifier({
-        issueType: 'bug_fix',
-        affectedModule: 'src/',
-        confidence: 0.59,
-        summary: 'Bug fix in src/: borderline issue',
-      });
-      const routing = await triageIssue(baseInput, classifier);
-      expect(routing.action).toBe('clarify');
-    });
-
-    it('routes normally when confidence is exactly at threshold', async () => {
-      const classifier = new MockClassifier({
-        issueType: 'bug_fix',
-        affectedModule: 'src/',
-        confidence: 0.6,
-        summary: 'Bug fix in src/: threshold issue',
-      });
-      const routing = await triageIssue(baseInput, classifier);
-      expect(routing.action).toBe('route_pm');
-    });
+  it('routes new_feature to PM', async () => {
+    const routing = await triageIssue({ ...baseInput, labels: ['enhancement'] }, new FakeAdapter('core'));
+    expect(routing.action).toBe('route_pm');
+    expect(routing.result.issueType).toBe('new_feature');
   });
 
-  describe('skip_pm_gate path', () => {
-    it('routes directly to fork when skip_pm_gate is set', async () => {
-      const classifier = new MockClassifier({
-        issueType: 'bug_fix',
-        affectedModule: 'src/services/',
-        confidence: 0.85,
-        summary: 'Bug fix in src/services/: Fix null pointer',
-      });
-      const routing = await triageIssue(skipPmGateInput, classifier);
-      expect(routing.action).toBe('route_fork');
-    });
+  it('routes docs directly to docs agent', async () => {
+    const routing = await triageIssue({ ...baseInput, labels: ['docs'], title: 'Fix docs' }, new FakeAdapter('core'));
+    expect(routing.action).toBe('route_docs');
+  });
 
-    it('skip_pm_gate routes to fork even for docs issues', async () => {
-      const input: TriageInput = { ...docsInput, hasSkipPmGate: true };
-      const classifier = new MockClassifier({
-        issueType: 'docs',
-        affectedModule: 'README.md',
-        confidence: 0.9,
-        summary: 'Docs update in README.md',
-      });
-      const routing = await triageIssue(input, classifier);
-      expect(routing.action).toBe('route_fork');
-    });
+  it('routes directly to fork when skip_pm_gate is set', async () => {
+    const routing = await triageIssue({ ...baseInput, hasSkipPmGate: true }, new FakeAdapter('core'));
+    expect(routing.action).toBe('route_fork');
+  });
 
-    it('skip_pm_gate does NOT override low confidence (clarify first)', async () => {
-      const input: TriageInput = { ...vagueInput, hasSkipPmGate: true };
-      const classifier = new MockClassifier({
-        issueType: 'bug_fix',
-        affectedModule: '/',
-        confidence: 0.3,
-        summary: 'Bug fix in /: vague',
-      });
-      const routing = await triageIssue(input, classifier);
-      expect(routing.action).toBe('clarify');
-    });
+  it('returns clarify for low-confidence issues before skip_pm_gate routing', async () => {
+    const routing = await triageIssue({ ...baseInput, title: 'Bad', body: '', labels: [], hasSkipPmGate: true }, new FakeAdapter('.'));
+    expect(routing.action).toBe('clarify');
+  });
+
+  it('throws AdapterContractError for invalid adapter module paths', async () => {
+    await expect(triageIssue(baseInput, new FakeAdapter('../bad'))).rejects.toThrow(AdapterContractError);
+  });
+
+  it('uses issueNumber option when input number is absent', async () => {
+    const adapter = new FakeAdapter('core');
+    await triageIssue({ ...baseInput, number: undefined }, adapter, { issueNumber: 99 });
+    expect(adapter.issues[0].number).toBe(99);
   });
 });
 
 describe('runTriage', () => {
   it('posts a clarification comment on low confidence', async () => {
-    const classifier = new MockClassifier({
-      issueType: 'bug_fix',
-      affectedModule: '/',
-      confidence: 0.3,
-      summary: 'Bug fix in /: vague issue',
-    });
     const commenter = new MockCommenter();
-
-    const routing = await runTriage(
-      'owner/repo',
-      42,
-      vagueInput,
-      classifier,
-      commenter
-    );
-
+    const routing = await runTriage('owner/repo', 7, { ...baseInput, title: 'Bad', body: '', labels: [] }, new FakeAdapter('.'), commenter);
     expect(routing.action).toBe('clarify');
     expect(commenter.comments).toHaveLength(1);
-    expect(commenter.comments[0].repo).toBe('owner/repo');
-    expect(commenter.comments[0].issueNumber).toBe(42);
-    expect(commenter.comments[0].comment).toContain('not fully confident');
+    expect(commenter.comments[0].issueNumber).toBe(7);
   });
 
-  it('does NOT post a comment when confidence is sufficient', async () => {
-    const classifier = new MockClassifier({
-      issueType: 'bug_fix',
-      affectedModule: 'src/',
-      confidence: 0.85,
-      summary: 'Bug fix in src/: Fix crash',
-    });
+  it('does not post a comment when confidence is sufficient', async () => {
     const commenter = new MockCommenter();
-
-    await runTriage('owner/repo', 42, baseInput, classifier, commenter);
-
+    await runTriage('owner/repo', 42, baseInput, new FakeAdapter('core'), commenter);
     expect(commenter.comments).toHaveLength(0);
-  });
-
-  it('returns routing result even when posting a comment', async () => {
-    const classifier = new MockClassifier({
-      issueType: 'new_feature',
-      affectedModule: 'src/api/',
-      confidence: 0.4,
-      summary: 'New feature in src/api/: unclear',
-    });
-    const commenter = new MockCommenter();
-
-    const routing = await runTriage('owner/repo', 7, featureInput, classifier, commenter);
-
-    expect(routing.action).toBe('clarify');
-    expect(routing.result.issueType).toBe('new_feature');
-    expect(routing.result.confidence).toBe(0.4);
   });
 });
 
 describe('buildClarificationComment', () => {
+  const result: TriageResult = { issueType: 'bug_fix', affectedModule: 'core', confidence: 0.45, summary: 'Bug fix in core' };
+
   it('includes the classified type', () => {
-    const result: TriageResult = {
-      issueType: 'bug_fix',
-      affectedModule: 'src/auth/',
-      confidence: 0.45,
-      summary: 'Bug fix in src/auth/',
-    };
-    const comment = buildClarificationComment(result);
-    expect(comment).toContain('bug_fix');
+    expect(buildClarificationComment(result)).toContain('bug_fix');
   });
 
   it('includes the affected module', () => {
-    const result: TriageResult = {
-      issueType: 'docs',
-      affectedModule: 'docs/api/',
-      confidence: 0.5,
-      summary: 'Docs update',
-    };
-    const comment = buildClarificationComment(result);
-    expect(comment).toContain('docs/api/');
+    expect(buildClarificationComment(result)).toContain('core');
   });
 
   it('includes the confidence percentage', () => {
-    const result: TriageResult = {
-      issueType: 'new_feature',
-      affectedModule: 'src/',
-      confidence: 0.55,
-      summary: 'Feature',
-    };
-    const comment = buildClarificationComment(result);
-    expect(comment).toContain('55%');
+    expect(buildClarificationComment(result)).toContain('45%');
   });
 
   it('asks for clarification questions', () => {
-    const result: TriageResult = {
-      issueType: 'bug_fix',
-      affectedModule: '/',
-      confidence: 0.3,
-      summary: 'Vague',
-    };
-    const comment = buildClarificationComment(result);
-    expect(comment).toContain('bug fix, new feature, or documentation');
-    expect(comment).toContain('module or file');
+    expect(buildClarificationComment(result)).toContain('module or file');
   });
 });
 
 describe('timing', () => {
-  it('triage completes in under 90 seconds (heuristic classifier)', async () => {
-    const classifier = new HeuristicClassifier();
+  it('triage completes in under 90 seconds', async () => {
     const start = Date.now();
-    await triageIssue(baseInput, classifier);
-    const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(90_000);
+    await triageIssue(baseInput, new FakeAdapter('core'));
+    expect(Date.now() - start).toBeLessThan(90_000);
+    expect(LOW_CONFIDENCE_THRESHOLD).toBe(0.6);
   });
 });

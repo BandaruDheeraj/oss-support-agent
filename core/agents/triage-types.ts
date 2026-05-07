@@ -11,6 +11,8 @@ export type IssueType = 'bug_fix' | 'new_feature' | 'docs';
  * Inputs provided to the triage agent.
  */
 export interface TriageInput {
+  /** Issue number within the repository */
+  number?: number;
   /** Issue title */
   title: string;
   /** Issue body/description */
@@ -19,12 +21,16 @@ export interface TriageInput {
   labels: string[];
   /** Issue author login */
   author: string;
-  /** Module taxonomy from the manifest (issue_types) */
-  moduleTaxonomy: IssueType[];
+  /** Allowed issue types (defaults to all). Previously derived from manifest.issue_types. */
+  moduleTaxonomy?: IssueType[];
   /** Shallow repo tree (top two directory levels) */
   repoTree: string[];
   /** Whether the issue has skip_pm_gate label */
   hasSkipPmGate: boolean;
+  /** Local cloned fork root used to validate adapter module routing */
+  clonedRepoRoot?: string;
+  /** Optional URL to the issue */
+  url?: string;
 }
 
 /**
@@ -51,10 +57,10 @@ export type TriageRouting =
   | { action: 'clarify'; result: TriageResult; comment: string };
 
 /**
- * Interface for the LLM classifier (allows mocking in tests).
+ * Interface for issue-type classifiers (allows mocking in tests).
  */
-export interface TriageClassifier {
-  classify(input: TriageInput): Promise<TriageResult>;
+export interface TriageTypeClassifier {
+  classifyIssueType(input: TriageInput): Promise<IssueType>;
 }
 
 /**
@@ -63,3 +69,6 @@ export interface TriageClassifier {
 export interface IssueCommenter {
   postComment(repo: string, issueNumber: number, comment: string): Promise<void>;
 }
+
+/** Backward-compatible alias for older imports. */
+export type TriageClassifier = TriageTypeClassifier;

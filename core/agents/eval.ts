@@ -17,87 +17,44 @@ import {
 } from './eval-types';
 import { SandboxArtifact } from '../sandbox-types';
 import { ConfirmedIssue } from './fix-types';
+import { BaseRepoAdapter, type EvalResult, type PRMetadata, type RepoAdapter } from '../adapter.interface';
 
 /**
  * Evaluate sandbox results and produce a pass/fail verdict.
  * In Phase 1, regression_detected is always false.
  */
-export function evaluateSandboxResults(
+export async function evaluateSandboxResults(
   sandboxArtifact: SandboxArtifact,
+  confirmedIssues: ConfirmedIssue[],
+  fixSummary: string,
+  adapter: RepoAdapter = new BaseRepoAdapter()
+): Promise<EvalAgentResult> {
+  const adapterEval = await adapter.runCustomEval(sandboxArtifact.commands);
+  return buildEvalAgentResult(adapterEval, confirmedIssues, fixSummary);
+}
+
+function buildEvalAgentResult(
+  adapterEval: EvalResult,
   confirmedIssues: ConfirmedIssue[],
   fixSummary: string
 ): EvalAgentResult {
-  const { result } = sandboxArtifact;
-
-  // Overall pass: sandbox completed with exit code 0
-  const overallPass = result.completed && result.exitCode === 0 && !result.timedOut;
-
-  // Per-issue verdicts: in Phase 1, all issues share the same verdict
   const perIssueVerdicts: IssueVerdict[] = confirmedIssues.map((issue) => ({
     issueNumber: issue.number,
-    passed: overallPass,
-    reason: overallPass
+    passed: adapterEval.passed,
+    reason: adapterEval.passed
       ? `Tests passed for fix addressing issue #${issue.number}`
-      : buildFailureReason(result.exitCode, result.timedOut, result.stderr),
+      : adapterEval.summary,
   }));
 
-  // Retry context: structured summary of what failed (for retry loop)
-  const retryContext = overallPass
-    ? null
-    : buildRetryContext(sandboxArtifact);
-
-  // PR summary
-  const prSummary = overallPass
-    ? `All tests passed. Fix addresses: ${confirmedIssues.map((i) => `#${i.number}`).join(', ')}. ${fixSummary}`
-    : `Tests failed. ${buildFailureReason(result.exitCode, result.timedOut, result.stderr)}`;
-
   return {
-    overallPass,
+    overallPass: adapterEval.passed,
     perIssueVerdicts,
-    regressionDetected: false, // Phase 1: always false
-    retryContext,
-    prSummary,
+    regressionDetected: false,
+    retryContext: adapterEval.passed ? null : adapterEval.retryContext.join('\n'),
+    prSummary: adapterEval.passed
+      ? `All tests passed. Fix addresses: ${confirmedIssues.map((i) => `#${i.number}`).join(', ')}. ${fixSummary}`
+      : `Tests failed. ${adapterEval.summary}`,
   };
-}
-
-/**
- * Build a failure reason string from sandbox results.
- */
-function buildFailureReason(
-  exitCode: number | null,
-  timedOut: boolean,
-  stderr: string
-): string {
-  if (timedOut) {
-    return 'Sandbox run timed out before completion';
-  }
-  if (exitCode === null) {
-    return 'Sandbox run did not complete (no exit code)';
-  }
-  const stderrSnippet = stderr.trim().length > 0
-    ? `: ${stderr.trim().slice(0, 200)}`
-    : '';
-  return `Tests failed with exit code ${exitCode}${stderrSnippet}`;
-}
-
-/**
- * Build structured retry context from sandbox results.
- */
-function buildRetryContext(artifact: SandboxArtifact): string {
-  const { result, config } = artifact;
-  const lines: string[] = [
-    `Test command: ${config.testCommand}`,
-    `Exit code: ${result.exitCode ?? 'N/A'}`,
-    `Timed out: ${result.timedOut}`,
-    `Duration: ${result.durationSeconds}s`,
-  ];
-  if (result.stderr.trim()) {
-    lines.push(`Stderr (first 500 chars): ${result.stderr.trim().slice(0, 500)}`);
-  }
-  if (result.stdout.trim()) {
-    lines.push(`Stdout (last 500 chars): ${result.stdout.trim().slice(-500)}`);
-  }
-  return lines.join('\n');
 }
 
 /**
@@ -105,7 +62,8 @@ function buildRetryContext(artifact: SandboxArtifact): string {
  */
 export function buildPRDetails(
   input: EvalAgentInput,
-  evalResult: EvalAgentResult
+  evalResult: EvalAgentResult,
+  metadata: PRMetadata = { extraLabels: [], extraBodySections: [] }
 ): PRDetails {
   const title = `[agent-fix] ${input.fixSummary}`;
 
@@ -132,8 +90,10 @@ export function buildPRDetails(
     bodyParts.push(`## Retry Information`, '', `This fix succeeded after ${input.retryCount} retry attempt(s).`, '');
   }
 
-  // Labels: agent-fix plus one per issue type
-  const labels = ['agent-fix', ...new Set(input.issueTypes)];
+  bodyParts.push(...metadata.extraBodySections.flatMap((section) => [section, '']));
+
+  // Labels: agent-fix plus one per issue type plus adapter-provided labels
+  const labels = ['agent-fix', ...new Set([...input.issueTypes, ...metadata.extraLabels])];
 
   // Head: fork_org:branch_name format for cross-fork PRs
   const [forkOrg] = input.forkFullName.split('/');
@@ -185,10 +145,12 @@ export async function runEvalAgent(
   prClient: PRClient
 ): Promise<{ result: EvalAgentResult; routing: EvalRouting }> {
   // Step 1: Evaluate sandbox results
-  const evalResult = evaluateSandboxResults(
+  const adapter = input.adapter ?? new BaseRepoAdapter();
+  const evalResult = await evaluateSandboxResults(
     input.sandboxArtifact,
     input.confirmedIssues,
-    input.fixSummary
+    input.fixSummary,
+    adapter
   );
 
   // Step 2: Route based on result
@@ -197,7 +159,15 @@ export async function runEvalAgent(
   // Step 3: On pass, open PR
   if (routing.action === 'open_pr') {
     try {
-      const prDetails = buildPRDetails(input, evalResult);
+      const metadata = await adapter.getPRMetadata(
+        input.confirmedIssues.map((issue) => ({
+          number: issue.number,
+          title: issue.title,
+          body: issue.body ?? '',
+          labels: issue.labels,
+        }))
+      );
+      const prDetails = buildPRDetails(input, evalResult, metadata);
       const { url } = await prClient.createPullRequest(input.upstreamRepo, prDetails);
 
       // Add labels (non-fatal if this fails)
