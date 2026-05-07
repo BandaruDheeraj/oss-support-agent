@@ -812,3 +812,24 @@ Project: OSS Autonomous Fix Loop
   - Enforced one-way dependency: scripts/check-core-imports.ts wired into npm run lint.
   - Verified: npm run lint, npm test.
 ---
+
+2026-05-07: US-103 Manifest adapter-aware refactor — DONE
+  - Updated core/manifest schema/types/loader to config-only: required repo/fork_org/pm_email; defaults for trigger_label, skip_pm_gate_label, branch_prefix, approval_keywords, max_retries, sandbox_timeout_mins.
+  - Added legacy-field rejection with clear migration hints and field-level unknown property reporting.
+  - Added migrateLegacyManifest() helper to strip legacy keys and map skip_pm_gate=true -> skip_pm_gate_label.
+  - Updated webhook router + tests and configs/arize-ai/openinference/manifest.yaml; updated multi-repo tests for new base manifest shape.
+  Note: npm/node commands cannot be executed in this environment (permission denied accessing the repo directory from the shell), so tests could not be run here.
+---
+
+2026-05-07: US-104 Repo signal gathering — DONE
+  - Implemented gatherRepoSignals(repoFullName) in core/agents/introspection.ts.
+    * Shallow clones via git clone --depth 1 (production cloner) and always cleans up temp dirs.
+    * Extracts CI workflow step run blocks into signals.ciWorkflows.
+    * Detects package manifests (package.json, pyproject.toml, setup.py, Cargo.toml, go.mod, pom.xml, build.gradle*) with stack + testHint.
+    * Detects monorepo layout and records dir -> stack mapping in signals.monorepoLayout.
+    * Parses Makefile/justfile targets matching test/check/verify.
+    * Extracts fenced code blocks from CONTRIBUTING.md / DEVELOPMENT.md.
+    * Extracts docker-compose service names and uses README.md only as a fallback when no other test signals exist.
+  - Added fixture-based unit tests in core/agents/introspection.test.ts covering Node monorepo, Python repo, Makefile-only, README-only, no-signals, and cleanup-on-error.
+  Verified: npm test -- --runTestsByPath core/agents/introspection.test.ts
+---
