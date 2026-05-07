@@ -1,0 +1,257 @@
+{
+  "project": "OSS Fix Loop - Harness Extensibility",
+  "description": "Adapter pattern and repo introspection agent for the OSS Autonomous Fix Loop. All repo-specific behaviour is isolated in a per-repo adapter; core orchestrator and agents never contain repo-specific logic. Onboarding a new repo means pointing the introspection agent at it - it reads the repo, generates the adapter and manifest, the user approves via email, and the harness goes live with zero core changes. See Harness Extensibility spec (May 2026 Draft).",
+  "userStories": [
+    {
+      "id": "US-100",
+      "title": "Shared LLM client via OpenRouter",
+      "description": "As every AI-backed agent in the harness (triage classifier, PM agent, fix generator, build scaffolder, introspection draft generator, eval reasoning, docs agent, usability agent), I need one shared LLM client that talks to OpenRouter so the operator can swap models per agent without code changes. OpenRouter exposes an OpenAI-compatible /chat/completions endpoint and supports Anthropic Claude, OpenAI GPT, Google Gemini, Llama, Mistral and others through a single API key. Today the codebase has no model wired up - every agent has an LLM-shaped interface (TriageClassifier, FixGenerator, ScaffoldGenerator, etc.) backed only by deterministic heuristic stubs. This story replaces those stubs with a real provider while keeping the interfaces so existing tests can still inject fakes.",
+      "acceptanceCriteria": [
+        "core/llm/client.ts exports an LLMClient class with chat(messages, options?) and chatJson<T>(messages, schema, options?) methods; chatJson validates the response against a JSON schema and retries on parse failure (default 3 retries)",
+        "Client posts to https://openrouter.ai/api/v1/chat/completions with the OpenAI-compatible request shape and an HTTP-Referer + X-Title header per OpenRouter conventions",
+        "Authentication reads OPENROUTER_API_KEY from env on construction and fails fast with a clear error if missing",
+        "Per-agent model selection via env: OPENROUTER_MODEL_TRIAGE, OPENROUTER_MODEL_PM, OPENROUTER_MODEL_FIX, OPENROUTER_MODEL_BUILD, OPENROUTER_MODEL_EVAL, OPENROUTER_MODEL_DOCS, OPENROUTER_MODEL_USABILITY, OPENROUTER_MODEL_INTROSPECTION; each falls back to OPENROUTER_MODEL_DEFAULT (e.g. anthropic/claude-3.7-sonnet) when unset",
+        "Streaming is not required for v1; non-streaming JSON responses only",
+        "Token usage from the response (prompt_tokens, completion_tokens, total_tokens) is returned alongside the content and forwarded to the existing cost-guardrails RunUsage accumulator so per-run token caps actually fire on real usage",
+        "Built-in retry with exponential backoff for 429/5xx (default max 5 attempts, jittered), and timeout (default 90s) configurable per call",
+        "Real LLM-backed implementations replace the heuristic stubs in: TriageClassifier (HeuristicClassifier becomes a fallback used only when OPENROUTER_API_KEY is absent), FixGenerator (no current real impl), ScaffoldGenerator (no current real impl), and the new introspection generator from US-105; the existing interfaces are preserved so test fakes still work",
+        "All test suites continue to pass with mocked clients; a thin LLMClient mock helper is exported from core/llm/test-utils for reuse",
+        "Unit tests cover: missing API key error, per-agent model resolution from env with default fallback, retry/backoff on 429, JSON parse retry on malformed response, token usage forwarded to cost guardrails, request body matches OpenAI chat-completions schema, custom headers (HTTP-Referer, X-Title) included",
+        "README documents the env vars and links to the OpenRouter model list so the operator can swap models per agent without redeploying"
+      ],
+      "priority": 0,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-101",
+      "title": "Adapter interface contract",
+      "description": "As a harness developer, I need a single TypeScript interface that every per-repo adapter implements so core agents have one stable contract for repo-specific behaviour. The interface defines five methods - classifyModule, getTestCommands, getSandboxServices, runCustomEval, getPRMetadata - and the supporting types Issue, ServiceConfig, SandboxOutput, EvalResult, and PRMetadata.",
+      "acceptanceCriteria": [
+        "core/adapter.interface.ts exports the RepoAdapter interface with exactly the five methods specified in spec section 2",
+        "All five methods are async (return Promise) so adapters can perform network I/O without interface changes",
+        "Supporting types ServiceConfig, SandboxOutput, EvalResult, PRMetadata, and Issue are exported with the field shapes from spec section 2.1",
+        "Interface and supporting types include TSDoc comments derived from the spec describing when each method is called and by which agent",
+        "A base adapter class (or default-implementation helper) is provided so adapters can return safe defaults (empty array, empty object, passed: true) without overriding every method",
+        "Type-level test (tsc --noEmit on a fixture) verifies a minimal adapter implementation compiles against the interface",
+        "Unit tests verify the supporting types serialize/deserialize correctly when a SandboxOutput is round-tripped through JSON"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-102",
+      "title": "Harness directory restructure with one-way dependency",
+      "description": "As a harness developer, I need the existing flat src/ layout reorganised into core/ and configs/ with a strict one-way import rule so repo-specific code can never leak into core. The current code lives flat in src/ (60+ files: triage-agent.ts, pm-agent.ts, fix-agent.ts, build-agent.ts, eval-agent.ts, sandbox-runner.ts, fork-manager.ts, gmail-mcp.ts, pm-email-loop.ts, retry-loop.ts, regression-guard.ts, usability-agent.ts, docs-agent.ts, issue-sweep.ts, multi-repo.ts, cost-guardrails.ts, plus their *-types/-index/.test files) with three subfolders src/manifest/, src/orchestrator/, src/webhook/. core/ never imports from configs/; configs/ may import from core/.",
+      "acceptanceCriteria": [
+        "Repository layout matches spec section 1: core/orchestrator.ts (current src/orchestrator/state-machine.ts entrypoint), core/agents/{triage,pm,fix,build,eval,docs,usability,regression-guard,introspection}.ts, core/email.ts (re-exports from gmail-mcp + pm-email-loop), core/github.ts (re-exports from fork-manager), core/sandbox.ts (current sandbox-runner.ts), core/manifest/, core/webhook/, core/adapter.interface.ts (new), configs/<org>/<repo>/{manifest.yaml,adapter.ts}, .github/workflows/sandbox.yml, scripts/",
+        "All existing src/*.ts files are relocated into core/ subfolders by responsibility (agents -> core/agents/, infra -> core/, manifest/orchestrator/webhook keep their subfolder structure under core/) with imports updated; no behavioural changes",
+        "examples/openinference.yaml is moved to configs/arize-ai/openinference/manifest.yaml as part of US-111; the old examples/openinference.yaml is deleted",
+        "An automated lint check fails the build if any file under core/ imports from configs/ (AST-based check via tsc resolution or eslint-plugin-import rule, run as part of npm run lint)",
+        "Files under configs/ may import from core/adapter.interface.ts and core/* type modules; this direction is permitted by the lint rule",
+        "tsconfig.json rootDir is updated from ./src to a path that covers both core/ and configs/, and jest.config.ts roots include both",
+        "README updated to describe the directory contract and the one-way dependency rule",
+        "All existing unit tests (manifest, orchestrator, webhook, every agent, retry-loop, sandbox-runner, multi-repo, cost-guardrails, fork-manager, gmail-mcp, pm-email-loop, issue-sweep) pass after the restructure with no test logic changes other than import paths"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-103",
+      "title": "Manifest adapter-aware refactor",
+      "description": "As the orchestrator, I need an updated manifest schema that contains only configuration values - no executable logic. The existing src/manifest/types.ts Manifest interface currently has test_command (string), sandbox_services (string[]), issue_types (array), and skip_pm_gate (boolean) - all four are removed or replaced because executable logic now lives in the adapter and skip_pm_gate becomes a per-issue label. New fields skip_pm_gate_label and sandbox_timeout_mins are added. Unknown fields fail startup loudly. This refactor coexists with the existing schema_version field used by multi-repo-types.ts (v1/v2 multi-repo coordination) - they are orthogonal and both must remain valid.",
+      "acceptanceCriteria": [
+        "core/manifest schema covers exactly the fields in spec section 3: repo, trigger_label, skip_pm_gate_label, fork_org, branch_prefix, pm_email, approval_keywords, max_retries, sandbox_timeout_mins (plus the orthogonal schema_version and coordinated_repos fields preserved from multi-repo-types.ts)",
+        "Required fields: repo, fork_org, pm_email; all other fields have defaults (trigger_label=agent-fix, skip_pm_gate_label=trivial-fix, branch_prefix=agent/scope-, approval_keywords=[approved, lgtm, ship it], max_retries=3, sandbox_timeout_mins=15)",
+        "Removed from Manifest: test_command, sandbox_services, issue_types, skip_pm_gate (boolean). Their presence in a manifest is rejected with a clear migration hint: test_command/sandbox_services -> adapter.getTestCommands/getSandboxServices, issue_types -> no longer needed (triage emits the type), skip_pm_gate -> use the skip_pm_gate_label on the issue instead",
+        "Schema rejects unknown fields - additionalProperties=false at every object level - and the orchestrator fails startup with a clear field-level error pointing at the offending key",
+        "Loader applies defaults, returns a fully-populated typed Manifest object, and exposes a migration helper migrateLegacyManifest(input) that strips test_command/sandbox_services/issue_types/skip_pm_gate, sets skip_pm_gate_label=trivial-fix when skip_pm_gate was true, and emits a warning per stripped field",
+        "All call sites that previously read manifest.test_command, manifest.sandbox_services, manifest.issue_types, manifest.skip_pm_gate (currently in webhook/router.ts, triage-agent.ts, sandbox-runner.ts, multi-repo.ts) are updated to read from the adapter or from the new fields; tsc passes",
+        "src/manifest/__tests__/loader.test.ts is updated for the new shape (existing tests for those four fields are migrated, not deleted) plus new tests for: skip_pm_gate_label default, sandbox_timeout_mins default, removed-field rejection with migration hint, migrateLegacyManifest behaviour, coexistence with schema_version=2 + coordinated_repos"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-104",
+      "title": "Repo signal gathering",
+      "description": "As the introspection agent, I need a function that shallow-clones a repo and extracts the structured signals needed to generate an adapter draft: CI workflows, package manifests, Makefile/justfile targets, CONTRIBUTING/DEVELOPMENT docs, docker-compose services, and README content.",
+      "acceptanceCriteria": [
+        "gatherRepoSignals(repoFullName) performs a shallow git clone (depth=1) into a temp directory and cleans up on completion or error",
+        "Reads .github/workflows/*.yml and extracts test job step commands verbatim into signals.ciWorkflows",
+        "Reads package.json, pyproject.toml, setup.py, Cargo.toml, go.mod, pom.xml, build.gradle if present and records language stack and configured test runner into signals.packageManifests",
+        "Reads Makefile and justfile if present and extracts targets matching test/check/verify into signals.makefileTargets",
+        "Reads CONTRIBUTING.md and DEVELOPMENT.md if present and extracts code blocks into signals.contributingDocs",
+        "Reads docker-compose.yml/compose.yaml if present and extracts service entries into signals.composeServices",
+        "Reads README.md as fallback into signals.readme (only used when nothing else yielded test commands)",
+        "Detects monorepo layout when multiple package manifests exist in subdirectories and records subdirectory->stack mapping",
+        "Function is tolerant of missing files - any unread signal is an empty array/string, never an exception",
+        "Unit tests use fixture repos covering: pure Node monorepo, single-package Python repo, repo with only Makefile, repo with only README, repo with no test signals at all"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-105",
+      "title": "Draft adapter generator (LLM prompt via OpenRouter)",
+      "description": "As the introspection agent, I need a function generateDraftAdapter(signals, repoFullName) that calls the shared LLMClient (US-100, model selected by OPENROUTER_MODEL_INTROSPECTION) with the full RepoAdapter interface source plus the gathered signals and returns a draft adapter.ts, manifest.yaml, decision rationale, and a list of open items. Function is deterministic given identical signals + model + temperature=0; the LLM call is the only source of non-determinism.",
+      "acceptanceCriteria": [
+        "generateDraftAdapter calls LLMClient.chatJson with temperature=0 and a JSON schema covering {adapterTs, manifestYaml, rationale, openItems}; the LLM call is the only source of non-determinism",
+        "The prompt includes the full current contents of core/adapter.interface.ts at runtime (not a cached or hard-coded copy) so generated adapters always match the current interface version",
+        "The prompt instructs the model to: implement all five interface methods, prefer CI workflow steps for getTestCommands, prefer compose services for getSandboxServices, generate keyword-matching classifyModule appropriate to the repo layout, implement runCustomEval to check exit codes plus coverage when configured, and export a default class named after the repo",
+        "Returned JSON has keys adapterTs (string), manifestYaml (string), rationale (Record<string,string> mapping decision to source signal), openItems (string[])",
+        "Malformed JSON triggers automatic retry with the same prompt via LLMClient.chatJson's built-in retry (default 3 attempts) before failing",
+        "Generated adapter.ts compiles against core/adapter.interface.ts (verified by tsc --noEmit on the temp file before continuing)",
+        "Generated adapter.ts always uses default export (export default class ...) - validated by parsing the output before sending the email",
+        "Token usage from the call is forwarded to the run's cost-guardrails RunUsage accumulator (via US-100)",
+        "Unit tests with a mocked LLMClient cover: monorepo with multiple packages, single-package repo, repo with only README signals, malformed JSON retry path, interface-mismatch failure path"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-106",
+      "title": "Introspection email review loop",
+      "description": "As the introspection agent, I need a multi-turn email conversation that sends the draft adapter to pm_email, waits for a reply, and either activates on approval or revises the draft using the user's corrections. The loop reuses the same Gmail MCP send + watch infrastructure as the PM agent design conversation.",
+      "acceptanceCriteria": [
+        "sendIntrospectionEmail(pmEmail, draft) sends an email containing: full manifest.yaml as a code block, full adapter.ts as a code block, rationale section explaining each decision and its source signal, open items list, and instructions to reply approve or with corrections",
+        "waitForEmailReply(repoFullName) blocks until a reply arrives on the same thread (or a configurable per-repo introspection thread)",
+        "isApproval(body) returns true when the body contains any of the configured approval_keywords (default approved/lgtm/ship it), case-insensitive, ignoring quoted reply text",
+        "On non-approval reply, reviseDraft(current, replyBody, signals) calls the shared LLMClient (US-100) with the previous draft, the reply, and the original signals and produces a revised draft; the loop sends the revised draft and waits again",
+        "Loop has a configurable max iterations (default 10) before failing with a clear error so a stuck conversation cannot run forever",
+        "Loop is restart-safe - the in-flight introspection state is persisted (repo, last draft, iteration count) and resumes after orchestrator restart",
+        "Unit tests with mocked email and LLMClient cover: first-reply approval, two-revision-then-approval, max-iterations exceeded, persisted-state resume, quoted-text approval-keyword false-positive guard"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-107",
+      "title": "Introspection orchestration and activation",
+      "description": "As the introspection agent, after approval I need to write the generated files into configs/<org>/<repo>/, add the four required labels (agent-fix, trivial-fix, agent-failed, needs-design) to the upstream repo, log activation, and re-queue the issue event that triggered introspection so the normal pipeline takes over.",
+      "acceptanceCriteria": [
+        "runIntrospection(repoFullName, pmEmail, forkOrg) executes the full flow: gatherRepoSignals -> generateDraftAdapter -> email loop -> writeAdapterFiles -> addGitHubLabels -> log activation",
+        "writeAdapterFiles creates configs/<org>/<repo>/manifest.yaml and configs/<org>/<repo>/adapter.ts with the approved content; the directory is created if missing; existing files are not overwritten without an explicit force flag",
+        "addGitHubLabels is idempotent: creates each of the four labels (agent-fix, trivial-fix, agent-failed, needs-design) on the upstream repo, skipping any that already exist",
+        "runIntrospection blocks the orchestrator pipeline for this repo until approval; concurrent issue events for the same repo queue up rather than running in parallel",
+        "After successful activation, the original issue event that triggered introspection is re-queued and processed by the normal pipeline (loadAdapter now succeeds because configs/<org>/<repo>/adapter.ts exists)",
+        "On any failure (signal gathering, LLM error after retries, file-write error, label-creation error) the run transitions to FAILED with a structured reason, an error email is sent to pm_email, and the original issue event is NOT marked as processed so it can be re-tried after the operator fixes the problem",
+        "Unit tests cover: full happy path, partial-failure rollback (file written but labels failed), concurrent-event queueing, re-queue verification, idempotent label creation"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-108",
+      "title": "Adapter loader with auto-introspection trigger",
+      "description": "As the orchestrator, when handling an issue event I need to dynamically load the per-repo adapter from configs/<org>/<repo>/adapter.ts, and if no adapter exists I need to run introspection automatically before continuing. Adapters export a default class; the orchestrator instantiates it via new mod.default().",
+      "acceptanceCriteria": [
+        "loadAdapter(repoFullName) resolves the path configs/<org>/<repo>/adapter.ts and dynamically imports it",
+        "If the adapter file does not exist, loadAdapter calls runIntrospection(repoFullName, DEFAULT_PM_EMAIL, DEFAULT_FORK_ORG) and waits for it to complete before retrying the import",
+        "DEFAULT_PM_EMAIL and DEFAULT_FORK_ORG are read from environment variables; missing values raise a clear startup error rather than triggering introspection with undefined",
+        "Adapter import expects a default export; missing or non-class default export raises a typed AdapterContractError with the offending repo path",
+        "Loaded adapter is instantiated as new mod.default() and the result is verified at runtime to satisfy the RepoAdapter shape (all five methods present and callable)",
+        "handleIssueEvent integrates: loadManifest -> loadAdapter -> runPipeline({event, manifest, adapter}); adapter is passed through to all downstream agents",
+        "Unit tests cover: existing adapter loaded successfully, missing adapter triggers introspection then loads, missing default export raises AdapterContractError, missing env vars raise startup error, runtime shape check rejects an adapter missing a method"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-109",
+      "title": "Wire adapter into core agents (incl. SandboxOutput shape change)",
+      "description": "As a core agent author, I need triage, sandbox runner, eval, and PR creator to call the adapter methods exclusively for repo-specific behaviour. This includes a breaking type change: the existing SandboxArtifact (single exitCode/stdout/stderr) is replaced or wrapped by the spec's SandboxOutput (array of per-command {command, exitCode, stdout, stderr}) so adapter.runCustomEval() can attribute results per command. The HeuristicClassifier in triage-agent.ts (label/keyword classification + path-matching identifyModule) is removed from core and replaced with adapter.classifyModule().",
+      "acceptanceCriteria": [
+        "Triage agent calls adapter.classifyModule(issue) to obtain the affected module path; HeuristicClassifier and identifyModule logic are deleted from core/agents/triage.ts (the issue-type classification stays - only the module-routing heuristics move to the adapter)",
+        "Sandbox runner calls adapter.getTestCommands() and adapter.getSandboxServices() to assemble workflow inputs - sandbox-runner.ts no longer reads manifest.test_command or manifest.sandbox_services and validateSandboxConfig no longer requires testCommand",
+        "SandboxArtifact in core/sandbox-types.ts is extended (or replaced) so the artifact contains commands: Array<{command, exitCode, stdout, stderr}> matching the spec's SandboxOutput; existing single-command callers get a synthesised single-element array during migration",
+        "Eval agent (eval-agent.ts evaluateSandboxResults) calls adapter.runCustomEval(sandboxOutput) to obtain the structured EvalResult and stops computing overallPass from a single exitCode; the generic exit-code-only eval becomes the default on the base adapter and is removed from core/agents/eval.ts",
+        "PR creator calls adapter.getPRMetadata(issues) and merges returned extraLabels and extraBodySections with harness defaults",
+        "Multi-repo coordinator (multi-repo.ts) is updated for the new flow - per-repo CoordinatedRepo entries no longer carry test_command (it comes from each repo's adapter); existing multi-repo tests are updated accordingly",
+        "classifyModule return value is validated to be a valid directory path relative to the repo root (no leading /, no .., resolves to an existing directory in the cloned fork) before being passed to fix and build agents; invalid paths fail the run with a typed AdapterContractError",
+        "Existing unit tests for triage-agent.test.ts (HeuristicClassifier suites), sandbox-runner.test.ts, eval-agent.test.ts, multi-repo.test.ts are migrated to inject a fake adapter; net test count does not decrease; new tests verify each agent calls the adapter with the documented arguments"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-110",
+      "title": "Parameterised shared sandbox workflow",
+      "description": "As the sandbox runner, I need a single shared GitHub Actions workflow that any repo's sandbox run dispatches against. The workflow has no repo-specific knowledge - test commands and services are passed as base64-encoded JSON inputs derived from the adapter output. This replaces the current sandbox-runner.ts buildWorkflowInputs path that passes a single testCommand string and the SANDBOX_WORKFLOW_FILE constant.",
+      "acceptanceCriteria": [
+        ".github/workflows/sandbox.yml exists with workflow_dispatch inputs: repo_full_name, fork_clone_url, branch_name, test_commands_b64 (base64 JSON string array), services_b64 (base64 JSON ServiceConfig[] array)",
+        "Workflow checks out the fork branch, decodes services_b64, starts each declared service via scripts/start-services.js, then decodes test_commands_b64 and executes each command in sequence via scripts/run-commands.js",
+        "scripts/start-services.js spins up declared services using docker run with the configured image and port mapping, and waits on healthCheckUrl when provided (with a timeout) before returning",
+        "scripts/run-commands.js runs each command sequentially, halts on the first non-zero exit, and emits a JSON artifact with {command, exitCode, stdout, stderr} per command matching the SandboxOutput shape from US-101",
+        "core/sandbox.ts (current sandbox-runner.ts) is updated: buildWorkflowInputs now takes string[] commands + ServiceConfig[] services and emits test_commands_b64 + services_b64 instead of a single testCommand; SANDBOX_WORKFLOW_FILE points at the new sandbox.yml",
+        "Sandbox runner serialises adapter.getTestCommands() and adapter.getSandboxServices() to base64 JSON and triggers the workflow via workflow_dispatch",
+        "Sandbox runner reads the emitted JSON artifact and returns it as the new SandboxArtifact.commands array (US-109) so eval can consume it via adapter.runCustomEval",
+        "Workflow is parameterised only - no secret values come from the adapter; secrets are injected from the GitHub Actions environment using repo_full_name as a namespace prefix",
+        "Sandbox wall-time is capped by manifest.sandbox_timeout_mins; runner cancels the workflow run on timeout and records timeout outcome (preserving existing SandboxTimeoutError behaviour)",
+        "sandbox-runner.test.ts existing tests are migrated to the new input shape; new tests cover: multi-command serialization, service inclusion, single-command compatibility (single-element array), timeout still triggers SandboxTimeoutError",
+        "Integration test dispatches the workflow against a fixture fork repo and verifies the JSON artifact matches the SandboxOutput shape consumed by the eval agent"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-111",
+      "title": "OpenInference reference adapter and validator script",
+      "description": "As the harness reference, I need configs/arize-ai/openinference/{manifest.yaml, adapter.ts} produced via the introspection conversation (not hand-written) and the standalone scripts/validate_spans.py committed in the harness repo. The adapter routes openinference issues across python/js/instrumentation submodules and parses VIOLATION: lines from the span validator output. The current examples/openinference.yaml (which contains the now-removed test_command, sandbox_services, issue_types, skip_pm_gate fields) is deleted as part of this story and its content informs the introspection-generated manifest.",
+      "acceptanceCriteria": [
+        "scripts/validate_spans.py is committed in the harness repo and accepts --phoenix-url; emits one VIOLATION: <message> line per failure on stdout and exits non-zero on any violation",
+        "configs/arize-ai/openinference/manifest.yaml is generated by the introspection conversation with repo=Arize-ai/openinference, fork_org and pm_email from bootstrap, and defaults for everything else; old examples/openinference.yaml is deleted",
+        "configs/arize-ai/openinference/adapter.ts is generated by the introspection conversation, exports default class OpenInferenceAdapter implements RepoAdapter, and matches the reference shape in spec section 6 (classifyModule routes to python/openinference-semantic-conventions, js/packages, python/instrumentation/openinference-instrumentation-<name>, or python/instrumentation default)",
+        "getTestCommands returns the pytest, npm test, and validate_spans.py commands in that order; getSandboxServices returns the arizephoenix/phoenix:latest service with the documented healthCheckUrl",
+        "runCustomEval finds the validate_spans command in the SandboxOutput, parses VIOLATION: lines, and returns passed=true only when both pytest exitCode is 0 and there are zero violations; retryContext lists the violation messages when present",
+        "getPRMetadata returns extraLabels=['openinference']",
+        "End-to-end test runs the adapter against a recorded SandboxOutput fixture and verifies pass and fail paths produce the expected EvalResult"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-112",
+      "title": "Onboarding bootstrap and watched-list trigger",
+      "description": "As an operator, I need to onboard a new repo by either adding it to a bootstrap watched list or by labeling an issue with agent-fix on a repo that has no configs/ folder yet. Both paths trigger introspection automatically.",
+      "acceptanceCriteria": [
+        "Bootstrap config (file or env) supports a watched_repos list with entries {repo, pm_email, fork_org}; on harness start, any watched repo without configs/<org>/<repo>/ enqueues a runIntrospection job",
+        "Webhook handler detects issue.labeled events with the trigger label on a repo that has no configs/<org>/<repo>/adapter.ts and triggers runIntrospection with DEFAULT_PM_EMAIL and DEFAULT_FORK_ORG before processing the event",
+        "After introspection completes successfully, the original issue event is re-processed end-to-end through the normal pipeline (verified by the same run-id appearing in pipeline logs after activation)",
+        "Operator-facing README documents the five onboarding steps from spec section 8",
+        "Integration test simulates the auto-trigger path: webhook receives issue.labeled for a repo with no adapter -> introspection runs against a fixture repo -> approval email simulated -> configs/ written -> labels added -> original issue processed"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-113",
+      "title": "Harness contract enforcement (constraints lint)",
+      "description": "As a harness maintainer, I need automated checks that enforce the architectural constraints from spec section 9 so the adapter contract is not silently broken in PRs.",
+      "acceptanceCriteria": [
+        "Build fails when any file under core/ contains an import path resolving inside configs/",
+        "Build fails when any file under configs/<org>/<repo>/adapter.ts does not have a default class export",
+        "Build fails when the RepoAdapter interface is modified without bumping a documented version constant; PR template asks contributors to update every existing adapter or add a default-implementation method on the base class",
+        "Manifest validator rejects unknown fields with a clear field-level error and is wired into harness startup",
+        "A startup-time check verifies each adapter method on every loaded adapter is async (returns a Promise) and rejects the adapter if any method is synchronous",
+        "Runtime check rejects classifyModule return values that contain '..' segments, leading '/', or resolve outside the cloned fork directory",
+        "Unit and lint tests cover each enforcement path with both a passing and a failing fixture"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}
