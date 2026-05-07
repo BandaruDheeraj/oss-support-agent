@@ -37,8 +37,8 @@
         "Unit tests verify the supporting types serialize/deserialize correctly when a SandboxOutput is round-tripped through JSON"
       ],
       "priority": 1,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Added core/adapter.interface.ts as the contract source-of-truth (RepoAdapter + Issue/ServiceConfig/SandboxOutput/EvalResult/PRMetadata, plus BaseRepoAdapter defaults) with TSDoc. Kept src/adapter.interface.ts as a re-export shim for existing imports. Added a tsc compile fixture (src/adapter.interface.fixture.ts) and unit tests validating JSON round-trip and BaseRepoAdapter default eval. Verified with: npm test -- src/adapter.interface.test.ts."
     },
     {
       "id": "US-102",

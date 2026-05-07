@@ -793,3 +793,12 @@ Project: OSS Autonomous Fix Loop
   - Added README env var documentation and OpenRouter model list link.
   Note: npm/node commands cannot be executed in this environment (permission denied), so tests could not be run here.
 ---
+
+2026-05-06: US-101 Adapter interface contract — DONE
+  - Added core/adapter.interface.ts as the contract source-of-truth (RepoAdapter + supporting types + BaseRepoAdapter defaults).
+  - Kept src/adapter.interface.ts as a re-export shim for existing imports.
+  - Added src/adapter.interface.fixture.ts (tsc contract fixture).
+  - Updated src/adapter.interface.test.ts to import core contract and verify JSON round-trip + BaseRepoAdapter default eval.
+  - Updated tsconfig.json to include both src/ and core/ (rootDir set to repo root).
+  - Verified: npm test -- src/adapter.interface.test.ts
+---

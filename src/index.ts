@@ -3,6 +3,17 @@ export { manifestSchema } from './manifest';
 export type { Manifest, ManifestValidationError } from './manifest';
 export { ManifestLoadError } from './manifest';
 
+export type {
+  RepoAdapter,
+  Issue,
+  ServiceConfig,
+  SandboxCommandResult,
+  SandboxOutput,
+  EvalResult,
+  PRMetadata,
+} from './adapter.interface';
+export { BaseRepoAdapter } from './adapter.interface';
+
 export {
   StateMachine,
   RunStore,
