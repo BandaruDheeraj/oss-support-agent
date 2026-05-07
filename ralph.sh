@@ -9,6 +9,7 @@ ITERATIONS=25
 MODEL="gpt-5.2"
 ALLOW_PROFILE="safe"
 DRY_RUN=0
+PRD_INPUT="scripts/ralph/prd.json"
 
 usage() {
     cat <<EOF
@@ -16,6 +17,10 @@ Usage: $0 [options]
   --iterations N        Max iterations (default 25)
   --model NAME          Model id (default gpt-5.2)
   --allow-profile P     safe | dev | locked (default safe)
+  --prd PATH            PRD file. Accepts absolute, project-relative,
+                        bare filename in scripts/ralph/, or short name
+                        (e.g. 'extensibility' -> scripts/ralph/prd-extensibility.json).
+                        Default: scripts/ralph/prd.json
   --dry-run             Print the copilot command without executing it
   -h, --help            Show this help
 EOF
@@ -26,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         --iterations)    ITERATIONS="$2"; shift 2 ;;
         --model)         MODEL="$2"; shift 2 ;;
         --allow-profile) ALLOW_PROFILE="$2"; shift 2 ;;
+        --prd)           PRD_INPUT="$2"; shift 2 ;;
         --dry-run)       DRY_RUN=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
@@ -33,11 +39,40 @@ while [[ $# -gt 0 ]]; do
 done
 
 PROJECT_ROOT="$(pwd)"
-PRD_FILE="$PROJECT_ROOT/scripts/ralph/prd.json"
+
+# Resolve $PRD_INPUT flexibly: absolute, project-relative, bare filename in scripts/ralph/,
+# or short name (e.g. 'extensibility' -> scripts/ralph/prd-extensibility.json).
+resolve_prd() {
+    local input="$1"
+    local -a candidates=()
+    if [[ "$input" = /* ]]; then
+        candidates+=( "$input" )
+    fi
+    candidates+=( "$PROJECT_ROOT/$input" )
+    candidates+=( "$PROJECT_ROOT/scripts/ralph/$input" )
+    if [[ "$input" != *.json ]]; then
+        local short="$input"
+        [[ "$short" != prd* ]] && short="prd-$short"
+        candidates+=( "$PROJECT_ROOT/scripts/ralph/$short.json" )
+    fi
+    for c in "${candidates[@]}"; do
+        if [[ -f "$c" ]]; then
+            printf '%s\n' "$c"
+            return 0
+        fi
+    done
+    {
+        echo "PRD file not found. Tried:"
+        for c in "${candidates[@]}"; do echo "  - $c"; done
+    } >&2
+    return 1
+}
+
+PRD_FILE="$(resolve_prd "$PRD_INPUT")" || exit 1
 PROGRESS_FILE="$PROJECT_ROOT/progress.txt"
 PROMPT_FILE="$PROJECT_ROOT/prompts/default.txt"
 
-for f in "$PRD_FILE" "$PROGRESS_FILE" "$PROMPT_FILE"; do
+for f in "$PROGRESS_FILE" "$PROMPT_FILE"; do
     [[ -f "$f" ]] || { echo "Required file missing: $f" >&2; exit 1; }
 done
 
@@ -65,6 +100,7 @@ for d in "${DENY[@]}";  do TOOL_ARGS+=( --deny-tool  "$d" ); done
 
 echo "Ralph loop starting"
 echo "  Project    : $PROJECT_ROOT"
+echo "  PRD        : $PRD_FILE"
 echo "  Iterations : $ITERATIONS"
 echo "  Model      : $MODEL"
 echo "  Profile    : $ALLOW_PROFILE"
@@ -76,10 +112,11 @@ for ((i=1; i<=ITERATIONS; i++)); do
 
     CTX_FILE="$(mktemp -t ralph-ctx-XXXXXX.md)"
 
+    PRD_REL="${PRD_FILE#$PROJECT_ROOT/}"
     {
         echo "# Ralph Iteration $i Context"
         echo
-        echo "## PRD (scripts/ralph/prd.json)"
+        echo "## PRD ($PRD_REL)"
         echo '```json'
         cat "$PRD_FILE"
         echo '```'

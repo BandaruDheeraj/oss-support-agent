@@ -18,8 +18,20 @@
 .PARAMETER DryRun
     Print the copilot command for each iteration without executing it.
 
+.PARAMETER PrdFile
+    Path to the PRD JSON file Ralph should drive against. Accepts an absolute path,
+    a path relative to the project root, a bare filename in scripts/ralph/, or a
+    short name without extension (e.g. 'extensibility' -> scripts/ralph/prd-extensibility.json).
+    Default: scripts/ralph/prd.json
+
 .EXAMPLE
     .\ralph.ps1 -Iterations 10 -Model gpt-5.2 -AllowProfile dev
+
+.EXAMPLE
+    .\ralph.ps1 -PrdFile extensibility            # uses scripts/ralph/prd-extensibility.json
+
+.EXAMPLE
+    .\ralph.ps1 -PrdFile scripts\ralph\prd-extensibility.json
 #>
 [CmdletBinding()]
 param(
@@ -27,16 +39,41 @@ param(
     [string]$Model = "gpt-5.2",
     [ValidateSet("safe", "dev", "locked")]
     [string]$AllowProfile = "safe",
-    [switch]$DryRun
+    [switch]$DryRun,
+    [string]$PrdFile = "scripts\ralph\prd.json"
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Get-Location).Path
-$PrdFile     = Join-Path $ProjectRoot "scripts\ralph\prd.json"
+
+# Resolve $PrdFile flexibly: absolute, project-relative, bare filename in scripts/ralph/,
+# or short name (e.g. 'extensibility' -> scripts/ralph/prd-extensibility.json).
+function Resolve-PrdPath {
+    param([string]$Path, [string]$Root)
+    $candidates = @()
+    if ([System.IO.Path]::IsPathRooted($Path)) {
+        $candidates += $Path
+    }
+    $candidates += (Join-Path $Root $Path)
+    $candidates += (Join-Path $Root (Join-Path "scripts\ralph" $Path))
+    if ($Path -notlike "*.json") {
+        $short = $Path
+        if ($short -notlike "prd*") { $short = "prd-$short" }
+        $candidates += (Join-Path $Root (Join-Path "scripts\ralph" "$short.json"))
+    }
+    foreach ($c in $candidates) {
+        if ((Test-Path $c) -and -not (Test-Path $c -PathType Container)) {
+            return (Resolve-Path $c).Path
+        }
+    }
+    throw "PRD file not found. Tried:`n  - $($candidates -join "`n  - ")"
+}
+
+$PrdFile     = Resolve-PrdPath -Path $PrdFile -Root $ProjectRoot
 $ProgressFile= Join-Path $ProjectRoot "progress.txt"
 $PromptFile  = Join-Path $ProjectRoot "prompts\default.txt"
 
-foreach ($f in @($PrdFile, $ProgressFile, $PromptFile)) {
+foreach ($f in @($ProgressFile, $PromptFile)) {
     if (-not (Test-Path $f)) { throw "Required file missing: $f" }
 }
 
@@ -64,6 +101,7 @@ foreach ($d in $deny)  { $toolArgs += @('--deny-tool',  $d) }
 
 Write-Host "Ralph loop starting" -ForegroundColor Cyan
 Write-Host "  Project    : $ProjectRoot"
+Write-Host "  PRD        : $PrdFile"
 Write-Host "  Iterations : $Iterations"
 Write-Host "  Model      : $Model"
 Write-Host "  Profile    : $AllowProfile"
@@ -83,7 +121,7 @@ for ($i = 1; $i -le $Iterations; $i++) {
     @"
 # Ralph Iteration $i Context
 
-## PRD (scripts/ralph/prd.json)
+## PRD ($([System.IO.Path]::GetRelativePath($ProjectRoot, $PrdFile) -replace '\\','/'))
 ``````json
 $prdContent
 ``````
