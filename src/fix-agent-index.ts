@@ -26,3 +26,5 @@ export {
   readFullModule,
   runFixAgent,
 } from './fix-agent';
+
+export { OpenRouterFixGenerator } from './openrouter-fix-generator';

@@ -5,3 +5,4 @@ dist/
 *.d.ts
 *.map
 src/manifest/__tests__/fixtures/
+src/_write_test*.tmp

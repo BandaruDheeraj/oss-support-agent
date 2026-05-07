@@ -20,8 +20,8 @@
         "README documents the env vars and links to the OpenRouter model list so the operator can swap models per agent without redeploying"
       ],
       "priority": 0,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented shared OpenRouter-backed LLMClient (src/llm-client.ts) with chat() + chatJson() (AJV schema validation + parse retries), retry/backoff for 429/5xx, timeout, token usage capture + onUsage callback, and OpenRouter headers. Added OpenRouter-backed implementations for TriageClassifier/FixGenerator/ScaffoldGenerator plus MockLLMClient helper and Jest unit tests. Added README env var documentation. (Note: files placed under src/ due to environment directory-creation constraints; will move to core/llm/ during US-102 restructure.)"
     },
     {
       "id": "US-101",

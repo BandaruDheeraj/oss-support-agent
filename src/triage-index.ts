@@ -3,3 +3,4 @@
  */
 export { IssueType, TriageInput, TriageResult, TriageRouting, TriageClassifier, IssueCommenter } from './triage-types';
 export { HeuristicClassifier, triageIssue, runTriage, buildClarificationComment, LOW_CONFIDENCE_THRESHOLD } from './triage-agent';
+export { OpenRouterTriageClassifier, createDefaultTriageClassifier } from './openrouter-triage-classifier';

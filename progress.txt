@@ -779,3 +779,17 @@ Project: OSS Autonomous Fix Loop
   Note: npm install required before running tests (env restriction prevented execution here)
   ALL USER STORIES COMPLETE (US-001 through US-019).
 ---
+
+2026-05-06: US-100 Shared LLM client via OpenRouter — DONE
+  - Added OpenRouter-backed LLMClient (src/llm-client.ts): chat() + chatJson() with AJV schema validation
+    and parse retries (default 3), HTTP retry/backoff on 429/5xx (default 5 attempts, jittered),
+    and per-call timeout (default 90s).
+  - Includes required OpenRouter headers (HTTP-Referer, X-Title) and captures token usage
+    (prompt/completion/total) with an onUsage callback for forwarding to cost guardrails.
+  - Added OpenRouter-backed implementations: OpenRouterTriageClassifier, OpenRouterFixGenerator,
+    OpenRouterScaffoldGenerator; heuristic triage remains available as fallback when no API key.
+  - Added MockLLMClient helper (src/llm-test-utils.ts) for unit tests and Jest test coverage
+    for client behaviors (missing key, model resolution, retry/backoff, JSON parse retry, headers/body).
+  - Added README env var documentation and OpenRouter model list link.
+  Note: npm/node commands cannot be executed in this environment (permission denied), so tests could not be run here.
+---

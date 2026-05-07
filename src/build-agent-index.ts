@@ -22,3 +22,5 @@ export {
   analyzeReferenceModules,
   runBuildAgent,
 } from './build-agent';
+
+export { OpenRouterScaffoldGenerator } from './openrouter-scaffold-generator';
