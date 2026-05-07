@@ -40,16 +40,14 @@ services:
       - key: DEFAULT_FORK_ORG
         sync: false
 
-      # Optional — required only for live PM design loop / introspection
-      - key: GMAIL_CLIENT_ID
+      # Required for live mail flows (PM design loop + introspection auto-onboarding)
+      - key: RESEND_API_KEY
         sync: false
-      - key: GMAIL_CLIENT_SECRET
+      - key: RESEND_FROM_ADDRESS
         sync: false
-      - key: GMAIL_REFRESH_TOKEN
+      - key: RESEND_REPLY_TO_BASE
         sync: false
-      - key: GMAIL_USER_EMAIL
-        sync: false
-      - key: REPLY_TO_ADDRESS
+      - key: RESEND_WEBHOOK_SECRET
         sync: false
 
       # Optional — falls back to heuristic LLM if absent

@@ -203,14 +203,42 @@ function startServer(): void {
   });
 
   if (live) {
-    live.watcher.start();
-    baseLog(`Gmail watcher started; polling for replies as ${live.monitoredEmail}`);
+    baseLog(`Resend mail enabled (from=${live.monitoredEmail}, replyTo=${live.replyToBase}+<runId>@...)`);
   }
 
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ status: 'ok', live: !!live }));
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/inbound') {
+      if (!live) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'mail not configured' }));
+        return;
+      }
+      const ichunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => ichunks.push(c));
+      req.on('end', async () => {
+        const raw = Buffer.concat(ichunks).toString('utf-8');
+        const headers = {
+          'svix-id': req.headers['svix-id'] as string | undefined,
+          'svix-timestamp': req.headers['svix-timestamp'] as string | undefined,
+          'svix-signature': req.headers['svix-signature'] as string | undefined,
+        };
+        try {
+          const result = await live.dispatchInbound(raw, headers);
+          res.writeHead(result.status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result.body));
+        } catch (err: any) {
+          // eslint-disable-next-line no-console
+          console.error('[fatal] unhandled error in inbound handler:', err);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Internal server error' }));
+        }
+      });
       return;
     }
 
@@ -272,7 +300,7 @@ function startServer(): void {
     );
     // eslint-disable-next-line no-console
     console.log(
-      `[server] live deps: ${live ? `enabled (Gmail=${live.monitoredEmail})` : 'disabled (skip-PM-gate path only)'}`
+      `[server] live deps: ${live ? `enabled (from=${live.monitoredEmail})` : 'disabled (skip-PM-gate path only)'}`
     );
   });
 }

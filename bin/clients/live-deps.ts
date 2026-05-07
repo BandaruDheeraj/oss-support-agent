@@ -1,11 +1,13 @@
 /**
  * Live dependency bundle for production server.
  *
- * Wires real GitHub REST + real Gmail OAuth + file-backed state stores into
- * the introspection-orchestration entrypoint and the runPipeline call.
+ * Wires real GitHub REST + real Resend mail (send via API, inbound via
+ * webhook with plus-addressed runId routing) + file-backed state stores
+ * into the introspection-orchestration entrypoint and the runPipeline call.
  *
- * Returns null if required Gmail env vars are not present, so the server can
- * still serve the skip-PM-gate path without Gmail (with degraded features).
+ * Returns null if required Resend env vars are not present, so the server
+ * can still serve the skip-PM-gate path without mail (with degraded
+ * features).
  */
 
 import * as path from 'path';
@@ -24,8 +26,9 @@ import {
   type RunIntrospectionResult,
   type RunIntrospectionOptions,
 } from '../../core/agents/introspection-orchestration';
+import { formatPlusReplyTo } from '../../core/resend-mail';
 
-import { buildGmailClientFromEnv, RealGmailClient } from './gmail-real';
+import { buildResendDepsFromEnv, type ResendDeps } from './resend-real';
 import { GitHubLabelClient } from './github-rest';
 import {
   FileIntrospectionStateStore,
@@ -42,11 +45,14 @@ import {
 import { OpenRouterDocsGenerator } from './openrouter-docs-generator';
 
 export interface LiveDeps {
-  gmail: RealGmailClient;
+  /** Mail client. Named `gmail` for backward compat with consumers typed against GmailClient. */
+  gmail: ResendDeps['client'];
+  /** Watcher exists for type compat with sendAndTrack/registerThread; never started (push-based inbound). */
   watcher: GmailWatcher;
   /**
    * Single reply waiter shared by introspection AND pm-email loops.
    * Keyed by runId — repoFullName for introspection, run-specific id for PM email.
+   * Inbound webhook deliveries fan into this via dispatchInbound().
    */
   replyWaiter: IntrospectionReplyWaiter;
   introspectionStateStore: FileIntrospectionStateStore;
@@ -60,11 +66,20 @@ export interface LiveDeps {
   issueLabeler: GitHubIssueLabeler;
   docsGenerator: OpenRouterDocsGenerator;
   llm: LLMClient;
+  /** From: address on outbound mail. */
   monitoredEmail: string;
-  replyToAddress: string;
+  /** Base reply-to address (no plus tag); use replyToFor(runId) for the per-run address. */
+  replyToBase: string;
+  /** Build a per-runId reply-to using plus-addressing. */
+  replyToFor: (runId: string) => string;
+  /** HTTP /inbound dispatcher: caller passes raw body + svix headers. */
+  dispatchInbound: (
+    rawBody: string,
+    headers: { 'svix-id'?: string; 'svix-timestamp'?: string; 'svix-signature'?: string }
+  ) => Promise<{ status: number; body: any }>;
   /**
    * Closure compatible with adapter-loader's RunIntrospectionLike signature.
-   * Performs the full live introspection flow (Gmail-driven approval).
+   * Performs the full live introspection flow (mail-driven approval).
    */
   runIntrospection: (
     repo: string,
@@ -80,35 +95,33 @@ export interface BuildLiveDepsOptions {
   log: (msg: string) => void;
   /** Repo root used to write configs/<org>/<repo>/. Defaults to process.cwd(). */
   repoRoot?: string;
-  /** Override poll interval for tests. */
+  /** Override poll interval (legacy; never used since we don't poll). */
   pollIntervalMs?: number;
 }
 
 /**
  * Build the live dependency bundle.
  *
- * Returns null if Gmail OAuth env vars are missing — caller should treat
- * that as "Gmail-dependent flows disabled".
+ * Returns null if Resend env vars are missing — caller should treat that as
+ * "mail-dependent flows disabled" (skip-PM-gate path still works).
  */
 export function buildLiveDeps(
   env: NodeJS.ProcessEnv,
   options: BuildLiveDepsOptions
 ): LiveDeps | null {
-  const gmail = buildGmailClientFromEnv(env);
-  if (!gmail) {
-    options.log(
-      '[live-deps] Gmail env vars missing (GMAIL_CLIENT_ID/SECRET/REFRESH_TOKEN/USER_EMAIL); Gmail-dependent flows disabled'
-    );
-    return null;
-  }
+  const built = buildResendDepsFromEnv(env, options.log);
+  if (!built) return null;
+  const resendDeps = built.deps;
 
-  const monitoredEmail = env.GMAIL_USER_EMAIL!;
-  const replyToAddress = env.REPLY_TO_ADDRESS ?? monitoredEmail;
+  const monitoredEmail = resendDeps.fromAddress;
+  const replyToBase = resendDeps.replyToBase;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
 
   const replyWaiter = new IntrospectionReplyWaiter();
+  // Watcher is constructed for type/back-compat (sendAndTrack calls registerThread)
+  // but never started — inbound is push-based via webhook.
   const watcher = new GmailWatcher(
-    gmail,
+    resendDeps.client,
     {
       pollIntervalMs,
       subjectPrefix: SUBJECT_PREFIX,
@@ -126,12 +139,14 @@ export function buildLiveDeps(
   const issueSearcher = new GitHubIssueSearcher(options.token);
   const prFetcher = new GitHubPRFetcher(options.token);
   const designDocFinder = new GitHubDesignDocFinder(options.token);
-  const failureNotifier = new GmailFailureNotifier(gmail);
+  const failureNotifier = new GmailFailureNotifier(resendDeps.client);
   const issueLabeler = new GitHubIssueLabeler(options.token);
   const docsGenerator = new OpenRouterDocsGenerator();
   const llm = new LLMClient();
 
   const repoRoot = options.repoRoot ?? process.cwd();
+
+  const replyToFor = (runId: string) => formatPlusReplyTo(replyToBase, runId);
 
   const runIntrospection: LiveDeps['runIntrospection'] = async (
     repo,
@@ -141,9 +156,10 @@ export function buildLiveDeps(
   ) => {
     const introspectionOptions: RunIntrospectionOptions = {
       repoRoot: opts?.repoRoot ?? repoRoot,
-      replyToAddress,
+      // runId for introspection IS the repo full-name; encode it into reply-to
+      replyToAddress: replyToFor(repo),
       deps: {
-        gmailClient: gmail,
+        gmailClient: resendDeps.client,
         watcher,
         stateStore: introspectionStateStore,
         replyWaiter,
@@ -159,8 +175,11 @@ export function buildLiveDeps(
     return coreRunIntrospection(repo, pmEmail, forkOrg, introspectionOptions);
   };
 
+  const dispatchInbound: LiveDeps['dispatchInbound'] = (rawBody, headers) =>
+    resendDeps.dispatchInbound(rawBody, headers, replyWaiter, options.log);
+
   return {
-    gmail,
+    gmail: resendDeps.client,
     watcher,
     replyWaiter,
     introspectionStateStore,
@@ -175,7 +194,9 @@ export function buildLiveDeps(
     docsGenerator,
     llm,
     monitoredEmail,
-    replyToAddress,
+    replyToBase,
+    replyToFor,
+    dispatchInbound,
     runIntrospection,
   };
 }

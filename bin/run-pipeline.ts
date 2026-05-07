@@ -194,7 +194,7 @@ async function runPMDesignLoop(args: {
 
   const config: PMEmailLoopConfig = {
     pmEmail: manifest.pm_email,
-    replyToAddress: live.replyToAddress,
+    replyToAddress: live.replyToFor(runId),
     repo: repoFullName,
     issueNumber,
     issueTitle: payload.issue.title ?? '',
@@ -566,7 +566,7 @@ export async function runPipeline(args: {
           upstreamRepo: repoFullName,
           primaryIssueNumber: issueNumber,
           pmEmail: manifest.pm_email,
-          replyToAddress: deps.live.replyToAddress,
+          replyToAddress: deps.live.replyToFor(runId),
           confirmedIssues,
           forkFullName: fork.forkFullName,
           branchName: fork.branchName,
