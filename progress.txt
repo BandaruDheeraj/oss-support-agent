@@ -844,3 +844,14 @@ Project: OSS Autonomous Fix Loop
   - Added unit tests (core/agents/introspection-draft.test.ts) covering: prompt/options, compile pass, missing default export, malformed JSON retry via LLMClient.chatJson, and interface mismatch compile failure.
   Note: npm/node commands are blocked in this environment (permission denied), so full repo test/lint runs could not be executed here.
 ---
+2026-05-07: US-106 Introspection email review loop — DONE
+  - Implemented core/introspection-email-loop.ts + core/introspection-email-types.ts (+ barrel index).
+    * sendIntrospectionEmail: emails full manifest.yaml + adapter.ts (code blocks), rationale, open items, and approval/corrections instructions; supports reusing an existing per-repo thread.
+    * stripQuotedReplyText + isApproval: approval keyword detection ignores quoted reply text to avoid false positives.
+    * reviseDraft: calls shared LLMClient.chatJson(agent=INTROSPECTION, temperature=0) using prior draft + PM reply + repo signals.
+    * processIntrospectionReply: sends revised draft on non-approval; configurable maxIterations (default 10) to prevent infinite loops.
+    * resumeIntrospectionEmailLoop: restart-safe thread re-registration; persisted state includes repo, last draft, iteration.
+    * IntrospectionReplyWaiter + waitForEmailReply(repoFullName) for blocking semantics.
+  - Added unit tests core/introspection-email-loop.test.ts covering: first-reply approval, two-revision-then-approval, max-iterations exceeded, persisted-state resume, quoted-text approval false-positive guard.
+  Verified: npm test -- --runTestsByPath core/introspection-email-loop.test.ts; npm run build
+---

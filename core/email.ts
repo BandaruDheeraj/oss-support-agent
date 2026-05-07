@@ -9,3 +9,5 @@ export * from './gmail-mcp';
 export * from './gmail-types';
 export * from './pm-email-loop';
 export * from './pm-email-types';
+export * from './introspection-email-loop';
+export * from './introspection-email-types';

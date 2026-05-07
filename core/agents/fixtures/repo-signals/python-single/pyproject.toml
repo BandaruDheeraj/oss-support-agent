@@ -1,0 +1,5 @@
+[project]
+name = "demo"
+
+[tool.pytest.ini_options]
+addopts = "-q"

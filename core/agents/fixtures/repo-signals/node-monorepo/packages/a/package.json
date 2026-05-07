@@ -1,0 +1,7 @@
+{
+  "name": "a",
+  "scripts": {
+    "test": "jest"
+  },
+  "packageManager": "pnpm@8.0.0"
+}

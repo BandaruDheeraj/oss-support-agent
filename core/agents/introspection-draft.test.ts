@@ -59,12 +59,36 @@ describe('generateDraftAdapter (US-105)', () => {
   test('calls chatJson with INTROSPECTION agent, temperature=0, and includes contract + signals in prompt', async () => {
     const tmp = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'oss-agent-us105-'));
     const contractPath = path.join(tmp, 'adapter.interface.ts');
-    await fs.promises.writeFile(contractPath, '/* CONTRACT_MARKER */', 'utf-8');
+
+    const mockContract = `/* CONTRACT_MARKER */
+export interface Issue { title?: string; body?: string | null; labels?: string[]; number?: number; }
+export interface ServiceConfig { name: string; image: string; ports: number[]; env?: Record<string, string>; healthCheckUrl?: string; }
+export interface SandboxCommandResult { command: string; exitCode: number; stdout: string; stderr: string; durationSeconds: number; }
+export interface SandboxOutput { commands: SandboxCommandResult[]; services: ServiceConfig[]; }
+export interface EvalResult { passed: boolean; retryContext?: Record<string, any>; }
+export interface PRMetadata { extraLabels: string[]; extraBodySections: string[]; }
+export interface RepoAdapter {
+  classifyModule(issue: Issue): Promise<string>;
+  getTestCommands(): Promise<string[]>;
+  getSandboxServices(): Promise<ServiceConfig[]>;
+  runCustomEval(output: SandboxOutput): Promise<EvalResult>;
+  getPRMetadata(issues: Issue[]): Promise<PRMetadata>;
+}
+export class BaseRepoAdapter implements RepoAdapter {
+  async classifyModule(_issue: Issue): Promise<string> { return '.'; }
+  async getTestCommands(): Promise<string[]> { return []; }
+  async getSandboxServices(): Promise<ServiceConfig[]> { return []; }
+  async runCustomEval(_output: SandboxOutput): Promise<EvalResult> { return { passed: true, retryContext: {} }; }
+  async getPRMetadata(_issues: Issue[]): Promise<PRMetadata> { return { extraLabels: [], extraBodySections: [] }; }
+}
+`;
+
+    await fs.promises.writeFile(contractPath, mockContract, 'utf-8');
 
     let captured: any = null;
 
     const llm = new MockLLMClient({
-      chatJson: async (messages, _schema, options) => {
+      chatJson: async <T>(messages: any, _schema: any, options: any) => {
         captured = { messages, options };
         return {
           data: {
@@ -72,7 +96,7 @@ describe('generateDraftAdapter (US-105)', () => {
             manifestYaml: 'repo: acme/demo\nfork_org: TODO\npm_email: TODO\n',
             rationale: { test: 'ci' },
             openItems: [],
-          },
+          } as any as T,
           usage: null,
           raw: null,
         };
@@ -94,13 +118,13 @@ describe('generateDraftAdapter (US-105)', () => {
 
   test('compiles a valid generated adapter.ts against the contract', async () => {
     const llm = new MockLLMClient({
-      chatJson: async () => ({
+      chatJson: async <T>() => ({
         data: {
           adapterTs: validAdapterTs(),
           manifestYaml: 'repo: acme/demo\nfork_org: TODO\npm_email: TODO\n',
           rationale: {},
           openItems: [],
-        },
+        } as any as T,
         usage: null,
         raw: null,
       }),
@@ -113,13 +137,13 @@ describe('generateDraftAdapter (US-105)', () => {
     const bad = `export class NotDefault {}`;
 
     const llm = new MockLLMClient({
-      chatJson: async () => ({
+      chatJson: async <T>() => ({
         data: {
           adapterTs: bad,
           manifestYaml: 'repo: acme/demo\nfork_org: TODO\npm_email: TODO\n',
           rationale: {},
           openItems: [],
-        },
+        } as any as T,
         usage: null,
         raw: null,
       }),
@@ -163,18 +187,22 @@ describe('generateDraftAdapter (US-105)', () => {
   });
 
   test('fails when adapter.ts does not compile against the contract (interface mismatch)', async () => {
-    const missingMethod = `import { BaseRepoAdapter } from '../../../core/adapter.interface';
-export default class DemoAdapter extends BaseRepoAdapter {}
+    const missingMethod = `import { BaseRepoAdapter, type DoesNotExist } from '../../../core/adapter.interface';
+
+export default class DemoAdapter extends BaseRepoAdapter {
+  // Force a compile-time failure if the contract changes unexpectedly.
+  private _x!: DoesNotExist;
+}
 `;
 
     const llm = new MockLLMClient({
-      chatJson: async () => ({
+      chatJson: async <T>() => ({
         data: {
           adapterTs: missingMethod,
           manifestYaml: 'repo: acme/demo\nfork_org: TODO\npm_email: TODO\n',
           rationale: {},
           openItems: [],
-        },
+        } as any as T,
         usage: null,
         raw: null,
       }),

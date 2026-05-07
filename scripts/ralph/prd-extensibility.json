@@ -128,8 +128,8 @@
         "Unit tests with mocked email and LLMClient cover: first-reply approval, two-revision-then-approval, max-iterations exceeded, persisted-state resume, quoted-text approval-keyword false-positive guard"
       ],
       "priority": 6,
-      "passes": false,
-      "notes": ""
+      "passes": true,
+      "notes": "Implemented introspection email review loop: core/introspection-email-loop.ts + core/introspection-email-types.ts (+ barrel). Includes sendIntrospectionEmail (manifest+adapter code blocks, rationale, open items), quoted-text-safe approval detection, reviseDraft via LLMClient.chatJson(agent=INTROSPECTION, temperature=0), max-iteration guard (default 10), restart-safe state resume, and a ReplyHandler-based waitForEmailReply. Added unit tests (core/introspection-email-loop.test.ts) covering approval, multi-revision, max iterations, resume, and quoted-text false-positive guard. Verified: npm test -- --runTestsByPath core/introspection-email-loop.test.ts; npm run build."
     },
     {
       "id": "US-107",
