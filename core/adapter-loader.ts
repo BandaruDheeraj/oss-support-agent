@@ -70,11 +70,16 @@ function fileExists(p: string): boolean {
 
 function resolveAdapterPath(repoRoot: string, repoFullName: string): string {
   const { owner, repo } = parseRepoFullName(repoFullName);
-  const tsPath = path.join(repoRoot, 'configs', owner, repo, 'adapter.ts');
-  if (fileExists(tsPath)) return tsPath;
+
+  // Prefer compiled .js (production: tsc outputs to dist/), then source .ts (ts-node / dev).
+  const distJsPath = path.join(repoRoot, 'dist', 'configs', owner, repo, 'adapter.js');
+  if (fileExists(distJsPath)) return distJsPath;
 
   const jsPath = path.join(repoRoot, 'configs', owner, repo, 'adapter.js');
-  return jsPath;
+  if (fileExists(jsPath)) return jsPath;
+
+  const tsPath = path.join(repoRoot, 'configs', owner, repo, 'adapter.ts');
+  return tsPath;
 }
 
 function clearRequireCache(modulePath: string): void {

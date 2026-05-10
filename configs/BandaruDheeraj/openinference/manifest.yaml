@@ -1,0 +1,12 @@
+repo: "BandaruDheeraj/openinference"
+trigger_label: "agent-fix"
+skip_pm_gate_label: "trivial-fix"
+fork_org: "BandaruDheeraj"
+branch_prefix: "agent/scope-"
+approval_keywords:
+  - "approved"
+  - "lgtm"
+  - "ship it"
+pm_email: "dheeraj.bandaru@hotmail.com"
+max_retries: 3
+sandbox_timeout_mins: 15
