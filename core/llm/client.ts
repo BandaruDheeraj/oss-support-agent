@@ -290,6 +290,11 @@ export class LLMClient {
         const ok = validate(parsed);
         if (!ok) {
           const errText = this.ajv.errorsText(validate.errors, { separator: '\n' });
+          // Diagnostic: log the raw model output so prompt/schema mismatches can be diagnosed in production.
+          // Truncate to avoid log bloat.
+          const preview = (result.content ?? '').slice(0, 500);
+          // eslint-disable-next-line no-console
+          console.warn(`[LLMClient.chatJson] schema validation failed (attempt ${i}/${parseRetries}). Raw response (truncated): ${preview}`);
           throw new Error(`LLM JSON failed schema validation:\n${errText}`);
         }
 

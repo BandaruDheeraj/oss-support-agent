@@ -31,7 +31,11 @@ export class OpenRouterTriageClassifier implements TriageTypeClassifier {
         content:
           'You are a triage classifier for an OSS agent harness. ' +
           'Classify only the issue type; module routing is handled by the repo adapter. ' +
-          'Output strictly JSON matching the schema.',
+          'Output strictly JSON of the form {"issueType": "<value>"} where <value> is exactly one of: ' +
+          '"bug_fix", "new_feature", or "docs". ' +
+          'Do not invent other values. Use "bug_fix" for bugs, regressions, or fixes. ' +
+          'Use "new_feature" for new functionality or enhancements. ' +
+          'Use "docs" for documentation, typos, or README changes.',
       },
       {
         role: 'user',
