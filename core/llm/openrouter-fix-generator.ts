@@ -53,8 +53,17 @@ export class OpenRouterFixGenerator implements FixGenerator {
         role: 'system',
         content:
           'You are a software engineer agent generating a targeted patch. ' +
-          'Return JSON matching the schema with sourceChanges, testChanges, and summary. ' +
-          'Only touch files within the affected module and related tests.',
+          'Return JSON with this exact shape:\n' +
+          '{\n' +
+          '  "sourceChanges": [{"path": string, "action": "modify"|"create", "content": string}],\n' +
+          '  "testChanges":   [{"path": string, "action": "modify"|"create", "content": string}],\n' +
+          '  "summary": string\n' +
+          '}\n' +
+          'Every entry in sourceChanges and testChanges MUST include all three fields: path, action, and content. ' +
+          'The "action" field must be exactly the string "modify" (for existing files) or "create" (for new files). ' +
+          'The "content" field is the COMPLETE file contents after your edit (not a diff). ' +
+          'Only touch files within the affected module and related tests. ' +
+          'Do not include any properties other than path, action, content.',
       },
       {
         role: 'user',
