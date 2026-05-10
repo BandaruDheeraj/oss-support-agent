@@ -131,9 +131,10 @@ export class LocalWorkspace {
     }
 
     // Fetch and check out the working branch (it should already exist on the fork
-    // because createForkAndBranch created it via the API).
-    await git(this.dir, ['fetch', 'origin', this.branch]);
-    await git(this.dir, ['checkout', this.branch]);
+    // because createForkAndBranch created it via the API). Use an explicit refspec
+    // so the remote-tracking ref is created under origin/ for the single-branch clone.
+    await git(this.dir, ['fetch', 'origin', `+refs/heads/${this.branch}:refs/remotes/origin/${this.branch}`]);
+    await git(this.dir, ['checkout', '-B', this.branch, `refs/remotes/origin/${this.branch}`]);
     await git(this.dir, ['reset', '--hard', `origin/${this.branch}`]);
   }
 
