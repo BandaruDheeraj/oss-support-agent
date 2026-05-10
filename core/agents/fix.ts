@@ -58,11 +58,15 @@ export function validateChangeScope(
   affectedModule: string
 ): { valid: boolean; outOfScope: string[] } {
   const outOfScope: string[] = [];
-  const normalizedModule = affectedModule.replace(/^\/+|\/+$/g, '');
+  const trimmed = affectedModule.replace(/^\/+|\/+$/g, '');
+  // "." or empty means repo root → all paths are in-scope.
+  const moduleIsRoot = trimmed === '' || trimmed === '.';
+  const normalizedModule = trimmed;
 
   for (const change of changes) {
     const normalizedPath = change.path.replace(/^\/+/, '');
-    const isInModule = normalizedPath.startsWith(normalizedModule) ||
+    const isInModule = moduleIsRoot ||
+      normalizedPath.startsWith(normalizedModule) ||
       normalizedPath.includes('__tests__') ||
       normalizedPath.includes('.test.') ||
       normalizedPath.includes('.spec.') ||
