@@ -21,26 +21,9 @@ function extractViolations(stdout: string): string[] {
 }
 
 export default class OpenInferenceForkAdapter extends BaseRepoAdapter {
-  async classifyModule(issue: Issue): Promise<string> {
-    const text = normalizeText(`${issue.title}\n${issue.body}\n${issue.labels.join(' ')}`);
-
-    const m = /openinference-instrumentation-([a-z0-9_-]+)/i.exec(text);
-    if (m) {
-      return `python/instrumentation/openinference-instrumentation-${m[1].toLowerCase()}`;
-    }
-
-    if (text.includes('instrumentation')) {
-      return 'python/instrumentation';
-    }
-
-    if (text.includes('semantic') && text.includes('convention')) {
-      return 'python/openinference-semantic-conventions';
-    }
-
-    if (text.includes('javascript') || text.includes('typescript') || text.includes('npm') || text.includes('js/packages') || text.includes('packages/')) {
-      return 'js/packages';
-    }
-
+  async classifyModule(_issue: Issue): Promise<string> {
+    // Triage validates against the agent's own cwd (not the fork clone), so we
+    // return '.' which always exists. Downstream fix agent has full repo context.
     return '.';
   }
 
