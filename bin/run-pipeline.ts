@@ -41,6 +41,8 @@ import {
   processReply,
   sendDesignBrief,
 } from '../core/pm-email-loop';
+import { OpenRouterPMFollowUpGenerator } from '../core/llm/openrouter-pm-followup-generator';
+import type { FollowUpGenerator } from '../core/pm-email-types';
 import type { PMEmailLoopConfig, DesignBriefInput } from '../core/pm-email-types';
 import { detectApproval } from '../core/gmail-mcp';
 
@@ -203,7 +205,9 @@ async function runPMDesignLoop(args: {
   };
 
   const briefGen = new HeuristicBriefGenerator();
-  const followUpGen = new HeuristicFollowUpGenerator();
+  const followUpGen: FollowUpGenerator = process.env.OPENROUTER_API_KEY
+    ? new OpenRouterPMFollowUpGenerator()
+    : new HeuristicFollowUpGenerator();
 
   log(`[pm] sending design brief to ${manifest.pm_email}`);
   const sendResult = await sendDesignBrief(

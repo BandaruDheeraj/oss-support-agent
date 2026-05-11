@@ -413,7 +413,7 @@ export async function processReply(
     unresolvedQuestions,
   };
 
-  const followUp = followUpGenerator.generateFollowUp(followUpInput);
+  const followUp = await followUpGenerator.generateFollowUp(followUpInput);
 
   // Send the follow-up response
   const message = buildEmailMessage({

@@ -131,7 +131,7 @@ export interface DesignBriefGenerator {
  */
 export interface FollowUpGenerator {
   /** Generate a follow-up response to a user reply */
-  generateFollowUp(input: FollowUpInput): FollowUpResult;
+  generateFollowUp(input: FollowUpInput): FollowUpResult | Promise<FollowUpResult>;
 }
 
 /**
