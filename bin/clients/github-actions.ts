@@ -80,9 +80,12 @@ export class GitHubActionsClient implements ActionsClient {
     const data: any = await res.json();
     const runs: any[] = data.workflow_runs ?? [];
     const cutoff = new Date(createdAfter).getTime();
+    // Sort newest-first so that on retries (which dispatch a new run with the
+    // same workflow + branch) the most recent dispatch is returned rather than
+    // a stale completed run from an earlier attempt.
     const matching = runs
       .filter((r) => new Date(r.created_at).getTime() >= cutoff)
-      .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
     const run = matching[0];
     if (!run) return null;
     return {

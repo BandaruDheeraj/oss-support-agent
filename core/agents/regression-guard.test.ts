@@ -266,6 +266,17 @@ describe('Regression Guard (US-016)', () => {
       expect(result).not.toContain('200ms');
       expect(result).not.toContain('0.5s');
     });
+
+    it('strips the synthetic GHA log archive marker so fork/upstream runs compare equal', () => {
+      const forkSide =
+        'tests passed\n(GHA log archive: 1234 bytes; run https://github.com/fork/repo/actions/runs/111)';
+      const upstreamSide =
+        'tests passed\n(GHA log archive: 9876 bytes; run https://github.com/upstream/repo/actions/runs/222)';
+      expect(normalizeOutput(forkSide)).toBe(normalizeOutput(upstreamSide));
+      expect(normalizeOutput(forkSide)).toContain('<GHA_LOG_MARKER>');
+      expect(normalizeOutput(forkSide)).not.toContain('1234');
+      expect(normalizeOutput(forkSide)).not.toContain('actions/runs/111');
+    });
   });
 
   describe('diffOutputs', () => {

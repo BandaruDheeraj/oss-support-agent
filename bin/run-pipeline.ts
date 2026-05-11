@@ -364,6 +364,207 @@ interface FixAttemptOutcome {
 }
 
 /**
+ * Pure decision helper: turn regression + usability findings into a retry
+ * signal. Used by the verification phase to decide whether the fix passes the
+ * sandbox-quality gate or needs another fix attempt.
+ *
+ * Exported for unit testing.
+ */
+export function decideVerificationOutcome(args: {
+  regressionDetected: boolean;
+  regressionDiffs?: Array<{ category: string; description: string }>;
+  blockers: string[];
+}): { ok: boolean; retryContext: string } {
+  const parts: string[] = [];
+
+  if (args.regressionDetected) {
+    const diffs = args.regressionDiffs ?? [];
+    parts.push(
+      `Regression guard detected behavioural changes between the fork branch and upstream main (${diffs.length} diff(s)). The fix changed observable behaviour outside the scope of the issue; address this:`
+    );
+    for (const d of diffs) {
+      parts.push(`- [${d.category}] ${d.description}`);
+    }
+  }
+
+  if (args.blockers.length > 0) {
+    if (parts.length > 0) parts.push('');
+    parts.push(
+      `Usability blockers found by the sandbox exerciser (these prevent a real user from consuming the change and must be fixed before opening a PR):`
+    );
+    for (const b of args.blockers) {
+      parts.push(`- ${b}`);
+    }
+  }
+
+  return { ok: parts.length === 0, retryContext: parts.join('\n') };
+}
+
+interface VerificationResult {
+  /** Aggregate gate outcome. ok=false means feed retryContext back to the fix agent. */
+  outcome: { ok: boolean; retryContext: string };
+  /** PR-body section for the regression guard run (may be empty). */
+  regressionSection: string;
+  /** Labels to apply to the PR for regression findings. */
+  regressionLabels: string[];
+  /** PR-body section for the usability run (may be empty). */
+  usabilitySection: string;
+  /** Labels to apply to the PR for usability findings. */
+  usabilityLabels: string[];
+}
+
+/**
+ * Run the post-fix verification phase: regression guard + usability agent.
+ * Gates the PR: if either signal fails, returns ok=false with a retryContext
+ * that the fix retry loop will feed back to the LLM.
+ *
+ * Each agent is wrapped so an infrastructure-level failure (e.g. GHA dispatch
+ * error) is non-blocking: the section says "⚠️ Not Run" and the gate passes,
+ * matching the prior behaviour of these blocks.
+ */
+async function runVerification(args: {
+  manifest: Manifest;
+  adapter: RepoAdapter;
+  token: string;
+  forkFullName: string;
+  branchName: string;
+  upstreamRepo: string;
+  upstreamDefaultBranch: string;
+  workspace: LocalWorkspace;
+  affectedModule: string;
+  confirmedIssues: ConfirmedIssue[];
+  log: (msg: string) => void;
+}): Promise<VerificationResult> {
+  const {
+    manifest,
+    adapter,
+    token,
+    forkFullName,
+    branchName,
+    upstreamRepo,
+    upstreamDefaultBranch,
+    workspace,
+    affectedModule,
+    confirmedIssues,
+    log,
+  } = args;
+
+  // Verification is GHA-only; in local sandbox mode skip silently with ok=true.
+  if (manifest.sandbox_runner !== 'gha') {
+    return {
+      outcome: { ok: true, retryContext: '' },
+      regressionSection: '',
+      regressionLabels: [],
+      usabilitySection: '',
+      usabilityLabels: [],
+    };
+  }
+
+  let regressionSection = '';
+  const regressionLabels: string[] = [];
+  let regressionDetected = false;
+  let regressionDiffs: Array<{ category: string; description: string }> = [];
+
+  try {
+    log(`[verify/regression-guard] sandbox_runner=gha; running regression guard`);
+    const testCommands = await adapter.getTestCommands();
+    const sandboxServices = await adapter.getSandboxServices();
+    const serviceNames = sandboxServices.map((s) =>
+      typeof s === 'string' ? s : s.name
+    );
+    const joinedCommand = testCommands.join(' && ');
+
+    const regressionConfig = createRegressionConfig(
+      forkFullName,
+      branchName,
+      upstreamRepo,
+      upstreamDefaultBranch,
+      joinedCommand,
+      serviceNames,
+      manifest.sandbox_timeout_mins ?? 15
+    );
+
+    const actionsClient = new GitHubActionsClient(token);
+    const regressionResult = await runRegressionGuard(regressionConfig, actionsClient);
+    regressionSection = generateRegressionSummary(regressionResult);
+    regressionDetected = regressionResult.regressionDetected;
+    regressionDiffs = regressionResult.diffs.map((d) => ({
+      category: d.category,
+      description: d.description,
+    }));
+    log(
+      `[verify/regression-guard] detected=${regressionResult.regressionDetected} diffs=${regressionResult.diffs.length}`
+    );
+    if (regressionResult.regressionDetected) {
+      regressionLabels.push('agent-regression-detected');
+    }
+  } catch (err: any) {
+    log(`[verify/regression-guard] failed (non-blocking): ${err?.message ?? err}`);
+    regressionSection = `### Regression Guard: ⚠️ Not Run\n\nRegression guard failed to execute: ${err?.message ?? err}`;
+    // Infrastructure failure: do not gate the PR on it.
+  }
+
+  let usabilitySection = '';
+  const usabilityLabels: string[] = [];
+  let usabilityBlockers: string[] = [];
+
+  try {
+    log(`[verify/usability] sandbox_runner=gha; running usability agent`);
+    const sandboxServices = await adapter.getSandboxServices();
+    const serviceNames = sandboxServices.map((s) =>
+      typeof s === 'string' ? s : s.name
+    );
+    const introspection = inferUsabilityIntrospection(workspace, affectedModule);
+
+    const usabilityInput: UsabilityAgentInput = {
+      forkFullName,
+      branchName,
+      affectedModule,
+      confirmedIssues: confirmedIssues.map((i) => ({
+        number: i.number,
+        title: i.title,
+        body: i.body ?? null,
+        labels: i.labels,
+      })),
+      sandboxServices: serviceNames,
+      timeoutMinutes: manifest.sandbox_timeout_mins ?? DEFAULT_USABILITY_TIMEOUT_MINUTES,
+      installCommand: introspection.installCommand,
+      entryPoints: introspection.entryPoints,
+    };
+
+    const actionsClient = new GitHubActionsClient(token);
+    const exerciser = new GHAUsabilityExerciser(token, actionsClient);
+    const usabilityResult = await runUsabilityAgent(usabilityInput, exerciser, actionsClient);
+    usabilitySection = usabilityResult.summary;
+    usabilityBlockers = usabilityResult.blockers;
+    log(
+      `[verify/usability] completed=${usabilityResult.completed} dx=${usabilityResult.dxScore} blockers=${usabilityResult.blockers.length}`
+    );
+    if (usabilityResult.blockers.length > 0) {
+      usabilityLabels.push('agent-usability-blockers');
+    }
+  } catch (err: any) {
+    log(`[verify/usability] failed (non-blocking): ${err?.message ?? err}`);
+    usabilitySection = `### Usability Report: ⚠️ Not Run\n\nUsability agent failed to execute: ${err?.message ?? err}`;
+    // Infrastructure failure: do not gate the PR on it.
+  }
+
+  const outcome = decideVerificationOutcome({
+    regressionDetected,
+    regressionDiffs,
+    blockers: usabilityBlockers,
+  });
+
+  return {
+    outcome,
+    regressionSection,
+    regressionLabels,
+    usabilitySection,
+    usabilityLabels,
+  };
+}
+
+/**
  * Run the issue-sweep / scope-confirmation flow over Gmail.
  *
  * After PM design approval, sweep all open issues in the repo and find ones
@@ -848,6 +1049,27 @@ export async function runPipeline(args: {
       `created=${fork.forkCreated} synced=${fork.forkSynced} reset=${fork.branchReset}`
   );
 
+  // ---------- Install verification workflows once (GHA only) ----------
+  // The verification gate (regression + usability) runs after each successful
+  // fix attempt inside the retry loop. We install the workflow files ONCE here
+  // — BEFORE the local workspace clone — so that:
+  //   - The local checkout already contains the workflow files; subsequent
+  //     `git push origin <branch>` from LocalForkCommitter won't fail
+  //     non-fast-forward because of remote-only workflow commits.
+  //   - The PUT cost is paid once, not per retry attempt.
+  // Failures are non-blocking: the verification step itself will report
+  // "⚠️ Not Run" if workflows are missing.
+  if (manifest.sandbox_runner === 'gha') {
+    try {
+      await ensureRegressionWorkflowOnFork(deps.token, fork.forkFullName, log);
+      await ensureRegressionWorkflowOnBranch(deps.token, fork.forkFullName, fork.branchName, log);
+      await ensureUsabilityWorkflowOnFork(deps.token, fork.forkFullName, log);
+      await ensureUsabilityWorkflowOnBranch(deps.token, fork.forkFullName, fork.branchName, log);
+    } catch (err: any) {
+      log(`[verify/install] failed to install verification workflows (non-blocking): ${err?.message ?? err}`);
+    }
+  }
+
   // ---------- Local workspace ----------
   const baseBranch = await ghClient.getDefaultBranch(fork.forkFullName);
   const workspace = new LocalWorkspace(
@@ -887,6 +1109,10 @@ export async function runPipeline(args: {
 
   let prSummary = '';
   let evalSummary = '';
+  let regressionSection = '';
+  let regressionLabels: string[] = [];
+  let usabilitySection = '';
+  let usabilityLabels: string[] = [];
 
   if (routing.action === 'route_docs') {
     // ---------- Docs path ----------
@@ -951,7 +1177,36 @@ export async function runPipeline(args: {
         };
       }
 
-      if (attempt.ok) break;
+      if (attempt.ok) {
+        log(`[build] attempt passed eval; running verification (regression + usability)`);
+        const verify = await runVerification({
+          manifest,
+          adapter,
+          token: deps.token,
+          forkFullName: fork.forkFullName,
+          branchName: fork.branchName,
+          upstreamRepo: repoFullName,
+          upstreamDefaultBranch: baseBranch,
+          workspace,
+          affectedModule: routing.result.affectedModule,
+          confirmedIssues,
+          log,
+        });
+        regressionSection = verify.regressionSection;
+        regressionLabels = verify.regressionLabels;
+        usabilitySection = verify.usabilitySection;
+        usabilityLabels = verify.usabilityLabels;
+
+        if (verify.outcome.ok) break;
+
+        log(`[build] verification gate FAILED; feeding findings back to retry loop`);
+        attempt = {
+          ok: false,
+          retryContext: verify.outcome.retryContext,
+          evalSummary: 'verification-failed',
+          fixSummary: attempt.fixSummary,
+        };
+      }
 
       if (deps.live) {
         const retryConfig: RetryLoopConfig = {
@@ -1044,7 +1299,36 @@ export async function runPipeline(args: {
         };
       }
 
-      if (attempt.ok) break;
+      if (attempt.ok) {
+        log(`[fix] attempt passed eval; running verification (regression + usability)`);
+        const verify = await runVerification({
+          manifest,
+          adapter,
+          token: deps.token,
+          forkFullName: fork.forkFullName,
+          branchName: fork.branchName,
+          upstreamRepo: repoFullName,
+          upstreamDefaultBranch: baseBranch,
+          workspace,
+          affectedModule: routing.result.affectedModule,
+          confirmedIssues,
+          log,
+        });
+        regressionSection = verify.regressionSection;
+        regressionLabels = verify.regressionLabels;
+        usabilitySection = verify.usabilitySection;
+        usabilityLabels = verify.usabilityLabels;
+
+        if (verify.outcome.ok) break;
+
+        log(`[fix] verification gate FAILED; feeding findings back to retry loop`);
+        attempt = {
+          ok: false,
+          retryContext: verify.outcome.retryContext,
+          evalSummary: 'verification-failed',
+          fixSummary: attempt.fixSummary,
+        };
+      }
 
       lastRetryContext = attempt.retryContext;
 
@@ -1095,105 +1379,6 @@ export async function runPipeline(args: {
 
     prSummary = attempt!.fixSummary;
     evalSummary = attempt!.evalSummary;
-  }
-
-  // ---------- Optional: regression guard (GHA sandbox only) ----------
-  let regressionSection = '';
-  const regressionLabels: string[] = [];
-  if (manifest.sandbox_runner === 'gha') {
-    try {
-      log(`[regression-guard] sandbox_runner=gha; running regression guard`);
-      await ensureRegressionWorkflowOnFork(deps.token, fork.forkFullName, log);
-      // Also push the workflow to the agent branch so workflow_dispatch can
-      // target it directly (matches head_branch on the resulting run).
-      await ensureRegressionWorkflowOnBranch(deps.token, fork.forkFullName, fork.branchName, log);
-
-      const testCommands = await adapter.getTestCommands();
-      const sandboxServices = await adapter.getSandboxServices();
-      const serviceNames = sandboxServices.map((s) =>
-        typeof s === 'string' ? s : s.name
-      );
-      const joinedCommand = testCommands.join(' && ');
-
-      const regressionConfig = createRegressionConfig(
-        fork.forkFullName,
-        fork.branchName,
-        repoFullName,
-        baseBranch,
-        joinedCommand,
-        serviceNames,
-        manifest.sandbox_timeout_mins ?? 15
-      );
-
-      const actionsClient = new GitHubActionsClient(deps.token);
-      const regressionResult = await runRegressionGuard(regressionConfig, actionsClient);
-      regressionSection = generateRegressionSummary(regressionResult);
-      log(
-        `[regression-guard] detected=${regressionResult.regressionDetected} diffs=${regressionResult.diffs.length}`
-      );
-      if (regressionResult.regressionDetected) {
-        regressionLabels.push('agent-regression-detected');
-      }
-    } catch (err: any) {
-      log(`[regression-guard] failed (non-blocking): ${err?.message ?? err}`);
-      regressionSection = `### Regression Guard: ⚠️ Not Run\n\nRegression guard failed to execute: ${err?.message ?? err}`;
-    }
-  }
-
-  // ---------- Optional: usability agent (GHA sandbox only) ----------
-  let usabilitySection = '';
-  const usabilityLabels: string[] = [];
-  if (manifest.sandbox_runner === 'gha') {
-    try {
-      log(`[usability] sandbox_runner=gha; running usability agent`);
-      await ensureUsabilityWorkflowOnFork(deps.token, fork.forkFullName, log);
-      // Also push the workflow to the agent branch so workflow_dispatch can
-      // target it directly (matches head_branch on the resulting run).
-      await ensureUsabilityWorkflowOnBranch(deps.token, fork.forkFullName, fork.branchName, log);
-
-      const sandboxServices = await adapter.getSandboxServices();
-      const serviceNames = sandboxServices.map((s) =>
-        typeof s === 'string' ? s : s.name
-      );
-      const introspection = inferUsabilityIntrospection(
-        workspace,
-        routing.result.affectedModule
-      );
-
-      const usabilityInput: UsabilityAgentInput = {
-        forkFullName: fork.forkFullName,
-        branchName: fork.branchName,
-        affectedModule: routing.result.affectedModule,
-        confirmedIssues: confirmedIssues.map((i) => ({
-          number: i.number,
-          title: i.title,
-          body: i.body ?? null,
-          labels: i.labels,
-        })),
-        sandboxServices: serviceNames,
-        timeoutMinutes: manifest.sandbox_timeout_mins ?? DEFAULT_USABILITY_TIMEOUT_MINUTES,
-        installCommand: introspection.installCommand,
-        entryPoints: introspection.entryPoints,
-      };
-
-      const actionsClient = new GitHubActionsClient(deps.token);
-      const exerciser = new GHAUsabilityExerciser(deps.token, actionsClient);
-      const usabilityResult = await runUsabilityAgent(
-        usabilityInput,
-        exerciser,
-        actionsClient
-      );
-      usabilitySection = usabilityResult.summary;
-      log(
-        `[usability] completed=${usabilityResult.completed} dx=${usabilityResult.dxScore} blockers=${usabilityResult.blockers.length}`
-      );
-      if (usabilityResult.blockers.length > 0) {
-        usabilityLabels.push('agent-usability-blockers');
-      }
-    } catch (err: any) {
-      log(`[usability] failed (non-blocking): ${err?.message ?? err}`);
-      usabilitySection = `### Usability Report: ⚠️ Not Run\n\nUsability agent failed to execute: ${err?.message ?? err}`;
-    }
   }
 
   // ---------- Draft PR ----------

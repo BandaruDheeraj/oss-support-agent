@@ -221,6 +221,12 @@ export function normalizeOutput(output: string): string {
   return output
     .replace(/\d+(\.\d+)?\s*(milliseconds?|ms|seconds?|secs?|sec|s)\b/gi, '<TIME>')
     .replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[^\s]*/g, '<TIMESTAMP>')
+    // Strip the synthetic GHA-log-archive marker produced by
+    // GitHubActionsClient.getWorkflowRunLogs (e.g. "(GHA log archive: 1234
+    // bytes; run https://...)"). The archive size and run URL differ between
+    // every workflow run, so without this scrub the regression guard reports
+    // a false-positive stdout diff on every comparison.
+    .replace(/\(GHA log archive: \d+ bytes; run https?:\/\/[^)]+\)/g, '<GHA_LOG_MARKER>')
     .trim();
 }
 
