@@ -64,6 +64,31 @@ export interface ReproGeneratorOutput {
    * Short one-line summary of what the repro asserts. Goes into the PR body.
    */
   summary: string;
+  /**
+   * Environment variables (credentials, API keys, base URLs) the test reads
+   * either directly via `os.environ[...]` or transitively through the
+   * libraries it imports (e.g. `OPENAI_API_KEY` when calling the OpenAI
+   * client). The LLM MUST enumerate every one it relies on — missing
+   * declarations cause the pipeline to halt for credentials BEFORE we
+   * waste a sandbox run.
+   */
+  requiredCredentials?: RequiredCredential[];
+}
+
+/**
+ * A single env var the repro needs available at run time.
+ */
+export interface RequiredCredential {
+  /** Env var name, e.g. "OPENAI_API_KEY". */
+  envVar: string;
+  /** One-line explanation of what it's used for. */
+  purpose: string;
+  /**
+   * Best-effort guidance on where the user can obtain this credential
+   * (e.g. "https://platform.openai.com/api-keys"). Free-form; surfaced
+   * verbatim in the credentials-needed email.
+   */
+  whereToGet?: string;
 }
 
 /**

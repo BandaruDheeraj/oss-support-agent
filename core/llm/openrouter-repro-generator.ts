@@ -28,6 +28,19 @@ const REPRO_SCHEMA = {
     content: { type: 'string', minLength: 1 },
     failureSentinel: { type: 'string', minLength: 6 },
     summary: { type: 'string', minLength: 1 },
+    requiredCredentials: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['envVar', 'purpose'],
+        properties: {
+          envVar: { type: 'string', minLength: 1 },
+          purpose: { type: 'string', minLength: 1 },
+          whereToGet: { type: 'string' },
+        },
+      },
+    },
   },
 } as const;
 
@@ -44,13 +57,15 @@ REQUIRED CONTRACT:
 8. Place the test under a tests/ directory. Pick a stable filename like tests/test_repro_issue_<N>.py.
 9. DO NOT modify any other repo file.
 10. The failureSentinel must be unique (include the bug short-name, e.g. "REPRO_FAILURE_NonRecordingSpan_status").
+11. If — and ONLY if — your test reads environment variables (directly via os.environ, or transitively because it instantiates a client that reads them, e.g. the OpenAI SDK reads OPENAI_API_KEY), enumerate EVERY one of them in requiredCredentials. For each: envVar (the exact name), purpose (one-line: what it's for), whereToGet (URL or short instructions). DO NOT include opentelemetry / wrapt / stdlib env vars — only secrets / API keys / base URLs that an end user would need to provide. If the test is fully self-contained (uses in-memory exporters, sys.path tricks, mocks, etc. — STRONGLY preferred), omit requiredCredentials or set it to []. Prefer self-contained tests wherever feasible; only declare credentials when the bug genuinely cannot be reproduced without a real external API call.
 
 Return JSON matching:
 {
   "path": string,
   "content": string,
   "failureSentinel": string,
-  "summary": string  // one-line: "Repro for: <bug>; fails on baseline with <sentinel>, passes once <fix>"
+  "summary": string,  // one-line: "Repro for: <bug>; fails on baseline with <sentinel>, passes once <fix>"
+  "requiredCredentials"?: [ { "envVar": string, "purpose": string, "whereToGet"?: string } ]
 }
 `;
 

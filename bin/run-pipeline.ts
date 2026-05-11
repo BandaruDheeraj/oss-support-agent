@@ -50,8 +50,13 @@ import type { PMEmailLoopConfig, DesignBriefInput } from '../core/pm-email-types
 import { detectApproval } from '../core/gmail-mcp';
 import { extractFilePathsFromAll } from '../core/issue-file-extractor';
 import { runReproAgent } from '../core/agents/repro';
-import type { ReproSpec } from '../core/agents/repro-types';
+import type { ReproSpec, RequiredCredential } from '../core/agents/repro-types';
 import { OpenRouterReproGenerator } from '../core/llm/openrouter-repro-generator';
+import {
+  findMissingDeclaredCredentials,
+  detectCredentialError,
+  mergeCredentialSources,
+} from '../core/credentials-check';
 
 import {
   runRetryLoop,
@@ -60,7 +65,7 @@ import {
 } from '../core/retry-loop';
 import type { RetryLoopConfig } from '../core/retry-loop-types';
 
-import { GitHubRestClient } from './clients/github-rest';
+import { GitHubRestClient, GitHubIssueCommenter } from './clients/github-rest';
 import type { IssueCommenter } from '../core/agents/triage-types';
 import { LocalWorkspace } from './clients/local-workspace';
 import { LocalForkCommitter, LocalRepoFileReader } from './clients/local-fork-deps';
@@ -112,6 +117,11 @@ export type PipelineResult =
   | { status: 'fix-failed'; reason: string }
   | { status: 'sandbox-failed'; reason: string; logsPath?: string }
   | { status: 'max-retries-exceeded'; reason: string }
+  | {
+      status: 'awaiting-credentials';
+      reason: string;
+      missingEnvVars: string[];
+    }
   | { status: 'pr-opened'; prUrl: string; prNumber: number };
 
 function buildTriageInput(payload: IssueEvent, manifest: Manifest, repoTree: string[]): TriageInput {
@@ -1471,9 +1481,97 @@ export async function runPipeline(args: {
     // infrastructure failures (ModuleNotFoundError etc.) (d) no timeout. If
     // valid we commit ONLY the repro file (not -A) so any sandbox side
     // effects don't sneak in, and feed its path+content into the fix agent.
+    //
+    // Credentials gate: if the LLM declares (or the baseline output implies)
+    // env vars we don't have, halt the run, email the user the list of
+    // env vars + where to add them, label the issue `awaiting-credentials`,
+    // and exit. The user re-triggers after adding the keys.
     let reproSpec: ReproSpec | undefined;
     let reproBaselineContent: string | undefined;
     let reproSetupCmds: string[] = [];
+
+    // Closure capturing pipeline locals so individual call-sites stay tight.
+    // Returns the awaiting-credentials PipelineResult after emailing + commenting + labeling.
+    const haltForCredentials = async (
+      creds: ReadonlyArray<RequiredCredential>,
+      detectionContext: string
+    ): Promise<PipelineResult> => {
+      // Always discard whatever we wrote to disk — we are NOT pushing this branch.
+      try {
+        await workspace.resetWorkingTree();
+      } catch {
+        /* best-effort */
+      }
+      const envNames = creds.map((c) => c.envVar);
+      log(
+        `[repro] HALT: missing credentials (${detectionContext}): ${envNames.join(', ')}`
+      );
+      const issueUrl = `https://github.com/${repoFullName}/issues/${issueNumber}`;
+      const renderUrl =
+        process.env.RENDER_DASHBOARD_URL ??
+        (process.env.RENDER_SERVICE_ID
+          ? `https://dashboard.render.com/web/${process.env.RENDER_SERVICE_ID}/env`
+          : null);
+      const credLines = creds.map((c) => {
+        const where = c.whereToGet ? `\n    where: ${c.whereToGet}` : '';
+        return `- ${c.envVar}\n    purpose: ${c.purpose}${where}`;
+      });
+      const subject = `[oss-agent] credentials needed for ${repoFullName}#${issueNumber}`;
+      const bodyLines = [
+        `The repro stage needs ${creds.length} credential(s) before it can prove the bug:`,
+        ``,
+        ...credLines,
+        ``,
+        `Detection: ${detectionContext}`,
+        ``,
+        renderUrl
+          ? `Add them at: ${renderUrl}\nThen re-trigger this issue (e.g. by re-applying the trigger label) to resume.`
+          : `Add them to the agent's runtime environment, then re-trigger this issue (e.g. by re-applying the trigger label) to resume.`,
+        ``,
+        `Issue: ${issueUrl}`,
+        ``,
+        `Run: ${runId}`,
+      ];
+      if (deps.live) {
+        try {
+          await deps.live.failureNotifier.sendEmail(
+            manifest.pm_email,
+            subject,
+            bodyLines.join('\n'),
+            manifest.pm_email
+          );
+          log(`[repro] credential request emailed to ${manifest.pm_email}`);
+        } catch (mailErr: any) {
+          log(`[repro] email send failed: ${mailErr?.message ?? mailErr}`);
+        }
+        try {
+          const issueCommenter = new GitHubIssueCommenter(deps.token);
+          await issueCommenter.postComment(
+            repoFullName,
+            issueNumber,
+            `🔒 **Awaiting credentials.** The reproduction test needs ${envNames.length} env var(s) (${envNames.join(', ')}) that aren't set on the agent runtime. The maintainer has been emailed with instructions; the run will be resumed after they're added.`
+          );
+        } catch (commentErr: any) {
+          log(`[repro] issue comment failed: ${commentErr?.message ?? commentErr}`);
+        }
+        try {
+          // /issues/{n}/labels works the same for issues and PRs in GH's API
+          await ghClient.addLabelsToPR(repoFullName, issueNumber, [
+            'awaiting-credentials',
+          ]);
+        } catch (labelErr: any) {
+          log(`[repro] label add failed: ${labelErr?.message ?? labelErr}`);
+        }
+      } else {
+        log(`[repro] (no live deps) would have emailed ${manifest.pm_email}: ${subject}`);
+      }
+      return {
+        status: 'awaiting-credentials',
+        reason: `missing env vars: ${envNames.join(', ')}`,
+        missingEnvVars: envNames,
+      };
+    };
+
     try {
       log('[repro] generating reproduction test');
       reproSetupCmds = (await adapter.getReproSetupCommands?.()) ?? [];
@@ -1491,6 +1589,25 @@ export async function runPipeline(args: {
         new OpenRouterReproGenerator()
       );
       log(`[repro] generated at ${generated.path} (sentinel="${generated.failureSentinel}")`);
+      if (generated.requiredCredentials && generated.requiredCredentials.length > 0) {
+        log(
+          `[repro] LLM declared ${generated.requiredCredentials.length} required credential(s): ${generated.requiredCredentials.map((c) => c.envVar).join(', ')}`
+        );
+      }
+
+      // ---- Proactive credentials gate ----
+      // If the LLM said it needs env vars we don't have, halt BEFORE the
+      // sandbox run. Costs nothing to skip a doomed run.
+      const declaredCheck = findMissingDeclaredCredentials(
+        generated.requiredCredentials,
+        process.env
+      );
+      if (declaredCheck.missing.length > 0) {
+        return await haltForCredentials(
+          declaredCheck.missing,
+          'declared by repro generator'
+        );
+      }
 
       // Write the repro into the workspace and run baseline.
       workspace.writeFile(generated.path, generated.content);
@@ -1518,6 +1635,8 @@ export async function runPipeline(args: {
       // whose exit code + output tells us if the bug reproduced.
       const reproRunResult =
         baselineArtifact.commands[baselineArtifact.commands.length - 1];
+      const reproStdout = reproRunResult?.stdout ?? '';
+      const reproStderr = reproRunResult?.stderr ?? '';
       let validation: { ok: true } | { ok: false; reason: string };
       if (baselineArtifact.result.timedOut) {
         validation = {
@@ -1527,11 +1646,39 @@ export async function runPipeline(args: {
       } else {
         validation = validateReproBaseline({
           exitCode: reproRunResult?.exitCode ?? null,
-          stdout: reproRunResult?.stdout ?? '',
-          stderr: reproRunResult?.stderr ?? '',
+          stdout: reproStdout,
+          stderr: reproStderr,
           failureSentinel: generated.failureSentinel,
         });
       }
+
+      // ---- Reactive credentials gate ----
+      // Sentinel-not-printed + auth-shaped stderr ⇒ probably the LLM didn't
+      // declare every env var it needed. Halt and report the union of
+      // declared + inferred names so the user sees the whole picture.
+      const sentinelPrinted =
+        reproStdout.includes(generated.failureSentinel) ||
+        reproStderr.includes(generated.failureSentinel);
+      if (!validation.ok && !sentinelPrinted) {
+        const detected = detectCredentialError(reproStdout, reproStderr);
+        if (detected.isCredentialError) {
+          const merged = mergeCredentialSources(
+            generated.requiredCredentials ?? [],
+            detected.inferredEnvVars
+          );
+          // Only halt for the env vars actually missing from process.env —
+          // some inferred names might already be set, in which case the
+          // failure is something else (back to fallback flow).
+          const recheck = findMissingDeclaredCredentials(merged, process.env);
+          if (recheck.missing.length > 0) {
+            return await haltForCredentials(
+              recheck.missing,
+              `inferred from baseline stderr (${detected.matchedPattern ?? 'unknown'})`
+            );
+          }
+        }
+      }
+
       if (!validation.ok) {
         log(`[repro] baseline INVALID: ${validation.reason}`);
         log(`[repro] falling back to non-repro fix flow`);
