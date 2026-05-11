@@ -62,6 +62,20 @@ import { LocalWorkspace } from './clients/local-workspace';
 import { LocalForkCommitter, LocalRepoFileReader } from './clients/local-fork-deps';
 import { runLocalSandbox } from './clients/local-sandbox';
 import type { LiveDeps } from './clients/live-deps';
+import {
+  InMemorySweepStateStore,
+  listOpenIssues,
+  getIssueDetails,
+} from './clients/issue-sweep-deps';
+import {
+  HeuristicIssueSweeper,
+  runIssueSweep,
+  processScopeReply,
+} from '../core/issue-sweep';
+import type { ScopeConfirmationConfig } from '../core/issue-sweep-types';
+
+/** Module-level sweep state store. Keyed by per-run sweep runId; no cross-run conflicts. */
+const sweepStateStore = new InMemorySweepStateStore();
 
 export interface PipelineDeps {
   token: string;
@@ -333,6 +347,140 @@ interface FixAttemptOutcome {
   retryContext: string;
   evalSummary: string;
   fixSummary: string;
+}
+
+/**
+ * Run the issue-sweep / scope-confirmation flow over Gmail.
+ *
+ * After PM design approval, sweep all open issues in the repo and find ones
+ * that match the agreed design. If only the primary issue is in scope, this
+ * short-circuits with no email. Otherwise sends a scope-confirmation email
+ * and blocks on the user's reply (parsed for include/exclude prose).
+ *
+ * Returns the list of confirmed issue numbers to feed into fix/build agents.
+ */
+async function runIssueSweepLoop(args: {
+  repoFullName: string;
+  primaryIssueNumber: number;
+  primaryIssueTitle: string;
+  agreedDesign: string;
+  affectedModule: string;
+  manifest: Manifest;
+  live: LiveDeps;
+  token: string;
+  log: (msg: string) => void;
+  parentRunId: string;
+  sweepStateStore: InMemorySweepStateStore;
+}): Promise<{ confirmedIssueNumbers: number[]; skipped: boolean; reason?: string }> {
+  const {
+    repoFullName,
+    primaryIssueNumber,
+    primaryIssueTitle,
+    agreedDesign,
+    affectedModule,
+    manifest,
+    live,
+    token,
+    log,
+    parentRunId,
+    sweepStateStore,
+  } = args;
+
+  log(`[sweep] fetching open issues for ${repoFullName}`);
+  let openIssues;
+  try {
+    openIssues = await listOpenIssues(token, repoFullName, 50);
+  } catch (err) {
+    log(`[sweep] failed to list issues (${(err as Error).message}); skipping sweep`);
+    return { confirmedIssueNumbers: [primaryIssueNumber], skipped: true, reason: 'list-failed' };
+  }
+  log(`[sweep] ${openIssues.length} open issues fetched`);
+
+  // Ensure the primary issue is present in the sweep input (sweeper expects it).
+  if (!openIssues.find((i) => i.number === primaryIssueNumber)) {
+    openIssues.push({
+      number: primaryIssueNumber,
+      title: primaryIssueTitle,
+      labels: [],
+      reason: '',
+    });
+  }
+
+  const sweeper = new HeuristicIssueSweeper();
+  const sweepResult = sweeper.sweepIssues({
+    agreedDesign,
+    affectedModule,
+    openIssues,
+    primaryIssueNumber,
+  });
+
+  const otherHigh = sweepResult.highConfidence.filter((i) => i.number !== primaryIssueNumber);
+  const otherMaybe = sweepResult.maybeInScope.filter((i) => i.number !== primaryIssueNumber);
+
+  log(
+    `[sweep] result: high=${sweepResult.highConfidence.length} ` +
+      `(${otherHigh.length} besides primary), maybe=${otherMaybe.length}`
+  );
+
+  // Short-circuit: no other candidates → don't email, just confirm primary.
+  if (otherHigh.length === 0 && otherMaybe.length === 0) {
+    log('[sweep] no other in-scope issues found; skipping scope-confirmation email');
+    return { confirmedIssueNumbers: [primaryIssueNumber], skipped: true, reason: 'no-candidates' };
+  }
+
+  const sweepRunId = `${parentRunId}-sweep`;
+  const config: ScopeConfirmationConfig = {
+    pmEmail: manifest.pm_email,
+    replyToAddress: live.replyToFor(sweepRunId),
+    repo: repoFullName,
+    issueNumber: primaryIssueNumber,
+    issueTitle: primaryIssueTitle,
+    runId: sweepRunId,
+  };
+
+  log(`[sweep] sending scope-confirmation email to ${manifest.pm_email} (runId=${sweepRunId})`);
+  const sendResult = await runIssueSweep(
+    live.gmail,
+    live.watcher,
+    config,
+    {
+      agreedDesign,
+      affectedModule,
+      openIssues,
+      primaryIssueNumber,
+    },
+    sweeper,
+    sweepStateStore
+  );
+  if (sendResult.action !== 'scope_email_sent') {
+    log(`[sweep] unexpected sweep send action ${sendResult.action}; falling back to primary`);
+    return { confirmedIssueNumbers: [primaryIssueNumber], skipped: true, reason: 'send-failed' };
+  }
+
+  log(`[sweep] waiting for scope reply on thread ${sendResult.thread.threadId}`);
+  const { reply } = await live.replyWaiter.waitForEmailReply(sweepRunId);
+  log(`[sweep] received scope reply (${reply.body.length} chars)`);
+
+  const confirmResult = processScopeReply(
+    reply.body,
+    sendResult.sweepResult,
+    sweepStateStore,
+    sweepRunId,
+    live.watcher,
+    sendResult.thread.threadId
+  );
+
+  if (confirmResult.action !== 'scope_confirmed') {
+    log(`[sweep] unexpected confirm action ${confirmResult.action}; falling back to primary`);
+    return { confirmedIssueNumbers: [primaryIssueNumber], skipped: true, reason: 'parse-failed' };
+  }
+
+  // Ensure primary is always included (defensive: parser excludes it from highConfidence
+  // bucket since it auto-adds with a different reason; if user wrote "drop primary" that's
+  // a non-sequitur — we still need to work on it).
+  const numbers = Array.from(new Set([primaryIssueNumber, ...confirmResult.confirmedIssueNumbers]));
+  log(`[sweep] confirmed issue numbers: ${numbers.join(', ')}`);
+  return { confirmedIssueNumbers: numbers, skipped: false };
 }
 
 /**
@@ -628,6 +776,7 @@ export async function runPipeline(args: {
 
   // ---------- Optional PM design loop ----------
   let designSummary = `Skip-PM-gate fix for issue #${issueNumber}: ${routing.result.summary}`;
+  let agreedDesignText: string | null = null;
   if (routing.action === 'route_pm') {
     const result = await runPMDesignLoop({
       payload,
@@ -639,6 +788,37 @@ export async function runPipeline(args: {
       runId,
     });
     designSummary = `Approved design for issue #${issueNumber}:\n${result.agreedDesign}`;
+    agreedDesignText = result.agreedDesign;
+  }
+
+  // ---------- Optional issue sweep (Phase 5) ----------
+  // Only sweep when PM design loop ran AND live deps are present. Sweep is a
+  // no-op short-circuit when no other in-scope issues are found (no email).
+  let extraConfirmedNumbers: number[] = [];
+  if (routing.action === 'route_pm' && deps.live && agreedDesignText) {
+    try {
+      const sweep = await runIssueSweepLoop({
+        repoFullName,
+        primaryIssueNumber: issueNumber,
+        primaryIssueTitle: payload.issue.title ?? '',
+        agreedDesign: agreedDesignText,
+        affectedModule: routing.result.affectedModule,
+        manifest,
+        live: deps.live,
+        token: deps.token,
+        log,
+        parentRunId: runId,
+        sweepStateStore,
+      });
+      extraConfirmedNumbers = sweep.confirmedIssueNumbers.filter((n) => n !== issueNumber);
+      if (sweep.skipped) {
+        log(`[sweep] skipped (${sweep.reason ?? 'unknown'})`);
+      }
+    } catch (err) {
+      // Sweep is best-effort; never block the pipeline on failure.
+      log(`[sweep] error: ${(err as Error).message}; falling back to primary issue only`);
+      extraConfirmedNumbers = [];
+    }
   }
 
   // ---------- Fork + branch ----------
@@ -677,6 +857,19 @@ export async function runPipeline(args: {
       labels: triageInput.labels,
     },
   ];
+
+  // Hydrate extra confirmed issues from the sweep with full details.
+  for (const num of extraConfirmedNumbers) {
+    try {
+      const details = await getIssueDetails(deps.token, repoFullName, num);
+      if (details) {
+        confirmedIssues.push(details);
+        log(`[sweep] added confirmed issue #${num}: ${details.title}`);
+      }
+    } catch (err) {
+      log(`[sweep] failed to fetch issue #${num}: ${(err as Error).message}; skipping`);
+    }
+  }
 
   let prSummary = '';
   let evalSummary = '';
