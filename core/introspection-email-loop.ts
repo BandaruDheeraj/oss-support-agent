@@ -25,6 +25,8 @@ import {
   IntrospectionEmailLoopError,
 } from './introspection-email-types';
 
+import { encodeRunIdForLocalPart } from './resend-mail';
+
 const DEFAULT_MAX_ITERATIONS = 10;
 
 export function formatIntrospectionSubject(repoFullName: string): string {
@@ -345,24 +347,31 @@ export function resumeIntrospectionEmailLoop(
 /**
  * A ReplyHandler implementation that allows blocking until a reply arrives.
  * Used to implement waitForEmailReply(repoFullName).
+ *
+ * Keys are normalized via encodeRunIdForLocalPart so that runIds containing
+ * characters that get rewritten in plus-addressed reply-to local-parts
+ * (slash, '#', uppercase, etc.) still match when the inbound webhook
+ * dispatches the reply with the encoded form.
  */
 export class IntrospectionReplyWaiter implements ReplyHandler {
   private readonly pending = new Map<string, { resolve: (v: { reply: GmailReply; thread: EmailThread }) => void; reject: (e: Error) => void }>();
 
   waitForEmailReply(repoFullName: string): Promise<{ reply: GmailReply; thread: EmailThread }> {
-    if (this.pending.has(repoFullName)) {
+    const key = encodeRunIdForLocalPart(repoFullName);
+    if (this.pending.has(key)) {
       return Promise.reject(new Error(`Already waiting for reply for ${repoFullName}`));
     }
 
     return new Promise((resolve, reject) => {
-      this.pending.set(repoFullName, { resolve, reject });
+      this.pending.set(key, { resolve, reject });
     });
   }
 
   async onReply(runId: string, reply: GmailReply, thread: EmailThread): Promise<void> {
-    const p = this.pending.get(runId);
+    const key = encodeRunIdForLocalPart(runId);
+    const p = this.pending.get(key);
     if (!p) return;
-    this.pending.delete(runId);
+    this.pending.delete(key);
     p.resolve({ reply, thread });
   }
 }
