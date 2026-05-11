@@ -33,6 +33,57 @@ async function ghFetch(token: string, url: string, init: RequestInit = {}): Prom
 export const REGRESSION_WORKFLOW_PATH = '.github/workflows/regression-test.yml';
 export const USABILITY_WORKFLOW_PATH = '.github/workflows/usability-test.yml';
 
+/**
+ * Generic helper: ensure a workflow file is present on a specific branch of the
+ * fork with the given content. Idempotent — no-op if the file already matches.
+ * Returns true if a commit was created.
+ */
+async function ensureWorkflowOnBranch(
+  token: string,
+  forkFullName: string,
+  workflowPath: string,
+  workflowContent: string,
+  branch: string,
+  commitMessage: string,
+  label: string,
+  log: (msg: string) => void
+): Promise<boolean> {
+  const contentUrl = `${GITHUB_API}/repos/${forkFullName}/contents/${workflowPath}?ref=${encodeURIComponent(branch)}`;
+  const contentRes = await ghFetch(token, contentUrl);
+  let existingSha: string | null = null;
+  if (contentRes.ok) {
+    const contentData: any = await contentRes.json();
+    if (typeof contentData.content === 'string') {
+      const decoded = Buffer.from(contentData.content, 'base64').toString('utf-8');
+      if (decoded.trim() === workflowContent.trim()) {
+        log(`[gha-setup] ${label} workflow already up to date on ${forkFullName}@${branch}`);
+        return false;
+      }
+      existingSha = contentData.sha;
+    }
+  } else if (contentRes.status !== 404) {
+    throw new Error(`GitHub get contents failed (${contentRes.status}): ${await contentRes.text()}`);
+  }
+
+  const putUrl = `${GITHUB_API}/repos/${forkFullName}/contents/${workflowPath}`;
+  const body: Record<string, unknown> = {
+    message: commitMessage,
+    content: Buffer.from(workflowContent, 'utf-8').toString('base64'),
+    branch,
+  };
+  if (existingSha) body.sha = existingSha;
+  const putRes = await ghFetch(token, putUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!putRes.ok) {
+    throw new Error(`GitHub put contents failed (${putRes.status}): ${await putRes.text()}`);
+  }
+  log(`[gha-setup] installed ${label} workflow on ${forkFullName}@${branch}`);
+  return true;
+}
+
 export const REGRESSION_WORKFLOW_CONTENT = `name: regression-test
 
 # Auto-installed by oss-support-agent to support the regression-guard agent.
@@ -347,50 +398,47 @@ export async function ensureRegressionWorkflowOnFork(
   forkFullName: string,
   log: (msg: string) => void = () => undefined
 ): Promise<{ committed: boolean; defaultBranch: string }> {
-  // 1. Get the default branch name
   const repoRes = await ghFetch(token, `${GITHUB_API}/repos/${forkFullName}`);
   if (!repoRes.ok) {
     throw new Error(`GitHub get repo failed (${repoRes.status}): ${await repoRes.text()}`);
   }
   const repoData: any = await repoRes.json();
   const defaultBranch: string = repoData.default_branch;
+  const committed = await ensureWorkflowOnBranch(
+    token,
+    forkFullName,
+    REGRESSION_WORKFLOW_PATH,
+    REGRESSION_WORKFLOW_CONTENT,
+    defaultBranch,
+    'chore(agent): install regression-test workflow for oss-support-agent\n\nAuto-installed by oss-support-agent. Safe to delete if you do not use the GHA sandbox runner.',
+    'regression-test',
+    log
+  );
+  return { committed, defaultBranch };
+}
 
-  // 2. Check if the file already exists with matching content
-  const contentUrl = `${GITHUB_API}/repos/${forkFullName}/contents/${REGRESSION_WORKFLOW_PATH}?ref=${encodeURIComponent(defaultBranch)}`;
-  const contentRes = await ghFetch(token, contentUrl);
-  let existingSha: string | null = null;
-  if (contentRes.ok) {
-    const contentData: any = await contentRes.json();
-    if (typeof contentData.content === 'string') {
-      const decoded = Buffer.from(contentData.content, 'base64').toString('utf-8');
-      if (decoded.trim() === REGRESSION_WORKFLOW_CONTENT.trim()) {
-        log(`[gha-setup] regression workflow already up to date on ${forkFullName}@${defaultBranch}`);
-        return { committed: false, defaultBranch };
-      }
-      existingSha = contentData.sha;
-    }
-  } else if (contentRes.status !== 404) {
-    throw new Error(`GitHub get contents failed (${contentRes.status}): ${await contentRes.text()}`);
-  }
-
-  // 3. Create or update the file
-  const putUrl = `${GITHUB_API}/repos/${forkFullName}/contents/${REGRESSION_WORKFLOW_PATH}`;
-  const body: Record<string, unknown> = {
-    message: 'chore(agent): install regression-test workflow for oss-support-agent\n\nAuto-installed by oss-support-agent. Safe to delete if you do not use the GHA sandbox runner.',
-    content: Buffer.from(REGRESSION_WORKFLOW_CONTENT, 'utf-8').toString('base64'),
-    branch: defaultBranch,
-  };
-  if (existingSha) body.sha = existingSha;
-  const putRes = await ghFetch(token, putUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!putRes.ok) {
-    throw new Error(`GitHub put contents failed (${putRes.status}): ${await putRes.text()}`);
-  }
-  log(`[gha-setup] installed regression-test workflow on ${forkFullName}@${defaultBranch}`);
-  return { committed: true, defaultBranch };
+/**
+ * Ensure the regression workflow file is present on a specific (non-default)
+ * branch of the fork. Used so that workflow_dispatch can be targeted at the
+ * agent branch (so head_branch of the resulting run matches the branch we want
+ * to look up).
+ */
+export async function ensureRegressionWorkflowOnBranch(
+  token: string,
+  forkFullName: string,
+  branch: string,
+  log: (msg: string) => void = () => undefined
+): Promise<boolean> {
+  return ensureWorkflowOnBranch(
+    token,
+    forkFullName,
+    REGRESSION_WORKFLOW_PATH,
+    REGRESSION_WORKFLOW_CONTENT,
+    branch,
+    'chore(agent): install regression-test workflow for oss-support-agent\n\nAuto-installed by oss-support-agent. Safe to delete if you do not use the GHA sandbox runner.',
+    'regression-test',
+    log
+  );
 }
 
 /**
@@ -408,39 +456,39 @@ export async function ensureUsabilityWorkflowOnFork(
   }
   const repoData: any = await repoRes.json();
   const defaultBranch: string = repoData.default_branch;
+  const committed = await ensureWorkflowOnBranch(
+    token,
+    forkFullName,
+    USABILITY_WORKFLOW_PATH,
+    USABILITY_WORKFLOW_CONTENT,
+    defaultBranch,
+    'chore(agent): install usability-test workflow for oss-support-agent\n\nAuto-installed by oss-support-agent. Safe to delete if you do not use the GHA sandbox runner.',
+    'usability-test',
+    log
+  );
+  return { committed, defaultBranch };
+}
 
-  const contentUrl = `${GITHUB_API}/repos/${forkFullName}/contents/${USABILITY_WORKFLOW_PATH}?ref=${encodeURIComponent(defaultBranch)}`;
-  const contentRes = await ghFetch(token, contentUrl);
-  let existingSha: string | null = null;
-  if (contentRes.ok) {
-    const contentData: any = await contentRes.json();
-    if (typeof contentData.content === 'string') {
-      const decoded = Buffer.from(contentData.content, 'base64').toString('utf-8');
-      if (decoded.trim() === USABILITY_WORKFLOW_CONTENT.trim()) {
-        log(`[gha-setup] usability workflow already up to date on ${forkFullName}@${defaultBranch}`);
-        return { committed: false, defaultBranch };
-      }
-      existingSha = contentData.sha;
-    }
-  } else if (contentRes.status !== 404) {
-    throw new Error(`GitHub get contents failed (${contentRes.status}): ${await contentRes.text()}`);
-  }
-
-  const putUrl = `${GITHUB_API}/repos/${forkFullName}/contents/${USABILITY_WORKFLOW_PATH}`;
-  const body: Record<string, unknown> = {
-    message: 'chore(agent): install usability-test workflow for oss-support-agent\n\nAuto-installed by oss-support-agent. Safe to delete if you do not use the GHA sandbox runner.',
-    content: Buffer.from(USABILITY_WORKFLOW_CONTENT, 'utf-8').toString('base64'),
-    branch: defaultBranch,
-  };
-  if (existingSha) body.sha = existingSha;
-  const putRes = await ghFetch(token, putUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!putRes.ok) {
-    throw new Error(`GitHub put contents failed (${putRes.status}): ${await putRes.text()}`);
-  }
-  log(`[gha-setup] installed usability-test workflow on ${forkFullName}@${defaultBranch}`);
-  return { committed: true, defaultBranch };
+/**
+ * Ensure the usability workflow file is present on a specific (non-default)
+ * branch of the fork. Used so that workflow_dispatch can be targeted at the
+ * agent branch (so head_branch of the resulting run matches the branch we want
+ * to look up).
+ */
+export async function ensureUsabilityWorkflowOnBranch(
+  token: string,
+  forkFullName: string,
+  branch: string,
+  log: (msg: string) => void = () => undefined
+): Promise<boolean> {
+  return ensureWorkflowOnBranch(
+    token,
+    forkFullName,
+    USABILITY_WORKFLOW_PATH,
+    USABILITY_WORKFLOW_CONTENT,
+    branch,
+    'chore(agent): install usability-test workflow for oss-support-agent\n\nAuto-installed by oss-support-agent. Safe to delete if you do not use the GHA sandbox runner.',
+    'usability-test',
+    log
+  );
 }
