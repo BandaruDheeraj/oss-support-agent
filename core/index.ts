@@ -27,19 +27,10 @@ export {
 } from './orchestrator';
 export type { Run, TransitionLogEntry } from './orchestrator';
 
-export {
-  createWebhookServer,
-  verifySignature,
-  computeSignature,
-  routeEvent,
-} from './webhook';
-export type {
-  WebhookServerOptions,
-  ManifestRegistry,
-  IssueEvent,
-  GitHubIssue,
-  WebhookResult,
-} from './webhook';
+export { verifySignature, computeSignature } from './webhook/signature';
+export { routeEvent } from './webhook/router';
+export type { ManifestRegistry } from './webhook/router';
+export type { IssueEvent, GitHubIssue, WebhookResult } from './webhook/types';
 
 export {
   loadAdapter,
