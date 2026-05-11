@@ -82,6 +82,80 @@ export function validateChangeScope(
 }
 
 /**
+ * Detect destructive whole-file rewrites where the LLM truncated existing
+ * file contents and replaced them with placeholder comments instead of
+ * returning the complete post-edit file. This is a common failure mode of
+ * "return the complete file contents" patch formats with long inputs.
+ *
+ * Returns details of any modify-action change whose new content either:
+ *   - shrinks the file by more than `maxShrinkRatio` (default 50%) when the
+ *     original was non-trivial in size, OR
+ *   - contains LLM placeholder strings like `# ... existing code ...`,
+ *     `# Other imports...`, `# Existing logic...`, `// ... rest of file ...`,
+ *     `<!-- existing content -->`, etc.
+ */
+export function detectDestructiveRewrites(
+  sourceChanges: FileChange[],
+  moduleSource: Array<{ path: string; content: string }>,
+  opts: { maxShrinkRatio?: number; minOriginalBytes?: number } = {}
+): Array<{ path: string; reason: string; originalBytes: number; newBytes: number }> {
+  const maxShrinkRatio = opts.maxShrinkRatio ?? 0.5;
+  const minOriginalBytes = opts.minOriginalBytes ?? 400;
+
+  const placeholderPatterns: RegExp[] = [
+    /#\s*\.{3,}\s*existing\s+(code|content|imports|logic)/i,
+    /#\s*existing\s+(code|content|imports|logic)\s*\.{3,}/i,
+    /#\s*other\s+(imports|code|content|logic)\s*\.{3,}/i,
+    /#\s*rest\s+of\s+(the\s+)?(file|code|module|imports)/i,
+    /\/\/\s*\.{3,}\s*existing\s+(code|content|imports|logic)/i,
+    /\/\/\s*existing\s+(code|content|imports|logic)\s*\.{3,}/i,
+    /\/\/\s*rest\s+of\s+(the\s+)?(file|code|module)/i,
+    /<!--\s*existing\s+(code|content)\s*-->/i,
+    /\/\*\s*\.{3,}\s*existing\s+(code|content)/i,
+    /#\s*\(unchanged\)/i,
+    /#\s*existing\s+logic\s*\.\.\./i,
+    /#\s*omitted\s+for\s+brevity/i,
+    /\/\/\s*omitted\s+for\s+brevity/i,
+  ];
+
+  const sourceByPath = new Map(moduleSource.map((f) => [f.path, f.content]));
+  const findings: Array<{ path: string; reason: string; originalBytes: number; newBytes: number }> = [];
+
+  for (const change of sourceChanges) {
+    if (change.action !== 'modify') continue;
+    const original = sourceByPath.get(change.path);
+    if (original === undefined) continue;
+    const originalBytes = Buffer.byteLength(original, 'utf-8');
+    const newBytes = Buffer.byteLength(change.content, 'utf-8');
+
+    const placeholderHit = placeholderPatterns.find((p) => p.test(change.content));
+    if (placeholderHit) {
+      findings.push({
+        path: change.path,
+        reason: `output contains placeholder pattern matching ${placeholderHit.source}; LLM truncated the file instead of returning complete contents`,
+        originalBytes,
+        newBytes,
+      });
+      continue;
+    }
+
+    if (originalBytes >= minOriginalBytes) {
+      const shrinkRatio = 1 - newBytes / originalBytes;
+      if (shrinkRatio > maxShrinkRatio) {
+        findings.push({
+          path: change.path,
+          reason: `file shrunk by ${(shrinkRatio * 100).toFixed(0)}% (${originalBytes}B → ${newBytes}B); LLM likely truncated instead of returning complete contents`,
+          originalBytes,
+          newBytes,
+        });
+      }
+    }
+  }
+
+  return findings;
+}
+
+/**
  * Verify the fix agent token does NOT have broad write access
  * that could allow writing to upstream.
  */
@@ -180,6 +254,29 @@ export async function runFixAgent(
       `Fix agent produced out-of-scope changes: ${scopeCheck.outOfScope.join(', ')}. ` +
       `Only changes within "${input.affectedModule}" and test files are allowed.`,
       'scope_validation'
+    );
+  }
+
+  // Step 4b: Detect destructive whole-file rewrites (truncation with
+  // placeholder comments, dramatic shrinkage). The LLM is asked to return
+  // complete post-edit file contents — sometimes it abridges. We surface
+  // this as a fix-agent error so the retry loop re-prompts with the
+  // explicit guidance below.
+  const destructive = detectDestructiveRewrites(
+    fixOutput.sourceChanges,
+    input.moduleSource
+  );
+  if (destructive.length > 0) {
+    const details = destructive
+      .map((d) => `  - ${d.path}: ${d.reason}`)
+      .join('\n');
+    throw new FixAgentError(
+      `Fix agent returned destructive whole-file rewrite(s):\n${details}\n` +
+      `When using action="modify" you MUST return the complete unabridged file ` +
+      `contents — no "# Other imports...", no "# Existing logic...", no ellipses or ` +
+      `placeholder comments. If you cannot reproduce the entire file verbatim, do ` +
+      `not modify it.`,
+      'destructive_rewrite'
     );
   }
 

@@ -28,25 +28,35 @@ export default class OpenInferenceForkAdapter extends BaseRepoAdapter {
   }
 
   async getTestCommands(): Promise<string[]> {
-    // Real-but-cheap signal for an openinference fork. Openinference is a
-    // multi-language monorepo (python/ js/ java/) and the fix agent typically
-    // edits a single instrumentation module, so running the full upstream
-    // suite is both overkill and prohibitively slow for the GHA free tier.
+    // Real-but-cheap signal for an openinference fork. The local sandbox
+    // (bin/clients/local-sandbox.ts) executes these on the agent's runner
+    // (e.g. Render) inside the fork's single-branch shallow clone — NOT in
+    // GHA — so we can only rely on tools that ship with that container.
+    // The Render runner has python + git but no uv/uvx/ruff.
     //
-    // We pick lightweight checks that:
-    //   - actually exercise the code on the fork branch (not just `echo ok`),
-    //   - pass cleanly against upstream main so the regression-guard diff has
-    //     a stable baseline,
-    //   - complete in <60s on a stock ubuntu-latest runner without any
-    //     dependency installs beyond what's already preinstalled.
+    // Strategy: run `python -m py_compile` only on the Python files the
+    // agent changed vs origin/main. This:
+    //   - catches real syntax errors the LLM introduces (the most common
+    //     destructive failure mode for whole-file LLM rewrites),
+    //   - has a stable baseline (we only check files the agent touched, so
+    //     pre-existing upstream-main issues never trip the gate),
+    //   - runs in <5s on a stock container with no extra installs,
+    //   - exits 0 when the agent touched no Python files (e.g. yaml-only
+    //     edits) instead of false-failing.
     //
-    // py_compile catches syntax errors anywhere under python/; ruff (fetched
-    // via uvx, which is preinstalled on ubuntu-latest) catches the style and
-    // common-bug rules the project already enforces in its Makefile.
-    return [
-      'python -m compileall -q python',
-      'uvx ruff@0.9.2 check python --output-format=concise',
-    ];
+    // The single-branch clone doesn't have origin/main locally, so we
+    // shallow-fetch it first. `set -e` ensures any failure (fetch, diff,
+    // or compile) propagates as a non-zero exit.
+    const pyCompileChanged = [
+      'set -e',
+      'git fetch --depth=50 origin main >/dev/null 2>&1',
+      "files=$(git diff --name-only origin/main...HEAD -- '*.py' || true)",
+      'if [ -z "$files" ]; then echo "no python files changed vs origin/main; skipping py_compile"; exit 0; fi',
+      'echo "checking $(echo \"$files\" | wc -l) python file(s):"',
+      'echo "$files"',
+      'echo "$files" | xargs python -m py_compile',
+    ].join(' && ');
+    return [pyCompileChanged];
   }
 
   async getSandboxServices(): Promise<ServiceConfig[]> {

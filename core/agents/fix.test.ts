@@ -10,6 +10,7 @@ import {
   validateTestCoverage,
   readFullModule,
   runFixAgent,
+  detectDestructiveRewrites,
 } from './fix';
 import {
   FixAgentInput,
@@ -201,6 +202,121 @@ describe('validateTestCoverage', () => {
   });
 });
 
+// ─── detectDestructiveRewrites ────────────────────────────────────────────────
+
+describe('detectDestructiveRewrites', () => {
+  const longOriginal = Array(50).fill('def fn(): pass').join('\n'); // ~700 bytes
+
+  it('flags a modify change containing a "# Other imports..." placeholder', () => {
+    const source: FileChange[] = [
+      {
+        path: 'src/auth/handler.py',
+        action: 'modify',
+        content: 'from x import y# Other imports...\ndef fn(): return 1',
+      },
+    ];
+    const findings = detectDestructiveRewrites(source, [
+      { path: 'src/auth/handler.py', content: longOriginal },
+    ]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].path).toBe('src/auth/handler.py');
+    expect(findings[0].reason).toMatch(/placeholder/);
+  });
+
+  it('flags a modify change containing a "# Existing logic..." placeholder', () => {
+    const source: FileChange[] = [
+      {
+        path: 'a.py',
+        action: 'modify',
+        content: 'def f():\n    if x: return\n    # Existing logic...',
+      },
+    ];
+    const findings = detectDestructiveRewrites(source, [
+      { path: 'a.py', content: longOriginal },
+    ]);
+    expect(findings).toHaveLength(1);
+  });
+
+  it('flags a modify change containing "// ... rest of file ..."', () => {
+    const source: FileChange[] = [
+      {
+        path: 'a.ts',
+        action: 'modify',
+        content: 'export function f() { return 1; }\n// ... rest of file ...',
+      },
+    ];
+    const findings = detectDestructiveRewrites(source, [
+      { path: 'a.ts', content: longOriginal },
+    ]);
+    expect(findings).toHaveLength(1);
+  });
+
+  it('flags a modify change that shrinks a large file by more than 50%', () => {
+    const source: FileChange[] = [
+      { path: 'a.py', action: 'modify', content: 'def f(): return 1\n' },
+    ];
+    const findings = detectDestructiveRewrites(source, [
+      { path: 'a.py', content: longOriginal },
+    ]);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].reason).toMatch(/shrunk/);
+  });
+
+  it('does not flag a small original file even if heavily edited', () => {
+    const source: FileChange[] = [
+      { path: 'a.py', action: 'modify', content: 'def f(): return 1' },
+    ];
+    const findings = detectDestructiveRewrites(source, [
+      { path: 'a.py', content: 'def f(): return 0' }, // <400B → exempt
+    ]);
+    expect(findings).toHaveLength(0);
+  });
+
+  it('does not flag a modify change that preserves most content', () => {
+    const newContent = longOriginal + '\ndef extra(): return 2';
+    const source: FileChange[] = [
+      { path: 'a.py', action: 'modify', content: newContent },
+    ];
+    const findings = detectDestructiveRewrites(source, [
+      { path: 'a.py', content: longOriginal },
+    ]);
+    expect(findings).toHaveLength(0);
+  });
+
+  it('does not flag a create action (no original to compare)', () => {
+    const source: FileChange[] = [
+      { path: 'new.py', action: 'create', content: 'def f(): pass' },
+    ];
+    const findings = detectDestructiveRewrites(source, []);
+    expect(findings).toHaveLength(0);
+  });
+
+  it('does not flag a modify when path is absent from moduleSource', () => {
+    const source: FileChange[] = [
+      { path: 'unknown.py', action: 'modify', content: 'tiny' },
+    ];
+    const findings = detectDestructiveRewrites(source, [
+      { path: 'other.py', content: longOriginal },
+    ]);
+    expect(findings).toHaveLength(0);
+  });
+
+  it('reproduces the live #17 destructive output (real-world regression)', () => {
+    const destructive =
+      'from opentelemetry.trace import NonRecordingSpan# Other imports...def _finalize_step_span(span):\n' +
+      '    # Guard against NonRecordingSpan\n' +
+      '    if isinstance(span, NonRecordingSpan):\n' +
+      '        return\n' +
+      '    if span.status.status_code != trace_api.StatusCode.ERROR:\n' +
+      '        # Existing logic...\n';
+    const findings = detectDestructiveRewrites(
+      [{ path: '_wrappers.py', action: 'modify', content: destructive }],
+      [{ path: '_wrappers.py', content: longOriginal }]
+    );
+    expect(findings).toHaveLength(1);
+  });
+});
+
 // ─── verifyForkOnlyAccess ─────────────────────────────────────────────────────
 
 describe('verifyForkOnlyAccess', () => {
@@ -286,6 +402,37 @@ describe('runFixAgent', () => {
       'agent/scope-142-156',
       'src/auth'
     );
+  });
+
+  it('rejects destructive whole-file rewrites with FixAgentError(destructive_rewrite)', async () => {
+    const longOriginal = Array(50).fill('def fn(): pass').join('\n');
+    const input = makeInput({
+      moduleSource: [{ path: 'src/auth/handler.ts', content: longOriginal }],
+    });
+    const generator: FixGenerator = {
+      generateFix: jest.fn().mockResolvedValue({
+        sourceChanges: [
+          {
+            path: 'src/auth/handler.ts',
+            action: 'modify',
+            content: 'import x\n// ... rest of file ...',
+          },
+        ],
+        testChanges: [
+          { path: 'src/auth/__tests__/handler.test.ts', action: 'modify', content: 'updated test' },
+        ],
+        summary: 'collapsed file',
+      }),
+    };
+    const committer = makeMockCommitter([]);
+    const reader = makeMockReader();
+
+    await expect(runFixAgent(input, generator, committer, reader)).rejects.toMatchObject({
+      name: 'FixAgentError',
+      phase: 'destructive_rewrite',
+    });
+    // Must not have committed anything
+    expect(committer.commitChanges).not.toHaveBeenCalled();
   });
 
   it('commits changes to the fork branch only', async () => {

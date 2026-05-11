@@ -62,6 +62,13 @@ export class OpenRouterFixGenerator implements FixGenerator {
           'Every entry in sourceChanges and testChanges MUST include all three fields: path, action, and content. ' +
           'The "action" field must be exactly the string "modify" (for existing files) or "create" (for new files). ' +
           'The "content" field is the COMPLETE file contents after your edit (not a diff). ' +
+          'CRITICAL: When action="modify" you MUST reproduce the entire file verbatim, ' +
+          'including every line that you are NOT changing. NEVER abbreviate, truncate, or ' +
+          'replace existing code with placeholder comments such as "# ...existing code...", ' +
+          '"# Other imports...", "# Existing logic...", "// ... rest of file ...", ' +
+          '"# (unchanged)", "# omitted for brevity", or any ellipsis-based summary. ' +
+          'If the file is too long to reproduce in full, prefer making no edit to that file ' +
+          'and explaining the limitation in summary. ' +
           'Only touch files within the affected module and related tests. ' +
           'IMPORTANT: If sourceChanges is non-empty, testChanges MUST also be non-empty. ' +
           'For documentation-only fixes (README, AGENTS.md, CHANGELOG, etc.) where no executable test makes sense, ' +
