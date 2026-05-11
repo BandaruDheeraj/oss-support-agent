@@ -206,7 +206,10 @@ async function runPMDesignLoop(args: {
 
   const briefGen = new HeuristicBriefGenerator();
   const followUpGen: FollowUpGenerator = process.env.OPENROUTER_API_KEY
-    ? new OpenRouterPMFollowUpGenerator()
+    ? new OpenRouterPMFollowUpGenerator(undefined, {
+        browser: live.codeBrowser,
+        repo: repoFullName,
+      })
     : new HeuristicFollowUpGenerator();
 
   log(`[pm] sending design brief to ${manifest.pm_email}`);

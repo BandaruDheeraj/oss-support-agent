@@ -42,6 +42,7 @@ import {
   GitHubIssueLabeler,
   GmailFailureNotifier,
 } from './pm-deps';
+import { GitHubCodeBrowser } from './github-code-browser';
 import { OpenRouterDocsGenerator } from './openrouter-docs-generator';
 
 export interface LiveDeps {
@@ -62,6 +63,7 @@ export interface LiveDeps {
   issueSearcher: GitHubIssueSearcher;
   prFetcher: GitHubPRFetcher;
   designDocFinder: GitHubDesignDocFinder;
+  codeBrowser: GitHubCodeBrowser;
   failureNotifier: GmailFailureNotifier;
   issueLabeler: GitHubIssueLabeler;
   docsGenerator: OpenRouterDocsGenerator;
@@ -139,6 +141,7 @@ export function buildLiveDeps(
   const issueSearcher = new GitHubIssueSearcher(options.token);
   const prFetcher = new GitHubPRFetcher(options.token);
   const designDocFinder = new GitHubDesignDocFinder(options.token);
+  const codeBrowser = new GitHubCodeBrowser(options.token);
   const failureNotifier = new GmailFailureNotifier(resendDeps.client);
   const issueLabeler = new GitHubIssueLabeler(options.token);
   const docsGenerator = new OpenRouterDocsGenerator();
@@ -189,6 +192,7 @@ export function buildLiveDeps(
     issueSearcher,
     prFetcher,
     designDocFinder,
+    codeBrowser,
     failureNotifier,
     issueLabeler,
     docsGenerator,
