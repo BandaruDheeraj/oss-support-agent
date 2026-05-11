@@ -1,4 +1,4 @@
-import { decideVerificationOutcome } from '../bin/run-pipeline';
+import { decideVerificationOutcome, summarizeVerificationFailure } from '../bin/run-pipeline';
 
 describe('decideVerificationOutcome', () => {
   test('returns ok=true with empty retryContext when no regression and no blockers', () => {
@@ -60,5 +60,49 @@ describe('decideVerificationOutcome', () => {
     });
     expect(r.ok).toBe(false);
     expect(r.retryContext).toContain('0 diff(s)');
+  });
+});
+
+describe('summarizeVerificationFailure', () => {
+  test('counts regressions from the diff(s) marker', () => {
+    const r = decideVerificationOutcome({
+      regressionDetected: true,
+      regressionDiffs: [
+        { category: 'exit_code', description: 'fork=1 main=0' },
+        { category: 'stderr', description: 'new traceback' },
+      ],
+      blockers: [],
+    });
+    expect(summarizeVerificationFailure(r.retryContext)).toBe(
+      'verification-failed: 2 regression'
+    );
+  });
+
+  test('counts usability blockers separately from regression diffs', () => {
+    const r = decideVerificationOutcome({
+      regressionDetected: false,
+      blockers: ['installation failed', 'import_paths broken'],
+    });
+    expect(summarizeVerificationFailure(r.retryContext)).toBe(
+      'verification-failed: 2 usability blockers'
+    );
+  });
+
+  test('combines both counts when both signals fail', () => {
+    const r = decideVerificationOutcome({
+      regressionDetected: true,
+      regressionDiffs: [{ category: 'timeout', description: 'fork timed out' }],
+      blockers: ['setup.py missing'],
+    });
+    expect(summarizeVerificationFailure(r.retryContext)).toBe(
+      'verification-failed: 1 regression, 1 usability blocker'
+    );
+  });
+
+  test('falls back to bare verification-failed for empty/unstructured context', () => {
+    expect(summarizeVerificationFailure('')).toBe('verification-failed');
+    expect(summarizeVerificationFailure('something else entirely')).toBe(
+      'verification-failed'
+    );
   });
 });

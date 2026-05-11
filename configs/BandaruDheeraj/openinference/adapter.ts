@@ -28,10 +28,25 @@ export default class OpenInferenceForkAdapter extends BaseRepoAdapter {
   }
 
   async getTestCommands(): Promise<string[]> {
-    // E2E test stub: always-pass commands so we can verify the full pipeline
-    // (fix → sandbox → eval → PR). Real test infra isn't available in the
-    // ephemeral sandbox clone for this fork.
-    return ['echo "sandbox ok"'];
+    // Real-but-cheap signal for an openinference fork. Openinference is a
+    // multi-language monorepo (python/ js/ java/) and the fix agent typically
+    // edits a single instrumentation module, so running the full upstream
+    // suite is both overkill and prohibitively slow for the GHA free tier.
+    //
+    // We pick lightweight checks that:
+    //   - actually exercise the code on the fork branch (not just `echo ok`),
+    //   - pass cleanly against upstream main so the regression-guard diff has
+    //     a stable baseline,
+    //   - complete in <60s on a stock ubuntu-latest runner without any
+    //     dependency installs beyond what's already preinstalled.
+    //
+    // py_compile catches syntax errors anywhere under python/; ruff (fetched
+    // via uvx, which is preinstalled on ubuntu-latest) catches the style and
+    // common-bug rules the project already enforces in its Makefile.
+    return [
+      'python -m compileall -q python',
+      'uvx ruff@0.9.2 check python --output-format=concise',
+    ];
   }
 
   async getSandboxServices(): Promise<ServiceConfig[]> {

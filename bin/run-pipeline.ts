@@ -235,11 +235,12 @@ async function runPMDesignLoop(args: {
   manifest: Manifest;
   triageSummary: string;
   affectedModule: string;
+  issueType: 'bug_fix' | 'new_feature' | 'docs';
   live: LiveDeps;
   log: (msg: string) => void;
   runId: string;
 }): Promise<{ approved: true; agreedDesign: string }> {
-  const { payload, manifest, triageSummary, affectedModule, live, log, runId } = args;
+  const { payload, manifest, triageSummary, affectedModule, issueType, live, log, runId } = args;
   const repoFullName = payload.repository.full_name;
   const issueNumber = payload.issue.number;
 
@@ -252,8 +253,14 @@ async function runPMDesignLoop(args: {
 
   const labels = (payload.issue.labels ?? []).map((l) => l.name);
 
+  // PM scoring expects bug_fix | new_feature. Docs issues route around the PM
+  // gate entirely, but guard the type narrowing here so a future code path
+  // change can't silently mislabel a docs issue as a bug.
+  const scoringIssueType: 'bug_fix' | 'new_feature' =
+    issueType === 'new_feature' ? 'new_feature' : 'bug_fix';
+
   const scoringInput = {
-    issueType: 'bug_fix' as const,
+    issueType: scoringIssueType,
     affectedModule,
     summary: triageSummary,
     title: payload.issue.title ?? '',
@@ -398,6 +405,27 @@ export function decideVerificationOutcome(args: {
   }
 
   return { ok: parts.length === 0, retryContext: parts.join('\n') };
+}
+
+/**
+ * One-line digest of a verification-gate failure, suitable for the
+ * max-retries-exceeded `reason` field and any other place where the rich
+ * multi-line retry context would be too noisy. Counts regression vs usability
+ * findings from the structured retry context so the surface is much more
+ * useful than the literal string `'verification-failed'`.
+ */
+export function summarizeVerificationFailure(retryContext: string): string {
+  const lines = retryContext.split('\n');
+  const regressionCountMatch = retryContext.match(/(\d+)\s+diff\(s\)/);
+  const regressionCount = regressionCountMatch ? Number(regressionCountMatch[1]) : 0;
+  const usabilityCount = lines.filter(
+    (l) => l.startsWith('- ') && !l.startsWith('- [')
+  ).length;
+  const sections: string[] = [];
+  if (regressionCount > 0) sections.push(`${regressionCount} regression`);
+  if (usabilityCount > 0) sections.push(`${usabilityCount} usability blocker${usabilityCount === 1 ? '' : 's'}`);
+  if (sections.length === 0) return 'verification-failed';
+  return `verification-failed: ${sections.join(', ')}`;
 }
 
 interface VerificationResult {
@@ -998,6 +1026,7 @@ export async function runPipeline(args: {
       manifest,
       triageSummary: routing.result.summary,
       affectedModule: routing.result.affectedModule,
+      issueType: routing.result.issueType,
       live: deps.live!,
       log,
       runId,
@@ -1203,7 +1232,7 @@ export async function runPipeline(args: {
         attempt = {
           ok: false,
           retryContext: verify.outcome.retryContext,
-          evalSummary: 'verification-failed',
+          evalSummary: summarizeVerificationFailure(verify.outcome.retryContext),
           fixSummary: attempt.fixSummary,
         };
       }
@@ -1325,7 +1354,7 @@ export async function runPipeline(args: {
         attempt = {
           ok: false,
           retryContext: verify.outcome.retryContext,
-          evalSummary: 'verification-failed',
+          evalSummary: summarizeVerificationFailure(verify.outcome.retryContext),
           fixSummary: attempt.fixSummary,
         };
       }
