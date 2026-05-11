@@ -48,17 +48,17 @@ export function routeEvent(
     return { status: 'skipped', reason: `No manifest found for repo: ${repo}` };
   }
 
-  // For issue.labeled, check if the label matches trigger_label or skip_pm_gate_label
+  // For issue.labeled, only the trigger_label kicks off a run. The
+  // skip_pm_gate_label is consulted from the issue's current label set during
+  // the pipeline, so accepting it here would just fire a duplicate parallel
+  // pipeline that stomps on the same workspace.
   if (event.action === 'labeled') {
     const labelName = event.label?.name;
     if (!labelName) {
       return { status: 'ignored', reason: 'Labeled event without label name' };
     }
 
-    const isTriggerLabel = labelName === manifest.trigger_label;
-    const isSkipPmGateLabel = labelName === manifest.skip_pm_gate_label;
-
-    if (!isTriggerLabel && !isSkipPmGateLabel) {
+    if (labelName !== manifest.trigger_label) {
       return {
         status: 'ignored',
         reason: `Label '${labelName}' does not match trigger_label '${manifest.trigger_label}'`,

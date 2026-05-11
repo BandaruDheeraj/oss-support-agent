@@ -118,10 +118,12 @@ async function processIssueEvent(
 
   if (manifest && action === 'labeled') {
     const labelName = (payload as any).label?.name;
-    if (
-      labelName !== manifest.trigger_label &&
-      labelName !== manifest.skip_pm_gate_label
-    ) {
+    // Only the trigger_label kicks off a pipeline run. The skip_pm_gate_label
+    // is read from the issue's full label set during the pipeline run, so
+    // adding it alone (or together with the trigger label) should NOT fire a
+    // second pipeline. Previously we accepted both, which caused two parallel
+    // pipelines to stomp on the same workspace when users added both labels.
+    if (labelName !== manifest.trigger_label) {
       return {
         status: 200,
         body: { status: 'ignored', reason: `label=${labelName}-not-trigger` },

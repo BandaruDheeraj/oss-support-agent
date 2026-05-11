@@ -203,7 +203,19 @@ REPRO CONTRACT — read carefully:
 1. The file must run as: \`python <path>\`.
 2. It MUST exit non-zero (raise / sys.exit(1)) WHEN the bug is present.
 3. It MUST exit zero AFTER a correct fix is applied.
-4. When it hits the BUG-SPECIFIC failure path (NOT ModuleNotFoundError, NOT SyntaxError, NOT pip failure) it MUST print the EXACT failureSentinel string to stdout BEFORE raising / exiting non-zero. The validator rejects the run if the sentinel is missing — that's how we distinguish "bug reproduced" from "the test is broken".
+4. When it hits the BUG-SPECIFIC failure path (NOT ModuleNotFoundError, NOT SyntaxError, NOT pip failure) it MUST print the EXACT failureSentinel string to stdout BEFORE raising / exiting non-zero. The validator rejects the run if the sentinel is missing — that's how we distinguish "bug reproduced" from "the test is broken". REQUIRED PATTERN — wrap the bug-triggering call in try/except so the exception cannot escape before the sentinel prints:
+
+   try:
+       trigger_the_buggy_code_path()
+   except ExpectedExceptionType as e:
+       # Optional: assert e matches the issue's specific failure (message substring, attribute, etc.)
+       print("REPRO_FAILURE_<bug_short>", flush=True)
+       raise
+   else:
+       # Bug did NOT fire — exit 0 so the loop knows assertions are wrong.
+       sys.exit(0)
+
+   Use \`flush=True\` (or \`sys.stdout.flush()\`) so the sentinel survives a crash. If the issue's bug fires at import time, wrap the import itself in try/except. Never put the sentinel print AFTER the line that raises — Python will not reach it.
 5. For repo-internal packages the test imports (e.g. \`openinference.instrumentation.<X>\`), declare the source dir in editableInstalls; the runner will \`pip install -e <dir>\`. Don't use sys.path hacks for these.
 6. For third-party deps (pytest, openai, pydantic, ...), declare them in pipPackages. Do NOT include opentelemetry-api / opentelemetry-sdk / wrapt — the adapter installs those. No flags, URLs, git refs, or local paths.
 7. Only assert the SPECIFIC failure mode described in the issue. Over-strict tests cause infinite retries.
@@ -217,6 +229,7 @@ USING FEEDBACK FROM PAST ATTEMPTS:
 - previousAttempts contains every prior turn's outcome (stage, reason, stdoutTail, stderrTail, exitCode).
 - If a prior attempt failed at "path_validation" / "sentinel_validation" / "setup_validation", FIX the structural issue — the same candidate will be rejected again.
 - If a prior attempt failed at "baseline_failed_to_repro" with exitCode=0, your test passed when it should have failed — your assertions don't match the bug. Re-read the issue, request more code if needed.
+- If a prior attempt failed at "baseline_failed_to_repro" with exitCode≠0 AND the reason says "did not print the failure sentinel", your test DID crash but the sentinel print line never ran because the exception escaped first. FIX: wrap the bug-triggering call in try/except (see REPRO CONTRACT #4), print(sentinel, flush=True) INSIDE the except, then \`raise\`. Read stderrTail to see which exception fired — that's the one to catch. Do NOT change the assertion logic; only restructure to print-before-raise.
 - If stderr shows ModuleNotFoundError / ImportError, declare the missing package in pipPackages or editableInstalls; do NOT add try/except around the import. Specifically: when stderr says "No module named 'X.Y.Z'" and 'X.Y.Z' looks like a repo-internal package (matches the affected module path), look at repoTreeSummary's "Candidate editableInstalls" section and add the INNERMOST candidate dir whose package path matches the import. Adapter setup ONLY installs third-party deps — it does NOT install in-repo packages.
 - If the same candidate is emitted twice it is rejected without running. Change SOMETHING.
 
