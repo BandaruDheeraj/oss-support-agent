@@ -63,6 +63,10 @@ export class OpenRouterFixGenerator implements FixGenerator {
           'The "action" field must be exactly the string "modify" (for existing files) or "create" (for new files). ' +
           'The "content" field is the COMPLETE file contents after your edit (not a diff). ' +
           'Only touch files within the affected module and related tests. ' +
+          'IMPORTANT: If sourceChanges is non-empty, testChanges MUST also be non-empty. ' +
+          'For documentation-only fixes (README, AGENTS.md, CHANGELOG, etc.) where no executable test makes sense, ' +
+          'add a trivial test entry such as a tests/test_docs_smoke.py with a single assertion that the doc file ' +
+          'exists and is non-empty. Do not omit testChanges. ' +
           'Do not include any properties other than path, action, content.',
       },
       {
