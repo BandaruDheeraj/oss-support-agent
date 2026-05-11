@@ -124,6 +124,60 @@ function buildTriageInput(payload: IssueEvent, manifest: Manifest, repoTree: str
   };
 }
 
+/**
+ * Extract file paths from a destructive_rewrite retry context. The error
+ * message produced by fix.ts is of the form:
+ *
+ *   Fix agent returned destructive whole-file rewrite(s):
+ *     - path/to/file.py: reason ...
+ *     - other/file.ts: reason ...
+ *   When using action="modify" ...
+ *
+ * We parse out the paths so the retry loop can augment moduleSource with the
+ * actual file content next time around — the LLM otherwise re-attempts a
+ * blind whole-file rewrite because the file isn't in the sampled moduleSource.
+ *
+ * Exported for testing.
+ */
+export function extractDestructivePaths(retryContext: string): string[] {
+  if (!retryContext.includes('destructive whole-file rewrite')) return [];
+  const paths: string[] = [];
+  for (const line of retryContext.split('\n')) {
+    const m = line.match(/^\s*-\s+([^\s:]+(?:\.[A-Za-z0-9]+)?):/);
+    if (m && m[1]) paths.push(m[1]);
+  }
+  return paths;
+}
+
+/**
+ * Read the actual content of files that a previous fix attempt destroyed and
+ * merge them into the FixAgentInput's moduleSource. This ensures that on
+ * retry, the LLM sees the full original file (not the sampled approximation
+ * gatherModuleFiles produced), giving it a chance to produce a surgical patch.
+ */
+async function augmentModuleSourceWithFiles(
+  baseInput: FixAgentInput,
+  paths: string[],
+  workspace: LocalWorkspace
+): Promise<FixAgentInput> {
+  if (paths.length === 0) return baseInput;
+  const reader = new LocalRepoFileReader(workspace);
+  const have = new Set(baseInput.moduleSource.map((f) => f.path));
+  const added: ModuleFile[] = [];
+  for (const p of paths) {
+    if (have.has(p)) continue;
+    try {
+      const content = await reader.readFile(baseInput.forkFullName, baseInput.branchName, p);
+      added.push({ path: p, content: content.slice(0, 200_000) });
+      have.add(p);
+    } catch {
+      /* file missing; skip */
+    }
+  }
+  if (added.length === 0) return baseInput;
+  return { ...baseInput, moduleSource: [...baseInput.moduleSource, ...added] };
+}
+
 function gatherModuleFiles(workspace: LocalWorkspace, modulePath: string): ModuleFile[] {
   const files: ModuleFile[] = [];
   const candidates = workspace.listFiles(modulePath);
@@ -1386,8 +1440,13 @@ export async function runPipeline(args: {
           return { status: 'max-retries-exceeded', reason: attempt.evalSummary };
         }
         log(`[retry] retrying (attempt ${decision.dispatch.retryCount}/${maxRetries})`);
+        const destructivePaths = extractDestructivePaths(attempt.retryContext);
+        if (destructivePaths.length > 0) {
+          log(`[retry] augmenting moduleSource with ${destructivePaths.length} destroyed file(s): ${destructivePaths.join(', ')}`);
+        }
+        const augmentedBase = await augmentModuleSourceWithFiles(fixInputBase, destructivePaths, workspace);
         currentInput = {
-          ...fixInputBase,
+          ...augmentedBase,
           designSummary: injectRetryContextForFixAgent(designSummary, decision.dispatch),
         };
       } else {
@@ -1398,8 +1457,13 @@ export async function runPipeline(args: {
           return { status: 'max-retries-exceeded', reason: attempt.evalSummary };
         }
         log(`[retry] retrying without persistence (attempt ${attemptsSoFar + 1}/${maxRetries})`);
+        const destructivePaths = extractDestructivePaths(attempt.retryContext);
+        if (destructivePaths.length > 0) {
+          log(`[retry] augmenting moduleSource with ${destructivePaths.length} destroyed file(s): ${destructivePaths.join(', ')}`);
+        }
+        const augmentedBase = await augmentModuleSourceWithFiles(fixInputBase, destructivePaths, workspace);
         currentInput = {
-          ...fixInputBase,
+          ...augmentedBase,
           designSummary:
             `${designSummary}\n\n## Latest Failure (address this in your fix)\n\n${attempt.retryContext}`,
         };
