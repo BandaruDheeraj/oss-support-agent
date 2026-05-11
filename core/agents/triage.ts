@@ -17,6 +17,7 @@ import {
   TriageTypeClassifier,
   IssueCommenter,
   IssueType,
+  TriageClassification,
 } from './triage-types';
 
 /** Confidence threshold below which a clarification comment is posted. */
@@ -24,8 +25,12 @@ export const LOW_CONFIDENCE_THRESHOLD = 0.6;
 
 /** Core issue-type classifier. Module routing is intentionally adapter-owned. */
 export class DefaultIssueTypeClassifier implements TriageTypeClassifier {
-  async classifyIssueType(input: TriageInput): Promise<IssueType> {
-    return classifyIssueType(input);
+  async classifyIssueType(input: TriageInput): Promise<TriageClassification> {
+    return {
+      issueType: classifyIssueType(input),
+      relevance: 'applicable',
+      relevanceReason: 'Heuristic classifier does not perform a relevance check; defaulting to applicable.',
+    };
   }
 }
 
@@ -157,6 +162,23 @@ export function buildClarificationComment(result: TriageResult): string {
   );
 }
 
+/**
+ * Generates a comment for issues triage judged not applicable to this codebase.
+ */
+export function buildNotApplicableComment(result: TriageResult): string {
+  return (
+    `🤖 **Triage Bot**: After reviewing this issue against the repository, ` +
+    `I do not see a clear connection to the code in this project.\n\n` +
+    `**My read:** ${result.relevanceReason}\n\n` +
+    `If I am wrong about this — for example, if the issue is about a ` +
+    `subsystem I missed, or if it is a feature request that should land in ` +
+    `this repo — please reply with a pointer to the relevant module, file, ` +
+    `or related issue and I will re-evaluate. ` +
+    `If the issue belongs in a different repository, closing it here is ` +
+    `probably the right move.`
+  );
+}
+
 export interface TriageOptions {
   issueNumber?: number;
   clonedRepoRoot?: string;
@@ -175,7 +197,7 @@ export async function triageIssue(
   const repoRoot = options.clonedRepoRoot ?? input.clonedRepoRoot ?? process.cwd();
   const typeClassifier = options.typeClassifier ?? new DefaultIssueTypeClassifier();
 
-  const issueType = await typeClassifier.classifyIssueType(input);
+  const classification = await typeClassifier.classifyIssueType(input);
   const rawModule = await adapter.classifyModule(buildAdapterIssue(input, issueNumber));
   const affectedModule = validateClassifiedModulePath(
     rawModule,
@@ -185,11 +207,18 @@ export async function triageIssue(
   );
   const confidence = computeConfidence(input, affectedModule);
   const result: TriageResult = {
-    issueType,
+    issueType: classification.issueType,
     affectedModule,
     confidence,
-    summary: generateSummary(input.title, issueType, affectedModule),
+    summary: generateSummary(input.title, classification.issueType, affectedModule),
+    relevance: classification.relevance,
+    relevanceReason: classification.relevanceReason,
   };
+
+  if (result.relevance === 'not_applicable') {
+    const comment = buildNotApplicableComment(result);
+    return { action: 'route_not_applicable', result, comment };
+  }
 
   if (result.confidence < LOW_CONFIDENCE_THRESHOLD) {
     const comment = buildClarificationComment(result);
@@ -225,7 +254,7 @@ export async function runTriage(
     repoFullName: repo,
   });
 
-  if (routing.action === 'clarify') {
+  if (routing.action === 'clarify' || routing.action === 'route_not_applicable') {
     await commenter.postComment(repo, issueNumber, routing.comment);
   }
 

@@ -77,8 +77,11 @@ describe('classifyIssueType', () => {
     expect(classifyIssueType({ ...baseInput, labels: [], title: 'Hello', body: null, moduleTaxonomy: ['docs'] })).toBe('docs');
   });
 
-  it('DefaultIssueTypeClassifier delegates to classifyIssueType', async () => {
-    await expect(new DefaultIssueTypeClassifier().classifyIssueType(baseInput)).resolves.toBe('bug_fix');
+  it('DefaultIssueTypeClassifier returns the rich classification shape', async () => {
+    const result = await new DefaultIssueTypeClassifier().classifyIssueType(baseInput);
+    expect(result.issueType).toBe('bug_fix');
+    expect(result.relevance).toBe('applicable');
+    expect(typeof result.relevanceReason).toBe('string');
   });
 });
 
@@ -171,10 +174,57 @@ describe('runTriage', () => {
     await runTriage('owner/repo', 42, baseInput, new FakeAdapter('core'), commenter);
     expect(commenter.comments).toHaveLength(0);
   });
+
+  it('posts a not-applicable comment when classifier returns relevance=not_applicable', async () => {
+    const commenter = new MockCommenter();
+    const stubClassifier = {
+      async classifyIssueType() {
+        return {
+          issueType: 'new_feature' as const,
+          relevance: 'not_applicable' as const,
+          relevanceReason: 'Issue references a product unrelated to this repository.',
+        };
+      },
+    };
+    const routing = await runTriage(
+      'owner/repo',
+      99,
+      baseInput,
+      new FakeAdapter('core'),
+      commenter,
+      { typeClassifier: stubClassifier }
+    );
+    expect(routing.action).toBe('route_not_applicable');
+    expect(routing.result.relevance).toBe('not_applicable');
+    expect(commenter.comments).toHaveLength(1);
+    expect(commenter.comments[0].comment).toContain('do not see a clear connection');
+  });
+
+  it('not_applicable short-circuits before low-confidence clarify', async () => {
+    const commenter = new MockCommenter();
+    const stubClassifier = {
+      async classifyIssueType() {
+        return {
+          issueType: 'bug_fix' as const,
+          relevance: 'not_applicable' as const,
+          relevanceReason: 'Off-topic.',
+        };
+      },
+    };
+    const routing = await runTriage(
+      'owner/repo',
+      1,
+      { ...baseInput, title: 'Bad', body: '', labels: [] },
+      new FakeAdapter('.'),
+      commenter,
+      { typeClassifier: stubClassifier }
+    );
+    expect(routing.action).toBe('route_not_applicable');
+  });
 });
 
 describe('buildClarificationComment', () => {
-  const result: TriageResult = { issueType: 'bug_fix', affectedModule: 'core', confidence: 0.45, summary: 'Bug fix in core' };
+  const result: TriageResult = { issueType: 'bug_fix', affectedModule: 'core', confidence: 0.45, summary: 'Bug fix in core', relevance: 'applicable', relevanceReason: 'Heuristic.' };
 
   it('includes the classified type', () => {
     expect(buildClarificationComment(result)).toContain('bug_fix');

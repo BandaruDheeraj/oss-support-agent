@@ -425,12 +425,24 @@ export async function runPipeline(args: {
     triageInput,
     adapter,
     commenter,
-    { typeClassifier: createDefaultTriageClassifier() }
+    {
+      typeClassifier: createDefaultTriageClassifier(
+        deps.live
+          ? { browser: deps.live.codeBrowser, repo: repoFullName }
+          : undefined
+      ),
+    }
   );
   log(
     `[triage] action=${routing.action} type=${routing.result.issueType} ` +
-      `module=${routing.result.affectedModule} confidence=${routing.result.confidence.toFixed(2)}`
+      `module=${routing.result.affectedModule} confidence=${routing.result.confidence.toFixed(2)} ` +
+      `relevance=${routing.result.relevance}`
   );
+
+  if (routing.action === 'route_not_applicable') {
+    log(`[triage] not_applicable: ${routing.result.relevanceReason}`);
+    return { status: 'commented', reason: 'not-applicable-comment-posted' };
+  }
 
   if (routing.action === 'clarify') {
     return { status: 'commented', reason: 'low-confidence-clarification-posted' };
