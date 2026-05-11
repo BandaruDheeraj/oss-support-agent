@@ -9,3 +9,5 @@ src/_write_test*.tmp
 data/workspaces/
 data/state/
 data/inbox/
+
+report.*.json
