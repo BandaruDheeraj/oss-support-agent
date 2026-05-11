@@ -169,6 +169,20 @@ export class LocalReproWorkspace implements ReproWorkspace {
       const affectedRoot = this.affectedModule.replace(/^\/+|\/+$/g, '');
       const sub = collectSubtree(this.inner, affectedRoot, 2, 200);
       for (const entry of sub) lines.push(`  ${entry}`);
+
+      // Surface candidate editableInstall paths: walk up from the affected
+      // module looking for dirs that contain a Python package manifest. The
+      // LLM otherwise has to guess which ancestor dir to `pip install -e`,
+      // and getting it wrong burns the whole baseline budget on
+      // ModuleNotFoundError.
+      const candidates = findEditableInstallCandidates(this.inner, affectedRoot);
+      if (candidates.length > 0) {
+        lines.push('');
+        lines.push(
+          'Candidate editableInstalls (dirs containing pyproject.toml/setup.py/setup.cfg on the path to the affected module — pick the INNERMOST one whose package matches the import you need):'
+        );
+        for (const c of candidates) lines.push(`  ${c}`);
+      }
     }
     return lines.join('\n');
   }
@@ -486,5 +500,33 @@ function collectSubtree(
     }
   };
   walk(rel, depth);
+  return out;
+}
+
+const PYTHON_PACKAGE_MANIFESTS = ['pyproject.toml', 'setup.py', 'setup.cfg'];
+
+/**
+ * Walk up from `rel` to the repo root, returning each ancestor dir that
+ * contains a Python package manifest. Innermost first.
+ */
+function findEditableInstallCandidates(
+  reader: FileReader,
+  rel: string
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let cur = rel.replace(/^\/+|\/+$/g, '');
+  // Cap iterations defensively in case of pathological inputs.
+  for (let i = 0; i < 32; i++) {
+    if (seen.has(cur)) break;
+    seen.add(cur);
+    const files = new Set(safeListFiles(reader, cur));
+    if (PYTHON_PACKAGE_MANIFESTS.some((m) => files.has(m))) {
+      out.push(cur === '' ? '.' : cur);
+    }
+    if (cur === '' || cur === '.') break;
+    const idx = cur.lastIndexOf('/');
+    cur = idx === -1 ? '' : cur.slice(0, idx);
+  }
   return out;
 }

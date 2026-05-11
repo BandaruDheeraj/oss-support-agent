@@ -217,7 +217,7 @@ USING FEEDBACK FROM PAST ATTEMPTS:
 - previousAttempts contains every prior turn's outcome (stage, reason, stdoutTail, stderrTail, exitCode).
 - If a prior attempt failed at "path_validation" / "sentinel_validation" / "setup_validation", FIX the structural issue — the same candidate will be rejected again.
 - If a prior attempt failed at "baseline_failed_to_repro" with exitCode=0, your test passed when it should have failed — your assertions don't match the bug. Re-read the issue, request more code if needed.
-- If stderr shows ModuleNotFoundError / ImportError, declare the missing package in pipPackages or editableInstalls; do NOT add try/except around the import.
+- If stderr shows ModuleNotFoundError / ImportError, declare the missing package in pipPackages or editableInstalls; do NOT add try/except around the import. Specifically: when stderr says "No module named 'X.Y.Z'" and 'X.Y.Z' looks like a repo-internal package (matches the affected module path), look at repoTreeSummary's "Candidate editableInstalls" section and add the INNERMOST candidate dir whose package path matches the import. Adapter setup ONLY installs third-party deps — it does NOT install in-repo packages.
 - If the same candidate is emitted twice it is rejected without running. Change SOMETHING.
 
 Be ruthless about correctness: a wrong repro wastes the budget and forces a halt with no PR.
