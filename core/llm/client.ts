@@ -37,7 +37,8 @@ export type OpenRouterAgent =
   | 'EVAL'
   | 'DOCS'
   | 'USABILITY'
-  | 'INTROSPECTION';
+  | 'INTROSPECTION'
+  | 'REPRO';
 
 export interface LLMChatOptions {
   /** Choose a model via env var mapping (e.g. OPENROUTER_MODEL_TRIAGE) */

@@ -259,6 +259,22 @@ export async function runFixAgent(
     );
   }
 
+  // Step 4a: Protected paths — refuse to commit modifications to the repro
+  // test file. The fix is expected to make the repro pass as-is. We check
+  // BEFORE commit so a violation cannot reach the fork.
+  if (input.reproTest) {
+    const protectedPath = input.reproTest.path;
+    const touched = allChanges.filter((c) => c.path === protectedPath);
+    if (touched.length > 0) {
+      throw new FixAgentError(
+        `Fix agent attempted to modify the repro test (${protectedPath}). ` +
+        `The repro test is read-only: your fix must make its existing assertions pass ` +
+        `without rewriting the test. Re-attempt without including this path in changes.`,
+        'protected_path'
+      );
+    }
+  }
+
   // Step 4b: Detect destructive whole-file rewrites (truncation with
   // placeholder comments, dramatic shrinkage). The LLM is asked to return
   // complete post-edit file contents — sometimes it abridges. We surface

@@ -75,4 +75,14 @@ export default class OpenInferenceForkAdapter extends BaseRepoAdapter {
   async getPRMetadata(_issues: Issue[]): Promise<PRMetadata> {
     return { extraLabels: ['openinference', 'agent-test'], extraBodySections: [] };
   }
+
+  /**
+   * Adapter-owned (NOT LLM-authored) setup for the repro stage. Keep this
+   * tight: only deps the repro file actually imports. The repro uses
+   * sys.path tricks to import smolagents from the package's src/ without
+   * pip-installing the package itself, but it still needs the otel API.
+   */
+  async getReproSetupCommands(): Promise<string[]> {
+    return ['pip install --quiet opentelemetry-api opentelemetry-sdk wrapt'];
+  }
 }

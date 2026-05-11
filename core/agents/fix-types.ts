@@ -51,6 +51,12 @@ export interface FixAgentInput {
   forkFullName: string;
   /** Branch name to commit to */
   branchName: string;
+  /**
+   * Optional: a reproduction test that currently fails on baseline. The fix
+   * agent MUST make this test pass and MUST NOT modify it. Surface its path
+   * + content so the LLM knows what to satisfy.
+   */
+  reproTest?: ModuleFile;
 }
 
 /**

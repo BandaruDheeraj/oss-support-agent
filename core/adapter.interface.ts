@@ -102,6 +102,14 @@ export interface RepoAdapter {
 
   /** Called by the PR creator to add repo-specific labels/body sections. */
   getPRMetadata(issues: Issue[]): Promise<PRMetadata>;
+
+  /**
+   * Optional. Shell commands run ONCE on the agent runner BEFORE the repro
+   * baseline check (e.g. `pip install --quiet opentelemetry-api`). These are
+   * adapter-owned, not LLM-authored — never expose this to the model.
+   * Default: no setup.
+   */
+  getReproSetupCommands?(): Promise<string[]>;
 }
 
 /**
@@ -145,5 +153,9 @@ export class BaseRepoAdapter implements RepoAdapter {
 
   async getPRMetadata(_issues: Issue[]): Promise<PRMetadata> {
     return { extraLabels: [], extraBodySections: [] };
+  }
+
+  async getReproSetupCommands(): Promise<string[]> {
+    return [];
   }
 }

@@ -181,6 +181,39 @@ export class LocalWorkspace {
     return rev.stdout.trim();
   }
 
+  /**
+   * Commit ONLY the given paths (use this when other files may have been
+   * modified by sandbox runs that we don't want to commit, e.g. baseline
+   * runs of LLM-authored repro scripts). Throws if there's nothing staged
+   * after `git add` for those paths.
+   */
+  async commitPaths(relPaths: string[], message: string): Promise<string> {
+    if (relPaths.length === 0) {
+      throw new Error('commitPaths called with no paths');
+    }
+    await git(this.dir, ['add', '--', ...relPaths]);
+    const staged = await execCommand('git', ['diff', '--cached', '--name-only'], this.dir);
+    if (!staged.stdout.trim()) {
+      throw new Error('No changes to commit');
+    }
+    await git(this.dir, ['commit', '-m', message]);
+    const rev = await git(this.dir, ['rev-parse', 'HEAD']);
+    return rev.stdout.trim();
+  }
+
+  /**
+   * Restore the working tree to HEAD: discard tracked-file modifications and
+   * delete any untracked files / directories. Use this after running an
+   * LLM-authored script in the sandbox so unintended side effects don't get
+   * swept into the next commit.
+   */
+  async resetWorkingTree(): Promise<void> {
+    await git(this.dir, ['reset', '--hard', 'HEAD']);
+    // -fd: discard untracked files + directories. NOT -x: keep .gitignored
+    // files like .venv/node_modules so we don't blow away install caches.
+    await git(this.dir, ['clean', '-fd']);
+  }
+
   async push(): Promise<void> {
     await git(this.dir, ['push', 'origin', this.branch]);
   }

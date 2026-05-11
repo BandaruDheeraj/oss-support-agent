@@ -48,6 +48,10 @@ import { OpenRouterPMFollowUpGenerator } from '../core/llm/openrouter-pm-followu
 import type { FollowUpGenerator } from '../core/pm-email-types';
 import type { PMEmailLoopConfig, DesignBriefInput } from '../core/pm-email-types';
 import { detectApproval } from '../core/gmail-mcp';
+import { extractFilePathsFromAll } from '../core/issue-file-extractor';
+import { runReproAgent } from '../core/agents/repro';
+import type { ReproSpec } from '../core/agents/repro-types';
+import { OpenRouterReproGenerator } from '../core/llm/openrouter-repro-generator';
 
 import {
   runRetryLoop,
@@ -206,6 +210,53 @@ function gatherTestFiles(workspace: LocalWorkspace, modulePath: string): ModuleF
     }
   }
   return tests;
+}
+
+/**
+ * Inspect the result of running the repro on baseline. A "valid" baseline
+ * means the bug actually reproduces — i.e. exit≠0 AND the failureSentinel
+ * appears in stdout/stderr. We explicitly reject infrastructure-level
+ * failures (ModuleNotFoundError, SyntaxError, pip install failure) so we
+ * don't mistake "the repro is broken" for "the bug is reproduced".
+ *
+ * Exported for testing.
+ */
+export function validateReproBaseline(args: {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  failureSentinel: string;
+}): { ok: true } | { ok: false; reason: string } {
+  const combined = `${args.stdout ?? ''}\n${args.stderr ?? ''}`;
+  const exit = args.exitCode ?? 1;
+  if (exit === 0) {
+    return { ok: false, reason: 'repro exited 0 on baseline; the bug did not reproduce' };
+  }
+  const infraMarkers = [
+    'ModuleNotFoundError',
+    'ImportError: cannot import name',
+    'No module named',
+    'SyntaxError',
+    'IndentationError',
+    'ERROR: Could not find a version',
+    'pip._vendor',
+    'pip install',
+  ];
+  for (const marker of infraMarkers) {
+    if (combined.includes(marker)) {
+      return {
+        ok: false,
+        reason: `repro failed for an infrastructure reason (matched "${marker}"), not the reported bug`,
+      };
+    }
+  }
+  if (!combined.includes(args.failureSentinel)) {
+    return {
+      ok: false,
+      reason: `repro exited ${exit} but did not print the failure sentinel (${args.failureSentinel}); cannot confirm it reproduces the reported bug`,
+    };
+  }
+  return { ok: true };
 }
 
 function gatherDocFiles(workspace: LocalWorkspace, modulePath: string): ModuleFile[] {
@@ -792,9 +843,15 @@ async function runFixAttempt(args: {
   forkFullName: string;
   branchName: string;
   ghClient: GitHubRestClient;
+  /** Optional: a repro spec whose run is prepended to sandbox commands. */
+  reproSpec?: ReproSpec;
+  /** Setup commands (e.g. `pip install ...`) to prepend before the repro run. */
+  reproSetupCmds?: string[];
+  /** Committed (baseline) content of the repro file — used to detect modification. */
+  reproBaselineContent?: string;
   log: (msg: string) => void;
 }): Promise<FixAttemptOutcome> {
-  const { fixInput, workspace, adapter, manifest, payload, log, ghClient } = args;
+  const { fixInput, workspace, adapter, manifest, payload, log, ghClient, reproSpec } = args;
   const reader = new LocalRepoFileReader(workspace);
   const tokenScopes = await ghClient.getTokenScopes();
   const committer = new LocalForkCommitter(workspace, tokenScopes);
@@ -812,7 +869,46 @@ async function runFixAttempt(args: {
   }
   log(`[fix] committed ${fixResult.changes.length} files: ${fixResult.summary}`);
 
-  const testCommands = await adapter.getTestCommands();
+  // Hard guard: the fix agent MUST NOT modify the repro file. If it did,
+  // refuse the attempt and feed back into the retry loop.
+  if (reproSpec && args.reproBaselineContent !== undefined) {
+    const modifiedRepro = fixResult.changes.some((c) => c.path === reproSpec.path);
+    if (modifiedRepro) {
+      return {
+        ok: false,
+        retryContext:
+          `Your fix modified the repro test (${reproSpec.path}). The repro is read-only — ` +
+          `you must make the existing assertions pass without rewriting them.`,
+        evalSummary: 'modified-repro',
+        fixSummary: fixResult.summary,
+      };
+    }
+    try {
+      const onDisk = workspace.readFile(reproSpec.path);
+      if (onDisk !== args.reproBaselineContent) {
+        return {
+          ok: false,
+          retryContext:
+            `Your fix's commit touched the repro test (${reproSpec.path}). The repro is read-only.`,
+          evalSummary: 'modified-repro',
+          fixSummary: fixResult.summary,
+        };
+      }
+    } catch {
+      return {
+        ok: false,
+        retryContext: `Your fix deleted the repro test (${reproSpec.path}). The repro is read-only.`,
+        evalSummary: 'modified-repro',
+        fixSummary: fixResult.summary,
+      };
+    }
+  }
+
+  const adapterTestCommands = await adapter.getTestCommands();
+  const reproSetupCmds = args.reproSetupCmds ?? [];
+  const testCommands = reproSpec
+    ? [...reproSetupCmds, reproSpec.runCommand, ...adapterTestCommands]
+    : adapterTestCommands;
   const sandboxServices = await adapter.getSandboxServices();
   log(
     `[sandbox] ${testCommands.length} command(s); services=${sandboxServices
@@ -1196,6 +1292,7 @@ export async function runPipeline(args: {
   let regressionLabels: string[] = [];
   let usabilitySection = '';
   let usabilityLabels: string[] = [];
+  let reproPRSection: string | null = null;
 
   if (routing.action === 'route_docs') {
     // ---------- Docs path ----------
@@ -1343,7 +1440,7 @@ export async function runPipeline(args: {
     const moduleTests = gatherTestFiles(workspace, routing.result.affectedModule);
     const recentCommits: ModuleCommit[] = [];
 
-    const fixInputBase: FixAgentInput = {
+    let fixInputBase: FixAgentInput = {
       designSummary,
       confirmedIssues,
       affectedModule: routing.result.affectedModule,
@@ -1353,6 +1450,137 @@ export async function runPipeline(args: {
       forkFullName: fork.forkFullName,
       branchName: fork.branchName,
     };
+
+    // Pre-load files explicitly named in the issue body / traceback so the
+    // FIRST fix attempt sees them — avoids the wasted attempt-1-then-retry
+    // cycle when gatherModuleFiles' blind sample misses the actual file.
+    const issueFragments = confirmedIssues.flatMap((i) => [i.title, i.body]);
+    const mentionedPaths = extractFilePathsFromAll(issueFragments);
+    if (mentionedPaths.length > 0) {
+      log(`[fix-prep] issue mentions ${mentionedPaths.length} candidate path(s): ${mentionedPaths.join(', ')}`);
+      const before = fixInputBase.moduleSource.length;
+      fixInputBase = await augmentModuleSourceWithFiles(fixInputBase, mentionedPaths, workspace);
+      const added = fixInputBase.moduleSource.length - before;
+      log(`[fix-prep] preloaded ${added} mentioned file(s) into moduleSource`);
+    }
+
+    // ---------- Repro stage: prove the bug reproduces BEFORE attempting a fix ----------
+    // We ask an LLM to write a small Python test that exits non-zero with a
+    // failure sentinel string on the reported bug. We then run it on baseline
+    // (pre-fix code) and require: (a) exit≠0 (b) sentinel printed (c) no
+    // infrastructure failures (ModuleNotFoundError etc.) (d) no timeout. If
+    // valid we commit ONLY the repro file (not -A) so any sandbox side
+    // effects don't sneak in, and feed its path+content into the fix agent.
+    let reproSpec: ReproSpec | undefined;
+    let reproBaselineContent: string | undefined;
+    let reproSetupCmds: string[] = [];
+    try {
+      log('[repro] generating reproduction test');
+      reproSetupCmds = (await adapter.getReproSetupCommands?.()) ?? [];
+      if (reproSetupCmds.length > 0) {
+        log(`[repro] adapter setup commands: ${reproSetupCmds.length}`);
+      }
+      const generated = await runReproAgent(
+        {
+          confirmedIssues,
+          affectedModule: routing.result.affectedModule,
+          moduleSource: fixInputBase.moduleSource,
+          language: 'python',
+          preferredTestDir: 'tests',
+        },
+        new OpenRouterReproGenerator()
+      );
+      log(`[repro] generated at ${generated.path} (sentinel="${generated.failureSentinel}")`);
+
+      // Write the repro into the workspace and run baseline.
+      workspace.writeFile(generated.path, generated.content);
+
+      const sandboxServices = await adapter.getSandboxServices();
+      const baselineCmds = [...reproSetupCmds, generated.runCommand];
+      log(`[repro] running baseline (${baselineCmds.length} command(s))`);
+      const baselineArtifact = await runLocalSandbox({
+        workspace,
+        config: {
+          repoFullName,
+          forkFullName: fork.forkFullName,
+          branchName: fork.branchName,
+          workflowRepoFullName: '',
+          testCommands: baselineCmds,
+          sandboxServices,
+          timeoutMinutes: manifest.sandbox_timeout_mins ?? 15,
+        },
+        services: sandboxServices.filter(
+          (s): s is Exclude<typeof s, string> => typeof s !== 'string'
+        ),
+        options: { log },
+      });
+      // The repro command is the LAST entry in baselineCmds; that's the one
+      // whose exit code + output tells us if the bug reproduced.
+      const reproRunResult =
+        baselineArtifact.commands[baselineArtifact.commands.length - 1];
+      let validation: { ok: true } | { ok: false; reason: string };
+      if (baselineArtifact.result.timedOut) {
+        validation = {
+          ok: false,
+          reason: 'repro timed out on baseline; cannot trust exit code as proof of bug',
+        };
+      } else {
+        validation = validateReproBaseline({
+          exitCode: reproRunResult?.exitCode ?? null,
+          stdout: reproRunResult?.stdout ?? '',
+          stderr: reproRunResult?.stderr ?? '',
+          failureSentinel: generated.failureSentinel,
+        });
+      }
+      if (!validation.ok) {
+        log(`[repro] baseline INVALID: ${validation.reason}`);
+        log(`[repro] falling back to non-repro fix flow`);
+        // Discard everything the LLM-authored script may have touched, not
+        // just the repro file itself. Then we're back to a clean HEAD.
+        try {
+          await workspace.resetWorkingTree();
+        } catch (resetErr: any) {
+          log(`[repro] workspace reset failed: ${resetErr?.message ?? resetErr}`);
+        }
+        reproSpec = undefined;
+        reproSetupCmds = [];
+      } else {
+        log(`[repro] baseline FAILED with sentinel (exit=${reproRunResult?.exitCode}) — bug confirmed`);
+        // Reset any side-effect files the script may have written during the
+        // baseline run, then re-write the canonical repro content and commit
+        // ONLY that path. This guarantees the repro commit contains nothing
+        // unexpected.
+        await workspace.resetWorkingTree();
+        workspace.writeFile(generated.path, generated.content);
+        reproBaselineContent = generated.content;
+        await workspace.commitPaths([generated.path], `test: add repro for #${issueNumber}`);
+        await workspace.push();
+        log(`[repro] committed and pushed (single path: ${generated.path})`);
+        reproSpec = generated;
+        fixInputBase = {
+          ...fixInputBase,
+          reproTest: { path: generated.path, content: reproBaselineContent },
+        };
+        reproPRSection = [
+          `## Reproduction Verification`,
+          `A reproduction test was generated and run before applying the fix:`,
+          ``,
+          `- **Path**: \`${generated.path}\``,
+          `- **Run command**: \`${generated.runCommand}\``,
+          `- **Baseline (pre-fix)**: failed with exit ${reproRunResult?.exitCode ?? '?'} and printed sentinel \`${generated.failureSentinel}\` — bug reproduced.`,
+          `- **Post-fix**: this PR's sandbox run executes the same command and requires it to pass (the eval gate enforces this on every retry).`,
+        ].join('\n');
+      }
+    } catch (err: any) {
+      log(`[repro] generation failed: ${err?.message ?? err}; falling back to non-repro fix flow`);
+      try {
+        await workspace.resetWorkingTree();
+      } catch {
+        /* ignore */
+      }
+      reproSpec = undefined;
+      reproSetupCmds = [];
+    }
 
     const maxRetries = manifest.max_retries ?? 3;
     let attempt: FixAttemptOutcome | null = null;
@@ -1370,6 +1598,9 @@ export async function runPipeline(args: {
           forkFullName: fork.forkFullName,
           branchName: fork.branchName,
           ghClient,
+          reproSpec,
+          reproSetupCmds,
+          reproBaselineContent,
           log,
         });
       } catch (err: any) {
@@ -1495,6 +1726,7 @@ export async function runPipeline(args: {
     `## Eval`,
     `- ${evalSummary}`,
     ``,
+    ...(reproPRSection ? [reproPRSection, ``] : []),
     ...(regressionSection ? [regressionSection, ``] : []),
     ...(usabilitySection ? [usabilitySection, ``] : []),
     ...(manifest.sandbox_runner === 'gha'

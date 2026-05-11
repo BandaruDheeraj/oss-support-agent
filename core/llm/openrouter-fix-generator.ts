@@ -74,6 +74,11 @@ export class OpenRouterFixGenerator implements FixGenerator {
           'For documentation-only fixes (README, AGENTS.md, CHANGELOG, etc.) where no executable test makes sense, ' +
           'add a trivial test entry such as a tests/test_docs_smoke.py with a single assertion that the doc file ' +
           'exists and is non-empty. Do not omit testChanges. ' +
+          'REPRO TEST: If the input has a "reproTest" field, a reproduction test already exists ' +
+          'on the branch at that path that currently FAILS on the bug. Your fix MUST make it ' +
+          'pass (exit code 0). UNDER NO CIRCUMSTANCES include the reproTest path in sourceChanges ' +
+          'or testChanges — it is read-only. Do not weaken its assertions, do not delete it, do ' +
+          'not move it. Fix the underlying bug so the existing repro passes as-is. ' +
           'Do not include any properties other than path, action, content.',
       },
       {
