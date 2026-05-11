@@ -73,6 +73,33 @@ export interface ReproGeneratorOutput {
    * waste a sandbox run.
    */
   requiredCredentials?: RequiredCredential[];
+  /**
+   * In-repo editable installs the repro needs. Each entry is a repo-relative
+   * directory containing a Python package (with pyproject.toml / setup.py).
+   * The pipeline runs `pip install -e <path>` for each before the baseline.
+   *
+   * Use this when the repro imports a package that lives in the monorepo
+   * (e.g. `python/instrumentation/openinference-instrumentation-smolagents`)
+   * and a `sys.path` trick at the top of the test file isn't sufficient
+   * (entry points, package metadata, plugin discovery).
+   *
+   * Security: each path is validated to:
+   *  - be repo-relative (no `..`, no leading `/`)
+   *  - resolve to an existing directory in the workspace
+   *  - contain a recognizable Python package manifest
+   * Anything that doesn't match → halt-and-email.
+   */
+  editableInstalls?: string[];
+  /**
+   * Additional PyPI packages (and version specs) the repro needs at runtime.
+   * Each entry is a single PEP-508 package spec — e.g. `pytest`,
+   * `requests>=2.0`, `openai==1.30.1`, `pydantic[email]`.
+   *
+   * Security: each spec is validated against a strict allowlist of
+   * characters and rejected if it looks like a flag (`-r`, `--index-url`),
+   * a URL (`http://`, `git+`), a local path, or contains shell metachars.
+   */
+  pipPackages?: string[];
 }
 
 /**

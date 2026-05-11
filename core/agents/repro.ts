@@ -15,6 +15,7 @@ import {
   type ReproSpec,
   ReproAgentError,
 } from './repro-types';
+import { validateReproSetup, ReproSetupValidationError } from './repro-setup-validation';
 
 function assertSafePath(p: string, preferredDir: string | undefined): void {
   if (!p) throw new ReproAgentError('repro path is empty', 'validate');
@@ -77,5 +78,18 @@ export async function runReproAgent(
   const out = await generator.generate(input);
   assertSafePath(out.path, input.preferredTestDir);
   assertSentinelInContent(out.failureSentinel, out.content);
+  // Validate (but don't materialize) the setup tokens. The pipeline does a
+  // second pass to verify editable paths exist in the workspace.
+  try {
+    validateReproSetup({
+      editableInstalls: out.editableInstalls,
+      pipPackages: out.pipPackages,
+    });
+  } catch (err) {
+    if (err instanceof ReproSetupValidationError) {
+      throw new ReproAgentError(err.message, 'validate');
+    }
+    throw err;
+  }
   return buildReproSpec(out);
 }

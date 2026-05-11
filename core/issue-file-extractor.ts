@@ -54,6 +54,9 @@ function hasKnownExt(p: string): boolean {
  * Normalize a candidate path:
  *  - strip surrounding punctuation
  *  - strip absolute path prefix back to a repo-relative best guess
+ *  - drop site-packages/ and dist-packages/ prefixes so the result is the
+ *    import-path suffix (`<pkg>/<rest>`) the workspace can resolve via
+ *    suffix matching
  *  - reject empty / parent-traversal
  *
  * Returns null if path is unsafe or doesn't look like a code file.
@@ -65,14 +68,48 @@ function normalize(raw: string): string | null {
   p = p.replace(/\\/g, '/');
   // strip line:col suffixes "foo.py:42:7" BEFORE extension check
   p = p.replace(/(\.[a-zA-Z]{1,5}):\d+(:\d+)?$/, '$1');
-  // If it's an absolute path or contains site-packages/.venv, try to recover a suffix
-  if (/^([a-zA-Z]:\/|\/)/.test(p) || p.includes('site-packages/') || p.includes('.venv/')) {
-    const markers = ['site-packages/', '.venv/', 'src/', 'python/', 'packages/'];
-    for (const m of markers) {
-      const idx = p.lastIndexOf(m);
-      if (idx >= 0) {
-        p = p.slice(idx);
-        break;
+  // If it's an absolute path or contains a virtualenv install root, try to
+  // recover a repo-relative suffix. site-packages/dist-packages prefixes
+  // never map to actual repo paths, so we drop them entirely — leaving the
+  // import-path suffix (e.g. "openinference/instrumentation/smolagents/_wrappers.py")
+  // which the workspace resolves via suffix matching.
+  if (
+    /^([a-zA-Z]:\/|\/)/.test(p) ||
+    p.includes('site-packages/') ||
+    p.includes('dist-packages/') ||
+    p.includes('.venv/')
+  ) {
+    // Try to peel back to a known repo marker first. We match at a path-
+    // component boundary (preceded by `/`) so that `packages/` doesn't
+    // erroneously match inside `site-packages/` or `dist-packages/`. We
+    // pick the LEFTMOST matching marker so the recovered path is as long
+    // (i.e. as repo-rooted) as possible — e.g. `python/.../src/foo.py`
+    // beats `src/foo.py`.
+    const repoMarkers = ['python/', 'packages/', 'src/'];
+    let bestIdx = -1;
+    for (const m of repoMarkers) {
+      const re = new RegExp('(?:^|/)' + m.replace(/\//g, '\\/'));
+      const match = re.exec(p);
+      if (!match) continue;
+      // index after the optional leading "/"
+      const idx = match.index + (p[match.index] === '/' ? 1 : 0);
+      if (bestIdx < 0 || idx < bestIdx) bestIdx = idx;
+    }
+    let recovered = false;
+    if (bestIdx >= 0) {
+      p = p.slice(bestIdx);
+      recovered = true;
+    }
+    // Otherwise, drop the install-root prefix entirely. The suffix that
+    // remains is the import path under the package — callers must resolve
+    // it against the repo (e.g. by suffix-globbing).
+    if (!recovered) {
+      for (const m of ['site-packages/', 'dist-packages/', '.venv/']) {
+        const idx = p.lastIndexOf(m);
+        if (idx >= 0) {
+          p = p.slice(idx + m.length);
+          break;
+        }
       }
     }
     if (/^([a-zA-Z]:\/|\/)/.test(p)) return null;

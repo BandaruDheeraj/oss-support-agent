@@ -53,6 +53,15 @@ import { runReproAgent } from '../core/agents/repro';
 import type { ReproSpec, RequiredCredential } from '../core/agents/repro-types';
 import { OpenRouterReproGenerator } from '../core/llm/openrouter-repro-generator';
 import {
+  validateReproSetup,
+  buildPipInstallCommands,
+  ReproSetupValidationError,
+} from '../core/agents/repro-setup-validation';
+import {
+  rankMatches,
+  validateEditableInstallPath,
+} from '../core/repo-path-resolver';
+import {
   findMissingDeclaredCredentials,
   detectCredentialError,
   mergeCredentialSources,
@@ -122,6 +131,10 @@ export type PipelineResult =
       reason: string;
       missingEnvVars: string[];
     }
+  | {
+      status: 'repro-not-runnable';
+      reason: string;
+    }
   | { status: 'pr-opened'; prUrl: string; prNumber: number };
 
 function buildTriageInput(payload: IssueEvent, manifest: Manifest, repoTree: string[]): TriageInput {
@@ -172,7 +185,8 @@ export function extractDestructivePaths(retryContext: string): string[] {
 async function augmentModuleSourceWithFiles(
   baseInput: FixAgentInput,
   paths: string[],
-  workspace: LocalWorkspace
+  workspace: LocalWorkspace,
+  log: (msg: string) => void = () => {}
 ): Promise<FixAgentInput> {
   if (paths.length === 0) return baseInput;
   const reader = new LocalRepoFileReader(workspace);
@@ -180,12 +194,40 @@ async function augmentModuleSourceWithFiles(
   const added: ModuleFile[] = [];
   for (const p of paths) {
     if (have.has(p)) continue;
+    // 1. Try the exact path first (direct repo path mentioned in the issue).
+    let resolved: string | null = null;
     try {
       const content = await reader.readFile(baseInput.forkFullName, baseInput.branchName, p);
       added.push({ path: p, content: content.slice(0, 200_000) });
       have.add(p);
+      resolved = p;
+      log(`[fix-prep] resolved ${p} directly`);
     } catch {
-      /* file missing; skip */
+      /* fall through to suffix search */
+    }
+    if (resolved) continue;
+    // 2. Treat the path as a suffix and search the workspace. This catches
+    //    site-packages-derived paths (`openinference/instrumentation/.../foo.py`)
+    //    that don't map to a top-level repo dir.
+    const candidates = workspace.findFilesBySuffix(p);
+    if (candidates.length === 0) {
+      log(`[fix-prep] no suffix match for ${p}`);
+      continue;
+    }
+    const ranked = rankMatches(candidates);
+    const picked = ranked[0];
+    if (have.has(picked)) continue;
+    try {
+      const content = await reader.readFile(baseInput.forkFullName, baseInput.branchName, picked);
+      added.push({ path: picked, content: content.slice(0, 200_000) });
+      have.add(picked);
+      log(
+        `[fix-prep] suffix-resolved ${p} -> ${picked}${
+          ranked.length > 1 ? ` (${ranked.length - 1} other candidate(s) ignored)` : ''
+        }`
+      );
+    } catch {
+      log(`[fix-prep] suffix match found but read failed: ${picked}`);
     }
   }
   if (added.length === 0) return baseInput;
@@ -1469,7 +1511,7 @@ export async function runPipeline(args: {
     if (mentionedPaths.length > 0) {
       log(`[fix-prep] issue mentions ${mentionedPaths.length} candidate path(s): ${mentionedPaths.join(', ')}`);
       const before = fixInputBase.moduleSource.length;
-      fixInputBase = await augmentModuleSourceWithFiles(fixInputBase, mentionedPaths, workspace);
+      fixInputBase = await augmentModuleSourceWithFiles(fixInputBase, mentionedPaths, workspace, log);
       const added = fixInputBase.moduleSource.length - before;
       log(`[fix-prep] preloaded ${added} mentioned file(s) into moduleSource`);
     }
@@ -1490,86 +1532,154 @@ export async function runPipeline(args: {
     let reproBaselineContent: string | undefined;
     let reproSetupCmds: string[] = [];
 
-    // Closure capturing pipeline locals so individual call-sites stay tight.
-    // Returns the awaiting-credentials PipelineResult after emailing + commenting + labeling.
-    const haltForCredentials = async (
-      creds: ReadonlyArray<RequiredCredential>,
-      detectionContext: string
-    ): Promise<PipelineResult> => {
-      // Always discard whatever we wrote to disk — we are NOT pushing this branch.
+    // Generic halt helper used by both the credentials gate and the
+    // repro-not-runnable gate. Resets the working tree, emails PM, comments
+    // on the issue, applies a label, and returns the right PipelineResult.
+    const haltAndEmail = async (args: {
+      label: string;
+      subject: string;
+      bodyLines: string[];
+      commentBody: string;
+      result: PipelineResult;
+      logTag: string;
+    }): Promise<PipelineResult> => {
       try {
         await workspace.resetWorkingTree();
       } catch {
         /* best-effort */
       }
-      const envNames = creds.map((c) => c.envVar);
-      log(
-        `[repro] HALT: missing credentials (${detectionContext}): ${envNames.join(', ')}`
-      );
-      const issueUrl = `https://github.com/${repoFullName}/issues/${issueNumber}`;
-      const renderUrl =
-        process.env.RENDER_DASHBOARD_URL ??
-        (process.env.RENDER_SERVICE_ID
-          ? `https://dashboard.render.com/web/${process.env.RENDER_SERVICE_ID}/env`
-          : null);
-      const credLines = creds.map((c) => {
-        const where = c.whereToGet ? `\n    where: ${c.whereToGet}` : '';
-        return `- ${c.envVar}\n    purpose: ${c.purpose}${where}`;
-      });
-      const subject = `[oss-agent] credentials needed for ${repoFullName}#${issueNumber}`;
-      const bodyLines = [
-        `The repro stage needs ${creds.length} credential(s) before it can prove the bug:`,
-        ``,
-        ...credLines,
-        ``,
-        `Detection: ${detectionContext}`,
-        ``,
-        renderUrl
-          ? `Add them at: ${renderUrl}\nThen re-trigger this issue (e.g. by re-applying the trigger label) to resume.`
-          : `Add them to the agent's runtime environment, then re-trigger this issue (e.g. by re-applying the trigger label) to resume.`,
-        ``,
-        `Issue: ${issueUrl}`,
-        ``,
-        `Run: ${runId}`,
-      ];
+      log(`[repro] HALT (${args.logTag})`);
       if (deps.live) {
         try {
           await deps.live.failureNotifier.sendEmail(
             manifest.pm_email,
-            subject,
-            bodyLines.join('\n'),
+            args.subject,
+            args.bodyLines.join('\n'),
             manifest.pm_email
           );
-          log(`[repro] credential request emailed to ${manifest.pm_email}`);
+          log(`[repro] notification emailed to ${manifest.pm_email}`);
         } catch (mailErr: any) {
           log(`[repro] email send failed: ${mailErr?.message ?? mailErr}`);
         }
         try {
           const issueCommenter = new GitHubIssueCommenter(deps.token);
-          await issueCommenter.postComment(
-            repoFullName,
-            issueNumber,
-            `🔒 **Awaiting credentials.** The reproduction test needs ${envNames.length} env var(s) (${envNames.join(', ')}) that aren't set on the agent runtime. The maintainer has been emailed with instructions; the run will be resumed after they're added.`
-          );
+          await issueCommenter.postComment(repoFullName, issueNumber, args.commentBody);
         } catch (commentErr: any) {
           log(`[repro] issue comment failed: ${commentErr?.message ?? commentErr}`);
         }
         try {
-          // /issues/{n}/labels works the same for issues and PRs in GH's API
-          await ghClient.addLabelsToPR(repoFullName, issueNumber, [
-            'awaiting-credentials',
-          ]);
+          await ghClient.addLabelsToPR(repoFullName, issueNumber, [args.label]);
         } catch (labelErr: any) {
           log(`[repro] label add failed: ${labelErr?.message ?? labelErr}`);
         }
       } else {
-        log(`[repro] (no live deps) would have emailed ${manifest.pm_email}: ${subject}`);
+        log(`[repro] (no live deps) would have emailed ${manifest.pm_email}: ${args.subject}`);
       }
-      return {
-        status: 'awaiting-credentials',
-        reason: `missing env vars: ${envNames.join(', ')}`,
-        missingEnvVars: envNames,
-      };
+      return args.result;
+    };
+
+    const renderEnvUrl = (): string | null =>
+      process.env.RENDER_DASHBOARD_URL ??
+      (process.env.RENDER_SERVICE_ID
+        ? `https://dashboard.render.com/web/${process.env.RENDER_SERVICE_ID}/env`
+        : null);
+
+    const haltForCredentials = async (
+      creds: ReadonlyArray<RequiredCredential>,
+      detectionContext: string
+    ): Promise<PipelineResult> => {
+      const envNames = creds.map((c) => c.envVar);
+      const issueUrl = `https://github.com/${repoFullName}/issues/${issueNumber}`;
+      const renderUrl = renderEnvUrl();
+      const credLines = creds.map((c) => {
+        const where = c.whereToGet ? `\n    where: ${c.whereToGet}` : '';
+        return `- ${c.envVar}\n    purpose: ${c.purpose}${where}`;
+      });
+      return haltAndEmail({
+        label: 'awaiting-credentials',
+        subject: `[oss-agent] credentials needed for ${repoFullName}#${issueNumber}`,
+        bodyLines: [
+          `The repro stage needs ${creds.length} credential(s) before it can prove the bug:`,
+          ``,
+          ...credLines,
+          ``,
+          `Detection: ${detectionContext}`,
+          ``,
+          renderUrl
+            ? `Add them at: ${renderUrl}\nThen re-trigger this issue (e.g. by re-applying the trigger label) to resume.`
+            : `Add them to the agent's runtime environment, then re-trigger this issue (e.g. by re-applying the trigger label) to resume.`,
+          ``,
+          `Issue: ${issueUrl}`,
+          ``,
+          `Run: ${runId}`,
+        ],
+        commentBody: `🔒 **Awaiting credentials.** The reproduction test needs ${envNames.length} env var(s) (${envNames.join(', ')}) that aren't set on the agent runtime. The maintainer has been emailed with instructions; the run will be resumed after they're added.`,
+        result: {
+          status: 'awaiting-credentials',
+          reason: `missing env vars: ${envNames.join(', ')}`,
+          missingEnvVars: envNames,
+        },
+        logTag: `missing credentials (${detectionContext}): ${envNames.join(', ')}`,
+      });
+    };
+
+    const haltForReproNotRunnable = async (args: {
+      reason: string;
+      stderrTail?: string;
+      stdoutTail?: string;
+      attemptedCommands: string[];
+      reproPath?: string;
+    }): Promise<PipelineResult> => {
+      const issueUrl = `https://github.com/${repoFullName}/issues/${issueNumber}`;
+      const branchUrl = `https://github.com/${fork.forkFullName}/tree/${fork.branchName}`;
+      const stderrBlock = (args.stderrTail ?? '').trim()
+        ? ['stderr (tail):', '```', args.stderrTail!.trim().slice(-2000), '```']
+        : [];
+      const stdoutBlock = (args.stdoutTail ?? '').trim()
+        ? ['stdout (tail):', '```', args.stdoutTail!.trim().slice(-2000), '```']
+        : [];
+      const cmdBlock =
+        args.attemptedCommands.length > 0
+          ? ['Commands executed (in order):', ...args.attemptedCommands.map((c) => `  $ ${c}`)]
+          : [];
+      const reproLine = args.reproPath
+        ? `Generated repro file: \`${args.reproPath}\` (on branch ${fork.branchName} — not yet pushed)`
+        : `No repro file was generated.`;
+      return haltAndEmail({
+        label: 'awaiting-repro-fix',
+        subject: `[oss-agent] repro cannot run for ${repoFullName}#${issueNumber}`,
+        bodyLines: [
+          `The reproduction test could not be established for this issue, so no PR will be opened.`,
+          ``,
+          `Reason: ${args.reason}`,
+          ``,
+          reproLine,
+          ``,
+          ...cmdBlock,
+          ``,
+          ...stderrBlock,
+          ...(stderrBlock.length && stdoutBlock.length ? [''] : []),
+          ...stdoutBlock,
+          ``,
+          `What to do:`,
+          `  1. Inspect the repro file on the agent branch: ${branchUrl}`,
+          `  2. If a dependency is missing, either:`,
+          `       - update the affected adapter to install it via getReproSetupCommands(), OR`,
+          `       - re-trigger so the LLM can declare it in editableInstalls / pipPackages.`,
+          `  3. If the repro is fundamentally wrong (asserts the wrong thing), close the issue or remove the agent label.`,
+          `  4. Re-apply the trigger label to resume.`,
+          ``,
+          `Issue: ${issueUrl}`,
+          ``,
+          `Run: ${runId}`,
+        ],
+        commentBody: `⛔ **Repro could not run.** ${args.reason}\n\nNo PR has been opened — the maintainer has been emailed with details. Re-trigger after addressing the cause.`,
+        result: {
+          status: 'repro-not-runnable',
+          reason: args.reason,
+        },
+        logTag: `repro-not-runnable: ${args.reason}`,
+      });
     };
 
     try {
@@ -1608,6 +1718,52 @@ export async function runPipeline(args: {
           'declared by repro generator'
         );
       }
+
+      // ---- Validate LLM-declared setup (editableInstalls + pipPackages) ----
+      // The LLM uses these to declare every dependency the repro needs. We
+      // pre-validate their SHAPE in the repro agent and re-validate their
+      // SEMANTICS here (do the editable paths actually exist in the
+      // workspace + look like Python packages?). If anything's off, halt
+      // immediately rather than letting pip blow up later.
+      let validatedSetup: { editableInstalls: string[]; pipPackages: string[] };
+      try {
+        validatedSetup = validateReproSetup({
+          editableInstalls: generated.editableInstalls,
+          pipPackages: generated.pipPackages,
+        });
+      } catch (err) {
+        if (err instanceof ReproSetupValidationError) {
+          return await haltForReproNotRunnable({
+            reason: `LLM-declared repro setup failed validation: ${err.message}`,
+            attemptedCommands: reproSetupCmds,
+            reproPath: generated.path,
+          });
+        }
+        throw err;
+      }
+
+      // Pre-flight: each editable path must exist + contain a Python manifest.
+      for (const dir of validatedSetup.editableInstalls) {
+        const reason = validateEditableInstallPath(workspace.dir, dir);
+        if (reason) {
+          return await haltForReproNotRunnable({
+            reason: `editable install path is invalid: ${reason}`,
+            attemptedCommands: reproSetupCmds,
+            reproPath: generated.path,
+          });
+        }
+      }
+
+      const llmSetupCmds = buildPipInstallCommands(validatedSetup);
+      if (llmSetupCmds.length > 0) {
+        log(
+          `[repro] LLM-declared setup: ${validatedSetup.pipPackages.length} pip package(s), ${validatedSetup.editableInstalls.length} editable install(s)`
+        );
+      }
+      // Effective setup = adapter baseline deps + LLM-declared deps. Used
+      // for BOTH the baseline run and every subsequent fix-attempt sandbox
+      // run, so the two are environmentally equivalent.
+      reproSetupCmds = [...reproSetupCmds, ...llmSetupCmds];
 
       // Write the repro into the workspace and run baseline.
       workspace.writeFile(generated.path, generated.content);
@@ -1652,6 +1808,13 @@ export async function runPipeline(args: {
         });
       }
 
+      // If any pre-repro setup command (pip install, etc.) failed, attribute
+      // the halt to that instead of the repro itself — much more actionable
+      // for the user.
+      const failedSetupCmd = baselineArtifact.commands
+        .slice(0, -1)
+        .find((c) => (c.exitCode ?? 1) !== 0);
+
       // ---- Reactive credentials gate ----
       // Sentinel-not-printed + auth-shaped stderr ⇒ probably the LLM didn't
       // declare every env var it needed. Halt and report the union of
@@ -1666,9 +1829,6 @@ export async function runPipeline(args: {
             generated.requiredCredentials ?? [],
             detected.inferredEnvVars
           );
-          // Only halt for the env vars actually missing from process.env —
-          // some inferred names might already be set, in which case the
-          // failure is something else (back to fallback flow).
           const recheck = findMissingDeclaredCredentials(merged, process.env);
           if (recheck.missing.length > 0) {
             return await haltForCredentials(
@@ -1680,53 +1840,57 @@ export async function runPipeline(args: {
       }
 
       if (!validation.ok) {
+        // ---- No graceful degradation: halt the run. ----
+        // The whole point of the repro stage is to produce a behaviorally
+        // verified PR. If we can't even prove the bug reproduces, opening a
+        // PR would just be guesswork. Email the maintainer + label the issue
+        // and stop.
         log(`[repro] baseline INVALID: ${validation.reason}`);
-        log(`[repro] falling back to non-repro fix flow`);
-        // Discard everything the LLM-authored script may have touched, not
-        // just the repro file itself. Then we're back to a clean HEAD.
-        try {
-          await workspace.resetWorkingTree();
-        } catch (resetErr: any) {
-          log(`[repro] workspace reset failed: ${resetErr?.message ?? resetErr}`);
-        }
-        reproSpec = undefined;
-        reproSetupCmds = [];
-      } else {
-        log(`[repro] baseline FAILED with sentinel (exit=${reproRunResult?.exitCode}) — bug confirmed`);
-        // Reset any side-effect files the script may have written during the
-        // baseline run, then re-write the canonical repro content and commit
-        // ONLY that path. This guarantees the repro commit contains nothing
-        // unexpected.
-        await workspace.resetWorkingTree();
-        workspace.writeFile(generated.path, generated.content);
-        reproBaselineContent = generated.content;
-        await workspace.commitPaths([generated.path], `test: add repro for #${issueNumber}`);
-        await workspace.push();
-        log(`[repro] committed and pushed (single path: ${generated.path})`);
-        reproSpec = generated;
-        fixInputBase = {
-          ...fixInputBase,
-          reproTest: { path: generated.path, content: reproBaselineContent },
-        };
-        reproPRSection = [
-          `## Reproduction Verification`,
-          `A reproduction test was generated and run before applying the fix:`,
-          ``,
-          `- **Path**: \`${generated.path}\``,
-          `- **Run command**: \`${generated.runCommand}\``,
-          `- **Baseline (pre-fix)**: failed with exit ${reproRunResult?.exitCode ?? '?'} and printed sentinel \`${generated.failureSentinel}\` — bug reproduced.`,
-          `- **Post-fix**: this PR's sandbox run executes the same command and requires it to pass (the eval gate enforces this on every retry).`,
-        ].join('\n');
+        const reason = failedSetupCmd
+          ? `setup command failed: \`${failedSetupCmd.command}\` (exit ${failedSetupCmd.exitCode}). ${validation.reason}`
+          : validation.reason;
+        return await haltForReproNotRunnable({
+          reason,
+          stderrTail: failedSetupCmd?.stderr ?? reproStderr,
+          stdoutTail: failedSetupCmd?.stdout ?? reproStdout,
+          attemptedCommands: baselineCmds,
+          reproPath: generated.path,
+        });
       }
+
+      log(`[repro] baseline FAILED with sentinel (exit=${reproRunResult?.exitCode}) — bug confirmed`);
+      // Reset any side-effect files the script may have written during the
+      // baseline run, then re-write the canonical repro content and commit
+      // ONLY that path. This guarantees the repro commit contains nothing
+      // unexpected.
+      await workspace.resetWorkingTree();
+      workspace.writeFile(generated.path, generated.content);
+      reproBaselineContent = generated.content;
+      await workspace.commitPaths([generated.path], `test: add repro for #${issueNumber}`);
+      await workspace.push();
+      log(`[repro] committed and pushed (single path: ${generated.path})`);
+      reproSpec = generated;
+      fixInputBase = {
+        ...fixInputBase,
+        reproTest: { path: generated.path, content: reproBaselineContent },
+      };
+      reproPRSection = [
+        `## Reproduction Verification`,
+        `A reproduction test was generated and run before applying the fix:`,
+        ``,
+        `- **Path**: \`${generated.path}\``,
+        `- **Run command**: \`${generated.runCommand}\``,
+        `- **Baseline (pre-fix)**: failed with exit ${reproRunResult?.exitCode ?? '?'} and printed sentinel \`${generated.failureSentinel}\` — bug reproduced.`,
+        `- **Post-fix**: this PR's sandbox run executes the same command and requires it to pass (the eval gate enforces this on every retry).`,
+      ].join('\n');
     } catch (err: any) {
-      log(`[repro] generation failed: ${err?.message ?? err}; falling back to non-repro fix flow`);
-      try {
-        await workspace.resetWorkingTree();
-      } catch {
-        /* ignore */
-      }
-      reproSpec = undefined;
-      reproSetupCmds = [];
+      // Repro generation / validation threw — that's also a halt, not a
+      // fallback. We never open a PR without a verified repro.
+      log(`[repro] generation failed: ${err?.message ?? err}`);
+      return await haltForReproNotRunnable({
+        reason: `repro generation failed: ${err?.message ?? String(err)}`,
+        attemptedCommands: reproSetupCmds,
+      });
     }
 
     const maxRetries = manifest.max_retries ?? 3;

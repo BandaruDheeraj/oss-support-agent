@@ -164,6 +164,67 @@ export class LocalWorkspace {
       .map((e) => e.name);
   }
 
+  /**
+   * Recursively search the workspace for files whose path ends with the
+   * given suffix (matched at a path-component boundary, i.e. `bar/baz.py`
+   * matches `foo/bar/baz.py` but not `xbar/baz.py`).
+   *
+   * Skips ignored / virtual dirs: `.git`, `node_modules`, `.venv`, `venv`,
+   * `__pycache__`, `dist`, `build`, `.tox`, `.pytest_cache`, `.mypy_cache`.
+   * Caps the total number of files visited to keep worst-case bounded.
+   *
+   * Returns repo-relative POSIX-normalized paths.
+   */
+  findFilesBySuffix(suffix: string, maxResults = 10): string[] {
+    if (!suffix) return [];
+    const norm = suffix.replace(/\\/g, '/').replace(/^\/+/, '');
+    if (!norm) return [];
+    const IGNORE = new Set([
+      '.git',
+      'node_modules',
+      '.venv',
+      'venv',
+      '__pycache__',
+      'dist',
+      'build',
+      '.tox',
+      '.pytest_cache',
+      '.mypy_cache',
+      '.next',
+      '.cache',
+    ]);
+    const MAX_FILES_VISITED = 50_000;
+    let visited = 0;
+    const matches: string[] = [];
+    const walk = (rel: string): void => {
+      if (matches.length >= maxResults) return;
+      if (visited >= MAX_FILES_VISITED) return;
+      const abs = path.join(this.dir, rel);
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(abs, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        if (matches.length >= maxResults) return;
+        if (visited >= MAX_FILES_VISITED) return;
+        if (IGNORE.has(e.name)) continue;
+        const childRel = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) {
+          walk(childRel);
+        } else if (e.isFile()) {
+          visited++;
+          if (childRel === norm || childRel.endsWith(`/${norm}`)) {
+            matches.push(childRel);
+          }
+        }
+      }
+    };
+    walk('');
+    return matches;
+  }
+
   writeFile(relPath: string, content: string): void {
     const abs = path.join(this.dir, relPath);
     fs.mkdirSync(path.dirname(abs), { recursive: true });

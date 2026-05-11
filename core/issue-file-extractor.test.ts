@@ -56,6 +56,34 @@ Some description.`;
     expect(paths.every((p) => !p.startsWith('/'))).toBe(true);
   });
 
+  it('drops site-packages/ prefix so the result is the import-path suffix', () => {
+    const body =
+      'File "/x/.venv/lib/python3.11/site-packages/openinference/instrumentation/smolagents/_wrappers.py", line 42';
+    const paths = extractFilePaths(body);
+    expect(paths).toContain(
+      'openinference/instrumentation/smolagents/_wrappers.py'
+    );
+    expect(paths.every((p) => !p.includes('site-packages'))).toBe(true);
+  });
+
+  it('drops dist-packages/ prefix (Debian-flavored venvs)', () => {
+    const body =
+      'File "/usr/lib/python3/dist-packages/openinference/instrumentation/smolagents/_wrappers.py", line 17';
+    const paths = extractFilePaths(body);
+    expect(paths).toContain(
+      'openinference/instrumentation/smolagents/_wrappers.py'
+    );
+  });
+
+  it('prefers repo marker (python/) over install-root strip when both present', () => {
+    const body =
+      'File "/home/user/repo/python/instrumentation/openinference-instrumentation-smolagents/src/openinference/instrumentation/smolagents/_wrappers.py", line 99';
+    const paths = extractFilePaths(body);
+    expect(paths).toContain(
+      'python/instrumentation/openinference-instrumentation-smolagents/src/openinference/instrumentation/smolagents/_wrappers.py'
+    );
+  });
+
   it('dedupes across multiple mentions', () => {
     const body = `See \`src/auth.py\`.
 File "src/auth.py", line 10
