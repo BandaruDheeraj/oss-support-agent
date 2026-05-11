@@ -74,12 +74,19 @@ import {
 } from '../core/issue-sweep';
 import type { ScopeConfirmationConfig } from '../core/issue-sweep-types';
 import { GitHubActionsClient } from './clients/github-actions';
-import { ensureRegressionWorkflowOnFork } from './clients/fork-workflow-installer';
+import { ensureRegressionWorkflowOnFork, ensureUsabilityWorkflowOnFork } from './clients/fork-workflow-installer';
 import {
   runRegressionGuard,
   createRegressionConfig,
   generateRegressionSummary,
 } from '../core/agents/regression-guard';
+import {
+  runUsabilityAgent,
+  DEFAULT_USABILITY_TIMEOUT_MINUTES,
+} from '../core/agents/usability-index';
+import type { UsabilityAgentInput } from '../core/agents/usability-types';
+import { GHAUsabilityExerciser } from './clients/gha-usability-exerciser';
+import { inferUsabilityIntrospection } from './clients/usability-introspect';
 
 /** Module-level sweep state store. Keyed by per-run sweep runId; no cross-run conflicts. */
 const sweepStateStore = new InMemorySweepStateStore();
@@ -1130,6 +1137,59 @@ export async function runPipeline(args: {
     }
   }
 
+  // ---------- Optional: usability agent (GHA sandbox only) ----------
+  let usabilitySection = '';
+  const usabilityLabels: string[] = [];
+  if (manifest.sandbox_runner === 'gha') {
+    try {
+      log(`[usability] sandbox_runner=gha; running usability agent`);
+      await ensureUsabilityWorkflowOnFork(deps.token, fork.forkFullName, log);
+
+      const sandboxServices = await adapter.getSandboxServices();
+      const serviceNames = sandboxServices.map((s) =>
+        typeof s === 'string' ? s : s.name
+      );
+      const introspection = inferUsabilityIntrospection(
+        workspace,
+        routing.result.affectedModule
+      );
+
+      const usabilityInput: UsabilityAgentInput = {
+        forkFullName: fork.forkFullName,
+        branchName: fork.branchName,
+        affectedModule: routing.result.affectedModule,
+        confirmedIssues: confirmedIssues.map((i) => ({
+          number: i.number,
+          title: i.title,
+          body: i.body ?? null,
+          labels: i.labels,
+        })),
+        sandboxServices: serviceNames,
+        timeoutMinutes: manifest.sandbox_timeout_mins ?? DEFAULT_USABILITY_TIMEOUT_MINUTES,
+        installCommand: introspection.installCommand,
+        entryPoints: introspection.entryPoints,
+      };
+
+      const actionsClient = new GitHubActionsClient(deps.token);
+      const exerciser = new GHAUsabilityExerciser(deps.token, actionsClient);
+      const usabilityResult = await runUsabilityAgent(
+        usabilityInput,
+        exerciser,
+        actionsClient
+      );
+      usabilitySection = usabilityResult.summary;
+      log(
+        `[usability] completed=${usabilityResult.completed} dx=${usabilityResult.dxScore} blockers=${usabilityResult.blockers.length}`
+      );
+      if (usabilityResult.blockers.length > 0) {
+        usabilityLabels.push('agent-usability-blockers');
+      }
+    } catch (err: any) {
+      log(`[usability] failed (non-blocking): ${err?.message ?? err}`);
+      usabilitySection = `### Usability Report: ⚠️ Not Run\n\nUsability agent failed to execute: ${err?.message ?? err}`;
+    }
+  }
+
   // ---------- Draft PR ----------
   const prMeta = await adapter.getPRMetadata(
     confirmedIssues.map((i) => ({
@@ -1152,10 +1212,11 @@ export async function runPipeline(args: {
     `- ${evalSummary}`,
     ``,
     ...(regressionSection ? [regressionSection, ``] : []),
+    ...(usabilitySection ? [usabilitySection, ``] : []),
     ...(manifest.sandbox_runner === 'gha'
       ? [
           `<!-- agent-setup -->`,
-          `> Note: this PR includes \`.github/workflows/regression-test.yml\` because the oss-support-agent's GHA sandbox runner is enabled. Feel free to delete that file before merging if you don't want it in your repo.`,
+          `> Note: this PR includes \`.github/workflows/regression-test.yml\` and \`.github/workflows/usability-test.yml\` because the oss-support-agent's GHA sandbox runner is enabled. Feel free to delete those files before merging if you don't want them in your repo.`,
           ``,
         ]
       : []),
@@ -1173,7 +1234,7 @@ export async function runPipeline(args: {
   });
   log(`[pr] opened ${pr.url}`);
 
-  const allLabels = [...(prMeta.extraLabels ?? []), ...regressionLabels];
+  const allLabels = [...(prMeta.extraLabels ?? []), ...regressionLabels, ...usabilityLabels];
   if (allLabels.length) {
     try {
       await ghClient.addLabelsToPR(repoFullName, pr.number, allLabels);
