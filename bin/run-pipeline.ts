@@ -52,7 +52,8 @@ import {
 } from '../core/retry-loop';
 import type { RetryLoopConfig } from '../core/retry-loop-types';
 
-import { GitHubIssueCommenter, GitHubRestClient } from './clients/github-rest';
+import { GitHubRestClient } from './clients/github-rest';
+import type { IssueCommenter } from '../core/agents/triage-types';
 import { LocalWorkspace } from './clients/local-workspace';
 import { LocalForkCommitter, LocalRepoFileReader } from './clients/local-fork-deps';
 import { runLocalSandbox } from './clients/local-sandbox';
@@ -416,7 +417,29 @@ export async function runPipeline(args: {
   const runId = `${repoFullName}#${issueNumber}-${Date.now()}`;
 
   // ---------- Triage ----------
-  const commenter = new GitHubIssueCommenter(deps.token);
+  // Triage uncertainty (clarify / not_applicable) is delivered to the maintainer
+  // via email so noisy / off-topic issues don't get a public bot reply. If
+  // Gmail/PM deps aren't configured we log the would-be comment instead.
+  const triageNotifier: IssueCommenter = deps.live
+    ? {
+        async postComment(repo, issueNumber, comment) {
+          const subject = `[oss-agent] triage notice for ${repo}#${issueNumber}`;
+          const issueUrl = `https://github.com/${repo}/issues/${issueNumber}`;
+          const body = `${comment}\n\n---\nIssue: ${issueUrl}`;
+          await deps.live!.failureNotifier.sendEmail(
+            manifest.pm_email,
+            subject,
+            body,
+            manifest.pm_email
+          );
+          log(`[triage] emailed maintainer at ${manifest.pm_email}`);
+        },
+      }
+    : {
+        async postComment(_repo, _issueNumber, comment) {
+          log(`[triage] (no live deps; would have emailed) ${comment.slice(0, 200)}`);
+        },
+      };
   const triageInput = buildTriageInput(payload, manifest, []);
 
   const routing = await runTriage(
@@ -424,7 +447,7 @@ export async function runPipeline(args: {
     issueNumber,
     triageInput,
     adapter,
-    commenter,
+    triageNotifier,
     {
       typeClassifier: createDefaultTriageClassifier(
         deps.live
@@ -441,11 +464,11 @@ export async function runPipeline(args: {
 
   if (routing.action === 'route_not_applicable') {
     log(`[triage] not_applicable: ${routing.result.relevanceReason}`);
-    return { status: 'commented', reason: 'not-applicable-comment-posted' };
+    return { status: 'commented', reason: 'not-applicable-emailed-maintainer' };
   }
 
   if (routing.action === 'clarify') {
-    return { status: 'commented', reason: 'low-confidence-clarification-posted' };
+    return { status: 'commented', reason: 'low-confidence-emailed-maintainer' };
   }
 
   // route_pm requires live deps for the Gmail design loop.
