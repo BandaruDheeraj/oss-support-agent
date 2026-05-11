@@ -9,7 +9,15 @@
  * the operator is expected to start them out-of-band (e.g. via docker compose) before
  * running the harness. If a service URL is unreachable, the corresponding command will
  * fail and that failure will flow through to the eval agent normally.
+ *
+ * Python isolation: before running any command, the runner ensures a workspace-local
+ * virtualenv exists at `<workspace>/.agent-venv` and prepends its bin directory to
+ * PATH. This way `pip install` works even on hosts (Render, modern Debian) where the
+ * system Python is locked down by PEP 668 ("externally-managed-environment").
  */
+
+import * as fs from 'fs';
+import * as path from 'path';
 
 import type { SandboxCommandResult, ServiceConfig } from '../../core/adapter.interface';
 import type { SandboxArtifact, SandboxConfig, SandboxResult } from '../../core/sandbox-types';
@@ -44,6 +52,74 @@ async function checkServices(services: ServiceConfig[], log: (m: string) => void
   }
 }
 
+/**
+ * Ensure a Python venv exists in the workspace and return its bin directory.
+ *
+ * Why: `pip install` on hosts with a PEP 668-managed system Python (Render's
+ * Ubuntu base image, modern Debian) errors out with "externally-managed-
+ * environment" unless we install into a venv. Creating a per-workspace venv
+ * also keeps installs isolated from other workspaces / the agent host itself.
+ *
+ * Idempotent: if `<workspaceDir>/.agent-venv/bin/pip` already exists, we
+ * reuse it. Otherwise we try `python3 -m venv` then fall back to `python -m
+ * venv`. On failure we return null and let the caller decide what to do
+ * (typically: continue without the venv and let pip fail naturally so the
+ * halt-and-email machinery kicks in with a useful stderr).
+ */
+async function ensurePythonVenv(
+  workspaceDir: string,
+  log: (m: string) => void,
+  perCommandTimeoutMs: number
+): Promise<{ binDir: string } | null> {
+  const venvDir = path.join(workspaceDir, '.agent-venv');
+  // venv layout differs between Unix (`bin`) and Windows (`Scripts`).
+  const binDirName = process.platform === 'win32' ? 'Scripts' : 'bin';
+  const binDir = path.join(venvDir, binDirName);
+  const pipPath = path.join(
+    binDir,
+    process.platform === 'win32' ? 'pip.exe' : 'pip'
+  );
+  if (fs.existsSync(pipPath)) {
+    log(`[sandbox] reusing venv at ${venvDir}`);
+    return { binDir };
+  }
+
+  // Try python3 first (Linux/Mac convention), fall back to python (Windows /
+  // some Render images). We pipe stderr→stdout via shell:true so any error
+  // shows up in the captured output.
+  const candidates = ['python3', 'python'];
+  for (const py of candidates) {
+    log(`[sandbox] creating venv with ${py} -m venv ${venvDir}`);
+    const create = await execCommand(
+      `${py} -m venv "${venvDir}"`,
+      [],
+      workspaceDir,
+      { shell: true, timeoutMs: perCommandTimeoutMs }
+    );
+    if (create.exitCode === 0 && fs.existsSync(pipPath)) {
+      // Bump pip + setuptools so editable installs (PEP 660) and modern
+      // wheels work reliably. Best-effort — failures here just mean we
+      // ship with whatever pip the venv was bootstrapped with.
+      const upgrade = await execCommand(
+        `"${pipPath}" install --quiet --upgrade pip setuptools wheel`,
+        [],
+        workspaceDir,
+        { shell: true, timeoutMs: perCommandTimeoutMs }
+      );
+      if (upgrade.exitCode !== 0) {
+        log(
+          `[sandbox] venv pip upgrade exit=${upgrade.exitCode} (continuing): ${upgrade.stderr.slice(0, 200)}`
+        );
+      }
+      return { binDir };
+    }
+    log(
+      `[sandbox] ${py} -m venv failed (exit=${create.exitCode}): ${create.stderr.slice(0, 200) || create.stdout.slice(0, 200)}`
+    );
+  }
+  return null;
+}
+
 export async function runLocalSandbox(args: {
   workspace: LocalWorkspace;
   config: SandboxConfig;
@@ -55,6 +131,21 @@ export async function runLocalSandbox(args: {
   const startedAt = new Date().toISOString();
 
   await checkServices(args.services, log);
+
+  // Set up an isolated Python venv for this sandbox run. If creation fails
+  // (e.g. python3 missing), we still proceed: the per-command pip will fail
+  // naturally and halt-and-email surfaces the real error to the operator.
+  const venv = await ensurePythonVenv(args.workspace.dir, log, timeoutMs);
+  const sandboxEnv: NodeJS.ProcessEnv = {};
+  if (venv) {
+    const sep = process.platform === 'win32' ? ';' : ':';
+    sandboxEnv.PATH = `${venv.binDir}${sep}${process.env.PATH ?? ''}`;
+    // Belt-and-suspenders: VIRTUAL_ENV makes some tools (pip, pipx, poetry)
+    // detect the venv even if PATH is overridden mid-script.
+    sandboxEnv.VIRTUAL_ENV = path.dirname(venv.binDir);
+  } else {
+    log(`[sandbox] proceeding WITHOUT venv (python3/python not available); pip commands likely to fail`);
+  }
 
   const commands = args.config.testCommands ?? (args.config.testCommand ? [args.config.testCommand] : []);
   const results: SandboxCommandResult[] = [];
@@ -69,6 +160,7 @@ export async function runLocalSandbox(args: {
     const r = await execCommand(cmd, [], args.workspace.dir, {
       timeoutMs,
       shell: true,
+      env: sandboxEnv,
     });
     const durSec = r.durationMs / 1000;
     totalDurationSec += durSec;
