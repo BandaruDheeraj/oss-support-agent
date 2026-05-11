@@ -435,6 +435,66 @@ describe('runFixAgent', () => {
     expect(committer.commitChanges).not.toHaveBeenCalled();
   });
 
+  // Regression test for the openinference #19 failure mode (2026-05-11):
+  // affectedModule="." causes gatherModuleFiles to sample only ~30 files
+  // from a huge repo, so the file the LLM actually modifies is often
+  // absent from input.moduleSource. The guard must fall back to the
+  // reader for ground truth — otherwise destructive rewrites slip through.
+  it('augments moduleSource via reader when the modified file is absent, then rejects destructive rewrite', async () => {
+    const longOriginal = Array(80).fill('def something(): return 42').join('\n');
+    const input = makeInput({
+      affectedModule: '.',
+      // The repo has thousands of files but the sample omits the file the
+      // LLM modifies — exactly what gatherModuleFiles cap-at-30 produces
+      // when affectedModule=".".
+      moduleSource: [
+        { path: 'unrelated/a.ts', content: 'export const a = 1;' },
+        { path: 'unrelated/b.ts', content: 'export const b = 2;' },
+      ],
+    });
+    const generator: FixGenerator = {
+      generateFix: jest.fn().mockResolvedValue({
+        sourceChanges: [
+          {
+            path: 'python/instrumentation/openinference-instrumentation-smolagents/src/openinference/instrumentation/smolagents/_wrappers.py',
+            action: 'modify',
+            content:
+              'from opentelemetry.trace import NonRecordingSpan\n' +
+              'def _finalize_step_span(span):\n' +
+              '    if isinstance(span, NonRecordingSpan):\n' +
+              '        return\n' +
+              '    # ... existing logic unchanged\n',
+          },
+        ],
+        testChanges: [
+          {
+            path: 'python/instrumentation/openinference-instrumentation-smolagents/tests/test_wrappers.py',
+            action: 'create',
+            content: 'def test_finalize_step_span_non_recording(): pass',
+          },
+        ],
+        summary: 'guard NonRecordingSpan',
+      }),
+    };
+    const committer = makeMockCommitter([]);
+    const reader: RepoFileReader = {
+      readFile: jest.fn().mockResolvedValue(longOriginal),
+      listFiles: jest.fn().mockResolvedValue([]),
+    };
+
+    await expect(runFixAgent(input, generator, committer, reader)).rejects.toMatchObject({
+      name: 'FixAgentError',
+      phase: 'destructive_rewrite',
+    });
+    // Reader must have been consulted for the missing-from-moduleSource path
+    expect(reader.readFile).toHaveBeenCalledWith(
+      input.forkFullName,
+      input.branchName,
+      'python/instrumentation/openinference-instrumentation-smolagents/src/openinference/instrumentation/smolagents/_wrappers.py'
+    );
+    expect(committer.commitChanges).not.toHaveBeenCalled();
+  });
+
   it('commits changes to the fork branch only', async () => {
     const input = makeInput();
     const generator = makeMockGenerator();

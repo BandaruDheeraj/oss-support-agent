@@ -105,10 +105,12 @@ export function detectDestructiveRewrites(
   const placeholderPatterns: RegExp[] = [
     /#\s*\.{3,}\s*existing\s+(code|content|imports|logic)/i,
     /#\s*existing\s+(code|content|imports|logic)\s*\.{3,}/i,
+    /#\s*existing\s+(code|content|imports|logic)\s+unchanged/i,
     /#\s*other\s+(imports|code|content|logic)\s*\.{3,}/i,
     /#\s*rest\s+of\s+(the\s+)?(file|code|module|imports)/i,
     /\/\/\s*\.{3,}\s*existing\s+(code|content|imports|logic)/i,
     /\/\/\s*existing\s+(code|content|imports|logic)\s*\.{3,}/i,
+    /\/\/\s*existing\s+(code|content|imports|logic)\s+unchanged/i,
     /\/\/\s*rest\s+of\s+(the\s+)?(file|code|module)/i,
     /<!--\s*existing\s+(code|content)\s*-->/i,
     /\/\*\s*\.{3,}\s*existing\s+(code|content)/i,
@@ -262,9 +264,35 @@ export async function runFixAgent(
   // complete post-edit file contents — sometimes it abridges. We surface
   // this as a fix-agent error so the retry loop re-prompts with the
   // explicit guidance below.
+  //
+  // `input.moduleSource` is a bounded sample of the affected module (see
+  // `gatherModuleFiles` in run-pipeline.ts — capped at 30 files). For
+  // repo-wide modules (affectedModule="."), the file the LLM actually
+  // modified may not be in the sample, leaving the guard with no baseline.
+  // Fetch any missing originals from the reader so we always have ground
+  // truth for the placeholder/shrinkage checks.
+  const moduleSourceByPath = new Map(input.moduleSource.map((f) => [f.path, f.content]));
+  const augmentedModuleSource = [...input.moduleSource];
+  for (const change of fixOutput.sourceChanges) {
+    if (change.action !== 'modify') continue;
+    if (moduleSourceByPath.has(change.path)) continue;
+    try {
+      const original = await reader.readFile(
+        input.forkFullName,
+        input.branchName,
+        change.path
+      );
+      augmentedModuleSource.push({ path: change.path, content: original });
+      moduleSourceByPath.set(change.path, original);
+    } catch {
+      // Reader failed (file may not exist yet, or transient I/O issue);
+      // leave it absent — the guard will treat the change as create-like
+      // and skip it rather than block on missing data.
+    }
+  }
   const destructive = detectDestructiveRewrites(
     fixOutput.sourceChanges,
-    input.moduleSource
+    augmentedModuleSource
   );
   if (destructive.length > 0) {
     const details = destructive
