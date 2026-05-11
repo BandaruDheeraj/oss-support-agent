@@ -163,6 +163,20 @@ export class LocalReproWorkspace implements ReproWorkspace {
     for (const d of safeListSubdirs(this.inner, '').sort()) {
       lines.push(`  ${d}/`);
     }
+
+    // Collect candidate editableInstall paths. We try in order:
+    // 1. Walk UP from affectedModule looking for ancestor dirs with a Python
+    //    package manifest. This is the precise hit when triage gave us a
+    //    real disk path.
+    // 2. If that yields nothing (e.g. triage produced an import-style path
+    //    like "openinference/instrumentation/smolagents/_wrappers.py" that
+    //    doesn't exist on disk), scan the whole repo for pyproject.toml /
+    //    setup.py / setup.cfg files and list those, capped.
+    // The LLM otherwise has no way to know which dir to `pip install -e`,
+    // and getting it wrong burns the entire baseline budget on
+    // ModuleNotFoundError.
+    let candidates: string[] = [];
+    let candidatesAreFallback = false;
     if (this.affectedModule && this.affectedModule !== '.' && this.affectedModule !== '') {
       lines.push('');
       lines.push(`Affected module subtree (${this.affectedModule}, depth=2):`);
@@ -170,19 +184,19 @@ export class LocalReproWorkspace implements ReproWorkspace {
       const sub = collectSubtree(this.inner, affectedRoot, 2, 200);
       for (const entry of sub) lines.push(`  ${entry}`);
 
-      // Surface candidate editableInstall paths: walk up from the affected
-      // module looking for dirs that contain a Python package manifest. The
-      // LLM otherwise has to guess which ancestor dir to `pip install -e`,
-      // and getting it wrong burns the whole baseline budget on
-      // ModuleNotFoundError.
-      const candidates = findEditableInstallCandidates(this.inner, affectedRoot);
-      if (candidates.length > 0) {
-        lines.push('');
-        lines.push(
-          'Candidate editableInstalls (dirs containing pyproject.toml/setup.py/setup.cfg on the path to the affected module — pick the INNERMOST one whose package matches the import you need):'
-        );
-        for (const c of candidates) lines.push(`  ${c}`);
-      }
+      candidates = findEditableInstallCandidates(this.inner, affectedRoot);
+    }
+    if (candidates.length === 0) {
+      candidates = findAllEditableInstallCandidates(this.inner, 6, 50);
+      candidatesAreFallback = true;
+    }
+    if (candidates.length > 0) {
+      lines.push('');
+      const header = candidatesAreFallback
+        ? 'Candidate editableInstalls (all dirs in the repo containing pyproject.toml/setup.py/setup.cfg — pick the one whose package name matches the import you need; in monorepos this is usually a subdir like python/instrumentation/<pkg>/):'
+        : 'Candidate editableInstalls (dirs containing pyproject.toml/setup.py/setup.cfg on the path to the affected module — pick the INNERMOST one whose package matches the import you need):';
+      lines.push(header);
+      for (const c of candidates) lines.push(`  ${c}`);
     }
     return lines.join('\n');
   }
@@ -527,6 +541,34 @@ function findEditableInstallCandidates(
     if (cur === '' || cur === '.') break;
     const idx = cur.lastIndexOf('/');
     cur = idx === -1 ? '' : cur.slice(0, idx);
+  }
+  return out;
+}
+
+/**
+ * BFS the whole repo (depth-capped, count-capped) returning every dir that
+ * contains a Python package manifest. Used as a fallback when the
+ * walk-up-from-affected-module strategy yields nothing — e.g. when triage
+ * gave us an import-style "module path" that doesn't exist on disk.
+ */
+function findAllEditableInstallCandidates(
+  reader: FileReader,
+  maxDepth: number,
+  cap: number
+): string[] {
+  const out: string[] = [];
+  const queue: Array<{ dir: string; depth: number }> = [{ dir: '', depth: 0 }];
+  while (queue.length > 0) {
+    if (out.length >= cap) break;
+    const { dir, depth } = queue.shift()!;
+    const files = new Set(safeListFiles(reader, dir));
+    if (PYTHON_PACKAGE_MANIFESTS.some((m) => files.has(m))) {
+      out.push(dir === '' ? '.' : dir);
+    }
+    if (depth >= maxDepth) continue;
+    for (const sub of safeListSubdirs(reader, dir)) {
+      queue.push({ dir: dir ? `${dir}/${sub}` : sub, depth: depth + 1 });
+    }
   }
   return out;
 }
