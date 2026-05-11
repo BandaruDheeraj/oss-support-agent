@@ -49,9 +49,19 @@ import type { FollowUpGenerator } from '../core/pm-email-types';
 import type { PMEmailLoopConfig, DesignBriefInput } from '../core/pm-email-types';
 import { detectApproval } from '../core/gmail-mcp';
 import { extractFilePathsFromAll } from '../core/issue-file-extractor';
-import { runReproAgent } from '../core/agents/repro';
-import type { ReproSpec, RequiredCredential } from '../core/agents/repro-types';
-import { OpenRouterReproGenerator } from '../core/llm/openrouter-repro-generator';
+import { runReproLoop } from '../core/agents/repro-loop';
+import { LocalReproWorkspace } from '../core/agents/repro-workspace';
+import type {
+  ReproSpec,
+  RequiredCredential,
+  BaselineRunResult,
+  BaselineRunner,
+} from '../core/agents/repro-types';
+import {
+  ReproUnreproducibleError,
+  ReproCredentialsRequiredError,
+} from '../core/agents/repro-types';
+import { OpenRouterIterativeReproGenerator } from '../core/llm/openrouter-repro-generator';
 import {
   validateReproSetup,
   buildPipInstallCommands,
@@ -309,6 +319,21 @@ export function validateReproBaseline(args: {
     };
   }
   return { ok: true };
+}
+
+/**
+ * Best-effort `git reset --hard` between repro-loop attempts. The repro
+ * loop must always start from a clean slate so attempt N+1 doesn't see
+ * files attempt N wrote (or kept around after pip install side effects).
+ * Failure to reset is logged but not thrown — the next baseline attempt
+ * will surface anything genuinely broken.
+ */
+async function safeReset(workspace: LocalWorkspace, log: (msg: string) => void): Promise<void> {
+  try {
+    await workspace.resetWorkingTree();
+  } catch (err: any) {
+    log(`[repro] workspace reset between attempts failed (continuing): ${err?.message ?? err}`);
+  }
 }
 
 function gatherDocFiles(workspace: LocalWorkspace, modulePath: string): ModuleFile[] {
@@ -1683,182 +1708,296 @@ export async function runPipeline(args: {
     };
 
     try {
-      log('[repro] generating reproduction test');
-      reproSetupCmds = (await adapter.getReproSetupCommands?.()) ?? [];
-      if (reproSetupCmds.length > 0) {
-        log(`[repro] adapter setup commands: ${reproSetupCmds.length}`);
+      log('[repro] generating reproduction test (iterative loop)');
+      const adapterReproSetup = (await adapter.getReproSetupCommands?.()) ?? [];
+      if (adapterReproSetup.length > 0) {
+        log(`[repro] adapter setup commands: ${adapterReproSetup.length}`);
       }
-      const generated = await runReproAgent(
-        {
-          confirmedIssues,
-          affectedModule: routing.result.affectedModule,
-          moduleSource: fixInputBase.moduleSource,
-          language: 'python',
-          preferredTestDir: 'tests',
-        },
-        new OpenRouterReproGenerator()
+      reproSetupCmds = [...adapterReproSetup];
+
+      const sandboxServices = await adapter.getSandboxServices();
+
+      const reproWorkspace = new LocalReproWorkspace(
+        workspace,
+        routing.result.affectedModule
       );
-      log(`[repro] generated at ${generated.path} (sentinel="${generated.failureSentinel}")`);
+
+      // Captured by the baseline-runner callback so we can surface the exact
+      // command list (adapter + final LLM-declared setup) on success or in
+      // halt diagnostics. Updated on EVERY attempt — the LLM may change its
+      // declared deps between iterations and the fix stage must use the
+      // setup that actually proved the bug.
+      let lastBaselineCmds: string[] = [];
+      let lastValidatedSetup: { editableInstalls: string[]; pipPackages: string[] } | null = null;
+
+      const baselineRunner: BaselineRunner = async (spec): Promise<BaselineRunResult> => {
+        // ---- Per-attempt setup validation (semantic: must exist on disk) ----
+        let validatedSetup: { editableInstalls: string[]; pipPackages: string[] };
+        try {
+          validatedSetup = validateReproSetup({
+            editableInstalls: spec.editableInstalls,
+            pipPackages: spec.pipPackages,
+          });
+        } catch (err: any) {
+          // Reset and report — feedback so the LLM can fix the setup next turn.
+          await safeReset(workspace, log);
+          return {
+            ok: false,
+            stage: 'workspace_setup',
+            reason:
+              err instanceof ReproSetupValidationError
+                ? `LLM-declared repro setup failed validation: ${err.message}`
+                : err?.message ?? String(err),
+            exitCode: null,
+            stdout: '',
+            stderr: '',
+          };
+        }
+
+        for (const dir of validatedSetup.editableInstalls) {
+          const reason = validateEditableInstallPath(workspace.dir, dir);
+          if (reason) {
+            await safeReset(workspace, log);
+            return {
+              ok: false,
+              stage: 'workspace_setup',
+              reason: `editable install path is invalid (${dir}): ${reason}`,
+              exitCode: null,
+              stdout: '',
+              stderr: '',
+            };
+          }
+        }
+
+        // ---- Proactive credentials check ----
+        const declaredCheck = findMissingDeclaredCredentials(
+          spec.requiredCredentials,
+          process.env
+        );
+        if (declaredCheck.missing.length > 0) {
+          // TERMINAL — we will not retry around missing real-world API keys.
+          await safeReset(workspace, log);
+          return {
+            ok: false,
+            stage: 'baseline_failed_to_repro',
+            reason: `repro requires undeclared credentials: ${declaredCheck.missing.map((c) => c.envVar).join(', ')}`,
+            exitCode: null,
+            stdout: '',
+            stderr: '',
+            credentialsTerminal: {
+              inferredEnvVars: declaredCheck.missing.map((c) => c.envVar),
+              matchedPattern: 'declared by repro generator',
+            },
+          };
+        }
+
+        const llmSetupCmds = buildPipInstallCommands(validatedSetup);
+        const baselineCmds = [...adapterReproSetup, ...llmSetupCmds, spec.runCommand];
+        lastBaselineCmds = baselineCmds;
+        lastValidatedSetup = validatedSetup;
+
+        log(`[repro] baseline attempt: ${baselineCmds.length} command(s) (path=${spec.path})`);
+
+        // Write the candidate into the workspace.
+        try {
+          workspace.writeFile(spec.path, spec.content);
+        } catch (err: any) {
+          await safeReset(workspace, log);
+          return {
+            ok: false,
+            stage: 'workspace_setup',
+            reason: `failed to write repro file: ${err?.message ?? err}`,
+            exitCode: null,
+            stdout: '',
+            stderr: '',
+          };
+        }
+
+        let baselineArtifact;
+        try {
+          baselineArtifact = await runLocalSandbox({
+            workspace,
+            config: {
+              repoFullName,
+              forkFullName: fork.forkFullName,
+              branchName: fork.branchName,
+              workflowRepoFullName: '',
+              testCommands: baselineCmds,
+              sandboxServices,
+              timeoutMinutes: manifest.sandbox_timeout_mins ?? 15,
+            },
+            services: sandboxServices.filter(
+              (s): s is Exclude<typeof s, string> => typeof s !== 'string'
+            ),
+            options: { log },
+          });
+        } catch (err: any) {
+          await safeReset(workspace, log);
+          throw err; // bubble up to loop's outer catch
+        }
+
+        const reproRunResult =
+          baselineArtifact.commands[baselineArtifact.commands.length - 1];
+        const reproStdout = reproRunResult?.stdout ?? '';
+        const reproStderr = reproRunResult?.stderr ?? '';
+
+        const failedSetupCmd = baselineArtifact.commands
+          .slice(0, -1)
+          .find((c) => (c.exitCode ?? 1) !== 0);
+
+        if (failedSetupCmd) {
+          await safeReset(workspace, log);
+          return {
+            ok: false,
+            stage: 'baseline_setup_command_failed',
+            reason: `setup command failed: \`${failedSetupCmd.command}\` (exit ${failedSetupCmd.exitCode})`,
+            exitCode: failedSetupCmd.exitCode ?? null,
+            stdout: failedSetupCmd.stdout ?? '',
+            stderr: failedSetupCmd.stderr ?? '',
+            failedSetupCommand: failedSetupCmd.command,
+          };
+        }
+
+        if (baselineArtifact.result.timedOut) {
+          await safeReset(workspace, log);
+          return {
+            ok: false,
+            stage: 'baseline_timeout',
+            reason: 'repro timed out on baseline; cannot trust exit code as proof of bug',
+            exitCode: reproRunResult?.exitCode ?? null,
+            stdout: reproStdout,
+            stderr: reproStderr,
+          };
+        }
+
+        const validation = validateReproBaseline({
+          exitCode: reproRunResult?.exitCode ?? null,
+          stdout: reproStdout,
+          stderr: reproStderr,
+          failureSentinel: spec.failureSentinel,
+        });
+
+        // ---- Reactive credentials gate ----
+        const sentinelPrinted =
+          reproStdout.includes(spec.failureSentinel) ||
+          reproStderr.includes(spec.failureSentinel);
+        if (!validation.ok && !sentinelPrinted) {
+          const detected = detectCredentialError(reproStdout, reproStderr);
+          if (detected.isCredentialError) {
+            const merged = mergeCredentialSources(
+              spec.requiredCredentials ?? [],
+              detected.inferredEnvVars
+            );
+            const recheck = findMissingDeclaredCredentials(merged, process.env);
+            if (recheck.missing.length > 0) {
+              await safeReset(workspace, log);
+              return {
+                ok: false,
+                stage: 'baseline_failed_to_repro',
+                reason: `repro stderr indicates missing credentials (${detected.matchedPattern ?? 'unknown'})`,
+                exitCode: reproRunResult?.exitCode ?? null,
+                stdout: reproStdout,
+                stderr: reproStderr,
+                credentialsTerminal: {
+                  inferredEnvVars: recheck.missing.map((c) => c.envVar),
+                  matchedPattern: detected.matchedPattern ?? null,
+                },
+              };
+            }
+          }
+        }
+
+        if (!validation.ok) {
+          await safeReset(workspace, log);
+          return {
+            ok: false,
+            stage: 'baseline_failed_to_repro',
+            reason: validation.reason,
+            exitCode: reproRunResult?.exitCode ?? null,
+            stdout: reproStdout,
+            stderr: reproStderr,
+          };
+        }
+
+        // SUCCESS — leave the workspace as the runner found it. The outer
+        // post-loop block re-resets, re-writes, and commits a clean repro.
+        return {
+          ok: true,
+          exitCode: reproRunResult?.exitCode ?? null,
+          stdout: reproStdout,
+          stderr: reproStderr,
+        };
+      };
+
+      let loopResult;
+      try {
+        loopResult = await runReproLoop(
+          {
+            confirmedIssues,
+            affectedModule: routing.result.affectedModule,
+            moduleSource: fixInputBase.moduleSource,
+            language: 'python',
+            preferredTestDir: 'tests',
+          },
+          new OpenRouterIterativeReproGenerator(),
+          reproWorkspace,
+          baselineRunner,
+          { log }
+        );
+      } catch (err: any) {
+        if (err instanceof ReproCredentialsRequiredError) {
+          // Map to the existing awaiting-credentials gate. We need to
+          // synthesise RequiredCredential entries from the env-var list.
+          const creds: RequiredCredential[] = err.missingEnvVars.map((envVar) => ({
+            envVar,
+            purpose: 'inferred from repro baseline output',
+          }));
+          return await haltForCredentials(creds, err.detectionContext);
+        }
+        if (err instanceof ReproUnreproducibleError) {
+          // Build a rich diagnostic from the attempt history.
+          const last = err.attempts[err.attempts.length - 1];
+          const summaryLines = err.attempts.map((a) => {
+            const stage = a.stage;
+            const ec = a.exitCode != null ? ` exit=${a.exitCode}` : '';
+            const candPath = a.candidate?.path ? ` ${a.candidate.path}` : '';
+            return `  - attempt ${a.attempt} [${stage}${ec}]${candPath}: ${a.reason}`;
+          });
+          const reason =
+            `repro loop exhausted (${err.attempts.length} attempt(s)): ${err.lastReason}\n` +
+            `History:\n${summaryLines.join('\n')}`;
+          log(`[repro] ${reason.split('\n')[0]}`);
+          return await haltForReproNotRunnable({
+            reason,
+            stderrTail: last?.stderrTail,
+            stdoutTail: last?.stdoutTail,
+            attemptedCommands: lastBaselineCmds,
+            reproPath: last?.candidate?.path,
+          });
+        }
+        throw err;
+      }
+
+      const generated = loopResult.spec;
+      log(`[repro] generated at ${generated.path} (sentinel="${generated.failureSentinel}", attempts=${loopResult.attempts.length})`);
       if (generated.requiredCredentials && generated.requiredCredentials.length > 0) {
         log(
           `[repro] LLM declared ${generated.requiredCredentials.length} required credential(s): ${generated.requiredCredentials.map((c) => c.envVar).join(', ')}`
         );
       }
 
-      // ---- Proactive credentials gate ----
-      // If the LLM said it needs env vars we don't have, halt BEFORE the
-      // sandbox run. Costs nothing to skip a doomed run.
-      const declaredCheck = findMissingDeclaredCredentials(
-        generated.requiredCredentials,
-        process.env
-      );
-      if (declaredCheck.missing.length > 0) {
-        return await haltForCredentials(
-          declaredCheck.missing,
-          'declared by repro generator'
-        );
-      }
-
-      // ---- Validate LLM-declared setup (editableInstalls + pipPackages) ----
-      // The LLM uses these to declare every dependency the repro needs. We
-      // pre-validate their SHAPE in the repro agent and re-validate their
-      // SEMANTICS here (do the editable paths actually exist in the
-      // workspace + look like Python packages?). If anything's off, halt
-      // immediately rather than letting pip blow up later.
-      let validatedSetup: { editableInstalls: string[]; pipPackages: string[] };
-      try {
-        validatedSetup = validateReproSetup({
-          editableInstalls: generated.editableInstalls,
-          pipPackages: generated.pipPackages,
-        });
-      } catch (err) {
-        if (err instanceof ReproSetupValidationError) {
-          return await haltForReproNotRunnable({
-            reason: `LLM-declared repro setup failed validation: ${err.message}`,
-            attemptedCommands: reproSetupCmds,
-            reproPath: generated.path,
-          });
-        }
-        throw err;
-      }
-
-      // Pre-flight: each editable path must exist + contain a Python manifest.
-      for (const dir of validatedSetup.editableInstalls) {
-        const reason = validateEditableInstallPath(workspace.dir, dir);
-        if (reason) {
-          return await haltForReproNotRunnable({
-            reason: `editable install path is invalid: ${reason}`,
-            attemptedCommands: reproSetupCmds,
-            reproPath: generated.path,
-          });
-        }
-      }
-
-      const llmSetupCmds = buildPipInstallCommands(validatedSetup);
-      if (llmSetupCmds.length > 0) {
+      // Effective setup the fix stage will inherit (adapter baseline + final
+      // LLM-declared deps from the winning attempt).
+      const finalSetup = lastValidatedSetup ?? { editableInstalls: [], pipPackages: [] };
+      const finalLlmSetupCmds = buildPipInstallCommands(finalSetup);
+      reproSetupCmds = [...adapterReproSetup, ...finalLlmSetupCmds];
+      if (finalLlmSetupCmds.length > 0) {
         log(
-          `[repro] LLM-declared setup: ${validatedSetup.pipPackages.length} pip package(s), ${validatedSetup.editableInstalls.length} editable install(s)`
+          `[repro] final LLM-declared setup: ${finalSetup.pipPackages.length} pip package(s), ${finalSetup.editableInstalls.length} editable install(s)`
         );
       }
-      // Effective setup = adapter baseline deps + LLM-declared deps. Used
-      // for BOTH the baseline run and every subsequent fix-attempt sandbox
-      // run, so the two are environmentally equivalent.
-      reproSetupCmds = [...reproSetupCmds, ...llmSetupCmds];
 
-      // Write the repro into the workspace and run baseline.
-      workspace.writeFile(generated.path, generated.content);
-
-      const sandboxServices = await adapter.getSandboxServices();
-      const baselineCmds = [...reproSetupCmds, generated.runCommand];
-      log(`[repro] running baseline (${baselineCmds.length} command(s))`);
-      const baselineArtifact = await runLocalSandbox({
-        workspace,
-        config: {
-          repoFullName,
-          forkFullName: fork.forkFullName,
-          branchName: fork.branchName,
-          workflowRepoFullName: '',
-          testCommands: baselineCmds,
-          sandboxServices,
-          timeoutMinutes: manifest.sandbox_timeout_mins ?? 15,
-        },
-        services: sandboxServices.filter(
-          (s): s is Exclude<typeof s, string> => typeof s !== 'string'
-        ),
-        options: { log },
-      });
-      // The repro command is the LAST entry in baselineCmds; that's the one
-      // whose exit code + output tells us if the bug reproduced.
-      const reproRunResult =
-        baselineArtifact.commands[baselineArtifact.commands.length - 1];
-      const reproStdout = reproRunResult?.stdout ?? '';
-      const reproStderr = reproRunResult?.stderr ?? '';
-      let validation: { ok: true } | { ok: false; reason: string };
-      if (baselineArtifact.result.timedOut) {
-        validation = {
-          ok: false,
-          reason: 'repro timed out on baseline; cannot trust exit code as proof of bug',
-        };
-      } else {
-        validation = validateReproBaseline({
-          exitCode: reproRunResult?.exitCode ?? null,
-          stdout: reproStdout,
-          stderr: reproStderr,
-          failureSentinel: generated.failureSentinel,
-        });
-      }
-
-      // If any pre-repro setup command (pip install, etc.) failed, attribute
-      // the halt to that instead of the repro itself — much more actionable
-      // for the user.
-      const failedSetupCmd = baselineArtifact.commands
-        .slice(0, -1)
-        .find((c) => (c.exitCode ?? 1) !== 0);
-
-      // ---- Reactive credentials gate ----
-      // Sentinel-not-printed + auth-shaped stderr ⇒ probably the LLM didn't
-      // declare every env var it needed. Halt and report the union of
-      // declared + inferred names so the user sees the whole picture.
-      const sentinelPrinted =
-        reproStdout.includes(generated.failureSentinel) ||
-        reproStderr.includes(generated.failureSentinel);
-      if (!validation.ok && !sentinelPrinted) {
-        const detected = detectCredentialError(reproStdout, reproStderr);
-        if (detected.isCredentialError) {
-          const merged = mergeCredentialSources(
-            generated.requiredCredentials ?? [],
-            detected.inferredEnvVars
-          );
-          const recheck = findMissingDeclaredCredentials(merged, process.env);
-          if (recheck.missing.length > 0) {
-            return await haltForCredentials(
-              recheck.missing,
-              `inferred from baseline stderr (${detected.matchedPattern ?? 'unknown'})`
-            );
-          }
-        }
-      }
-
-      if (!validation.ok) {
-        // ---- No graceful degradation: halt the run. ----
-        // The whole point of the repro stage is to produce a behaviorally
-        // verified PR. If we can't even prove the bug reproduces, opening a
-        // PR would just be guesswork. Email the maintainer + label the issue
-        // and stop.
-        log(`[repro] baseline INVALID: ${validation.reason}`);
-        const reason = failedSetupCmd
-          ? `setup command failed: \`${failedSetupCmd.command}\` (exit ${failedSetupCmd.exitCode}). ${validation.reason}`
-          : validation.reason;
-        return await haltForReproNotRunnable({
-          reason,
-          stderrTail: failedSetupCmd?.stderr ?? reproStderr,
-          stdoutTail: failedSetupCmd?.stdout ?? reproStdout,
-          attemptedCommands: baselineCmds,
-          reproPath: generated.path,
-        });
-      }
-
-      log(`[repro] baseline FAILED with sentinel (exit=${reproRunResult?.exitCode}) — bug confirmed`);
+      log(`[repro] baseline FAILED with sentinel (exit=${loopResult.baseline.exitCode}) — bug confirmed`);
       // Reset any side-effect files the script may have written during the
       // baseline run, then re-write the canonical repro content and commit
       // ONLY that path. This guarantees the repro commit contains nothing
@@ -1880,12 +2019,13 @@ export async function runPipeline(args: {
         ``,
         `- **Path**: \`${generated.path}\``,
         `- **Run command**: \`${generated.runCommand}\``,
-        `- **Baseline (pre-fix)**: failed with exit ${reproRunResult?.exitCode ?? '?'} and printed sentinel \`${generated.failureSentinel}\` — bug reproduced.`,
+        `- **Baseline (pre-fix)**: failed with exit ${loopResult.baseline.exitCode ?? '?'} and printed sentinel \`${generated.failureSentinel}\` — bug reproduced.`,
+        `- **Iterations**: produced after ${loopResult.attempts.length} repro-agent turn(s).`,
         `- **Post-fix**: this PR's sandbox run executes the same command and requires it to pass (the eval gate enforces this on every retry).`,
       ].join('\n');
     } catch (err: any) {
-      // Repro generation / validation threw — that's also a halt, not a
-      // fallback. We never open a PR without a verified repro.
+      // Anything that escapes the loop / runner that isn't already handled
+      // above is treated as a halt — never open a PR without a verified repro.
       log(`[repro] generation failed: ${err?.message ?? err}`);
       return await haltForReproNotRunnable({
         reason: `repro generation failed: ${err?.message ?? String(err)}`,

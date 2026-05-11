@@ -139,3 +139,228 @@ export class ReproAgentError extends Error {
     this.phase = phase;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Iterative repro loop types
+//
+// The iterative repro generator is allowed to do one of two things per turn:
+//   1. Ask for additional context (read a file, list a dir, find by suffix,
+//      grep) — used when the LLM doesn't have enough code to write a
+//      faithful repro.
+//   2. Emit a candidate repro (same shape as the one-shot generator).
+//
+// The loop services context requests through a workspace adapter (which
+// applies the safety/size caps) and runs candidate repros against a
+// baseline runner (callback). It feeds back structured outcomes for each
+// failed attempt so the next turn can refine.
+// ---------------------------------------------------------------------------
+
+/** A single context request the LLM can make per turn. */
+export type ContextRequest =
+  | { op: 'read_file'; path: string; purpose: string }
+  | { op: 'list_dir'; path: string; purpose: string; maxEntries?: number }
+  | { op: 'find_file'; suffix: string; purpose: string; maxResults?: number }
+  | {
+      op: 'grep';
+      query: string;
+      purpose: string;
+      pathPrefix?: string;
+      extensions?: string[];
+      fixedString?: boolean;
+      maxResults?: number;
+    };
+
+/** Structured response to a context request. Shape mirrors the request `op`. */
+export type ContextResult =
+  | {
+      op: 'read_file';
+      path: string;
+      status: 'ok' | 'denied' | 'not_found' | 'too_large' | 'binary' | 'truncated';
+      content?: string;
+      bytes?: number;
+      reason?: string;
+    }
+  | {
+      op: 'list_dir';
+      path: string;
+      status: 'ok' | 'denied' | 'not_found';
+      entries?: Array<{ name: string; kind: 'file' | 'dir' }>;
+      truncated?: boolean;
+      reason?: string;
+    }
+  | {
+      op: 'find_file';
+      suffix: string;
+      status: 'ok' | 'denied';
+      matches?: string[];
+      truncated?: boolean;
+      reason?: string;
+    }
+  | {
+      op: 'grep';
+      query: string;
+      status: 'ok' | 'denied';
+      hits?: Array<{ path: string; line: number; preview: string }>;
+      truncated?: boolean;
+      reason?: string;
+    };
+
+/** Workspace adapter the loop uses to service context requests. */
+export interface ReproWorkspace {
+  readFile(req: Extract<ContextRequest, { op: 'read_file' }>): ContextResult;
+  listDir(req: Extract<ContextRequest, { op: 'list_dir' }>): ContextResult;
+  findFile(req: Extract<ContextRequest, { op: 'find_file' }>): ContextResult;
+  grep(req: Extract<ContextRequest, { op: 'grep' }>): ContextResult;
+  /**
+   * Brief summary of the top-level repo layout, included once at the start of
+   * the loop so the LLM has a map. Implementation-defined; recommended:
+   * top-level dirs + the affected module's subtree (a few levels deep).
+   */
+  repoTreeSummary(): string;
+}
+
+/**
+ * Validation stage at which a candidate repro failed. Surfaced verbatim to
+ * the LLM in the next turn's history so it can target its retry.
+ */
+export type ReproAttemptStage =
+  | 'schema'
+  | 'path_validation'
+  | 'sentinel_validation'
+  | 'setup_validation'
+  | 'workspace_setup'
+  | 'baseline_failed_to_repro'
+  | 'baseline_setup_command_failed'
+  | 'baseline_timeout';
+
+/** One past attempt, sent back to the LLM so it can refine. */
+export interface ReproAttemptHistoryEntry {
+  attempt: number;
+  /** What the LLM tried to write (path + truncated content preview). */
+  candidate?: {
+    path: string;
+    failureSentinel: string;
+    summary: string;
+    contentPreview: string; // first ~2KB
+    pipPackages?: string[];
+    editableInstalls?: string[];
+  };
+  stage: ReproAttemptStage;
+  /** Short human-readable reason. */
+  reason: string;
+  /** Tail of stdout (≤2 KB, redacted). */
+  stdoutTail?: string;
+  /** Tail of stderr (≤2 KB, redacted). */
+  stderrTail?: string;
+  exitCode?: number | null;
+  failedSetupCommand?: string;
+}
+
+/**
+ * Result of a baseline run. The loop calls this back via the runner injected
+ * by the pipeline; the runner is responsible for executing setup commands +
+ * the repro and reporting back. The runner MUST reset the workspace to a
+ * clean state before returning so attempt N+1 starts fresh.
+ */
+export interface BaselineRunResult {
+  ok: boolean;
+  /** When ok=false, why (mapped to ReproAttemptStage). */
+  stage?: Exclude<ReproAttemptStage, 'schema' | 'path_validation' | 'sentinel_validation' | 'setup_validation'>;
+  reason?: string;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  /** Setup command that failed (when stage = baseline_setup_command_failed). */
+  failedSetupCommand?: string;
+  /** True iff inferred-credentials path was hit (terminal — do not retry). */
+  credentialsTerminal?: {
+    inferredEnvVars: string[];
+    matchedPattern: string | null;
+  };
+}
+
+/** Function the pipeline injects to run a candidate spec on the sandbox. */
+export type BaselineRunner = (spec: ReproSpec) => Promise<BaselineRunResult>;
+
+/** What the iterative generator returns each turn. */
+export type ReproGeneratorAction =
+  | { kind: 'request_context'; reasoning: string; requests: ContextRequest[] }
+  | { kind: 'repro'; reasoning: string; output: ReproGeneratorOutput };
+
+/** Input passed to the iterative generator each turn. */
+export interface IterativeReproGeneratorInput extends ReproAgentInput {
+  /** Brief tree summary so the LLM knows what exists. */
+  repoTreeSummary: string;
+  /** Past attempts (oldest → newest). */
+  previousAttempts: ReproAttemptHistoryEntry[];
+  /** Context requests already serviced (deduped & truncated). */
+  loadedContext: ContextResult[];
+  /**
+   * Iteration index (1-based) and remaining budget so the LLM can choose
+   * between requesting more context vs. committing to a repro.
+   */
+  iteration: number;
+  remainingIterations: number;
+  remainingBaselineAttempts: number;
+}
+
+export interface IterativeReproGenerator {
+  generate(input: IterativeReproGeneratorInput): Promise<ReproGeneratorAction>;
+}
+
+/** Final result of the iterative loop on success. */
+export interface ReproLoopSuccess {
+  spec: ReproSpec;
+  baseline: BaselineRunResult;
+  attempts: ReproAttemptHistoryEntry[];
+}
+
+/**
+ * Thrown when the loop exhausts its budget without a verified repro.
+ * Carries enough diagnostics for the pipeline to surface a useful
+ * halt-and-email message.
+ */
+export class ReproUnreproducibleError extends Error {
+  public readonly attempts: ReproAttemptHistoryEntry[];
+  public readonly lastReason: string;
+  public readonly terminalCategory:
+    | 'budget_exhausted'
+    | 'credentials_required'
+    | 'generator_error'
+    | 'no_progress';
+
+  constructor(args: {
+    attempts: ReproAttemptHistoryEntry[];
+    lastReason: string;
+    terminalCategory: ReproUnreproducibleError['terminalCategory'];
+  }) {
+    super(`repro loop exhausted: ${args.lastReason}`);
+    this.name = 'ReproUnreproducibleError';
+    this.attempts = args.attempts;
+    this.lastReason = args.lastReason;
+    this.terminalCategory = args.terminalCategory;
+  }
+}
+
+/**
+ * Surfaced when the loop detects (proactively or reactively) that the repro
+ * needs credentials we don't have. Pipeline maps this to its existing
+ * `awaiting-credentials` halt path.
+ */
+export class ReproCredentialsRequiredError extends Error {
+  public readonly missingEnvVars: string[];
+  public readonly detectionContext: string;
+  public readonly attempts: ReproAttemptHistoryEntry[];
+
+  constructor(args: {
+    missingEnvVars: string[];
+    detectionContext: string;
+    attempts: ReproAttemptHistoryEntry[];
+  }) {
+    super(`repro requires credentials: ${args.missingEnvVars.join(', ')}`);
+    this.name = 'ReproCredentialsRequiredError';
+    this.missingEnvVars = args.missingEnvVars;
+    this.detectionContext = args.detectionContext;
+    this.attempts = args.attempts;
+  }
+}

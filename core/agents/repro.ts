@@ -57,6 +57,33 @@ function assertSentinelInContent(sentinel: string, content: string): void {
 }
 
 /**
+ * Validate a generator output and (on success) build the final spec. Shared
+ * between the legacy one-shot `runReproAgent` and the new iterative loop.
+ *
+ * Throws `ReproAgentError` on any structural / setup issue. The pipeline
+ * still validates editable-install path existence on disk separately.
+ */
+export function validateAndBuildReproSpec(
+  out: ReproGeneratorOutput,
+  preferredTestDir: string | undefined
+): ReproSpec {
+  assertSafePath(out.path, preferredTestDir);
+  assertSentinelInContent(out.failureSentinel, out.content);
+  try {
+    validateReproSetup({
+      editableInstalls: out.editableInstalls,
+      pipPackages: out.pipPackages,
+    });
+  } catch (err) {
+    if (err instanceof ReproSetupValidationError) {
+      throw new ReproAgentError(err.message, 'validate');
+    }
+    throw err;
+  }
+  return buildReproSpec(out);
+}
+
+/**
  * Build the spec (incl. runCommand) without executing anything.
  * `runCommand` is constructed by the runner, not the LLM.
  */
@@ -76,20 +103,5 @@ export async function runReproAgent(
     throw new ReproAgentError(`unsupported language: ${input.language}`, 'validate');
   }
   const out = await generator.generate(input);
-  assertSafePath(out.path, input.preferredTestDir);
-  assertSentinelInContent(out.failureSentinel, out.content);
-  // Validate (but don't materialize) the setup tokens. The pipeline does a
-  // second pass to verify editable paths exist in the workspace.
-  try {
-    validateReproSetup({
-      editableInstalls: out.editableInstalls,
-      pipPackages: out.pipPackages,
-    });
-  } catch (err) {
-    if (err instanceof ReproSetupValidationError) {
-      throw new ReproAgentError(err.message, 'validate');
-    }
-    throw err;
-  }
-  return buildReproSpec(out);
+  return validateAndBuildReproSpec(out, input.preferredTestDir);
 }
