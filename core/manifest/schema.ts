@@ -56,6 +56,13 @@ export const manifestSchema = {
       description: 'Sandbox wall-time cap (minutes)',
       default: 15,
     },
+    sandbox_runner: {
+      type: 'string',
+      enum: ['local', 'gha'],
+      description:
+        'Sandbox runner. "local" runs subprocess on the harness host (default). "gha" dispatches to GitHub Actions; required for macOS/iOS targets and for regression-guard/usability cross-branch runs.',
+      default: 'local',
+    },
   },
   additionalProperties: false,
 } as const;

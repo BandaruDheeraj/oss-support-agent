@@ -22,6 +22,17 @@ export interface Manifest {
   max_retries: number;
   /** Sandbox wall-time cap (minutes) */
   sandbox_timeout_mins: number;
+  /**
+   * Which sandbox runner to use.
+   * - 'local': subprocess on the harness host (Linux only, fast, default).
+   * - 'gha':   dispatch to GitHub Actions workflow (supports macOS/Windows
+   *             runners; required for iOS/macOS targets; also used for
+   *             regression-guard and usability agents which need parallel
+   *             cross-branch runs). When 'gha', the target fork must expose
+   *             the workflow files referenced by the agents.
+   * Defaults to 'local' when absent.
+   */
+  sandbox_runner?: 'local' | 'gha';
 }
 
 export interface ManifestValidationError {
