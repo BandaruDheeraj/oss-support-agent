@@ -73,6 +73,13 @@ import {
   processScopeReply,
 } from '../core/issue-sweep';
 import type { ScopeConfirmationConfig } from '../core/issue-sweep-types';
+import { GitHubActionsClient } from './clients/github-actions';
+import { ensureRegressionWorkflowOnFork } from './clients/fork-workflow-installer';
+import {
+  runRegressionGuard,
+  createRegressionConfig,
+  generateRegressionSummary,
+} from '../core/agents/regression-guard';
 
 /** Module-level sweep state store. Keyed by per-run sweep runId; no cross-run conflicts. */
 const sweepStateStore = new InMemorySweepStateStore();
@@ -1083,6 +1090,46 @@ export async function runPipeline(args: {
     evalSummary = attempt!.evalSummary;
   }
 
+  // ---------- Optional: regression guard (GHA sandbox only) ----------
+  let regressionSection = '';
+  const regressionLabels: string[] = [];
+  if (manifest.sandbox_runner === 'gha') {
+    try {
+      log(`[regression-guard] sandbox_runner=gha; running regression guard`);
+      await ensureRegressionWorkflowOnFork(deps.token, fork.forkFullName, log);
+
+      const testCommands = await adapter.getTestCommands();
+      const sandboxServices = await adapter.getSandboxServices();
+      const serviceNames = sandboxServices.map((s) =>
+        typeof s === 'string' ? s : s.name
+      );
+      const joinedCommand = testCommands.join(' && ');
+
+      const regressionConfig = createRegressionConfig(
+        fork.forkFullName,
+        fork.branchName,
+        repoFullName,
+        baseBranch,
+        joinedCommand,
+        serviceNames,
+        manifest.sandbox_timeout_mins ?? 15
+      );
+
+      const actionsClient = new GitHubActionsClient(deps.token);
+      const regressionResult = await runRegressionGuard(regressionConfig, actionsClient);
+      regressionSection = generateRegressionSummary(regressionResult);
+      log(
+        `[regression-guard] detected=${regressionResult.regressionDetected} diffs=${regressionResult.diffs.length}`
+      );
+      if (regressionResult.regressionDetected) {
+        regressionLabels.push('agent-regression-detected');
+      }
+    } catch (err: any) {
+      log(`[regression-guard] failed (non-blocking): ${err?.message ?? err}`);
+      regressionSection = `### Regression Guard: ⚠️ Not Run\n\nRegression guard failed to execute: ${err?.message ?? err}`;
+    }
+  }
+
   // ---------- Draft PR ----------
   const prMeta = await adapter.getPRMetadata(
     confirmedIssues.map((i) => ({
@@ -1104,6 +1151,14 @@ export async function runPipeline(args: {
     `## Eval`,
     `- ${evalSummary}`,
     ``,
+    ...(regressionSection ? [regressionSection, ``] : []),
+    ...(manifest.sandbox_runner === 'gha'
+      ? [
+          `<!-- agent-setup -->`,
+          `> Note: this PR includes \`.github/workflows/regression-test.yml\` because the oss-support-agent's GHA sandbox runner is enabled. Feel free to delete that file before merging if you don't want it in your repo.`,
+          ``,
+        ]
+      : []),
     ...(prMeta.extraBodySections ?? []),
   ].join('\n');
 
@@ -1118,9 +1173,10 @@ export async function runPipeline(args: {
   });
   log(`[pr] opened ${pr.url}`);
 
-  if (prMeta.extraLabels?.length) {
+  const allLabels = [...(prMeta.extraLabels ?? []), ...regressionLabels];
+  if (allLabels.length) {
     try {
-      await ghClient.addLabelsToPR(repoFullName, pr.number, prMeta.extraLabels);
+      await ghClient.addLabelsToPR(repoFullName, pr.number, allLabels);
     } catch (err: any) {
       log(`[pr] label apply failed (non-fatal): ${err?.message ?? err}`);
     }
