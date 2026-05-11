@@ -272,7 +272,11 @@ export class LocalWorkspace {
     await git(this.dir, ['reset', '--hard', 'HEAD']);
     // -fd: discard untracked files + directories. NOT -x: keep .gitignored
     // files like .venv/node_modules so we don't blow away install caches.
-    await git(this.dir, ['clean', '-fd']);
+    // -e .agent-venv: explicitly preserve our per-workspace Python venv even
+    // when the upstream repo doesn't gitignore it. Recreating the venv on
+    // every attempt is slow and (on Render) flaky enough to break the repro
+    // loop entirely; reusing it is both correct and dramatically faster.
+    await git(this.dir, ['clean', '-fd', '-e', '.agent-venv']);
   }
 
   async push(): Promise<void> {
