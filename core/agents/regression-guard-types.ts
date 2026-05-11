@@ -24,6 +24,14 @@ export interface RegressionConfig {
   sandboxServices: string[];
   /** Maximum run duration in minutes per job */
   timeoutMinutes: number;
+  /**
+   * Ref to dispatch the workflow against (the ref where the workflow YAML
+   * lives — typically the fork's default branch). The actual branch to test
+   * is `forkBranchName` / `upstreamDefaultBranch` and is passed as a
+   * workflow input. Defaults to `upstreamDefaultBranch` when omitted for
+   * backwards compatibility with older callers/tests.
+   */
+  dispatchRef?: string;
 }
 
 /**

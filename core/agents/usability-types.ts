@@ -79,6 +79,14 @@ export interface UsabilityAgentInput {
   installCommand: string;
   /** Entry point patterns for the affected API (import paths to exercise) */
   entryPoints: string[];
+  /**
+   * Ref to dispatch the workflow against (typically the fork's default
+   * branch where the workflow YAML was installed). The agent branch being
+   * exercised is `branchName` and is passed as a workflow input. Defaults
+   * to `branchName` when omitted for backwards compatibility with older
+   * callers/tests.
+   */
+  dispatchRef?: string;
 }
 
 /**

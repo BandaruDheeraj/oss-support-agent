@@ -124,11 +124,15 @@ async function runBranchTest(
   const inputs = buildRegressionWorkflowInputs(config, branch);
 
   // Trigger workflow_dispatch
+  // The workflow YAML lives on the fork's default branch (where the installer
+  // committed it). The actual branch to test is `branch` and is passed as
+  // a workflow input — the workflow checks it out via actions/checkout.
+  const dispatchRef = config.dispatchRef ?? config.upstreamDefaultBranch;
   try {
     await client.triggerWorkflowDispatch(
       config.forkFullName,
       REGRESSION_WORKFLOW_FILE,
-      branch,
+      dispatchRef,
       inputs
     );
   } catch (err: unknown) {

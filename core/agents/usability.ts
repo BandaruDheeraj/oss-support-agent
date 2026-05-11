@@ -197,10 +197,14 @@ export async function runUsabilityAgent(
 
   let workflowRunUrl = '';
   try {
+    // The workflow YAML lives on the fork's default branch (where the installer
+    // committed it). The actual agent branch is `branchName` and is passed as
+    // a workflow input — the workflow checks it out via actions/checkout.
+    const dispatchRef = input.dispatchRef ?? input.branchName;
     await actionsClient.triggerWorkflowDispatch(
       input.forkFullName,
       USABILITY_WORKFLOW_FILE,
-      input.branchName,
+      dispatchRef,
       workflowInputs
     );
 

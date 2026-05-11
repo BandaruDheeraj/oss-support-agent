@@ -346,7 +346,7 @@ export async function ensureRegressionWorkflowOnFork(
   token: string,
   forkFullName: string,
   log: (msg: string) => void = () => undefined
-): Promise<boolean> {
+): Promise<{ committed: boolean; defaultBranch: string }> {
   // 1. Get the default branch name
   const repoRes = await ghFetch(token, `${GITHUB_API}/repos/${forkFullName}`);
   if (!repoRes.ok) {
@@ -365,7 +365,7 @@ export async function ensureRegressionWorkflowOnFork(
       const decoded = Buffer.from(contentData.content, 'base64').toString('utf-8');
       if (decoded.trim() === REGRESSION_WORKFLOW_CONTENT.trim()) {
         log(`[gha-setup] regression workflow already up to date on ${forkFullName}@${defaultBranch}`);
-        return false;
+        return { committed: false, defaultBranch };
       }
       existingSha = contentData.sha;
     }
@@ -390,18 +390,18 @@ export async function ensureRegressionWorkflowOnFork(
     throw new Error(`GitHub put contents failed (${putRes.status}): ${await putRes.text()}`);
   }
   log(`[gha-setup] installed regression-test workflow on ${forkFullName}@${defaultBranch}`);
-  return true;
+  return { committed: true, defaultBranch };
 }
 
 /**
  * Ensure the usability workflow file is present on the fork's default branch.
- * Returns true if a commit was created, false if the file already matched.
+ * Returns { committed: true } if a commit was created, false if the file already matched.
  */
 export async function ensureUsabilityWorkflowOnFork(
   token: string,
   forkFullName: string,
   log: (msg: string) => void = () => undefined
-): Promise<boolean> {
+): Promise<{ committed: boolean; defaultBranch: string }> {
   const repoRes = await ghFetch(token, `${GITHUB_API}/repos/${forkFullName}`);
   if (!repoRes.ok) {
     throw new Error(`GitHub get repo failed (${repoRes.status}): ${await repoRes.text()}`);
@@ -418,7 +418,7 @@ export async function ensureUsabilityWorkflowOnFork(
       const decoded = Buffer.from(contentData.content, 'base64').toString('utf-8');
       if (decoded.trim() === USABILITY_WORKFLOW_CONTENT.trim()) {
         log(`[gha-setup] usability workflow already up to date on ${forkFullName}@${defaultBranch}`);
-        return false;
+        return { committed: false, defaultBranch };
       }
       existingSha = contentData.sha;
     }
@@ -442,5 +442,5 @@ export async function ensureUsabilityWorkflowOnFork(
     throw new Error(`GitHub put contents failed (${putRes.status}): ${await putRes.text()}`);
   }
   log(`[gha-setup] installed usability-test workflow on ${forkFullName}@${defaultBranch}`);
-  return true;
+  return { committed: true, defaultBranch };
 }

@@ -441,9 +441,11 @@ describe('Regression Guard (US-016)', () => {
       expect(client.triggerWorkflowDispatch).toHaveBeenCalledTimes(2);
 
       const calls = (client.triggerWorkflowDispatch as jest.Mock).mock.calls;
-      const branches = calls.map((c: any[]) => c[2]);
-      expect(branches).toContain('agent/scope-42');
-      expect(branches).toContain('main');
+      const dispatchRefs = calls.map((c: any[]) => c[2]);
+      expect(dispatchRefs).toEqual(['main', 'main']);
+      const inputBranches = calls.map((c: any[]) => c[3]?.branch);
+      expect(inputBranches).toContain('agent/scope-42');
+      expect(inputBranches).toContain('main');
     });
 
     it('uses REGRESSION_WORKFLOW_FILE for dispatch', async () => {

@@ -1103,7 +1103,7 @@ export async function runPipeline(args: {
   if (manifest.sandbox_runner === 'gha') {
     try {
       log(`[regression-guard] sandbox_runner=gha; running regression guard`);
-      await ensureRegressionWorkflowOnFork(deps.token, fork.forkFullName, log);
+      const regressionInstall = await ensureRegressionWorkflowOnFork(deps.token, fork.forkFullName, log);
 
       const testCommands = await adapter.getTestCommands();
       const sandboxServices = await adapter.getSandboxServices();
@@ -1121,6 +1121,7 @@ export async function runPipeline(args: {
         serviceNames,
         manifest.sandbox_timeout_mins ?? 15
       );
+      regressionConfig.dispatchRef = regressionInstall.defaultBranch;
 
       const actionsClient = new GitHubActionsClient(deps.token);
       const regressionResult = await runRegressionGuard(regressionConfig, actionsClient);
@@ -1143,7 +1144,7 @@ export async function runPipeline(args: {
   if (manifest.sandbox_runner === 'gha') {
     try {
       log(`[usability] sandbox_runner=gha; running usability agent`);
-      await ensureUsabilityWorkflowOnFork(deps.token, fork.forkFullName, log);
+      const usabilityInstall = await ensureUsabilityWorkflowOnFork(deps.token, fork.forkFullName, log);
 
       const sandboxServices = await adapter.getSandboxServices();
       const serviceNames = sandboxServices.map((s) =>
@@ -1168,6 +1169,7 @@ export async function runPipeline(args: {
         timeoutMinutes: manifest.sandbox_timeout_mins ?? DEFAULT_USABILITY_TIMEOUT_MINUTES,
         installCommand: introspection.installCommand,
         entryPoints: introspection.entryPoints,
+        dispatchRef: usabilityInstall.defaultBranch,
       };
 
       const actionsClient = new GitHubActionsClient(deps.token);
