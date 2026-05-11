@@ -19,6 +19,7 @@ import { runTriage } from '../core/agents/triage';
 import type { TriageInput } from '../core/agents/triage-types';
 import { createForkAndBranch } from '../core/fork-manager';
 import { runFixAgent } from '../core/agents/fix';
+import { runBuildAgent } from '../core/agents/build';
 import { runDocsAgent } from '../core/agents/docs';
 import type {
   ConfirmedIssue,
@@ -26,8 +27,10 @@ import type {
   ModuleCommit,
   ModuleFile,
 } from '../core/agents/fix-types';
+import type { BuildAgentInput, ReferenceModule } from '../core/agents/build-types';
 import type { DocsAgentInput } from '../core/agents/docs-types';
 import { OpenRouterFixGenerator } from '../core/llm/openrouter-fix-generator';
+import { OpenRouterScaffoldGenerator } from '../core/llm/openrouter-scaffold-generator';
 import { createDefaultTriageClassifier } from '../core/llm/openrouter-triage-classifier';
 import type { IssueEvent } from '../core/webhook/types';
 
@@ -49,6 +52,7 @@ import { detectApproval } from '../core/gmail-mcp';
 import {
   runRetryLoop,
   injectRetryContextForFixAgent,
+  injectRetryContextForBuildAgent,
 } from '../core/retry-loop';
 import type { RetryLoopConfig } from '../core/retry-loop-types';
 
@@ -136,6 +140,62 @@ function gatherDocFiles(workspace: LocalWorkspace, modulePath: string): ModuleFi
     }
   }
   return docs.slice(0, 20);
+}
+
+/**
+ * Pick up to 2 sibling modules of the affected (new) module to use as
+ * structural references for scaffolding. Prefers siblings under the same
+ * parent directory; falls back to empty if the affected module is top-level
+ * or has no siblings with code.
+ */
+function pickReferenceModules(
+  workspace: LocalWorkspace,
+  affectedModule: string
+): ReferenceModule[] {
+  const normalized = affectedModule.replace(/^\/+|\/+$/g, '');
+  const parts = normalized.split('/');
+  if (parts.length < 2) return [];
+
+  const parentPath = parts.slice(0, -1).join('/');
+  const affectedName = parts[parts.length - 1];
+  const candidates = workspace
+    .listSubdirs(parentPath)
+    .filter((d) => d !== affectedName);
+
+  const refs: ReferenceModule[] = [];
+  for (const subdir of candidates) {
+    const refPath = `${parentPath}/${subdir}`;
+    const files = gatherModuleFiles(workspace, refPath);
+    if (files.length > 0) {
+      refs.push({ path: refPath, files });
+      if (refs.length >= 2) break;
+    }
+  }
+  return refs;
+}
+
+/**
+ * Locate a CONTRIBUTING guide at common paths and return its content,
+ * truncated to 30KB. Returns null when not found.
+ */
+function findContributingGuide(workspace: LocalWorkspace): string | null {
+  const candidates = [
+    'CONTRIBUTING.md',
+    'CONTRIBUTING.rst',
+    'CONTRIBUTING.txt',
+    'docs/CONTRIBUTING.md',
+    '.github/CONTRIBUTING.md',
+  ];
+  for (const relPath of candidates) {
+    try {
+      if (workspace.fileExists(relPath)) {
+        return workspace.readFile(relPath).slice(0, 30_000);
+      }
+    } catch {
+      /* skip */
+    }
+  }
+  return null;
 }
 
 /**
@@ -357,6 +417,92 @@ async function runFixAttempt(args: {
 }
 
 /**
+ * Run a single build → sandbox → eval attempt for new_feature issues.
+ * Mirrors runFixAttempt but uses the scaffold generator + build agent.
+ */
+async function runBuildAttempt(args: {
+  buildInput: BuildAgentInput;
+  workspace: LocalWorkspace;
+  adapter: RepoAdapter;
+  manifest: Manifest;
+  payload: IssueEvent;
+  forkFullName: string;
+  branchName: string;
+  ghClient: GitHubRestClient;
+  log: (msg: string) => void;
+}): Promise<FixAttemptOutcome> {
+  const { buildInput, workspace, adapter, manifest, payload, log, ghClient } = args;
+  const reader = new LocalRepoFileReader(workspace);
+  const tokenScopes = await ghClient.getTokenScopes();
+  const committer = new LocalForkCommitter(workspace, tokenScopes);
+  const generator = new OpenRouterScaffoldGenerator();
+
+  log('[build] invoking OpenRouter scaffold generator');
+  const buildResult = await runBuildAgent(buildInput, generator, committer, reader);
+  if (!buildResult.success) {
+    return {
+      ok: false,
+      retryContext: 'Scaffold generator returned no files.',
+      evalSummary: 'no-scaffold',
+      fixSummary: '',
+    };
+  }
+  const totalFiles =
+    buildResult.moduleFiles.length +
+    buildResult.testFiles.length +
+    buildResult.indexFiles.length;
+  log(`[build] committed ${totalFiles} files: ${buildResult.summary}`);
+
+  const testCommands = await adapter.getTestCommands();
+  const sandboxServices = await adapter.getSandboxServices();
+  log(
+    `[sandbox] ${testCommands.length} command(s); services=${sandboxServices
+      .map((s) => (typeof s === 'string' ? s : s.name))
+      .join(',') || '(none)'}`
+  );
+
+  const sandboxArtifact = await runLocalSandbox({
+    workspace,
+    config: {
+      repoFullName: payload.repository.full_name,
+      forkFullName: args.forkFullName,
+      branchName: args.branchName,
+      workflowRepoFullName: '',
+      testCommands,
+      sandboxServices,
+      timeoutMinutes: manifest.sandbox_timeout_mins ?? 15,
+    },
+    services: sandboxServices.filter(
+      (s): s is Exclude<typeof s, string> => typeof s !== 'string'
+    ),
+    options: { log },
+  });
+
+  const evalResult = await adapter.runCustomEval(sandboxArtifact.commands);
+  log(`[eval] passed=${evalResult.passed} summary=${evalResult.summary}`);
+
+  if (evalResult.passed) {
+    return {
+      ok: true,
+      retryContext: '',
+      evalSummary: evalResult.summary,
+      fixSummary: buildResult.summary,
+    };
+  }
+
+  return {
+    ok: false,
+    retryContext:
+      `Eval failed: ${evalResult.summary}\n` +
+      (evalResult.retryContext.length
+        ? `Retry hints:\n${evalResult.retryContext.map((c) => `- ${c}`).join('\n')}`
+        : ''),
+    evalSummary: evalResult.summary,
+    fixSummary: buildResult.summary,
+  };
+}
+
+/**
  * Run the docs agent path (no PM design loop, no retry loop).
  */
 async function runDocsPath(args: {
@@ -551,6 +697,101 @@ export async function runPipeline(args: {
     });
     prSummary = result.summary;
     evalSummary = 'docs-only (no eval)';
+  } else if (routing.result.issueType === 'new_feature') {
+    // ---------- Build path with retry loop (new_feature issues) ----------
+    const referenceModules = pickReferenceModules(workspace, routing.result.affectedModule);
+    const contributingGuide = findContributingGuide(workspace);
+    log(
+      `[build] reference modules: ${referenceModules.length}` +
+        ` (${referenceModules.map((r) => r.path).join(', ') || 'none'})` +
+        `; CONTRIBUTING: ${contributingGuide ? 'found' : 'not found'}`
+    );
+
+    const buildInputBase: BuildAgentInput = {
+      designSummary,
+      confirmedIssues,
+      affectedModule: routing.result.affectedModule,
+      referenceModules,
+      contributingGuide,
+      forkFullName: fork.forkFullName,
+      branchName: fork.branchName,
+    };
+
+    const maxRetries = manifest.max_retries ?? 3;
+    let attempt: FixAttemptOutcome | null = null;
+    let currentInput = buildInputBase;
+
+    while (true) {
+      try {
+        attempt = await runBuildAttempt({
+          buildInput: currentInput,
+          workspace,
+          adapter,
+          manifest,
+          payload,
+          forkFullName: fork.forkFullName,
+          branchName: fork.branchName,
+          ghClient,
+          log,
+        });
+      } catch (err: any) {
+        log(`[build] attempt threw: ${err?.message ?? err}`);
+        attempt = {
+          ok: false,
+          retryContext: `Build attempt threw: ${err?.message ?? err}`,
+          evalSummary: 'exception',
+          fixSummary: '',
+        };
+      }
+
+      if (attempt.ok) break;
+
+      if (deps.live) {
+        const retryConfig: RetryLoopConfig = {
+          runId,
+          maxRetries,
+          agentType: 'build',
+          upstreamRepo: repoFullName,
+          primaryIssueNumber: issueNumber,
+          pmEmail: manifest.pm_email,
+          replyToAddress: deps.live.replyToFor(runId),
+          confirmedIssues,
+          forkFullName: fork.forkFullName,
+          branchName: fork.branchName,
+        };
+        const decision = await runRetryLoop(
+          attempt.retryContext,
+          retryConfig,
+          deps.live.retryStateStore,
+          deps.live.failureNotifier,
+          deps.live.issueLabeler
+        );
+        if (decision.action === 'max_retries_exceeded') {
+          log(`[retry] max_retries exceeded; labeled agent-failed and emailed PM`);
+          return { status: 'max-retries-exceeded', reason: attempt.evalSummary };
+        }
+        log(`[retry] retrying build (attempt ${decision.dispatch.retryCount}/${maxRetries})`);
+        currentInput = {
+          ...buildInputBase,
+          designSummary: injectRetryContextForBuildAgent(designSummary, decision.dispatch),
+        };
+      } else {
+        const attemptsSoFar = (currentInput.designSummary.match(/## Latest Failure/g) ?? []).length;
+        if (attemptsSoFar >= maxRetries) {
+          log(`[retry] max_retries exceeded (no live deps to label/email)`);
+          return { status: 'max-retries-exceeded', reason: attempt.evalSummary };
+        }
+        log(`[retry] retrying build without persistence (attempt ${attemptsSoFar + 1}/${maxRetries})`);
+        currentInput = {
+          ...buildInputBase,
+          designSummary:
+            `${designSummary}\n\n## Latest Failure (address this in your fix)\n\n${attempt.retryContext}`,
+        };
+      }
+    }
+
+    prSummary = attempt!.fixSummary;
+    evalSummary = attempt!.evalSummary;
   } else {
     // ---------- Fix path with retry loop ----------
     const moduleSource = gatherModuleFiles(workspace, routing.result.affectedModule);

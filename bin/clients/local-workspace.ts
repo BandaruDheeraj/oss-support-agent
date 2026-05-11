@@ -155,6 +155,15 @@ export class LocalWorkspace {
       .map((e) => path.posix.join(relDir, e.name));
   }
 
+  listSubdirs(relDir: string): string[] {
+    const abs = path.join(this.dir, relDir);
+    if (!fs.existsSync(abs)) return [];
+    return fs
+      .readdirSync(abs, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules')
+      .map((e) => e.name);
+  }
+
   writeFile(relPath: string, content: string): void {
     const abs = path.join(this.dir, relPath);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
