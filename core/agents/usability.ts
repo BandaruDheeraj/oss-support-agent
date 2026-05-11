@@ -207,14 +207,23 @@ export async function runUsabilityAgent(
       workflowInputs
     );
 
-    // Poll for the run
+    // Poll for the run — workflow_dispatch returns immediately but the run may
+    // not be indexed in the runs API for a second or two. Retry briefly.
     const createdAfter = new Date(startTime - 5000).toISOString();
-    const run = await actionsClient.getWorkflowRun(
-      input.forkFullName,
-      USABILITY_WORKFLOW_FILE,
-      input.branchName,
-      createdAfter
-    );
+    let run: { id: number; html_url: string; status: string; conclusion: string | null; created_at: string } | null = null;
+    const runPollIntervalMs = 2_000;
+    const maxWaitForRunMs = 30_000;
+    const runPollStart = Date.now();
+    while (Date.now() - runPollStart < maxWaitForRunMs) {
+      run = await actionsClient.getWorkflowRun(
+        input.forkFullName,
+        USABILITY_WORKFLOW_FILE,
+        input.branchName,
+        createdAfter
+      );
+      if (run) break;
+      await new Promise((resolve) => setTimeout(resolve, runPollIntervalMs));
+    }
 
     if (run) {
       workflowRunUrl = run.html_url;

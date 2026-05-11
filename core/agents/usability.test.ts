@@ -569,12 +569,17 @@ describe('runUsabilityAgent', () => {
   });
 
   it('handles workflow run not found gracefully', async () => {
+    jest.useFakeTimers();
     const client = makeMockActionsClient({
       getWorkflowRun: jest.fn().mockResolvedValue(null),
     });
     const exerciser = makeMockExerciser();
     // Should still proceed to exercise (workflow run URL will be empty)
-    const result = await runUsabilityAgent(makeInput(), exerciser, client);
+    const promise = runUsabilityAgent(makeInput(), exerciser, client);
+    // Advance through the polling loop (30s ceiling, 2s interval)
+    await jest.advanceTimersByTimeAsync(35_000);
+    const result = await promise;
+    jest.useRealTimers();
     expect(result.completed).toBe(true);
     expect(result.workflowRunUrl).toBe('');
   });
