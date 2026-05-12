@@ -534,8 +534,8 @@ function findEditableInstallCandidates(
   for (let i = 0; i < 32; i++) {
     if (seen.has(cur)) break;
     seen.add(cur);
-    const files = new Set(safeListFiles(reader, cur));
-    if (PYTHON_PACKAGE_MANIFESTS.some((m) => files.has(m))) {
+    const basenames = new Set(safeListFiles(reader, cur).map((f) => f.split('/').pop() ?? f));
+    if (PYTHON_PACKAGE_MANIFESTS.some((m) => basenames.has(m))) {
       out.push(cur === '' ? '.' : cur);
     }
     if (cur === '' || cur === '.') break;
@@ -561,8 +561,8 @@ function findAllEditableInstallCandidates(
   while (queue.length > 0) {
     if (out.length >= cap) break;
     const { dir, depth } = queue.shift()!;
-    const files = new Set(safeListFiles(reader, dir));
-    if (PYTHON_PACKAGE_MANIFESTS.some((m) => files.has(m))) {
+    const basenames = new Set(safeListFiles(reader, dir).map((f) => f.split('/').pop() ?? f));
+    if (PYTHON_PACKAGE_MANIFESTS.some((m) => basenames.has(m))) {
       out.push(dir === '' ? '.' : dir);
     }
     if (depth >= maxDepth) continue;
