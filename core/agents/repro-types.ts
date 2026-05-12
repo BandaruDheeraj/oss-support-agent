@@ -317,6 +317,29 @@ export interface IterativeReproGeneratorInput extends ReproAgentInput {
    * an iteration with no progress.
    */
   remainingContextRequests: number;
+  /**
+   * One-line, stage-specific, ACTIONABLE directive computed from the LAST
+   * attempt only. Promoted to the top of the user message by the generator
+   * so the most relevant feedback isn't buried inside a large
+   * `previousAttempts` JSON blob. Empty on iteration 1.
+   *
+   * Example values:
+   *   - "Your previous candidate (hash c1234567) was rejected as identical.
+   *      You MUST emit a structurally different test (different trigger,
+   *      different assertion, or different setup)."
+   *   - "Your test crashed with exit=1 but bypassed the sentinel print.
+   *      WRAP the bug-triggering call in try/except, print(sentinel,
+   *      flush=True) INSIDE the except BEFORE re-raising."
+   *   - "stderr says: No module named 'X.Y.Z'. Add the matching
+   *      editableInstall from repoTreeSummary's candidates."
+   */
+  failureDirective?: string;
+  /**
+   * Sampling temperature hint computed by the loop. The loop bumps this
+   * after duplicate emissions to break the t=0 deterministic-decode trap.
+   * Generators MAY honor this; the OpenRouter generator does. Default 0.
+   */
+  temperatureHint?: number;
 }
 
 export interface IterativeReproGenerator {

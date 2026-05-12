@@ -1,10 +1,14 @@
 import {
   runReproLoop,
+  computeFailureDirective,
+  preloadIssueSymbols,
   type ReproLoopOptions,
 } from './repro-loop';
 import {
   type IterativeReproGenerator,
+  type IterativeReproGeneratorInput,
   type ReproAgentInput,
+  type ReproAttemptHistoryEntry,
   type ReproGeneratorAction,
   type ReproWorkspace,
   type BaselineRunResult,
@@ -29,16 +33,16 @@ const validOutput = (overrides: Partial<{ content: string; sentinel: string; pat
 });
 
 class StubWorkspace implements ReproWorkspace {
-  readFile(): ContextResult {
+  readFile(_req?: any): ContextResult {
     return { op: 'read_file', path: 'x', status: 'not_found' };
   }
-  listDir(): ContextResult {
+  listDir(_req?: any): ContextResult {
     return { op: 'list_dir', path: '/', status: 'ok', entries: [] };
   }
-  findFile(): ContextResult {
+  findFile(_req?: any): ContextResult {
     return { op: 'find_file', suffix: '', status: 'ok', matches: [] };
   }
-  grep(): ContextResult {
+  grep(_req?: any): ContextResult {
     return { op: 'grep', query: '', status: 'ok', hits: [] };
   }
   repoTreeSummary() {
@@ -169,5 +173,176 @@ describe('runReproLoop', () => {
     const result = await runReproLoop(baseInput, gen, new WS(), baseline, opts);
     expect(readCount).toBe(1);
     expect(result.spec.path).toBe('tests/test_repro.py');
+  });
+
+  test('passes a failureDirective and escalating temperatureHint after duplicates', async () => {
+    const out = validOutput();
+    const inputs: IterativeReproGeneratorInput[] = [];
+    class CapturingGen implements IterativeReproGenerator {
+      private i = 0;
+      constructor(private readonly steps: ReproGeneratorAction[]) {}
+      async generate(input: IterativeReproGeneratorInput): Promise<ReproGeneratorAction> {
+        inputs.push(input);
+        return this.steps[this.i++];
+      }
+    }
+    // Sequence: first ok candidate -> baseline fails (no sentinel) -> duplicate -> duplicate -> different -> ok.
+    const gen = new CapturingGen([
+      { kind: 'repro', reasoning: 't1', output: out }, // baseline fails: no sentinel
+      { kind: 'repro', reasoning: 't2 dup', output: out }, // duplicate -> dupCount=1
+      { kind: 'repro', reasoning: 't3 dup', output: out }, // duplicate -> dupCount=2
+      {
+        kind: 'repro',
+        reasoning: 't4 different',
+        output: validOutput({ content: 'print("EXPECTED_REPRO_FAILURE:bug") # v4\n' }),
+      }, // baseline ok
+    ]);
+    let n = 0;
+    const baseline = async (): Promise<BaselineRunResult> => {
+      n++;
+      if (n === 1) {
+        return {
+          ok: false,
+          stage: 'baseline_failed_to_repro',
+          reason: 'repro exited 1 but did not print the failure sentinel (EXPECTED_REPRO_FAILURE:bug)',
+          exitCode: 1,
+          stdout: '',
+          stderr: 'Traceback...\nValueError: bad input\n',
+        };
+      }
+      return okBaseline();
+    };
+    await runReproLoop(baseInput, gen, new StubWorkspace(), baseline, {
+      ...opts,
+      maxIterations: 6,
+      maxBaselineAttempts: 4,
+    });
+
+    // Turn 1 has no prior attempts -> no directive, default temperature.
+    expect(inputs[0].failureDirective).toBeUndefined();
+    expect(inputs[0].temperatureHint ?? 0).toBe(0);
+
+    // Turn 2 follows a sentinel-miss baseline -> directive must mention sentinel + try/except.
+    expect(inputs[1].failureDirective).toMatch(/sentinel/i);
+    expect(inputs[1].failureDirective).toMatch(/try.*except/i);
+
+    // Turn 3 follows 1 duplicate -> temperature escalates to 0.3.
+    expect(inputs[2].temperatureHint).toBe(0.3);
+    expect(inputs[2].failureDirective).toMatch(/STRUCTURALLY DIFFERENT/);
+
+    // Turn 4 follows 2 consecutive duplicates -> temperature escalates to 0.6.
+    expect(inputs[3].temperatureHint).toBe(0.6);
+  });
+});
+
+describe('computeFailureDirective', () => {
+  const baseAttempt = (overrides: Partial<ReproAttemptHistoryEntry>): ReproAttemptHistoryEntry => ({
+    attempt: 1,
+    stage: 'baseline_failed_to_repro',
+    reason: '',
+    ...overrides,
+  });
+
+  test('returns undefined for empty history', () => {
+    expect(computeFailureDirective([], 'repo/')).toBeUndefined();
+  });
+
+  test('detects no-sentinel failure and prescribes try/except wrapper', () => {
+    const dir = computeFailureDirective(
+      [baseAttempt({
+        reason: 'repro exited 1 but did not print the failure sentinel (X)',
+        stderrTail: 'Traceback (most recent call last):\n  File "x.py"\nKeyError: \'foo\'',
+        exitCode: 1,
+      })],
+      'repo/'
+    );
+    expect(dir).toMatch(/sentinel/i);
+    expect(dir).toMatch(/try.*except.*KeyError/i);
+    expect(dir).toMatch(/raise/);
+  });
+
+  test('detects ModuleNotFoundError and points to editableInstalls', () => {
+    const tree = 'repo/\nCandidate editableInstalls:\n  - openinference-instrumentation/python\n  - openinference-core/python\n';
+    const dir = computeFailureDirective(
+      [baseAttempt({
+        stage: 'baseline_failed_to_repro',
+        reason: 'matched "ModuleNotFoundError"',
+        stderrTail: "ModuleNotFoundError: No module named 'openinference.instrumentation'",
+        exitCode: 1,
+      })],
+      tree
+    );
+    expect(dir).toMatch(/openinference\.instrumentation/);
+    expect(dir).toMatch(/editableInstalls/);
+    expect(dir).toMatch(/openinference-instrumentation\/python/);
+  });
+
+  test('detects SyntaxError and asks for re-emit', () => {
+    const dir = computeFailureDirective(
+      [baseAttempt({
+        stage: 'workspace_setup',
+        reason: 'Python SyntaxError: invalid syntax (line 12)',
+        stderrTail: '  File "<stdin>", line 12\n    def foo(\n            ^\nSyntaxError: invalid syntax',
+      })],
+      'repo/'
+    );
+    expect(dir).toMatch(/parse error/i);
+    expect(dir).toMatch(/Re-emit/);
+  });
+
+  test('escalates language when a duplicate has been emitted 3+ times', () => {
+    const attempts = [
+      baseAttempt({ attempt: 1, reason: 'already tried this exact candidate (hash=abc)' }),
+      baseAttempt({ attempt: 2, reason: 'already tried (hash=abc)' }),
+      baseAttempt({ attempt: 3, reason: 'already tried (hash=abc)' }),
+    ];
+    const dir = computeFailureDirective(attempts, 'repo/');
+    expect(dir).toMatch(/CRITICAL/);
+    expect(dir).toMatch(/STRUCTURALLY DIFFERENT/);
+  });
+});
+
+describe('preloadIssueSymbols', () => {
+  class TracebackWorkspace extends StubWorkspace {
+    public readPaths: string[] = [];
+    readFile(req: any): ContextResult {
+      this.readPaths.push(req.path);
+      if (req.path.endsWith('exporter.py')) {
+        return { op: 'read_file', path: req.path, status: 'ok', content: 'def export(): raise ValueError\n', bytes: 32 };
+      }
+      return { op: 'read_file', path: req.path, status: 'not_found' };
+    }
+  }
+
+  test('extracts traceback file paths and loads them into seeds', () => {
+    const ws = new TracebackWorkspace();
+    const seeds = preloadIssueSymbols(
+      [
+        {
+          number: 1,
+          title: 'crash on export',
+          body: 'Traceback (most recent call last):\n  File "src/openinference/exporter.py", line 42, in export\n    raise ValueError\nValueError\n',
+          labels: [],
+        },
+      ],
+      ws,
+      () => undefined
+    );
+    expect(ws.readPaths).toContain('src/openinference/exporter.py');
+    expect(seeds.length).toBeGreaterThan(0);
+    const exporterSeed = seeds.find((s) => s.req.op === 'read_file' && s.req.path.endsWith('exporter.py'));
+    expect(exporterSeed).toBeDefined();
+    expect(exporterSeed!.result.status).toBe('ok');
+  });
+
+  test('returns no seeds when issues mention no symbols or paths', () => {
+    const ws = new TracebackWorkspace();
+    const seeds = preloadIssueSymbols(
+      [{ number: 1, title: 'docs typo', body: 'fix the README please', labels: [] }],
+      ws,
+      () => undefined
+    );
+    expect(seeds).toEqual([]);
+    expect(ws.readPaths).toEqual([]);
   });
 });

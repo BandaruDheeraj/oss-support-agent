@@ -246,10 +246,20 @@ export class OpenRouterIterativeReproGenerator implements IterativeReproGenerato
   }
 
   async generate(input: IterativeReproGeneratorInput): Promise<ReproGeneratorAction> {
+    // Promote the failureDirective to the TOP of the user message. Buried
+    // inside the JSON blob the LLM treats it as one of N attempt entries;
+    // promoted as a top-line preamble it reliably steers the next emission.
+    const directive = input.failureDirective;
+    const preamble = directive
+      ? `‼️ DIRECTIVE FROM PREVIOUS ATTEMPT (read this before anything else):\n${directive}\n\n` +
+        `Below is the full input (repoTreeSummary, loadedContext, previousAttempts, budgets). The directive above is the single most important signal — address it first.\n\n`
+      : '';
+
     const messages: LLMMessage[] = [
       { role: 'system', content: ITERATIVE_SYSTEM_PROMPT },
-      { role: 'user', content: JSON.stringify(input, null, 2) },
+      { role: 'user', content: preamble + JSON.stringify(input, null, 2) },
     ];
+    const temperature = input.temperatureHint ?? 0;
     const { data } = await this.client.chatJson<{
       kind: 'request_context' | 'repro';
       reasoning: string;
@@ -257,7 +267,7 @@ export class OpenRouterIterativeReproGenerator implements IterativeReproGenerato
       output?: ReproGeneratorOutput;
     }>(messages, ITERATIVE_SCHEMA, {
       agent: 'REPRO',
-      temperature: 0,
+      temperature,
       // Cost guard: the loop has its own retry budget; we don't want chatJson
       // silently multiplying calls 3x per turn.
       parseRetries: 1,

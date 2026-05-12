@@ -12,6 +12,7 @@
  */
 
 import * as path from 'path';
+import * as childProcess from 'child_process';
 
 import type { RepoAdapter } from '../core/adapter.interface';
 import type { Manifest } from '../core/manifest/types';
@@ -318,6 +319,50 @@ export function validateReproBaseline(args: {
       reason: `repro exited ${exit} but did not print the failure sentinel (${args.failureSentinel}); cannot confirm it reproduces the reported bug`,
     };
   }
+  return { ok: true };
+}
+
+/**
+ * Cheap pre-flight: ask the local Python interpreter to parse the candidate
+ * repro before we pay for a full sandbox cycle (~80s + pip install cost).
+ * SyntaxError / IndentationError → return a clear reason string.
+ *
+ * Best-effort: if `python3`/`python` isn't available, returns ok=true and
+ * lets the sandbox surface the error normally. Never throws.
+ *
+ * Exported for testing.
+ */
+export async function pythonAstCheck(content: string): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const pythons = process.platform === 'win32' ? ['python', 'py'] : ['python3', 'python'];
+  for (const py of pythons) {
+    try {
+      const out = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+        const proc = childProcess.spawn(py, ['-c', 'import sys, ast; ast.parse(sys.stdin.read())'], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        let stderr = '';
+        proc.stderr.on('data', (d) => { stderr += d.toString(); });
+        proc.on('error', () => resolve({ code: null, stderr: 'spawn-error' }));
+        proc.on('close', (code) => resolve({ code, stderr }));
+        // Guard against tools that hang on stdin.
+        const t = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* ignore */ } }, 5_000);
+        proc.on('close', () => clearTimeout(t));
+        try { proc.stdin.write(content); proc.stdin.end(); } catch { /* ignore */ }
+      });
+      if (out.stderr === 'spawn-error') continue; // try next interpreter
+      if (out.code === 0) return { ok: true };
+      // Extract the SyntaxError line — Python writes it on the last line.
+      const lines = out.stderr.split('\n').map((l) => l.trim()).filter(Boolean);
+      const errLine = lines.reverse().find((l) => /(SyntaxError|IndentationError|TabError):/.test(l));
+      return {
+        ok: false,
+        reason: `Python ${errLine ?? out.stderr.slice(0, 200) ?? 'parse error'}`,
+      };
+    } catch {
+      continue;
+    }
+  }
+  // No usable interpreter — skip the gate, sandbox will catch it later.
   return { ok: true };
 }
 
@@ -1797,6 +1842,25 @@ export async function runPipeline(args: {
         lastValidatedSetup = validatedSetup;
 
         log(`[repro] baseline attempt: ${baselineCmds.length} command(s) (path=${spec.path})`);
+
+        // ---- AST pre-flight gate ----
+        // A SyntaxError in the LLM-emitted Python burns ~80s + pip cost in
+        // the sandbox. Catch it locally with `python -c "import ast; ast.parse(...)"`
+        // first. Best-effort — falls through to the sandbox if no python is
+        // available on this host.
+        const ast = await pythonAstCheck(spec.content);
+        if (!ast.ok) {
+          await safeReset(workspace, log);
+          log(`[repro] AST pre-flight rejected candidate: ${ast.reason}`);
+          return {
+            ok: false,
+            stage: 'workspace_setup',
+            reason: ast.reason,
+            exitCode: null,
+            stdout: '',
+            stderr: ast.reason,
+          };
+        }
 
         // Write the candidate into the workspace.
         try {

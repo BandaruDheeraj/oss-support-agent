@@ -95,12 +95,31 @@ export async function runReproLoop(
   const attempts: ReproAttemptHistoryEntry[] = [];
   const loadedContext: ContextResult[] = [];
   const seenCandidateHashes = new Set<string>();
+  let duplicateCount = 0;
 
   let baselineAttempts = 0;
   let contextRounds = 0;
   let lastReason = 'no attempts made';
 
   const repoTreeSummary = safeRepoTree(workspace);
+
+  // Pre-flight: extract symbols / file paths mentioned in confirmed-issue
+  // bodies (typically Python tracebacks like
+  // `File ".../foo.py", line 42, in bar`) and seed loadedContext with the
+  // matching repo files. The LLM no longer has to spend turns hunting for
+  // the buggy code — it sees the actual implementation from turn 1.
+  // Best-effort: failures here are silent (workspace adapter may not
+  // implement the optional context APIs).
+  try {
+    const seeds = preloadIssueSymbols(input.confirmedIssues, workspace, log);
+    for (const seed of seeds) {
+      if (!isDuplicateContext(loadedContext, seed.req, seed.result)) {
+        loadedContext.push(seed.result);
+      }
+    }
+  } catch (err: any) {
+    log(`[repro-loop] preflight symbol extraction skipped: ${err?.message ?? err}`);
+  }
 
   for (let iter = 1; iter <= opts.maxIterations; iter++) {
     if ('beginTurn' in workspace && typeof (workspace as any).beginTurn === 'function') {
@@ -119,6 +138,8 @@ export async function runReproLoop(
       remainingIterations,
       remainingBaselineAttempts,
       remainingContextRequests,
+      failureDirective: computeFailureDirective(attempts, repoTreeSummary),
+      temperatureHint: temperatureForDuplicates(duplicateCount),
     };
 
     let action: ReproGeneratorAction;
@@ -195,12 +216,13 @@ export async function runReproLoop(
     const hash = candidateHash(spec);
     if (seenCandidateHashes.has(hash)) {
       lastReason = 'identical candidate emitted twice';
-      log(`[repro-loop] duplicate candidate ${hash}; skipping baseline`);
+      duplicateCount++;
+      log(`[repro-loop] duplicate candidate ${hash} (#${duplicateCount}); skipping baseline`);
       attempts.push({
         attempt: iter,
         candidate: candidatePreview(out, opts.contentPreviewBytes),
         stage: 'schema',
-        reason: 'this exact candidate (same content/sentinel/setup) was already tried — change something',
+        reason: `this exact candidate (hash=${hash}, same content/sentinel/setup) was already tried — change something`,
       });
       continue;
     }
@@ -500,5 +522,298 @@ function extractTopLevelImports(content: string): Set<string> {
     tops.delete(t);
   }
   return tops;
+}
+
+// ---------------------------------------------------------------------------
+// Failure-directive synthesis
+//
+// Computes a single-line, stage-specific, ACTIONABLE directive from the LAST
+// attempt only. The OpenRouter generator promotes it to the top of the user
+// message so it isn't buried inside the previousAttempts JSON. Empirically
+// this is the strongest signal we have to break the duplicate-emission and
+// no-sentinel patterns we observe in production.
+// ---------------------------------------------------------------------------
+export function computeFailureDirective(
+  attempts: ReproAttemptHistoryEntry[],
+  repoTreeSummary: string
+): string | undefined {
+  if (attempts.length === 0) return undefined;
+  const last = attempts[attempts.length - 1];
+  const stderr = last.stderrTail ?? '';
+  const stdout = last.stdoutTail ?? '';
+  const reason = last.reason ?? '';
+
+  // Duplicate — count consecutive duplicates at the tail to escalate tone.
+  if (/already tried|hash=/i.test(reason)) {
+    const dupCount = countTailingDuplicates(attempts);
+    const sev =
+      dupCount >= 3
+        ? `CRITICAL — you have emitted the same candidate ${dupCount} times in a row.`
+        : `Your previous candidate was rejected as identical.`;
+    return (
+      `${sev} You MUST emit a STRUCTURALLY DIFFERENT test this turn: ` +
+      `change the trigger call, the assertion, the sentinel string, OR the setup. ` +
+      `If your last attempt failed because the sentinel didn't print, restructure with try/except (sentinel printed INSIDE except, BEFORE raise) — ` +
+      `that counts as a meaningful structural change. Do NOT just rephrase comments.`
+    );
+  }
+
+  // No sentinel — most common true failure mode.
+  if (/did not print the failure sentinel/i.test(reason)) {
+    const exc = inferExceptionType(stderr) ?? 'Exception';
+    const lastLine = lastNonEmptyLine(stderr) ?? '';
+    return (
+      `Your test crashed (exit=${last.exitCode ?? 'unknown'}) but did NOT print the sentinel — the exception escaped before the print line ran. ` +
+      `REQUIRED FIX: wrap the bug-triggering call in \`try: ... except ${exc} as e: print(<sentinel>, flush=True); raise\`. ` +
+      `The sentinel print MUST be inside the except, BEFORE the raise. ` +
+      (lastLine ? `Stderr's last line: \`${truncate(lastLine, 200)}\`. ` : '') +
+      `Re-emit the entire file with this restructuring; do not change the assertion logic.`
+    );
+  }
+
+  // Missing module — almost always a missing/wrong editableInstall.
+  const moduleMatch =
+    /No module named ['"]([\w.]+)['"]/.exec(stderr) ||
+    /No module named ['"]([\w.]+)['"]/.exec(stdout) ||
+    /ModuleNotFoundError.*?['"]([\w.]+)['"]/.exec(stderr);
+  if (moduleMatch || /ModuleNotFoundError|ImportError/.test(reason) || /matched "ModuleNotFoundError"/.test(reason)) {
+    const missing = moduleMatch?.[1] ?? '<see stderr>';
+    const candidatesHint = extractCandidateInstallsLine(repoTreeSummary);
+    return (
+      `stderr: \`No module named '${missing}'\`. This is an in-repo package, not a third-party dep. ` +
+      `Add the matching directory from repoTreeSummary's "Candidate editableInstalls" section to \`editableInstalls\` (NOT pipPackages). ` +
+      (candidatesHint ? `Candidates available: ${candidatesHint}. ` : '') +
+      `Pick the INNERMOST candidate whose path matches '${missing.replace(/\./g, '/')}'. Do NOT add try/except around the import.`
+    );
+  }
+
+  // SyntaxError / IndentationError — Python won't even parse the file.
+  if (/SyntaxError|IndentationError/.test(reason) || /SyntaxError|IndentationError/.test(stderr)) {
+    const m = /(?:SyntaxError|IndentationError):\s*([^\n]+)/.exec(stderr) || /(?:SyntaxError|IndentationError):\s*([^\n]+)/.exec(reason);
+    const detail = m?.[1] ?? 'unknown';
+    return (
+      `Your candidate had a Python parse error: \`${truncate(detail, 200)}\`. ` +
+      `Re-emit the entire file with corrected syntax. Common causes: unclosed string/bracket, mixed indentation (tabs vs spaces), missing colon after \`def\`/\`if\`/\`try\`, or invalid escape in a regular (non-raw) string.`
+    );
+  }
+
+  // Setup command failed — usually a bad pipPackages entry.
+  if (/setup command failed/i.test(reason)) {
+    return (
+      `Your declared setup failed: ${truncate(reason, 200)}. ` +
+      `Check pipPackages: each must be a plain PEP-508 spec (no flags, no URLs, no git refs, no local paths). ` +
+      `If the failure is a version conflict, drop the version pin and let pip resolve.`
+    );
+  }
+
+  // Exit 0 — bug didn't fire.
+  if (/exited 0|exitCode=0|the bug did not reproduce/.test(reason)) {
+    return (
+      `Your test exited 0 — the bug did NOT fire. Your assertions don't match the bug or you're triggering the wrong code path. ` +
+      `Re-read the issue: which exact API call / input triggers the failure? Make the test fail (raise / sys.exit(1)) ONLY when that specific failure mode is observed.`
+    );
+  }
+
+  // Generic catch-all — surface the reason so the LLM sees it at top of message.
+  return `Last attempt failed: ${truncate(reason, 280)}. Address this specifically before committing the next candidate.`;
+}
+
+function temperatureForDuplicates(dupCount: number): number {
+  if (dupCount === 0) return 0;
+  if (dupCount === 1) return 0.3;
+  return 0.6;
+}
+
+function countTailingDuplicates(attempts: ReproAttemptHistoryEntry[]): number {
+  let n = 0;
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    if (/already tried|hash=/i.test(attempts[i].reason ?? '')) n++;
+    else break;
+  }
+  return n;
+}
+
+function inferExceptionType(stderr: string): string | undefined {
+  // Python traceback final line: `KindError: detail` — capture the kind.
+  const m = /^([A-Z][\w.]*Error|[A-Z][\w.]*Exception|[A-Z][\w.]*Warning):/m.exec(
+    stderr.split('\n').reverse().join('\n')
+  );
+  return m?.[1];
+}
+
+function lastNonEmptyLine(s: string): string | undefined {
+  const lines = s.split('\n').map((l) => l.trim()).filter(Boolean);
+  return lines[lines.length - 1];
+}
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + '…';
+}
+
+function extractCandidateInstallsLine(repoTreeSummary: string): string | undefined {
+  // The workspace appends a "Candidate editableInstalls:" section; surface the
+  // first few entries so the directive is self-contained.
+  const idx = repoTreeSummary.toLowerCase().indexOf('candidate editableinstalls');
+  if (idx < 0) return undefined;
+  const slice = repoTreeSummary.slice(idx, idx + 600);
+  const lines = slice.split('\n').slice(1, 6).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return undefined;
+  return lines.join(', ');
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flight symbol extraction
+//
+// Scans confirmed-issue bodies for Python tracebacks and explicit symbol
+// mentions, then loads matching repo files into the loop's loadedContext
+// before the first LLM call. The LLM no longer wastes turns hunting for
+// the buggy implementation.
+// ---------------------------------------------------------------------------
+interface PreloadSeed {
+  req: ContextRequest;
+  result: ContextResult;
+}
+
+export function preloadIssueSymbols(
+  confirmedIssues: ReproAgentInput['confirmedIssues'],
+  workspace: ReproWorkspace,
+  log: (msg: string) => void
+): PreloadSeed[] {
+  const seeds: PreloadSeed[] = [];
+  const filePaths = new Set<string>();
+  const symbols = new Set<string>();
+
+  for (const issue of confirmedIssues) {
+    const text = `${issue.title ?? ''}\n${issue.body ?? ''}`;
+    extractTracebackPaths(text).forEach((p) => filePaths.add(p));
+    extractTracebackSymbols(text).forEach((s) => symbols.add(s));
+  }
+
+  // Load any direct file paths the traceback references (capped).
+  let loaded = 0;
+  for (const p of filePaths) {
+    if (loaded >= 5) break;
+    const repoRel = stripToRepoRelative(p);
+    if (!repoRel) continue;
+    const req: ContextRequest = {
+      op: 'read_file',
+      path: repoRel,
+      purpose: 'preflight: file mentioned in issue traceback',
+    };
+    let result: ContextResult;
+    try {
+      result = workspace.readFile(req as Extract<ContextRequest, { op: 'read_file' }>);
+    } catch {
+      continue;
+    }
+    if (result.op === 'read_file' && result.status === 'ok') {
+      seeds.push({ req, result });
+      loaded++;
+      log(`[repro-loop] preflight: loaded ${repoRel}`);
+    }
+  }
+
+  // For each remaining symbol, grep the repo for `def <symbol>` / `class <symbol>`.
+  // Cap aggressively — we don't want to balloon loadedContext.
+  let grepped = 0;
+  for (const sym of symbols) {
+    if (grepped >= 4) break;
+    const req: ContextRequest = {
+      op: 'grep',
+      query: `def ${sym}|class ${sym}`,
+      purpose: `preflight: locate '${sym}' from issue traceback`,
+      extensions: ['py'],
+      maxResults: 8,
+    };
+    let result: ContextResult;
+    try {
+      result = workspace.grep(req as Extract<ContextRequest, { op: 'grep' }>);
+    } catch {
+      continue;
+    }
+    if (result.op === 'grep' && result.status === 'ok' && (result.hits?.length ?? 0) > 0) {
+      seeds.push({ req, result });
+      grepped++;
+      log(`[repro-loop] preflight: grep '${sym}' → ${result.hits!.length} hit(s)`);
+      // Auto-load the first matching file too (most relevant).
+      const firstHit = result.hits![0];
+      if (loaded < 5) {
+        const fileReq: ContextRequest = {
+          op: 'read_file',
+          path: firstHit.path,
+          purpose: `preflight: file containing '${sym}'`,
+        };
+        try {
+          const fr = workspace.readFile(
+            fileReq as Extract<ContextRequest, { op: 'read_file' }>
+          );
+          if (fr.op === 'read_file' && fr.status === 'ok') {
+            seeds.push({ req: fileReq, result: fr });
+            loaded++;
+            log(`[repro-loop] preflight: loaded ${firstHit.path} (contains ${sym})`);
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  return seeds;
+}
+
+function extractTracebackPaths(text: string): string[] {
+  const out = new Set<string>();
+  // `File ".../foo/bar.py", line 42, in baz`
+  const re = /File\s+"([^"]+\.py)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    out.add(m[1]);
+  }
+  return [...out];
+}
+
+function extractTracebackSymbols(text: string): string[] {
+  const out = new Set<string>();
+  // `File "...", line N, in <symbol>`
+  const re1 = /,\s*line\s+\d+,\s*in\s+([A-Za-z_][\w]*)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re1.exec(text)) !== null) {
+    if (m[1] !== '<module>' && m[1].length > 1) out.add(m[1]);
+  }
+  // Backtick-quoted Python identifiers in the issue body — high signal when
+  // the reporter calls out a function/class name explicitly. Conservative:
+  // require a leading lowercase letter or underscore + at least one underscore
+  // OR a leading uppercase letter (likely class name).
+  const re2 = /`([a-z_][a-z0-9_]{2,}_[a-z0-9_]{2,}|[A-Z][A-Za-z0-9_]{3,})`/g;
+  while ((m = re2.exec(text)) !== null) {
+    out.add(m[1]);
+  }
+  return [...out].slice(0, 8);
+}
+
+function stripToRepoRelative(p: string): string | undefined {
+  // Common patterns:
+  //   /home/user/.venv/lib/python3.11/site-packages/foo/bar.py  → foo/bar.py
+  //   /github/workspace/python/instrumentation/x/foo.py         → python/instrumentation/x/foo.py
+  //   relative paths just pass through
+  const norm = p.replace(/\\/g, '/');
+  if (norm.startsWith('./')) return norm.slice(2);
+  if (!norm.startsWith('/')) {
+    // Already repo-relative-ish; reject obvious traversal.
+    if (norm.includes('..')) return undefined;
+    return norm;
+  }
+  // Strip everything up to and including site-packages/ if present.
+  const sp = norm.indexOf('/site-packages/');
+  if (sp >= 0) return norm.slice(sp + '/site-packages/'.length);
+  // Strip /github/workspace/ or /workspace/ prefix.
+  for (const prefix of ['/github/workspace/', '/workspace/', '/repo/']) {
+    if (norm.startsWith(prefix)) return norm.slice(prefix.length);
+  }
+  // Otherwise drop the leading slash and let the workspace's path validation
+  // decide if it's safe; most absolute paths from tracebacks won't exist
+  // inside the repo and will simply be skipped.
+  return undefined;
 }
 
