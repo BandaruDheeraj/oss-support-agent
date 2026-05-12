@@ -53,6 +53,8 @@ export interface LLMChatOptions {
   maxAttempts?: number;
   /** Called with token usage when present */
   onUsage?: (usage: LLMUsage) => void;
+  /** Cap on response tokens. Defaults to OPENROUTER_MAX_TOKENS env (or 16000). */
+  maxTokens?: number;
 }
 
 export interface LLMChatJsonOptions extends LLMChatOptions {
@@ -193,12 +195,20 @@ export class LLMClient {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
 
-    const body = {
+    const body: Record<string, unknown> = {
       model,
       messages: messages.map((m) => ({ role: m.role, content: m.content, ...(m.name ? { name: m.name } : {}) })),
       temperature,
       stream: false,
     };
+
+    const envMaxTokens = process.env.OPENROUTER_MAX_TOKENS
+      ? Number(process.env.OPENROUTER_MAX_TOKENS)
+      : NaN;
+    const maxTokens = options.maxTokens ?? (Number.isFinite(envMaxTokens) ? envMaxTokens : 16000);
+    if (Number.isFinite(maxTokens) && maxTokens > 0) {
+      body.max_tokens = maxTokens;
+    }
 
     let lastErr: unknown = null;
 
