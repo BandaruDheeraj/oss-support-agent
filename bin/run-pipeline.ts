@@ -188,6 +188,79 @@ export function extractDestructivePaths(retryContext: string): string[] {
 }
 
 /**
+ * Compute a single-line, ACTIONABLE directive from the previous fix attempt's
+ * retry context. Mirrors the failureDirective pattern from the repro loop —
+ * the corrective signal is otherwise buried in `designSummary`'s "Latest
+ * Failure" section, which the LLM empirically does not internalize when it
+ * conflicts with its urge to "fix" the failing test by rewriting it.
+ *
+ * Returns undefined when the failure doesn't map to a known recoverable
+ * pattern. The OpenRouterFixGenerator handles undefined by skipping the
+ * preamble entirely.
+ *
+ * Exported for testing.
+ */
+export function computeFixFailureDirective(
+  retryContext: string,
+  reproTestPath: string | undefined,
+  affectedModule: string
+): string | undefined {
+  if (!retryContext) return undefined;
+
+  // Protected path — the LLM tried to modify the read-only repro test.
+  // Surface the exact path it must NOT include and remind it where the fix
+  // actually belongs. This is the most common fix-retry failure.
+  const protMatch = /attempted to modify the repro test \(([^)]+)\)/.exec(retryContext);
+  if (protMatch || /repro test is read-only/.test(retryContext)) {
+    const reproPath = protMatch?.[1] ?? reproTestPath ?? '<the reproTest path>';
+    return (
+      `Your previous attempt tried to include "${reproPath}" in testChanges. ` +
+      `That file is READ-ONLY and was rejected. DO NOT list "${reproPath}" in either ` +
+      `sourceChanges or testChanges this turn — listing it WILL cause another rejection. ` +
+      `The bug is in the source files under "${affectedModule}" — modify those so the ` +
+      `existing repro test's assertions pass as-is. If you must add tests, add them to ` +
+      `a DIFFERENT path (e.g. ${affectedModule.replace(/\/$/, '')}/tests/test_fix.py), ` +
+      `not the repro path.`
+    );
+  }
+
+  // Out-of-scope changes.
+  if (/produced out-of-scope changes/.test(retryContext)) {
+    const m = /out-of-scope changes:\s*([^.]+)/.exec(retryContext);
+    const offending = m?.[1]?.trim() ?? '<see retry context>';
+    return (
+      `Your previous attempt was rejected for out-of-scope changes: ${offending}. ` +
+      `Every change MUST be inside "${affectedModule}" or inside the matching tests ` +
+      `directory. Remove any file outside that scope from sourceChanges/testChanges.`
+    );
+  }
+
+  // Destructive whole-file rewrite — the destroyed files are added back to
+  // moduleSource by augmentModuleSourceWithFiles, but the LLM still needs to
+  // know not to truncate.
+  if (/destructive whole-file rewrite/.test(retryContext)) {
+    return (
+      `Your previous attempt was rejected for whole-file truncation: you replaced ` +
+      `existing code with placeholder comments like "# ...existing code...". This ` +
+      `turn, re-read the moduleSource entries (now expanded with the destroyed ` +
+      `files' full content) and emit the COMPLETE post-edit file content for every ` +
+      `modify entry — no ellipses, no "(unchanged)" markers.`
+    );
+  }
+
+  // Empty changes — generator returned nothing.
+  if (/No changes generated/.test(retryContext)) {
+    return (
+      `Your previous attempt returned zero changes. Re-read the reproTest content ` +
+      `and the moduleSource: identify the EXACT line in the source that produces the ` +
+      `error the repro asserts on, and emit a targeted modify for that file.`
+    );
+  }
+
+  return undefined;
+}
+
+/**
  * Read the actual content of files that a previous fix attempt destroyed and
  * merge them into the FixAgentInput's moduleSource. This ensures that on
  * retry, the LLM sees the full original file (not the sampled approximation
@@ -2191,9 +2264,18 @@ export async function runPipeline(args: {
           log(`[retry] augmenting moduleSource with ${destructivePaths.length} destroyed file(s): ${destructivePaths.join(', ')}`);
         }
         const augmentedBase = await augmentModuleSourceWithFiles(fixInputBase, destructivePaths, workspace);
+        const directive = computeFixFailureDirective(
+          attempt.retryContext,
+          fixInputBase.reproTest?.path,
+          fixInputBase.affectedModule
+        );
+        if (directive) {
+          log(`[retry] promoting failure directive: ${directive.slice(0, 120)}${directive.length > 120 ? '…' : ''}`);
+        }
         currentInput = {
           ...augmentedBase,
           designSummary: injectRetryContextForFixAgent(designSummary, decision.dispatch),
+          failureDirective: directive,
         };
       } else {
         // No live deps -> simple in-memory retry without persistence/notifications.
@@ -2208,10 +2290,16 @@ export async function runPipeline(args: {
           log(`[retry] augmenting moduleSource with ${destructivePaths.length} destroyed file(s): ${destructivePaths.join(', ')}`);
         }
         const augmentedBase = await augmentModuleSourceWithFiles(fixInputBase, destructivePaths, workspace);
+        const directive = computeFixFailureDirective(
+          attempt.retryContext,
+          fixInputBase.reproTest?.path,
+          fixInputBase.affectedModule
+        );
         currentInput = {
           ...augmentedBase,
           designSummary:
             `${designSummary}\n\n## Latest Failure (address this in your fix)\n\n${attempt.retryContext}`,
+          failureDirective: directive,
         };
       }
     }

@@ -48,6 +48,23 @@ export class OpenRouterFixGenerator implements FixGenerator {
   }
 
   async generateFix(input: FixAgentInput): Promise<FixGeneratorOutput> {
+    // Strip failureDirective from the JSON body — we'll promote it to a
+    // dedicated preamble at the TOP of the user message so the LLM cannot
+    // miss it, mirroring what we do in OpenRouterIterativeReproGenerator.
+    const { failureDirective, ...inputForJson } = input;
+    const userParts: string[] = [];
+    if (failureDirective && failureDirective.trim().length > 0) {
+      userParts.push(
+        '‼️ DIRECTIVE FROM PREVIOUS ATTEMPT — READ FIRST, OBEY UNCONDITIONALLY:',
+        failureDirective.trim(),
+        '',
+        '↑ If you ignore the directive above, this attempt will be rejected the same way the last one was. ' +
+        'Read it, then read the rest of the input.',
+        '',
+      );
+    }
+    userParts.push(JSON.stringify(inputForJson, null, 2));
+
     const messages: LLMMessage[] = [
       {
         role: 'system',
@@ -79,11 +96,15 @@ export class OpenRouterFixGenerator implements FixGenerator {
           'pass (exit code 0). UNDER NO CIRCUMSTANCES include the reproTest path in sourceChanges ' +
           'or testChanges — it is read-only. Do not weaken its assertions, do not delete it, do ' +
           'not move it. Fix the underlying bug so the existing repro passes as-is. ' +
+          'If the user message begins with a "‼️ DIRECTIVE FROM PREVIOUS ATTEMPT" block, ' +
+          'that directive takes precedence over your own judgment about what to do next: ' +
+          'the previous attempt was rejected for a specific reason and the directive tells ' +
+          'you exactly how to avoid the same rejection. ' +
           'Do not include any properties other than path, action, content.',
       },
       {
         role: 'user',
-        content: JSON.stringify(input, null, 2),
+        content: userParts.join('\n'),
       },
     ];
 

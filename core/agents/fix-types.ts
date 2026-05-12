@@ -57,6 +57,26 @@ export interface FixAgentInput {
    * + content so the LLM knows what to satisfy.
    */
   reproTest?: ModuleFile;
+  /**
+   * Optional: a stage-specific, ACTIONABLE single-line directive computed
+   * from the *previous* fix attempt's failure. The OpenRouterFixGenerator
+   * promotes this to the TOP of the user message (instead of leaving the
+   * corrective signal buried in `designSummary`'s "Latest Failure" section,
+   * which the LLM empirically does not internalize when it conflicts with
+   * the otherwise-strong urge to "fix" the failing test).
+   *
+   * Set by the retry path in `bin/run-pipeline.ts` when an attempt threw a
+   * `FixAgentError` (protected_path, scope_validation, destructive_rewrite)
+   * or when a verification gate produced an unambiguous next-step instruction.
+   *
+   * Examples:
+   *  - "DO NOT include tests/test_repro_issue_23.py in your output. It is
+   *     read-only. The fix belongs in the source files under
+   *     python/instrumentation/openinference-instrumentation-smolagents/."
+   *  - "Your previous attempt produced out-of-scope changes to docs/X. Only
+   *     emit changes under affectedModule + its tests."
+   */
+  failureDirective?: string;
 }
 
 /**
