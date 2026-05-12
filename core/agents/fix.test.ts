@@ -655,4 +655,115 @@ describe('runFixAgent', () => {
 
     expect(result.commitMessage).toBe('fix(webhook/router): fix route matching — closes #99');
   });
+
+  it('expands sourcePatches into commit-ready FileChange entries', async () => {
+    const original =
+      'def handle(user):\n    if user is None:\n        return None\n    return user.name\n';
+    const input = makeInput({
+      moduleSource: [{ path: 'src/auth/handler.ts', content: original }],
+      moduleTests: [],
+      reproTest: {
+        path: 'src/auth/__tests__/repro_45.test.ts',
+        content: 'noop',
+      },
+    });
+    const generator: FixGenerator = {
+      generateFix: jest.fn().mockResolvedValue({
+        sourceChanges: [],
+        testChanges: [],
+        sourcePatches: [
+          {
+            path: 'src/auth/handler.ts',
+            oldText: '    if user is None:\n        return None\n',
+            newText: '    if user is None:\n        return ""  # patched\n',
+          },
+        ],
+        summary: 'guard against null user',
+      }),
+    };
+    const committer = makeMockCommitter([]);
+    const reader: RepoFileReader = {
+      readFile: jest.fn().mockResolvedValue(original),
+      listFiles: jest.fn().mockResolvedValue(['src/auth/handler.ts']),
+    };
+
+    const result = await runFixAgent(input, generator, committer, reader);
+
+    expect(result.success).toBe(true);
+    expect(committer.commitChanges).toHaveBeenCalledTimes(1);
+    const committed = (committer.commitChanges as jest.Mock).mock.calls[0][2];
+    expect(committed).toHaveLength(1);
+    expect(committed[0].path).toBe('src/auth/handler.ts');
+    expect(committed[0].action).toBe('modify');
+    expect(committed[0].content).toContain('# patched');
+    expect(committed[0].content).toContain('return user.name');
+    expect(committed[0].content).not.toBe(original);
+  });
+
+  it('rethrows FixAgentError with patch_not_found when sourcePatch oldText is missing', async () => {
+    const input = makeInput({
+      moduleSource: [{ path: 'src/auth/handler.ts', content: 'def handle():\n    pass\n' }],
+      moduleTests: [],
+      reproTest: { path: 'src/auth/__tests__/repro.test.ts', content: '' },
+    });
+    const generator: FixGenerator = {
+      generateFix: jest.fn().mockResolvedValue({
+        sourceChanges: [],
+        testChanges: [],
+        sourcePatches: [
+          {
+            path: 'src/auth/handler.ts',
+            oldText: 'this text does not exist anywhere\n',
+            newText: 'irrelevant\n',
+          },
+        ],
+        summary: 'attempt fix',
+      }),
+    };
+    const committer = makeMockCommitter([]);
+    const reader: RepoFileReader = {
+      readFile: jest.fn().mockResolvedValue('def handle():\n    pass\n'),
+      listFiles: jest.fn().mockResolvedValue(['src/auth/handler.ts']),
+    };
+
+    await expect(runFixAgent(input, generator, committer, reader)).rejects.toMatchObject({
+      name: 'FixAgentError',
+      phase: 'patch_not_found',
+    });
+    expect(committer.commitChanges).not.toHaveBeenCalled();
+  });
+
+  it('prefers sourcePatches over a same-path sourceChanges entry', async () => {
+    const original = 'one\ntwo\nthree\n';
+    const input = makeInput({
+      moduleSource: [{ path: 'src/auth/handler.ts', content: original }],
+      moduleTests: [],
+      reproTest: { path: 'src/auth/__tests__/repro.test.ts', content: '' },
+    });
+    const generator: FixGenerator = {
+      generateFix: jest.fn().mockResolvedValue({
+        sourceChanges: [
+          // Same path as the patch — patch entry should win.
+          { path: 'src/auth/handler.ts', action: 'modify', content: 'WRONG\n' },
+        ],
+        testChanges: [],
+        sourcePatches: [
+          { path: 'src/auth/handler.ts', oldText: 'two\n', newText: 'TWO\n' },
+        ],
+        summary: 'patched',
+      }),
+    };
+    const committer = makeMockCommitter([]);
+    const reader: RepoFileReader = {
+      readFile: jest.fn().mockResolvedValue(original),
+      listFiles: jest.fn().mockResolvedValue(['src/auth/handler.ts']),
+    };
+
+    await runFixAgent(input, generator, committer, reader);
+
+    const committed = (committer.commitChanges as jest.Mock).mock.calls[0][2];
+    expect(committed).toHaveLength(1);
+    expect(committed[0].content).toBe('one\nTWO\nthree\n');
+    expect(committed[0].content).not.toContain('WRONG');
+  });
 });

@@ -16,6 +16,7 @@ import {
   FixAgentError,
   UpstreamWriteAttemptError,
 } from './fix-types';
+import { applyPatches } from './fix-patches';
 
 /** Broad token scopes that would indicate upstream write access */
 const DANGEROUS_SCOPES = ['public_repo', 'repo'];
@@ -236,6 +237,40 @@ export async function runFixAgent(
 
   // Step 3: Generate the fix
   const fixOutput = await generator.generateFix(input);
+
+  // Step 3a: Expand search/replace patches into full-content FileChange
+  // entries. Patches sidestep Claude's verbatim-reproduction failure on large
+  // files (>~20KB) — see fix-patches.ts for background. Patches are merged
+  // into the corresponding sourceChanges/testChanges arrays so all downstream
+  // validation (scope, destructive-rewrite, repro-protection) runs against
+  // the synthesised post-edit file content.
+  const patchCtx = {
+    forkFullName: input.forkFullName,
+    branch: input.branchName,
+    reader,
+  };
+  const sourcePatches = fixOutput.sourcePatches ?? [];
+  const testPatches = fixOutput.testPatches ?? [];
+  if (sourcePatches.length > 0) {
+    const synthesised = await applyPatches(sourcePatches, patchCtx);
+    // Patch entries take precedence over any same-path full-content entry —
+    // the LLM should not emit both, but if it does we trust the patch.
+    const patchedPaths = new Set(synthesised.map((c) => c.path));
+    fixOutput.sourceChanges = [
+      ...fixOutput.sourceChanges.filter((c) => !patchedPaths.has(c.path)),
+      ...synthesised,
+    ];
+    console.log(`[fix] expanded ${sourcePatches.length} sourcePatch(es) into ${synthesised.length} file change(s)`);
+  }
+  if (testPatches.length > 0) {
+    const synthesised = await applyPatches(testPatches, patchCtx);
+    const patchedPaths = new Set(synthesised.map((c) => c.path));
+    fixOutput.testChanges = [
+      ...fixOutput.testChanges.filter((c) => !patchedPaths.has(c.path)),
+      ...synthesised,
+    ];
+    console.log(`[fix] expanded ${testPatches.length} testPatch(es) into ${synthesised.length} file change(s)`);
+  }
 
   if (fixOutput.sourceChanges.length === 0 && fixOutput.testChanges.length === 0) {
     return {

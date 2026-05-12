@@ -102,4 +102,43 @@ describe('computeFixFailureDirective', () => {
     expect(d).toContain('read-only');
     expect(d).toContain('AssertionError');
   });
+
+  test('no_changes_to_commit: switches the LLM to sourcePatches mode', () => {
+    const ctx = 'Fix attempt threw: No changes to commit — your content was BYTE-FOR-BYTE IDENTICAL to HEAD.';
+    const d = computeFixFailureDirective(ctx, reproPath, module);
+    expect(d).toBeDefined();
+    expect(d).toContain('sourcePatches');
+    expect(d).toContain('oldText');
+    expect(d).toContain('newText');
+    expect(d).toContain(reproPath);
+  });
+
+  test('patch_not_found: tells the LLM to copy oldText byte-for-byte', () => {
+    const ctx =
+      'Fix attempt threw: Patch oldText for src/foo.py was not found in the file.';
+    const d = computeFixFailureDirective(ctx, reproPath, module);
+    expect(d).toBeDefined();
+    expect(d).toContain('src/foo.py');
+    expect(d).toContain('byte-for-byte');
+    expect(d).toContain('moduleSource');
+  });
+
+  test('patch_ambiguous: tells the LLM to expand oldText with more surrounding lines', () => {
+    const ctx =
+      'Fix attempt threw: Patch oldText for src/foo.py matched 3 times — it is ambiguous.';
+    const d = computeFixFailureDirective(ctx, reproPath, module);
+    expect(d).toBeDefined();
+    expect(d).toContain('src/foo.py');
+    expect(d).toContain('3');
+    expect(d).toContain('EXPAND');
+  });
+
+  test('patch_target_missing: tells the LLM to use action="create" for new files', () => {
+    const ctx =
+      'Fix attempt threw: Patch target src/missing.py could not be read from the branch: ENOENT.';
+    const d = computeFixFailureDirective(ctx, reproPath, module);
+    expect(d).toBeDefined();
+    expect(d).toContain('src/missing.py');
+    expect(d).toContain('action="create"');
+  });
 });

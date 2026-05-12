@@ -141,13 +141,39 @@ export interface FixGenerator {
 }
 
 /**
+ * A search/replace patch produced by the fix agent.
+ *
+ * For files large enough that LLMs cannot reliably reproduce the entire file
+ * verbatim with a small targeted edit (empirically Claude fails on >~20KB),
+ * the LLM emits a patch instead of full content: it picks a UNIQUE block of
+ * existing code (`oldText`) and supplies the replacement (`newText`). The fix
+ * agent reads the current file from the fork branch, validates that
+ * `oldText` appears exactly once, performs a substring replacement, and
+ * synthesises a full-content FileChange entry for the downstream pipeline.
+ *
+ * Patches are reserved for `action: 'modify'` on EXISTING files. New files
+ * must use FileChange (full content).
+ */
+export interface FilePatch {
+  path: string;
+  /** The existing block of code to replace. Must appear EXACTLY once in the file. Should be 3+ lines for uniqueness. */
+  oldText: string;
+  /** The replacement block. May be empty (deletion). */
+  newText: string;
+}
+
+/**
  * Output from the fix generator (LLM or heuristic).
  */
 export interface FixGeneratorOutput {
-  /** Source code changes */
+  /** Source code changes (full file content; required for `create`, optional for `modify` if a patch is supplied instead) */
   sourceChanges: FileChange[];
-  /** Test changes (new or updated tests) */
+  /** Test changes (full file content) */
   testChanges: FileChange[];
+  /** Source code patches (search/replace; preferred for `modify` on existing files) */
+  sourcePatches?: FilePatch[];
+  /** Test patches (search/replace) */
+  testPatches?: FilePatch[];
   /** One-line summary of what was fixed */
   summary: string;
 }

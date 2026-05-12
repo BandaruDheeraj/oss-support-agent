@@ -258,6 +258,75 @@ export function computeFixFailureDirective(
     );
   }
 
+  // No-op content — generator returned a sourceChanges entry whose `content`
+  // is byte-identical to the file already on disk, so git found nothing to
+  // commit. This is the LLM "describing" a fix in `summary` while reproducing
+  // the file verbatim in `content`. Empirically Claude fails this on large
+  // files (>20KB) when asked to reproduce-with-edit; the corrective signal
+  // must be loud and at the top of the prompt — and the path forward is to
+  // switch to a sourcePatches entry.
+  if (/No changes to commit/i.test(retryContext) || /BYTE-FOR-BYTE IDENTICAL/.test(retryContext)) {
+    const reproPath = reproTestPath ?? '<the reproTest path>';
+    return (
+      `Your previous attempt returned a sourceChanges entry, but the "content" you ` +
+      `wrote was BYTE-FOR-BYTE IDENTICAL to the file already on the branch — git found ` +
+      `nothing to commit. Your summary described an edit that you did NOT actually make ` +
+      `in the content you emitted. This is a known failure mode on long files where ` +
+      `verbatim reproduction silently drops the targeted edit.\n` +
+      `THIS TURN, USE A PATCH INSTEAD OF FULL FILE CONTENT:\n` +
+      `  • Empty out sourceChanges (move that entry's path out of sourceChanges).\n` +
+      `  • Add a "sourcePatches" entry: {"path": "<same path>", "oldText": "<3-10 line ` +
+      `block from the file, copied byte-for-byte>", "newText": "<the same block with ` +
+      `your fix applied>"}.\n` +
+      `  • The oldText must appear EXACTLY ONCE in the file. Pick a window that uniquely ` +
+      `identifies the location (e.g. include the function signature line plus the lines ` +
+      `you are editing).\n` +
+      `  • Copy oldText character-for-character from moduleSource (same indentation, same ` +
+      `whitespace, same newlines). One mismatch and the patch is rejected.\n` +
+      `DO NOT modify the repro test "${reproPath}" — it is read-only.`
+    );
+  }
+
+  // Patch search/replace failed — oldText didn't match (0 occurrences) or
+  // matched ambiguously (>1 occurrences). Tell the LLM exactly which case.
+  if (/Patch oldText for .* was not found/.test(retryContext)) {
+    const m = /Patch oldText for ([^\s]+) was not found/.exec(retryContext);
+    const target = m?.[1] ?? '<the patch path>';
+    return (
+      `Your previous sourcePatches entry for ${target} was rejected: the "oldText" you ` +
+      `supplied does not appear anywhere in that file on the branch. The most common ` +
+      `cause is that you paraphrased or reformatted the existing code instead of copying ` +
+      `it byte-for-byte. This turn, OPEN ${target} from moduleSource, copy a 3-10 line ` +
+      `contiguous block EXACTLY (same indentation, same whitespace, same blank lines, ` +
+      `same comments) into oldText, then write the replacement in newText. Do not retype ` +
+      `from memory — copy from moduleSource verbatim.`
+    );
+  }
+  if (/Patch oldText for .* matched \d+ times/.test(retryContext)) {
+    const m = /Patch oldText for ([^\s]+) matched (\d+) times/.exec(retryContext);
+    const target = m?.[1] ?? '<the patch path>';
+    const count = m?.[2] ?? 'multiple';
+    return (
+      `Your previous sourcePatches entry for ${target} was rejected: "oldText" matched ` +
+      `${count} places in the file (must match exactly once). This turn, EXPAND oldText ` +
+      `to include MORE surrounding lines — typically the function signature, a ` +
+      `distinctive variable name, or a unique comment near your target line — until the ` +
+      `block uniquely identifies the edit location. Then re-emit the patch.`
+    );
+  }
+  if (/Patch target .* could not be read/.test(retryContext)) {
+    const m = /Patch target ([^\s]+) could not be read/.exec(retryContext);
+    const target = m?.[1] ?? '<the patch path>';
+    return (
+      `Your previous sourcePatches entry for ${target} was rejected: that path does not ` +
+      `exist on the branch. If you intended to create a new file, use sourceChanges with ` +
+      `action="create" and full file content instead of a patch. If you intended to edit ` +
+      `an existing file, double-check the path against moduleSource (paths must be ` +
+      `repo-relative, exactly as they appear in moduleSource entries).`
+    );
+  }
+
+
   // Eval failed after a committed fix — patch was accepted by validation but
   // running the repro/tests in the sandbox still produces a failure. The raw
   // stderr is in retryContext but the LLM empirically doesn't internalize it
