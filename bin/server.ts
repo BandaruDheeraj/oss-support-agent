@@ -116,6 +116,24 @@ async function processIssueEvent(
     };
   }
 
+  if (manifest && action === 'opened') {
+    // Only act on 'opened' if the trigger_label is already on the issue. The
+    // typical flow is: user creates issue (no labels) then adds trigger_label
+    // — the 'labeled' event drives the pipeline. Accepting every 'opened'
+    // event would race a second pipeline against the 'labeled' one.
+    const labels: Array<{ name?: string }> = (payload.issue as any).labels ?? [];
+    const hasTrigger = labels.some((l) => l?.name === manifest.trigger_label);
+    if (!hasTrigger) {
+      return {
+        status: 200,
+        body: {
+          status: 'ignored',
+          reason: `opened-without-trigger-label=${manifest.trigger_label}`,
+        },
+      };
+    }
+  }
+
   if (manifest && action === 'labeled') {
     const labelName = (payload as any).label?.name;
     // Only the trigger_label kicks off a pipeline run. The skip_pm_gate_label

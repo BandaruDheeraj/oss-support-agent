@@ -48,6 +48,22 @@ export function routeEvent(
     return { status: 'skipped', reason: `No manifest found for repo: ${repo}` };
   }
 
+  // For issue.opened, only kick off a run if the trigger_label is already on
+  // the issue at creation time (rare, but supported). Otherwise the user
+  // adds the trigger_label later and that 'labeled' event drives the run.
+  // Accepting every 'opened' event would fire a pipeline that races against
+  // a subsequent 'labeled' pipeline on the same workspace.
+  if (event.action === 'opened') {
+    const labels: Array<{ name?: string }> = (event.issue as any).labels ?? [];
+    const hasTrigger = labels.some((l) => l?.name === manifest.trigger_label);
+    if (!hasTrigger) {
+      return {
+        status: 'ignored',
+        reason: `Issue opened without trigger_label '${manifest.trigger_label}'`,
+      };
+    }
+  }
+
   // For issue.labeled, only the trigger_label kicks off a run. The
   // skip_pm_gate_label is consulted from the issue's current label set during
   // the pipeline, so accepting it here would just fire a duplicate parallel
