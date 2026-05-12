@@ -201,6 +201,18 @@ export class LocalReproWorkspace implements ReproWorkspace {
     return lines.join('\n');
   }
 
+  editableInstallCandidates(): string[] {
+    let candidates: string[] = [];
+    if (this.affectedModule && this.affectedModule !== '.' && this.affectedModule !== '') {
+      const affectedRoot = this.affectedModule.replace(/^\/+|\/+$/g, '');
+      candidates = findEditableInstallCandidates(this.inner, affectedRoot);
+    }
+    if (candidates.length === 0) {
+      candidates = findAllEditableInstallCandidates(this.inner, 6, 50);
+    }
+    return candidates;
+  }
+
   readFile(req: Extract<ContextRequest, { op: 'read_file' }>): ContextResult {
     const safety = this.validateRelPath(req.path);
     if (!safety.ok) {

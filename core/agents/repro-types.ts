@@ -217,6 +217,15 @@ export interface ReproWorkspace {
    * top-level dirs + the affected module's subtree (a few levels deep).
    */
   repoTreeSummary(): string;
+
+  /**
+   * Return the list of repo-relative dirs containing a Python package
+   * manifest (pyproject.toml / setup.py / setup.cfg). Used by the loop to
+   * auto-inject `editableInstalls` when the LLM forgets to declare them and
+   * its repro then crashes with ModuleNotFoundError on an in-repo import.
+   * Returns an empty array for non-Python repos.
+   */
+  editableInstallCandidates?(): string[];
 }
 
 /**

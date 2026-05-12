@@ -102,14 +102,6 @@ export async function runReproLoop(
 
   const repoTreeSummary = safeRepoTree(workspace);
 
-  // Log the tree summary once at the start so we can verify what hints the
-  // LLM is actually getting (esp. the candidate editableInstalls list).
-  // First-line + size are usually enough; full body redacted-ish via prefix
-  // tag so debug filters can grab it.
-  for (const line of repoTreeSummary.split('\n')) {
-    log(`[repro-loop] tree | ${line}`);
-  }
-
   for (let iter = 1; iter <= opts.maxIterations; iter++) {
     if ('beginTurn' in workspace && typeof (workspace as any).beginTurn === 'function') {
       (workspace as any).beginTurn();
@@ -211,6 +203,23 @@ export async function runReproLoop(
       continue;
     }
     seenCandidateHashes.add(hash);
+
+    // Auto-inject editableInstalls when the LLM forgot to declare them and
+    // its test imports an in-repo package. Without this, attempt 1 typically
+    // dies with ModuleNotFoundError before any real bug-trigger runs, and
+    // the LLM tends to burn its context-request budget hunting for "where is
+    // the package?" rather than refining the assertion. The cost of an
+    // unnecessary editable install is small; the cost of a wasted baseline
+    // attempt is large.
+    if (!spec.editableInstalls || spec.editableInstalls.length === 0) {
+      const injected = inferEditableInstalls(spec.content, workspace);
+      if (injected.length > 0) {
+        log(
+          `[repro-loop] auto-injecting editableInstalls (LLM omitted them): ${injected.join(', ')}`
+        );
+        spec = { ...spec, editableInstalls: injected };
+      }
+    }
 
     if (baselineAttempts >= opts.maxBaselineAttempts) {
       lastReason = `baseline-attempt budget exhausted (${opts.maxBaselineAttempts})`;
@@ -395,3 +404,99 @@ function safeRepoTree(workspace: ReproWorkspace): string {
     return '(repo tree unavailable)';
   }
 }
+
+/**
+ * Best-effort: parse `import foo` / `from foo.bar import ...` statements
+ * from a Python repro and return the subset of repo-relative
+ * `editableInstallCandidates()` whose directory path contains a segment
+ * matching the top-level import (or a `<anything>-<top>` form, which is
+ * the standard monorepo layout, e.g. `openinference-instrumentation-X`).
+ *
+ * Conservative: only fires when candidates are advertised by the workspace,
+ * the test content actually imports something, and the match is clear.
+ * Returns innermost first; callers should de-dup. Capped at 5 results.
+ */
+function inferEditableInstalls(
+  content: string,
+  workspace: ReproWorkspace
+): string[] {
+  if (typeof workspace.editableInstallCandidates !== 'function') return [];
+  let candidates: string[];
+  try {
+    candidates = workspace.editableInstallCandidates();
+  } catch {
+    return [];
+  }
+  if (!candidates || candidates.length === 0) return [];
+
+  const tops = extractTopLevelImports(content);
+  if (tops.size === 0) return [];
+
+  // Score each candidate dir by how many of the imported top-level modules
+  // its path segments mention. We accept exact segment match or
+  // suffix-segment match (e.g. segment `openinference-instrumentation-smolagents`
+  // matches top-level `openinference` AND `smolagents`).
+  const scored: Array<{ dir: string; score: number }> = [];
+  for (const dir of candidates) {
+    const segs = dir.split('/').filter((s) => s.length > 0);
+    let score = 0;
+    for (const top of tops) {
+      for (const seg of segs) {
+        if (seg === top || seg.endsWith(`-${top}`) || seg.includes(`-${top}-`)) {
+          score++;
+          break;
+        }
+      }
+    }
+    if (score > 0) scored.push({ dir, score });
+  }
+  if (scored.length === 0) return [];
+  // Higher score first, then longer (more specific) path first.
+  scored.sort((a, b) => b.score - a.score || b.dir.length - a.dir.length);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const { dir } of scored) {
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    out.push(dir);
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
+function extractTopLevelImports(content: string): Set<string> {
+  const tops = new Set<string>();
+  const stdlib = new Set([
+    'os', 'sys', 'json', 'time', 'threading', 'asyncio', 'logging', 're',
+    'pathlib', 'subprocess', 'tempfile', 'typing', 'functools', 'itertools',
+    'collections', 'unittest', 'pytest', 'dataclasses', 'enum', 'abc',
+    'io', 'math', 'random', 'datetime', 'traceback', 'warnings', 'inspect',
+    'contextlib', 'concurrent', 'multiprocessing', 'queue', 'socket',
+    'struct', 'hashlib', 'base64', 'copy', 'string', 'textwrap',
+    '__future__', 'argparse', 'pickle', 'csv', 'urllib', 'http',
+  ]);
+  const reFrom = /^\s*from\s+([\w][\w.]*)\s+import\b/gm;
+  const reImp = /^\s*import\s+([\w][\w.]*(?:\s*,\s*[\w][\w.]*)*)/gm;
+  let m: RegExpExecArray | null;
+  while ((m = reFrom.exec(content)) !== null) {
+    const top = m[1].split('.')[0];
+    if (top && !stdlib.has(top)) tops.add(top);
+  }
+  while ((m = reImp.exec(content)) !== null) {
+    for (const piece of m[1].split(',')) {
+      const top = piece.trim().split('.')[0];
+      if (top && !stdlib.has(top)) tops.add(top);
+    }
+  }
+  // Filter out very generic third-party hints that aren't in-repo packages.
+  for (const t of [
+    'opentelemetry', 'wrapt', 'pydantic', 'openai', 'anthropic', 'httpx',
+    'requests', 'numpy', 'pandas', 'attrs', 'click', 'rich', 'tqdm',
+    'aiohttp', 'starlette', 'fastapi', 'flask', 'django', 'sqlalchemy',
+    'boto3', 'redis', 'pymongo', 'psycopg2',
+  ]) {
+    tops.delete(t);
+  }
+  return tops;
+}
+
