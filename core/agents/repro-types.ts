@@ -311,6 +311,12 @@ export interface IterativeReproGeneratorInput extends ReproAgentInput {
   iteration: number;
   remainingIterations: number;
   remainingBaselineAttempts: number;
+  /**
+   * Remaining number of `request_context` turns. When 0, the LLM MUST emit
+   * `kind: "repro"` — additional context requests are rejected and burn
+   * an iteration with no progress.
+   */
+  remainingContextRequests: number;
 }
 
 export interface IterativeReproGenerator {

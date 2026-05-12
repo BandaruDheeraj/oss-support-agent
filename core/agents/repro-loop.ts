@@ -64,7 +64,7 @@ export interface ReproLoopOptions {
 const DEFAULTS: Required<Omit<ReproLoopOptions, 'log'>> = {
   maxIterations: 8,
   maxBaselineAttempts: 4,
-  maxContextRequestRounds: 5,
+  maxContextRequestRounds: 8,
   feedbackTailBytes: 2048,
   contentPreviewBytes: 2048,
 };
@@ -108,6 +108,7 @@ export async function runReproLoop(
     }
     const remainingIterations = opts.maxIterations - iter;
     const remainingBaselineAttempts = opts.maxBaselineAttempts - baselineAttempts;
+    const remainingContextRequests = Math.max(0, opts.maxContextRequestRounds - contextRounds);
 
     const turnInput: IterativeReproGeneratorInput = {
       ...input,
@@ -117,6 +118,7 @@ export async function runReproLoop(
       iteration: iter,
       remainingIterations,
       remainingBaselineAttempts,
+      remainingContextRequests,
     };
 
     let action: ReproGeneratorAction;
