@@ -102,6 +102,14 @@ export async function runReproLoop(
 
   const repoTreeSummary = safeRepoTree(workspace);
 
+  // Log the tree summary once at the start so we can verify what hints the
+  // LLM is actually getting (esp. the candidate editableInstalls list).
+  // First-line + size are usually enough; full body redacted-ish via prefix
+  // tag so debug filters can grab it.
+  for (const line of repoTreeSummary.split('\n')) {
+    log(`[repro-loop] tree | ${line}`);
+  }
+
   for (let iter = 1; iter <= opts.maxIterations; iter++) {
     if ('beginTurn' in workspace && typeof (workspace as any).beginTurn === 'function') {
       (workspace as any).beginTurn();
