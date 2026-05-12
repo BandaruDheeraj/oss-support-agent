@@ -257,6 +257,51 @@ export function computeFixFailureDirective(
     );
   }
 
+  // Eval failed after a committed fix — patch was accepted by validation but
+  // running the repro/tests in the sandbox still produces a failure. The raw
+  // stderr is in retryContext but the LLM empirically doesn't internalize it
+  // when it's buried in ## Latest Failure; it regresses to modifying the
+  // protected repro test. Promote the actionable signal to top-of-prompt and
+  // detect common Python patch bugs the model can correct without re-running.
+  if (/^Eval failed:/.test(retryContext)) {
+    const reproPath = reproTestPath ?? '<the reproTest path>';
+    const hints = retryContext.slice(0, 2000); // cap to keep prompt small
+
+    // Most common bug: model added a guard like `isinstance(x, SomeName)` but
+    // forgot to import SomeName. Surface it precisely.
+    const nameErr = /NameError: name ['"]([^'"]+)['"] is not defined/.exec(retryContext);
+    if (nameErr) {
+      const sym = nameErr[1];
+      return (
+        `Your previous fix referenced "${sym}" in the source but did NOT import it, so ` +
+        `running the repro raised "NameError: name '${sym}' is not defined". This turn, ` +
+        `add the missing import to the SAME modify entry (e.g. an "from ... import ${sym}" ` +
+        `line at the top of the file) alongside your existing change. DO NOT modify the ` +
+        `repro test "${reproPath}" — it is read-only. Sandbox output:\n${hints}`
+      );
+    }
+
+    // ImportError / ModuleNotFoundError — likely wrong import path.
+    const importErr = /(ImportError|ModuleNotFoundError):\s*([^\n]+)/.exec(retryContext);
+    if (importErr) {
+      return (
+        `Your previous fix introduced an import that failed at runtime: ` +
+        `"${importErr[1]}: ${importErr[2]}". Correct the import path in the SAME source ` +
+        `file (check how neighboring imports in moduleSource are written). DO NOT modify ` +
+        `the repro test "${reproPath}" — it is read-only. Sandbox output:\n${hints}`
+      );
+    }
+
+    // Generic fallback — fix committed but the repro/eval still red. The
+    // critical signal is "don't touch the repro; adjust YOUR source patch".
+    return (
+      `Your previous fix was committed but the sandbox eval still failed. Read the ` +
+      `sandbox output below and adjust the SAME source file(s) accordingly. DO NOT ` +
+      `modify the repro test "${reproPath}" — it is read-only and rewriting it will be ` +
+      `rejected. Sandbox output:\n${hints}`
+    );
+  }
+
   return undefined;
 }
 

@@ -60,4 +60,46 @@ describe('computeFixFailureDirective', () => {
     expect(d).toBeDefined();
     expect(d!.toLowerCase()).toContain('zero changes');
   });
+
+  test('eval-failed (NameError): surfaces missing import and forbids touching repro', () => {
+    const ctx =
+      `Eval failed: A sandbox command failed\n` +
+      `Retry hints:\n` +
+      `- python tests/test_repro_issue_23.py: Traceback (most recent call last):\n` +
+      `  File ".../tests/test_repro_issue_23.py", line 29, in test_x\n` +
+      `    _finalize_step_span(span, step_log)\n` +
+      `  File ".../_wrappers.py", line 247, in _finalize_step_span\n` +
+      `    if isinstance(span, NonRecordingSpan):\n` +
+      `NameError: name 'NonRecordingSpan' is not defined`;
+    const d = computeFixFailureDirective(ctx, reproPath, module);
+    expect(d).toBeDefined();
+    expect(d).toContain('NonRecordingSpan');
+    expect(d).toContain('did NOT import');
+    expect(d).toContain('read-only');
+    expect(d).toContain(reproPath);
+  });
+
+  test('eval-failed (ImportError): tells LLM to fix the import path, not the repro', () => {
+    const ctx =
+      `Eval failed: A sandbox command failed\n` +
+      `Retry hints:\n` +
+      `- python tests/test_repro_issue_23.py: ImportError: cannot import name 'Foo' from 'bar'`;
+    const d = computeFixFailureDirective(ctx, reproPath, module);
+    expect(d).toBeDefined();
+    expect(d).toContain('ImportError');
+    expect(d).toContain('read-only');
+    expect(d).toContain(reproPath);
+  });
+
+  test('eval-failed (generic): falls back to forbidding repro edits and surfacing sandbox output', () => {
+    const ctx =
+      `Eval failed: A sandbox command failed\n` +
+      `Retry hints:\n` +
+      `- pytest tests/: AssertionError: expected X got Y`;
+    const d = computeFixFailureDirective(ctx, reproPath, module);
+    expect(d).toBeDefined();
+    expect(d).toContain('still failed');
+    expect(d).toContain('read-only');
+    expect(d).toContain('AssertionError');
+  });
 });
