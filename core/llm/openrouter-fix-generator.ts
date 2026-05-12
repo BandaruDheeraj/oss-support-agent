@@ -118,6 +118,24 @@ export class OpenRouterFixGenerator implements FixGenerator {
       temperature: 0,
     });
 
+    // Diagnostic: surface what the LLM returned so we can tell whether
+    // "No changes to commit" is caused by empty arrays vs no-op content.
+    const sourceSummary = (data.sourceChanges ?? [])
+      .map((c) => `${c.action} ${c.path} (${(c.content ?? '').length}b)`)
+      .join('; ');
+    const testSummary = (data.testChanges ?? [])
+      .map((c) => `${c.action} ${c.path} (${(c.content ?? '').length}b)`)
+      .join('; ');
+    console.log(
+      `[fix-gen] returned sourceChanges=${(data.sourceChanges ?? []).length} ` +
+        `testChanges=${(data.testChanges ?? []).length} summaryLen=${(data.summary ?? '').length}`
+    );
+    if (sourceSummary) console.log(`[fix-gen] source: ${sourceSummary}`);
+    if (testSummary) console.log(`[fix-gen] tests:  ${testSummary}`);
+    if ((data.summary ?? '').trim()) {
+      console.log(`[fix-gen] summary: ${data.summary.slice(0, 240)}`);
+    }
+
     return data;
   }
 }

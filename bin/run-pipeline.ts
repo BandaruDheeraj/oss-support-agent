@@ -2278,10 +2278,22 @@ export async function runPipeline(args: {
           log,
         });
       } catch (err: any) {
-        log(`[fix] attempt threw: ${err?.message ?? err}`);
+        const msg = err?.message ?? String(err);
+        log(`[fix] attempt threw: ${msg}`);
+        let retryContext = `Fix attempt threw: ${msg}`;
+        if (/No changes to commit/i.test(msg)) {
+          retryContext =
+            `Your previous attempt returned sourceChanges paths, but the "content" you ` +
+            `wrote for each path was BYTE-FOR-BYTE IDENTICAL to the file already on the ` +
+            `branch — so git found nothing to commit. The bug is real (the repro test ` +
+            `currently fails) and your fix is necessary. Re-read the repro test and the ` +
+            `affected module, then emit at least one sourceChanges entry whose "content" ` +
+            `actually differs from the current file. Make sure the change you describe in ` +
+            `your summary is actually present in the content you emit.`;
+        }
         attempt = {
           ok: false,
-          retryContext: `Fix attempt threw: ${err?.message ?? err}`,
+          retryContext,
           evalSummary: 'exception',
           fixSummary: '',
         };

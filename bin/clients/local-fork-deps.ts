@@ -47,6 +47,21 @@ export class LocalForkCommitter implements ForkCommitter {
     // (see issue #38 → PR #39 incident). The fix-agent's `changes` list
     // is the authoritative set of paths that should land in the commit.
     const paths = changes.map((c) => c.path);
+    // Diagnostic: surface git status for the LLM-authored paths before
+    // attempting the commit. If the LLM returned content identical to
+    // HEAD, `git status` will show nothing for those paths and the
+    // commit will fail with "No changes to commit" — log enough context
+    // to tell that case apart from a missing-paths case.
+    try {
+      const status = await this.workspace.statusForPaths(paths);
+      console.log(
+        `[fix-commit] writing ${paths.length} path(s); ` +
+          `git-status lines for those paths: ${status.length === 0 ? '(none — no diff vs HEAD)' : status.length}`
+      );
+      for (const line of status) console.log(`[fix-commit]   ${line}`);
+    } catch {
+      // status probe is best-effort; never let it mask the real error
+    }
     const sha = await this.workspace.commitPaths(paths, message);
     await this.workspace.push();
     return sha;

@@ -288,6 +288,26 @@ export class LocalWorkspace {
   }
 
   /**
+   * Return `git status --porcelain` lines that match the given paths.
+   * Used as a diagnostic before a commit — answers "would `git add` of
+   * these paths stage anything?". Returns an empty array if there are
+   * no pending differences for those paths (e.g. LLM wrote content
+   * identical to HEAD).
+   */
+  async statusForPaths(relPaths: string[]): Promise<string[]> {
+    if (relPaths.length === 0) return [];
+    const status = await execCommand(
+      'git',
+      ['status', '--porcelain', '--', ...relPaths],
+      this.dir
+    );
+    return status.stdout
+      .split('\n')
+      .map((l) => l.trimEnd())
+      .filter((l) => l.length > 0);
+  }
+
+  /**
    * Restore the working tree to HEAD: discard tracked-file modifications and
    * delete any untracked files / directories. Use this after running an
    * LLM-authored script in the sandbox so unintended side effects don't get
