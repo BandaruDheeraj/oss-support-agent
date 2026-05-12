@@ -128,6 +128,23 @@ export class LocalWorkspace {
       ]);
       await git(this.dir, ['config', 'user.name', this.opts.authorName]);
       await git(this.dir, ['config', 'user.email', this.opts.authorEmail]);
+      // Defense-in-depth: register .agent-venv in the repo-local exclude
+      // file so even an accidental `git add -A` (e.g. from a future code
+      // path) cannot stage the per-workspace Python venv. This is local
+      // to the clone — it does NOT modify the upstream repo's .gitignore.
+      try {
+        const excludePath = path.join(this.dir, '.git', 'info', 'exclude');
+        fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+        const existing = fs.existsSync(excludePath)
+          ? fs.readFileSync(excludePath, 'utf-8')
+          : '';
+        if (!/^\.agent-venv\/?$/m.test(existing)) {
+          const sep = existing.endsWith('\n') || existing.length === 0 ? '' : '\n';
+          fs.writeFileSync(excludePath, `${existing}${sep}.agent-venv/\n`, 'utf-8');
+        }
+      } catch {
+        // Best-effort; commitChanges already restricts to authored paths.
+      }
     }
 
     // Fetch and check out the working branch (it should already exist on the fork

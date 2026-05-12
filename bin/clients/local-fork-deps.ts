@@ -40,7 +40,14 @@ export class LocalForkCommitter implements ForkCommitter {
     for (const change of changes) {
       this.workspace.writeFile(change.path, change.content);
     }
-    const sha = await this.workspace.commitAll(message);
+    // Commit ONLY the LLM-authored paths. Using commitAll (`git add -A`)
+    // here would sweep in untracked side-effects like the per-workspace
+    // .agent-venv/ that the sandbox creates for editable pip installs,
+    // producing PRs with hundreds of thousands of unrelated additions
+    // (see issue #38 → PR #39 incident). The fix-agent's `changes` list
+    // is the authoritative set of paths that should land in the commit.
+    const paths = changes.map((c) => c.path);
+    const sha = await this.workspace.commitPaths(paths, message);
     await this.workspace.push();
     return sha;
   }
