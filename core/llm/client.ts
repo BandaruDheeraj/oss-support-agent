@@ -86,7 +86,14 @@ export class OpenRouterHTTPError extends Error {
   public readonly body: unknown;
 
   constructor(status: number, body: unknown) {
-    super(`OpenRouter request failed with HTTP ${status}`);
+    let bodySnippet = '';
+    try {
+      const s = typeof body === 'string' ? body : JSON.stringify(body);
+      if (s) bodySnippet = ` body=${s.length > 500 ? s.slice(0, 500) + '...' : s}`;
+    } catch {
+      // ignore
+    }
+    super(`OpenRouter request failed with HTTP ${status}${bodySnippet}`);
     this.name = 'OpenRouterHTTPError';
     this.status = status;
     this.body = body;
