@@ -324,14 +324,19 @@ export async function runFixAgent(
     );
   }
 
-  // Step 5: Validate test coverage
-  const testCheck = validateTestCoverage(fixOutput.sourceChanges, fixOutput.testChanges);
-  if (!testCheck.covered) {
-    throw new FixAgentError(
-      `Fix agent must write or update tests for every code change. ` +
-      `Missing tests for: ${testCheck.uncoveredFiles.join(', ')}`,
-      'test_coverage'
-    );
+  // Step 5: Validate test coverage. When a repro test exists on the branch,
+  // it already provides coverage — the fix isn't expected (or allowed) to
+  // touch it, and an empty testChanges array is the right answer in that
+  // case. Skip the coverage gate so the LLM stops adding noise tests.
+  if (!input.reproTest) {
+    const testCheck = validateTestCoverage(fixOutput.sourceChanges, fixOutput.testChanges);
+    if (!testCheck.covered) {
+      throw new FixAgentError(
+        `Fix agent must write or update tests for every code change. ` +
+        `Missing tests for: ${testCheck.uncoveredFiles.join(', ')}`,
+        'test_coverage'
+      );
+    }
   }
 
   // Step 6: Format commit message

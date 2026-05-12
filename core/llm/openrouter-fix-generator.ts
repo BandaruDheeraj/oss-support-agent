@@ -87,7 +87,7 @@ export class OpenRouterFixGenerator implements FixGenerator {
           'If the file is too long to reproduce in full, prefer making no edit to that file ' +
           'and explaining the limitation in summary. ' +
           'Only touch files within the affected module and related tests. ' +
-          'IMPORTANT: If sourceChanges is non-empty, testChanges MUST also be non-empty. ' +
+          'IMPORTANT: If sourceChanges is non-empty AND no "reproTest" is provided, testChanges MUST also be non-empty. ' +
           'For documentation-only fixes (README, AGENTS.md, CHANGELOG, etc.) where no executable test makes sense, ' +
           'add a trivial test entry such as a tests/test_docs_smoke.py with a single assertion that the doc file ' +
           'exists and is non-empty. Do not omit testChanges. ' +
@@ -96,6 +96,11 @@ export class OpenRouterFixGenerator implements FixGenerator {
           'pass (exit code 0). UNDER NO CIRCUMSTANCES include the reproTest path in sourceChanges ' +
           'or testChanges — it is read-only. Do not weaken its assertions, do not delete it, do ' +
           'not move it. Fix the underlying bug so the existing repro passes as-is. ' +
+          'When a "reproTest" is present, the repro IS your test coverage — testChanges should be ' +
+          'an empty array []. Do NOT add unrelated smoke tests, README-exists assertions, or any ' +
+          'other new test files; doing so will get those files stripped post-fix. ' +
+          'Likewise, do NOT reformat unrelated functions or whitespace — only emit hunks that ' +
+          'directly change behaviour to address the bug. ' +
           'If the user message begins with a "‼️ DIRECTIVE FROM PREVIOUS ATTEMPT" block, ' +
           'that directive takes precedence over your own judgment about what to do next: ' +
           'the previous attempt was rejected for a specific reason and the directive tells ' +

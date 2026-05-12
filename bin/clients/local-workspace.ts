@@ -31,7 +31,7 @@ export async function execCommand(
   cmd: string,
   args: string[],
   cwd: string,
-  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number; shell?: boolean } = {}
+  opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number; shell?: boolean; stdin?: string } = {}
 ): Promise<ExecResult> {
   const start = Date.now();
   return new Promise((resolve) => {
@@ -39,12 +39,20 @@ export async function execCommand(
       cwd,
       env: { ...process.env, ...(opts.env ?? {}) },
       shell: opts.shell ?? false,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [opts.stdin !== undefined ? 'pipe' : 'ignore', 'pipe', 'pipe'],
     };
     const proc = spawn(cmd, args, spawnOpts);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+
+    if (opts.stdin !== undefined && proc.stdin) {
+      proc.stdin.on('error', () => {
+        /* ignore EPIPE etc — the spawn error handler covers it */
+      });
+      proc.stdin.write(opts.stdin);
+      proc.stdin.end();
+    }
 
     proc.stdout?.on('data', (d: Buffer) => {
       stdout += d.toString('utf-8');
@@ -298,5 +306,15 @@ export class LocalWorkspace {
 
   async push(): Promise<void> {
     await git(this.dir, ['push', 'origin', this.branch]);
+  }
+
+  /**
+   * Force-push the local branch tip over the remote, but only if the remote
+   * still matches what we last saw — so a concurrent push from another
+   * pipeline run cannot get silently overwritten. Used by the post-fix
+   * sanitizer after `git commit --amend`.
+   */
+  async pushForceWithLease(): Promise<void> {
+    await git(this.dir, ['push', '--force-with-lease', 'origin', this.branch]);
   }
 }

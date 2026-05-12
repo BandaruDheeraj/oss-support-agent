@@ -59,6 +59,22 @@ export default class OpenInferenceForkAdapter extends BaseRepoAdapter {
     return [pyCompileChanged];
   }
 
+  /**
+   * Heavy regression suite run ONLY by the post-fix regression-guard GHA job.
+   * Runs the actual smolagents test suite from the package directory. This is
+   * the real signal that the fix didn't break existing tests. The GHA runner
+   * has full Python + pip + network so we can `pip install -e .[test]`.
+   */
+  async getRegressionCommands(): Promise<string[]> {
+    const cmd = [
+      'set -e',
+      'cd python/instrumentation/openinference-instrumentation-smolagents',
+      'python -m pip install --quiet -e ".[test]"',
+      'python -m pytest tests/ -q',
+    ].join(' && ');
+    return [cmd];
+  }
+
   async getSandboxServices(): Promise<ServiceConfig[]> {
     return [];
   }

@@ -94,6 +94,16 @@ export interface RepoAdapter {
   /** Called by the sandbox runner to determine which test commands to execute. */
   getTestCommands(): Promise<string[]>;
 
+  /**
+   * Optional. Heavier test suite used ONLY by the post-fix regression guard
+   * (GHA job), which has full Ubuntu + pip and is not bound by the local
+   * runner's tool constraints. Defaults to `getTestCommands()` when absent.
+   *
+   * Use this to run the project's real pytest/jest/etc. suite for regression
+   * detection while keeping `getTestCommands` light for the local-sandbox eval.
+   */
+  getRegressionCommands?(): Promise<string[]>;
+
   /** Called by the sandbox runner to determine which services must be started. */
   getSandboxServices(): Promise<ServiceConfig[]>;
 
@@ -124,6 +134,10 @@ export class BaseRepoAdapter implements RepoAdapter {
 
   async getTestCommands(): Promise<string[]> {
     return [];
+  }
+
+  async getRegressionCommands(): Promise<string[]> {
+    return this.getTestCommands();
   }
 
   async getSandboxServices(): Promise<ServiceConfig[]> {

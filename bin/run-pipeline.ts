@@ -20,6 +20,7 @@ import { runTriage } from '../core/agents/triage';
 import type { TriageInput } from '../core/agents/triage-types';
 import { createForkAndBranch } from '../core/fork-manager';
 import { runFixAgent } from '../core/agents/fix';
+import { sanitizeFixCommit, SanitizeError } from '../core/agents/fix-sanitize';
 import { runBuildAgent } from '../core/agents/build';
 import { runDocsAgent } from '../core/agents/docs';
 import type {
@@ -840,7 +841,13 @@ async function runVerification(args: {
 
   try {
     log(`[verify/regression-guard] sandbox_runner=gha; running regression guard`);
-    const testCommands = await adapter.getTestCommands();
+    const useRegression = typeof adapter.getRegressionCommands === 'function';
+    const testCommands = useRegression
+      ? await adapter.getRegressionCommands!()
+      : await adapter.getTestCommands();
+    log(
+      `[verify/regression-guard] source=${useRegression ? 'getRegressionCommands' : 'getTestCommands'} commands=${testCommands.length}`
+    );
     const sandboxServices = await adapter.getSandboxServices();
     const serviceNames = sandboxServices.map((s) =>
       typeof s === 'string' ? s : s.name
@@ -1141,6 +1148,40 @@ async function runFixAttempt(args: {
         evalSummary: 'modified-repro',
         fixSummary: fixResult.summary,
       };
+    }
+  }
+
+  // Post-fix sanitizer: strip out-of-scope files and whitespace-only hunks
+  // from the just-committed (and already-pushed) fix attempt, then
+  // amend + force-push-with-lease. Sanitizer failures are retry-eligible.
+  if (reproSpec) {
+    try {
+      const sanitizeResult = await sanitizeFixCommit({
+        workspaceDir: workspace.dir,
+        branch: workspace.branch,
+        affectedModule: fixInput.affectedModule,
+        reproPath: reproSpec.path,
+        log,
+      });
+      if (sanitizeResult.amended) {
+        log(
+          `[sanitize] amended=true dropped=${sanitizeResult.droppedPaths.length} ` +
+            `ws-hunks-stripped=${sanitizeResult.wsHunksStripped} retained=${sanitizeResult.retainedPaths.length}`
+        );
+      }
+    } catch (err: any) {
+      if (err instanceof SanitizeError) {
+        const isEmpty = err.kind === 'empty';
+        return {
+          ok: false,
+          retryContext: isEmpty
+            ? `Your fix contained only out-of-scope edits or whitespace-only reformats; nothing functional addressed the bug. Emit ONLY the changes that fix the issue under "${fixInput.affectedModule}". Do not add unrelated test files or reformat unrelated code.`
+            : `Post-fix sanitization failed mechanically (${err.message}). Re-emit the fix as a minimal, targeted edit under "${fixInput.affectedModule}".`,
+          evalSummary: isEmpty ? 'sanitize-empty' : 'sanitize-error',
+          fixSummary: fixResult.summary,
+        };
+      }
+      throw err;
     }
   }
 
