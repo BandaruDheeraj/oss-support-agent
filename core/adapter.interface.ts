@@ -10,7 +10,7 @@
  *
  * Bump this number when you make any breaking change to RepoAdapter or its supporting types.
  */
-export const ADAPTER_INTERFACE_VERSION = 1;
+export const ADAPTER_INTERFACE_VERSION = 2;
 
 
 /** A GitHub issue (or issue-like) input used for routing decisions. */

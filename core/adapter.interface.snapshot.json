@@ -1,6 +1,7 @@
 {
   "_comment": "Snapshot of core/adapter.interface.ts hashed by version. Update this file whenever ADAPTER_INTERFACE_VERSION is bumped (US-113).",
   "versions": {
-    "1": "f3b8566a1986c09f5aec72461c35e94d06c7085ef1dcfdf1a65b9aa72b8c00c2"
+    "1": "f3b8566a1986c09f5aec72461c35e94d06c7085ef1dcfdf1a65b9aa72b8c00c2",
+    "2": "de6e149a58ff1aa77a3f194366848b773f3dcbc4cf954d268d77a4fe1c70a660"
   }
 }

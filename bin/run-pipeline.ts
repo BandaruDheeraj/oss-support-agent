@@ -19,22 +19,22 @@ import type { Manifest } from '../core/manifest/types';
 import { runTriage } from '../core/agents/triage';
 import type { TriageInput } from '../core/agents/triage-types';
 import { createForkAndBranch } from '../core/fork-manager';
-import { runFixAgent } from '../core/agents/fix';
 import { sanitizeFixCommit, SanitizeError } from '../core/agents/fix-sanitize';
 import { runBuildAgent } from '../core/agents/build';
 import { runDocsAgent } from '../core/agents/docs';
 import type {
   ConfirmedIssue,
-  FixAgentInput,
   ModuleCommit,
   ModuleFile,
 } from '../core/agents/fix-types';
 import type { BuildAgentInput, ReferenceModule } from '../core/agents/build-types';
 import type { DocsAgentInput } from '../core/agents/docs-types';
-import { OpenRouterFixGenerator } from '../core/llm/openrouter-fix-generator';
 import { OpenRouterScaffoldGenerator } from '../core/llm/openrouter-scaffold-generator';
 import { createDefaultTriageClassifier } from '../core/llm/openrouter-triage-classifier';
 import type { IssueEvent } from '../core/webhook/types';
+
+import { runReproPipeline, runFixPipeline } from '../core/agents/run-v2';
+import type { ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
 
 import { scoreDesign } from '../core/agents/pm';
 import {
@@ -51,37 +51,10 @@ import type { FollowUpGenerator } from '../core/pm-email-types';
 import type { PMEmailLoopConfig, DesignBriefInput } from '../core/pm-email-types';
 import { detectApproval } from '../core/gmail-mcp';
 import { extractFilePathsFromAll } from '../core/issue-file-extractor';
-import { runReproLoop } from '../core/agents/repro-loop';
-import { LocalReproWorkspace } from '../core/agents/repro-workspace';
-import type {
-  ReproSpec,
-  RequiredCredential,
-  BaselineRunResult,
-  BaselineRunner,
-} from '../core/agents/repro-types';
-import {
-  ReproUnreproducibleError,
-  ReproCredentialsRequiredError,
-} from '../core/agents/repro-types';
-import { OpenRouterIterativeReproGenerator } from '../core/llm/openrouter-repro-generator';
-import {
-  validateReproSetup,
-  buildPipInstallCommands,
-  ReproSetupValidationError,
-} from '../core/agents/repro-setup-validation';
-import {
-  rankMatches,
-  validateEditableInstallPath,
-} from '../core/repo-path-resolver';
-import {
-  findMissingDeclaredCredentials,
-  detectCredentialError,
-  mergeCredentialSources,
-} from '../core/credentials-check';
+import type { RequiredCredential } from '../core/agents/repro-types';
 
 import {
   runRetryLoop,
-  injectRetryContextForFixAgent,
   injectRetryContextForBuildAgent,
 } from '../core/retry-loop';
 import type { RetryLoopConfig } from '../core/retry-loop-types';
@@ -373,64 +346,6 @@ export function computeFixFailureDirective(
   }
 
   return undefined;
-}
-
-/**
- * Read the actual content of files that a previous fix attempt destroyed and
- * merge them into the FixAgentInput's moduleSource. This ensures that on
- * retry, the LLM sees the full original file (not the sampled approximation
- * gatherModuleFiles produced), giving it a chance to produce a surgical patch.
- */
-async function augmentModuleSourceWithFiles(
-  baseInput: FixAgentInput,
-  paths: string[],
-  workspace: LocalWorkspace,
-  log: (msg: string) => void = () => {}
-): Promise<FixAgentInput> {
-  if (paths.length === 0) return baseInput;
-  const reader = new LocalRepoFileReader(workspace);
-  const have = new Set(baseInput.moduleSource.map((f) => f.path));
-  const added: ModuleFile[] = [];
-  for (const p of paths) {
-    if (have.has(p)) continue;
-    // 1. Try the exact path first (direct repo path mentioned in the issue).
-    let resolved: string | null = null;
-    try {
-      const content = await reader.readFile(baseInput.forkFullName, baseInput.branchName, p);
-      added.push({ path: p, content: content.slice(0, 200_000) });
-      have.add(p);
-      resolved = p;
-      log(`[fix-prep] resolved ${p} directly`);
-    } catch {
-      /* fall through to suffix search */
-    }
-    if (resolved) continue;
-    // 2. Treat the path as a suffix and search the workspace. This catches
-    //    site-packages-derived paths (`openinference/instrumentation/.../foo.py`)
-    //    that don't map to a top-level repo dir.
-    const candidates = workspace.findFilesBySuffix(p);
-    if (candidates.length === 0) {
-      log(`[fix-prep] no suffix match for ${p}`);
-      continue;
-    }
-    const ranked = rankMatches(candidates);
-    const picked = ranked[0];
-    if (have.has(picked)) continue;
-    try {
-      const content = await reader.readFile(baseInput.forkFullName, baseInput.branchName, picked);
-      added.push({ path: picked, content: content.slice(0, 200_000) });
-      have.add(picked);
-      log(
-        `[fix-prep] suffix-resolved ${p} -> ${picked}${
-          ranked.length > 1 ? ` (${ranked.length - 1} other candidate(s) ignored)` : ''
-        }`
-      );
-    } catch {
-      log(`[fix-prep] suffix match found but read failed: ${picked}`);
-    }
-  }
-  if (added.length === 0) return baseInput;
-  return { ...baseInput, moduleSource: [...baseInput.moduleSource, ...added] };
 }
 
 function gatherModuleFiles(workspace: LocalWorkspace, modulePath: string): ModuleFile[] {
@@ -1148,166 +1063,6 @@ async function runIssueSweepLoop(args: {
 }
 
 /**
- * Run a single fix → sandbox → eval attempt.
- */
-async function runFixAttempt(args: {
-  fixInput: FixAgentInput;
-  workspace: LocalWorkspace;
-  adapter: RepoAdapter;
-  manifest: Manifest;
-  payload: IssueEvent;
-  forkFullName: string;
-  branchName: string;
-  ghClient: GitHubRestClient;
-  /** Optional: a repro spec whose run is prepended to sandbox commands. */
-  reproSpec?: ReproSpec;
-  /** Setup commands (e.g. `pip install ...`) to prepend before the repro run. */
-  reproSetupCmds?: string[];
-  /** Committed (baseline) content of the repro file — used to detect modification. */
-  reproBaselineContent?: string;
-  log: (msg: string) => void;
-}): Promise<FixAttemptOutcome> {
-  const { fixInput, workspace, adapter, manifest, payload, log, ghClient, reproSpec } = args;
-  const reader = new LocalRepoFileReader(workspace);
-  const tokenScopes = await ghClient.getTokenScopes();
-  const committer = new LocalForkCommitter(workspace, tokenScopes);
-  const generator = new OpenRouterFixGenerator();
-
-  log('[fix] invoking OpenRouter fix generator');
-  const fixResult = await runFixAgent(fixInput, generator, committer, reader);
-  if (!fixResult.success) {
-    return {
-      ok: false,
-      retryContext: 'Fix generator returned no changes.',
-      evalSummary: 'no-changes',
-      fixSummary: '',
-    };
-  }
-  log(`[fix] committed ${fixResult.changes.length} files: ${fixResult.summary}`);
-
-  // Hard guard: the fix agent MUST NOT modify the repro file. If it did,
-  // refuse the attempt and feed back into the retry loop.
-  if (reproSpec && args.reproBaselineContent !== undefined) {
-    const modifiedRepro = fixResult.changes.some((c) => c.path === reproSpec.path);
-    if (modifiedRepro) {
-      return {
-        ok: false,
-        retryContext:
-          `Your fix modified the repro test (${reproSpec.path}). The repro is read-only — ` +
-          `you must make the existing assertions pass without rewriting them.`,
-        evalSummary: 'modified-repro',
-        fixSummary: fixResult.summary,
-      };
-    }
-    try {
-      const onDisk = workspace.readFile(reproSpec.path);
-      if (onDisk !== args.reproBaselineContent) {
-        return {
-          ok: false,
-          retryContext:
-            `Your fix's commit touched the repro test (${reproSpec.path}). The repro is read-only.`,
-          evalSummary: 'modified-repro',
-          fixSummary: fixResult.summary,
-        };
-      }
-    } catch {
-      return {
-        ok: false,
-        retryContext: `Your fix deleted the repro test (${reproSpec.path}). The repro is read-only.`,
-        evalSummary: 'modified-repro',
-        fixSummary: fixResult.summary,
-      };
-    }
-  }
-
-  // Post-fix sanitizer: strip out-of-scope files and whitespace-only hunks
-  // from the just-committed (and already-pushed) fix attempt, then
-  // amend + force-push-with-lease. Sanitizer failures are retry-eligible.
-  if (reproSpec) {
-    try {
-      const sanitizeResult = await sanitizeFixCommit({
-        workspaceDir: workspace.dir,
-        branch: workspace.branch,
-        affectedModule: fixInput.affectedModule,
-        reproPath: reproSpec.path,
-        log,
-      });
-      if (sanitizeResult.amended) {
-        log(
-          `[sanitize] amended=true dropped=${sanitizeResult.droppedPaths.length} ` +
-            `ws-hunks-stripped=${sanitizeResult.wsHunksStripped} retained=${sanitizeResult.retainedPaths.length}`
-        );
-      }
-    } catch (err: any) {
-      if (err instanceof SanitizeError) {
-        const isEmpty = err.kind === 'empty';
-        return {
-          ok: false,
-          retryContext: isEmpty
-            ? `Your fix contained only out-of-scope edits or whitespace-only reformats; nothing functional addressed the bug. Emit ONLY the changes that fix the issue under "${fixInput.affectedModule}". Do not add unrelated test files or reformat unrelated code.`
-            : `Post-fix sanitization failed mechanically (${err.message}). Re-emit the fix as a minimal, targeted edit under "${fixInput.affectedModule}".`,
-          evalSummary: isEmpty ? 'sanitize-empty' : 'sanitize-error',
-          fixSummary: fixResult.summary,
-        };
-      }
-      throw err;
-    }
-  }
-
-  const adapterTestCommands = await adapter.getTestCommands();
-  const reproSetupCmds = args.reproSetupCmds ?? [];
-  const testCommands = reproSpec
-    ? [...reproSetupCmds, reproSpec.runCommand, ...adapterTestCommands]
-    : adapterTestCommands;
-  const sandboxServices = await adapter.getSandboxServices();
-  log(
-    `[sandbox] ${testCommands.length} command(s); services=${sandboxServices
-      .map((s) => (typeof s === 'string' ? s : s.name))
-      .join(',') || '(none)'}`
-  );
-
-  const sandboxArtifact = await runLocalSandbox({
-    workspace,
-    config: {
-      repoFullName: payload.repository.full_name,
-      forkFullName: args.forkFullName,
-      branchName: args.branchName,
-      workflowRepoFullName: '',
-      testCommands,
-      sandboxServices,
-      timeoutMinutes: manifest.sandbox_timeout_mins ?? 15,
-    },
-    services: sandboxServices.filter(
-      (s): s is Exclude<typeof s, string> => typeof s !== 'string'
-    ),
-    options: { log },
-  });
-
-  const evalResult = await adapter.runCustomEval(sandboxArtifact.commands);
-  log(`[eval] passed=${evalResult.passed} summary=${evalResult.summary}`);
-
-  if (evalResult.passed) {
-    return {
-      ok: true,
-      retryContext: '',
-      evalSummary: evalResult.summary,
-      fixSummary: fixResult.summary,
-    };
-  }
-
-  return {
-    ok: false,
-    retryContext:
-      `Eval failed: ${evalResult.summary}\n` +
-      (evalResult.retryContext.length
-        ? `Retry hints:\n${evalResult.retryContext.map((c) => `- ${c}`).join('\n')}`
-        : ''),
-    evalSummary: evalResult.summary,
-    fixSummary: fixResult.summary,
-  };
-}
-
-/**
  * Run a single build → sandbox → eval attempt for new_feature issues.
  * Mirrors runFixAttempt but uses the scaffold generator + build agent.
  */
@@ -1785,54 +1540,22 @@ export async function runPipeline(args: {
     prSummary = attempt!.fixSummary;
     evalSummary = attempt!.evalSummary;
   } else {
-    // ---------- Fix path with retry loop ----------
-    const moduleSource = gatherModuleFiles(workspace, routing.result.affectedModule);
-    const moduleTests = gatherTestFiles(workspace, routing.result.affectedModule);
-    const recentCommits: ModuleCommit[] = [];
+    // ---------- v2 cutover: Analyst → Investigator → Planner → Executor → Critic ----------
+    // The legacy one-shot fix agent + iterative repro loop have been retired.
+    // The v2 driver internally manages retry (Planner can replan, Critic gates
+    // approval). The outer retry-loop / RetryStateStore are no longer used on
+    // this path; only the verification gate (regression + usability) runs
+    // afterwards as a final safety check.
 
-    let fixInputBase: FixAgentInput = {
-      designSummary,
-      confirmedIssues,
-      affectedModule: routing.result.affectedModule,
-      moduleSource,
-      moduleTests,
-      recentCommits,
-      forkFullName: fork.forkFullName,
-      branchName: fork.branchName,
-    };
-
-    // Pre-load files explicitly named in the issue body / traceback so the
-    // FIRST fix attempt sees them — avoids the wasted attempt-1-then-retry
-    // cycle when gatherModuleFiles' blind sample misses the actual file.
-    const issueFragments = confirmedIssues.flatMap((i) => [i.title, i.body]);
-    const mentionedPaths = extractFilePathsFromAll(issueFragments);
-    if (mentionedPaths.length > 0) {
-      log(`[fix-prep] issue mentions ${mentionedPaths.length} candidate path(s): ${mentionedPaths.join(', ')}`);
-      const before = fixInputBase.moduleSource.length;
-      fixInputBase = await augmentModuleSourceWithFiles(fixInputBase, mentionedPaths, workspace, log);
-      const added = fixInputBase.moduleSource.length - before;
-      log(`[fix-prep] preloaded ${added} mentioned file(s) into moduleSource`);
+    let baselineSha = '';
+    try {
+      baselineSha = await workspace.headSha();
+      log("[v2] baselineSha=" + baselineSha.slice(0, 12));
+    } catch (err: any) {
+      log("[v2] could not capture baselineSha (" + (err?.message ?? err) + "); continuing");
     }
 
-    // ---------- Repro stage: prove the bug reproduces BEFORE attempting a fix ----------
-    // We ask an LLM to write a small Python test that exits non-zero with a
-    // failure sentinel string on the reported bug. We then run it on baseline
-    // (pre-fix code) and require: (a) exit≠0 (b) sentinel printed (c) no
-    // infrastructure failures (ModuleNotFoundError etc.) (d) no timeout. If
-    // valid we commit ONLY the repro file (not -A) so any sandbox side
-    // effects don't sneak in, and feed its path+content into the fix agent.
-    //
-    // Credentials gate: if the LLM declares (or the baseline output implies)
-    // env vars we don't have, halt the run, email the user the list of
-    // env vars + where to add them, label the issue `awaiting-credentials`,
-    // and exit. The user re-triggers after adding the keys.
-    let reproSpec: ReproSpec | undefined;
-    let reproBaselineContent: string | undefined;
-    let reproSetupCmds: string[] = [];
-
-    // Generic halt helper used by both the credentials gate and the
-    // repro-not-runnable gate. Resets the working tree, emails PM, comments
-    // on the issue, applies a label, and returns the right PipelineResult.
+    // ---- Halt helpers (used by repro stage on credentials / non-ok) -----
     const haltAndEmail = async (args: {
       label: string;
       subject: string;
@@ -1846,7 +1569,7 @@ export async function runPipeline(args: {
       } catch {
         /* best-effort */
       }
-      log(`[repro] HALT (${args.logTag})`);
+      log("[v2-halt] HALT (" + args.logTag + ")");
       if (deps.live) {
         try {
           await deps.live.failureNotifier.sendEmail(
@@ -1855,23 +1578,23 @@ export async function runPipeline(args: {
             args.bodyLines.join('\n'),
             manifest.pm_email
           );
-          log(`[repro] notification emailed to ${manifest.pm_email}`);
+          log("[v2-halt] notification emailed to " + manifest.pm_email);
         } catch (mailErr: any) {
-          log(`[repro] email send failed: ${mailErr?.message ?? mailErr}`);
+          log("[v2-halt] email send failed: " + (mailErr?.message ?? mailErr));
         }
         try {
           const issueCommenter = new GitHubIssueCommenter(deps.token);
           await issueCommenter.postComment(repoFullName, issueNumber, args.commentBody);
         } catch (commentErr: any) {
-          log(`[repro] issue comment failed: ${commentErr?.message ?? commentErr}`);
+          log("[v2-halt] issue comment failed: " + (commentErr?.message ?? commentErr));
         }
         try {
           await ghClient.addLabelsToPR(repoFullName, issueNumber, [args.label]);
         } catch (labelErr: any) {
-          log(`[repro] label add failed: ${labelErr?.message ?? labelErr}`);
+          log("[v2-halt] label add failed: " + (labelErr?.message ?? labelErr));
         }
       } else {
-        log(`[repro] (no live deps) would have emailed ${manifest.pm_email}: ${args.subject}`);
+        log("[v2-halt] (no live deps) would have emailed " + manifest.pm_email + ": " + args.subject);
       }
       return args.result;
     };
@@ -1879,7 +1602,7 @@ export async function runPipeline(args: {
     const renderEnvUrl = (): string | null =>
       process.env.RENDER_DASHBOARD_URL ??
       (process.env.RENDER_SERVICE_ID
-        ? `https://dashboard.render.com/web/${process.env.RENDER_SERVICE_ID}/env`
+        ? "https://dashboard.render.com/web/" + process.env.RENDER_SERVICE_ID + "/env"
         : null);
 
     const haltForCredentials = async (
@@ -1887,628 +1610,214 @@ export async function runPipeline(args: {
       detectionContext: string
     ): Promise<PipelineResult> => {
       const envNames = creds.map((c) => c.envVar);
-      const issueUrl = `https://github.com/${repoFullName}/issues/${issueNumber}`;
+      const issueUrl = "https://github.com/" + repoFullName + "/issues/" + issueNumber;
       const renderUrl = renderEnvUrl();
       const credLines = creds.map((c) => {
-        const where = c.whereToGet ? `\n    where: ${c.whereToGet}` : '';
-        return `- ${c.envVar}\n    purpose: ${c.purpose}${where}`;
+        const where = c.whereToGet ? "\n    where: " + c.whereToGet : '';
+        return "- " + c.envVar + "\n    purpose: " + c.purpose + where;
       });
       return haltAndEmail({
         label: 'awaiting-credentials',
-        subject: `[oss-agent] credentials needed for ${repoFullName}#${issueNumber}`,
+        subject: "[oss-agent] credentials needed for " + repoFullName + "#" + issueNumber,
         bodyLines: [
-          `The repro stage needs ${creds.length} credential(s) before it can prove the bug:`,
-          ``,
+          "The repro stage needs " + creds.length + " credential(s) before it can prove the bug:",
+          '',
           ...credLines,
-          ``,
-          `Detection: ${detectionContext}`,
-          ``,
+          '',
+          "Detection: " + detectionContext,
+          '',
           renderUrl
-            ? `Add them at: ${renderUrl}\nThen re-trigger this issue (e.g. by re-applying the trigger label) to resume.`
-            : `Add them to the agent's runtime environment, then re-trigger this issue (e.g. by re-applying the trigger label) to resume.`,
-          ``,
-          `Issue: ${issueUrl}`,
-          ``,
-          `Run: ${runId}`,
+            ? "Add them at: " + renderUrl + "\nThen re-trigger this issue (e.g. by re-applying the trigger label) to resume."
+            : "Add them to the agent's runtime environment, then re-trigger this issue (e.g. by re-applying the trigger label) to resume.",
+          '',
+          "Issue: " + issueUrl,
+          '',
+          "Run: " + runId,
         ],
-        commentBody: `🔒 **Awaiting credentials.** The reproduction test needs ${envNames.length} env var(s) (${envNames.join(', ')}) that aren't set on the agent runtime. The maintainer has been emailed with instructions; the run will be resumed after they're added.`,
+        commentBody: "\uD83D\uDD12 **Awaiting credentials.** The reproduction test needs " + envNames.length + " env var(s) (" + envNames.join(', ') + ") that aren't set on the agent runtime. The maintainer has been emailed with instructions; the run will be resumed after they're added.",
         result: {
           status: 'awaiting-credentials',
-          reason: `missing env vars: ${envNames.join(', ')}`,
+          reason: "missing env vars: " + envNames.join(', '),
           missingEnvVars: envNames,
         },
-        logTag: `missing credentials (${detectionContext}): ${envNames.join(', ')}`,
+        logTag: "missing credentials (" + detectionContext + "): " + envNames.join(', '),
       });
     };
 
     const haltForReproNotRunnable = async (args: {
       reason: string;
-      stderrTail?: string;
-      stdoutTail?: string;
-      attemptedCommands: string[];
-      reproPath?: string;
     }): Promise<PipelineResult> => {
-      const issueUrl = `https://github.com/${repoFullName}/issues/${issueNumber}`;
-      const branchUrl = `https://github.com/${fork.forkFullName}/tree/${fork.branchName}`;
-      const stderrBlock = (args.stderrTail ?? '').trim()
-        ? ['stderr (tail):', '```', args.stderrTail!.trim().slice(-2000), '```']
-        : [];
-      const stdoutBlock = (args.stdoutTail ?? '').trim()
-        ? ['stdout (tail):', '```', args.stdoutTail!.trim().slice(-2000), '```']
-        : [];
-      const cmdBlock =
-        args.attemptedCommands.length > 0
-          ? ['Commands executed (in order):', ...args.attemptedCommands.map((c) => `  $ ${c}`)]
-          : [];
-      const reproLine = args.reproPath
-        ? `Generated repro file: \`${args.reproPath}\` (on branch ${fork.branchName} — not yet pushed)`
-        : `No repro file was generated.`;
+      const issueUrl = "https://github.com/" + repoFullName + "/issues/" + issueNumber;
+      const branchUrl = "https://github.com/" + fork.forkFullName + "/tree/" + fork.branchName;
       return haltAndEmail({
         label: 'awaiting-repro-fix',
-        subject: `[oss-agent] repro cannot run for ${repoFullName}#${issueNumber}`,
+        subject: "[oss-agent] repro cannot run for " + repoFullName + "#" + issueNumber,
         bodyLines: [
-          `The reproduction test could not be established for this issue, so no PR will be opened.`,
-          ``,
-          `Reason: ${args.reason}`,
-          ``,
-          reproLine,
-          ``,
-          ...cmdBlock,
-          ``,
-          ...stderrBlock,
-          ...(stderrBlock.length && stdoutBlock.length ? [''] : []),
-          ...stdoutBlock,
-          ``,
-          `What to do:`,
-          `  1. Inspect the repro file on the agent branch: ${branchUrl}`,
-          `  2. If a dependency is missing, either:`,
-          `       - update the affected adapter to install it via getReproSetupCommands(), OR`,
-          `       - re-trigger so the LLM can declare it in editableInstalls / pipPackages.`,
-          `  3. If the repro is fundamentally wrong (asserts the wrong thing), close the issue or remove the agent label.`,
-          `  4. Re-apply the trigger label to resume.`,
-          ``,
-          `Issue: ${issueUrl}`,
-          ``,
-          `Run: ${runId}`,
+          "The reproduction test could not be established for this issue, so no PR will be opened.",
+          '',
+          "Reason: " + args.reason,
+          '',
+          "Inspect the agent branch: " + branchUrl,
+          '',
+          "What to do:",
+          "  1. If the repro is fundamentally wrong (asserts the wrong thing), close the issue or remove the agent label.",
+          "  2. Re-apply the trigger label to resume.",
+          '',
+          "Issue: " + issueUrl,
+          '',
+          "Run: " + runId,
         ],
-        commentBody: `⛔ **Repro could not run.** ${args.reason}\n\nNo PR has been opened — the maintainer has been emailed with details. Re-trigger after addressing the cause.`,
+        commentBody: "\u26D4 **Repro could not run.** " + args.reason + "\n\nNo PR has been opened \u2014 the maintainer has been emailed with details. Re-trigger after addressing the cause.",
         result: {
           status: 'repro-not-runnable',
           reason: args.reason,
         },
-        logTag: `repro-not-runnable: ${args.reason}`,
+        logTag: "repro-not-runnable: " + args.reason,
       });
     };
 
-    try {
-      log('[repro] generating reproduction test (iterative loop)');
-      const adapterReproSetup = (await adapter.getReproSetupCommands?.()) ?? [];
-      if (adapterReproSetup.length > 0) {
-        log(`[repro] adapter setup commands: ${adapterReproSetup.length}`);
-      }
-      reproSetupCmds = [...adapterReproSetup];
+    // ---- Repro stage (v2) -----------------------------------------------
+    const reproAttemptId = runId + "-repro";
+    const reproOutcome = await runReproPipeline({
+      attemptId: reproAttemptId,
+      payload,
+      workspace,
+      forkFullName: fork.forkFullName,
+      branch: fork.branchName,
+      baselineSha,
+      affectedModule: routing.result.affectedModule,
+      language: 'python',
+      log,
+    });
 
-      const sandboxServices = await adapter.getSandboxServices();
-
-      const reproWorkspace = new LocalReproWorkspace(
-        workspace,
-        routing.result.affectedModule
+    if (reproOutcome.status === 'credentials_required') {
+      const term = reproOutcome.v2.credentialsTerminal;
+      const envVars = term?.inferredEnvVars ?? [];
+      const creds: RequiredCredential[] = envVars.map((envVar) => ({
+        envVar,
+        purpose: 'inferred from repro baseline output',
+      }));
+      return await haltForCredentials(
+        creds,
+        term?.matchedPattern ?? 'credentials terminal'
       );
+    }
 
-      // Captured by the baseline-runner callback so we can surface the exact
-      // command list (adapter + final LLM-declared setup) on success or in
-      // halt diagnostics. Updated on EVERY attempt — the LLM may change its
-      // declared deps between iterations and the fix stage must use the
-      // setup that actually proved the bug.
-      let lastBaselineCmds: string[] = [];
-      let lastValidatedSetup: { editableInstalls: string[]; pipPackages: string[] } | null = null;
-
-      const baselineRunner: BaselineRunner = async (spec): Promise<BaselineRunResult> => {
-        // ---- Per-attempt setup validation (semantic: must exist on disk) ----
-        let validatedSetup: { editableInstalls: string[]; pipPackages: string[] };
-        try {
-          validatedSetup = validateReproSetup({
-            editableInstalls: spec.editableInstalls,
-            pipPackages: spec.pipPackages,
-          });
-        } catch (err: any) {
-          // Reset and report — feedback so the LLM can fix the setup next turn.
-          await safeReset(workspace, log);
-          return {
-            ok: false,
-            stage: 'workspace_setup',
-            reason:
-              err instanceof ReproSetupValidationError
-                ? `LLM-declared repro setup failed validation: ${err.message}`
-                : err?.message ?? String(err),
-            exitCode: null,
-            stdout: '',
-            stderr: '',
-          };
-        }
-
-        for (const dir of validatedSetup.editableInstalls) {
-          const reason = validateEditableInstallPath(workspace.dir, dir);
-          if (reason) {
-            await safeReset(workspace, log);
-            return {
-              ok: false,
-              stage: 'workspace_setup',
-              reason: `editable install path is invalid (${dir}): ${reason}`,
-              exitCode: null,
-              stdout: '',
-              stderr: '',
-            };
-          }
-        }
-
-        // ---- Proactive credentials check ----
-        const declaredCheck = findMissingDeclaredCredentials(
-          spec.requiredCredentials,
-          process.env
-        );
-        if (declaredCheck.missing.length > 0) {
-          // TERMINAL — we will not retry around missing real-world API keys.
-          await safeReset(workspace, log);
-          return {
-            ok: false,
-            stage: 'baseline_failed_to_repro',
-            reason: `repro requires undeclared credentials: ${declaredCheck.missing.map((c) => c.envVar).join(', ')}`,
-            exitCode: null,
-            stdout: '',
-            stderr: '',
-            credentialsTerminal: {
-              inferredEnvVars: declaredCheck.missing.map((c) => c.envVar),
-              matchedPattern: 'declared by repro generator',
-            },
-          };
-        }
-
-        const llmSetupCmds = buildPipInstallCommands(validatedSetup);
-        const baselineCmds = [...adapterReproSetup, ...llmSetupCmds, spec.runCommand];
-        lastBaselineCmds = baselineCmds;
-        lastValidatedSetup = validatedSetup;
-
-        log(`[repro] baseline attempt: ${baselineCmds.length} command(s) (path=${spec.path})`);
-
-        // ---- AST pre-flight gate ----
-        // A SyntaxError in the LLM-emitted Python burns ~80s + pip cost in
-        // the sandbox. Catch it locally with `python -c "import ast; ast.parse(...)"`
-        // first. Best-effort — falls through to the sandbox if no python is
-        // available on this host.
-        const ast = await pythonAstCheck(spec.content);
-        if (!ast.ok) {
-          await safeReset(workspace, log);
-          log(`[repro] AST pre-flight rejected candidate: ${ast.reason}`);
-          return {
-            ok: false,
-            stage: 'workspace_setup',
-            reason: ast.reason,
-            exitCode: null,
-            stdout: '',
-            stderr: ast.reason,
-          };
-        }
-
-        // Write the candidate into the workspace.
-        try {
-          workspace.writeFile(spec.path, spec.content);
-        } catch (err: any) {
-          await safeReset(workspace, log);
-          return {
-            ok: false,
-            stage: 'workspace_setup',
-            reason: `failed to write repro file: ${err?.message ?? err}`,
-            exitCode: null,
-            stdout: '',
-            stderr: '',
-          };
-        }
-
-        let baselineArtifact;
-        try {
-          baselineArtifact = await runLocalSandbox({
-            workspace,
-            config: {
-              repoFullName,
-              forkFullName: fork.forkFullName,
-              branchName: fork.branchName,
-              workflowRepoFullName: '',
-              testCommands: baselineCmds,
-              sandboxServices,
-              timeoutMinutes: manifest.sandbox_timeout_mins ?? 15,
-            },
-            services: sandboxServices.filter(
-              (s): s is Exclude<typeof s, string> => typeof s !== 'string'
-            ),
-            options: { log },
-          });
-        } catch (err: any) {
-          await safeReset(workspace, log);
-          throw err; // bubble up to loop's outer catch
-        }
-
-        const reproRunResult =
-          baselineArtifact.commands[baselineArtifact.commands.length - 1];
-        const reproStdout = reproRunResult?.stdout ?? '';
-        const reproStderr = reproRunResult?.stderr ?? '';
-
-        const failedSetupCmd = baselineArtifact.commands
-          .slice(0, -1)
-          .find((c) => (c.exitCode ?? 1) !== 0);
-
-        if (failedSetupCmd) {
-          await safeReset(workspace, log);
-          return {
-            ok: false,
-            stage: 'baseline_setup_command_failed',
-            reason: `setup command failed: \`${failedSetupCmd.command}\` (exit ${failedSetupCmd.exitCode})`,
-            exitCode: failedSetupCmd.exitCode ?? null,
-            stdout: failedSetupCmd.stdout ?? '',
-            stderr: failedSetupCmd.stderr ?? '',
-            failedSetupCommand: failedSetupCmd.command,
-          };
-        }
-
-        if (baselineArtifact.result.timedOut) {
-          await safeReset(workspace, log);
-          return {
-            ok: false,
-            stage: 'baseline_timeout',
-            reason: 'repro timed out on baseline; cannot trust exit code as proof of bug',
-            exitCode: reproRunResult?.exitCode ?? null,
-            stdout: reproStdout,
-            stderr: reproStderr,
-          };
-        }
-
-        const validation = validateReproBaseline({
-          exitCode: reproRunResult?.exitCode ?? null,
-          stdout: reproStdout,
-          stderr: reproStderr,
-          failureSentinel: spec.failureSentinel,
-        });
-
-        // ---- Reactive credentials gate ----
-        const sentinelPrinted =
-          reproStdout.includes(spec.failureSentinel) ||
-          reproStderr.includes(spec.failureSentinel);
-        if (!validation.ok && !sentinelPrinted) {
-          const detected = detectCredentialError(reproStdout, reproStderr);
-          if (detected.isCredentialError) {
-            const merged = mergeCredentialSources(
-              spec.requiredCredentials ?? [],
-              detected.inferredEnvVars
-            );
-            const recheck = findMissingDeclaredCredentials(merged, process.env);
-            if (recheck.missing.length > 0) {
-              await safeReset(workspace, log);
-              return {
-                ok: false,
-                stage: 'baseline_failed_to_repro',
-                reason: `repro stderr indicates missing credentials (${detected.matchedPattern ?? 'unknown'})`,
-                exitCode: reproRunResult?.exitCode ?? null,
-                stdout: reproStdout,
-                stderr: reproStderr,
-                credentialsTerminal: {
-                  inferredEnvVars: recheck.missing.map((c) => c.envVar),
-                  matchedPattern: detected.matchedPattern ?? null,
-                },
-              };
-            }
-          }
-        }
-
-        if (!validation.ok) {
-          await safeReset(workspace, log);
-          return {
-            ok: false,
-            stage: 'baseline_failed_to_repro',
-            reason: validation.reason,
-            exitCode: reproRunResult?.exitCode ?? null,
-            stdout: reproStdout,
-            stderr: reproStderr,
-          };
-        }
-
-        // SUCCESS — leave the workspace as the runner found it. The outer
-        // post-loop block re-resets, re-writes, and commits a clean repro.
-        return {
-          ok: true,
-          exitCode: reproRunResult?.exitCode ?? null,
-          stdout: reproStdout,
-          stderr: reproStderr,
-        };
-      };
-
-      let loopResult;
-      try {
-        loopResult = await runReproLoop(
-          {
-            confirmedIssues,
-            affectedModule: routing.result.affectedModule,
-            moduleSource: fixInputBase.moduleSource,
-            language: 'python',
-            preferredTestDir: 'tests',
-          },
-          new OpenRouterIterativeReproGenerator(),
-          reproWorkspace,
-          baselineRunner,
-          { log }
-        );
-      } catch (err: any) {
-        if (err instanceof ReproCredentialsRequiredError) {
-          // Map to the existing awaiting-credentials gate. We need to
-          // synthesise RequiredCredential entries from the env-var list.
-          const creds: RequiredCredential[] = err.missingEnvVars.map((envVar) => ({
-            envVar,
-            purpose: 'inferred from repro baseline output',
-          }));
-          return await haltForCredentials(creds, err.detectionContext);
-        }
-        if (err instanceof ReproUnreproducibleError) {
-          // Build a rich diagnostic from the attempt history.
-          const last = err.attempts[err.attempts.length - 1];
-          const summaryLines = err.attempts.map((a) => {
-            const stage = a.stage;
-            const ec = a.exitCode != null ? ` exit=${a.exitCode}` : '';
-            const candPath = a.candidate?.path ? ` ${a.candidate.path}` : '';
-            return `  - attempt ${a.attempt} [${stage}${ec}]${candPath}: ${a.reason}`;
-          });
-          const reason =
-            `repro loop exhausted (${err.attempts.length} attempt(s)): ${err.lastReason}\n` +
-            `History:\n${summaryLines.join('\n')}`;
-          log(`[repro] ${reason.split('\n')[0]}`);
-          return await haltForReproNotRunnable({
-            reason,
-            stderrTail: last?.stderrTail,
-            stdoutTail: last?.stdoutTail,
-            attemptedCommands: lastBaselineCmds,
-            reproPath: last?.candidate?.path,
-          });
-        }
-        throw err;
-      }
-
-      const generated = loopResult.spec;
-      log(`[repro] generated at ${generated.path} (sentinel="${generated.failureSentinel}", attempts=${loopResult.attempts.length})`);
-      if (generated.requiredCredentials && generated.requiredCredentials.length > 0) {
-        log(
-          `[repro] LLM declared ${generated.requiredCredentials.length} required credential(s): ${generated.requiredCredentials.map((c) => c.envVar).join(', ')}`
-        );
-      }
-
-      // Effective setup the fix stage will inherit (adapter baseline + final
-      // LLM-declared deps from the winning attempt).
-      const finalSetup = lastValidatedSetup ?? { editableInstalls: [], pipPackages: [] };
-      const finalLlmSetupCmds = buildPipInstallCommands(finalSetup);
-      reproSetupCmds = [...adapterReproSetup, ...finalLlmSetupCmds];
-      if (finalLlmSetupCmds.length > 0) {
-        log(
-          `[repro] final LLM-declared setup: ${finalSetup.pipPackages.length} pip package(s), ${finalSetup.editableInstalls.length} editable install(s)`
-        );
-      }
-
-      log(`[repro] baseline FAILED with sentinel (exit=${loopResult.baseline.exitCode}) — bug confirmed`);
-      // Reset any side-effect files the script may have written during the
-      // baseline run, then re-write the canonical repro content and commit
-      // ONLY that path. This guarantees the repro commit contains nothing
-      // unexpected.
-      await workspace.resetWorkingTree();
-      workspace.writeFile(generated.path, generated.content);
-      reproBaselineContent = generated.content;
-      await workspace.commitPaths([generated.path], `test: add repro for #${issueNumber}`);
-      await workspace.push();
-      log(`[repro] committed and pushed (single path: ${generated.path})`);
-      reproSpec = generated;
-      fixInputBase = {
-        ...fixInputBase,
-        reproTest: { path: generated.path, content: reproBaselineContent },
-      };
-      reproPRSection = [
-        `## Reproduction Verification`,
-        `A reproduction test was generated and run before applying the fix:`,
-        ``,
-        `- **Path**: \`${generated.path}\``,
-        `- **Run command**: \`${generated.runCommand}\``,
-        `- **Baseline (pre-fix)**: failed with exit ${loopResult.baseline.exitCode ?? '?'} and printed sentinel \`${generated.failureSentinel}\` — bug reproduced.`,
-        `- **Iterations**: produced after ${loopResult.attempts.length} repro-agent turn(s).`,
-        `- **Post-fix**: this PR's sandbox run executes the same command and requires it to pass (the eval gate enforces this on every retry).`,
-      ].join('\n');
-    } catch (err: any) {
-      // Anything that escapes the loop / runner that isn't already handled
-      // above is treated as a halt — never open a PR without a verified repro.
-      log(`[repro] generation failed: ${err?.message ?? err}`);
+    if (!reproOutcome.ok || !reproOutcome.candidateTestPath || !reproOutcome.candidateTestContent) {
       return await haltForReproNotRunnable({
-        reason: `repro generation failed: ${err?.message ?? String(err)}`,
-        attemptedCommands: reproSetupCmds,
+        reason: reproOutcome.message,
       });
     }
 
-    const maxRetries = manifest.max_retries ?? 3;
-    let attempt: FixAttemptOutcome | null = null;
-    let currentInput = fixInputBase;
-    let lastRetryContext: string | null = null;
-    // Branch tip after the repro commit. Each fix retry must reset to this
-    // SHA before invoking the LLM so its sourcePatches.oldText (derived from
-    // the baseline file content) keeps matching what's actually on the branch.
-    // Without this, attempt N+1 reliably fails with patch_not_found because
-    // attempt N already mutated the file.
-    let baselineSha: string;
+    // Commit ONLY the verified repro file (clean) and push.
+    const reproPath = reproOutcome.candidateTestPath;
+    await workspace.resetWorkingTree();
+    workspace.writeFile(reproPath, reproOutcome.candidateTestContent);
+    await workspace.commitPaths([reproPath], "test: add repro for #" + issueNumber);
+    await workspace.push();
+    log("[v2-repro] committed and pushed " + reproPath);
+
+    reproPRSection = buildReproPRSectionFromV2(reproOutcome.v2);
+
+    // Capture branch SHA AFTER the repro commit \u2014 the fix pipeline runs on
+    // top of this baseline.
+    let fixBaselineSha = baselineSha;
     try {
-      baselineSha = await workspace.headSha();
-      log(`[fix] captured baselineSha=${baselineSha.slice(0, 12)} for retry resets`);
-    } catch (err: any) {
-      log(`[fix] could not capture baselineSha (${err?.message ?? err}); retries will not reset branch`);
-      baselineSha = '';
+      fixBaselineSha = await workspace.headSha();
+    } catch {
+      /* best-effort */
     }
 
-    while (true) {
-      // Wipe any prior attempt's commit from local + remote so the LLM sees a
-      // fresh baseline on retry. No-op on the first iteration. Located here
-      // so the reset also fires before augmentModuleSourceWithFiles() reads
-      // from the workspace below.
-      try {
-        attempt = await runFixAttempt({
-          fixInput: currentInput,
-          workspace,
-          adapter,
-          manifest,
-          payload,
-          forkFullName: fork.forkFullName,
-          branchName: fork.branchName,
-          ghClient,
-          reproSpec,
-          reproSetupCmds,
-          reproBaselineContent,
-          log,
-        });
-      } catch (err: any) {
-        const msg = err?.message ?? String(err);
-        log(`[fix] attempt threw: ${msg}`);
-        let retryContext = `Fix attempt threw: ${msg}`;
-        if (/No changes to commit/i.test(msg)) {
-          retryContext =
-            `Your previous attempt returned sourceChanges paths, but the "content" you ` +
-            `wrote for each path was BYTE-FOR-BYTE IDENTICAL to the file already on the ` +
-            `branch — so git found nothing to commit. The bug is real (the repro test ` +
-            `currently fails) and your fix is necessary. Re-read the repro test and the ` +
-            `affected module, then emit at least one sourceChanges entry whose "content" ` +
-            `actually differs from the current file. Make sure the change you describe in ` +
-            `your summary is actually present in the content you emit.`;
-        }
-        attempt = {
-          ok: false,
-          retryContext,
-          evalSummary: 'exception',
-          fixSummary: '',
-        };
-      }
+    // ---- Fix stage (v2) -------------------------------------------------
+    const fixAttemptId = runId + "-fix";
+    const fixOutcome = await runFixPipeline({
+      attemptId: fixAttemptId,
+      payload,
+      workspace,
+      forkFullName: fork.forkFullName,
+      branch: fork.branchName,
+      baselineSha: fixBaselineSha,
+      affectedModule: routing.result.affectedModule,
+      language: 'python',
+      dossier: reproOutcome.v2.dossier,
+      reproTestPath: reproPath,
+      log,
+    });
 
-      if (attempt.ok) {
-        log(`[fix] attempt passed eval; running verification (regression + usability)`);
-        const verify = await runVerification({
-          manifest,
-          adapter,
-          token: deps.token,
-          forkFullName: fork.forkFullName,
-          branchName: fork.branchName,
-          upstreamRepo: repoFullName,
-          upstreamDefaultBranch: baseBranch,
-          workspace,
-          affectedModule: routing.result.affectedModule,
-          confirmedIssues,
-          log,
-        });
-        regressionSection = verify.regressionSection;
-        regressionLabels = verify.regressionLabels;
-        usabilitySection = verify.usabilitySection;
-        usabilityLabels = verify.usabilityLabels;
-
-        if (verify.outcome.ok) break;
-
-        log(`[fix] verification gate FAILED; feeding findings back to retry loop`);
-        attempt = {
-          ok: false,
-          retryContext: verify.outcome.retryContext,
-          evalSummary: summarizeVerificationFailure(verify.outcome.retryContext),
-          fixSummary: attempt.fixSummary,
-        };
-      }
-
-      lastRetryContext = attempt.retryContext;
-
-      // Wipe the failed attempt's commit from local + remote BEFORE we read
-      // anything from the workspace (augmentModuleSourceWithFiles below) and
-      // BEFORE the next runFixAttempt invokes the LLM. This ensures the LLM's
-      // sourcePatches.oldText (derived from the baseline file content) keeps
-      // matching what's actually on the branch — without this, attempt N+1
-      // reliably fails with patch_not_found because attempt N already mutated
-      // the file. Logs the failed SHA so production debugging can correlate.
-      if (baselineSha) {
-        try {
-          const failedSha = await workspace.headSha();
-          if (failedSha !== baselineSha) {
-            log(`[fix] resetting branch from failed attempt ${failedSha.slice(0, 12)} back to baselineSha=${baselineSha.slice(0, 12)} before retry`);
-            await workspace.resetToShaAndForcePush(baselineSha);
-          }
-        } catch (err: any) {
-          log(`[fix] baseline reset failed (continuing): ${err?.message ?? err}`);
-        }
-      }
-
+    if (!fixOutcome.ok) {
+      log("[v2-fix] not approved: " + fixOutcome.status + " \u2014 " + fixOutcome.message);
       if (deps.live) {
-        const retryConfig: RetryLoopConfig = {
-          runId,
-          maxRetries,
-          agentType: 'fix',
-          upstreamRepo: repoFullName,
-          primaryIssueNumber: issueNumber,
-          pmEmail: manifest.pm_email,
-          replyToAddress: deps.live.replyToFor(runId),
-          confirmedIssues,
-          forkFullName: fork.forkFullName,
-          branchName: fork.branchName,
-        };
-        const decision = await runRetryLoop(
-          attempt.retryContext,
-          retryConfig,
-          deps.live.retryStateStore,
-          deps.live.failureNotifier,
-          deps.live.issueLabeler
-        );
-        if (decision.action === 'max_retries_exceeded') {
-          log(`[retry] max_retries exceeded; labeled agent-failed and emailed PM`);
-          return { status: 'max-retries-exceeded', reason: attempt.evalSummary };
+        try {
+          await deps.live.failureNotifier.sendEmail(
+            manifest.pm_email,
+            "[oss-agent] fix could not be approved for " + repoFullName + "#" + issueNumber,
+            [
+              "The v2 fix pipeline terminated without an approved diff.",
+              '',
+              "Status: " + fixOutcome.status,
+              "Detail: " + fixOutcome.message,
+              '',
+              "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber,
+              "Run: " + runId,
+            ].join('\n'),
+            manifest.pm_email
+          );
+        } catch (mailErr: any) {
+          log("[v2-fix] email send failed: " + (mailErr?.message ?? mailErr));
         }
-        log(`[retry] retrying (attempt ${decision.dispatch.retryCount}/${maxRetries})`);
-        const destructivePaths = extractDestructivePaths(attempt.retryContext);
-        if (destructivePaths.length > 0) {
-          log(`[retry] augmenting moduleSource with ${destructivePaths.length} destroyed file(s): ${destructivePaths.join(', ')}`);
-        }
-        const augmentedBase = await augmentModuleSourceWithFiles(fixInputBase, destructivePaths, workspace);
-        const directive = computeFixFailureDirective(
-          attempt.retryContext,
-          fixInputBase.reproTest?.path,
-          fixInputBase.affectedModule
-        );
-        if (directive) {
-          log(`[retry] promoting failure directive: ${directive.slice(0, 120)}${directive.length > 120 ? '…' : ''}`);
-        }
-        currentInput = {
-          ...augmentedBase,
-          designSummary: injectRetryContextForFixAgent(designSummary, decision.dispatch),
-          failureDirective: directive,
-        };
-      } else {
-        // No live deps -> simple in-memory retry without persistence/notifications.
-        const attemptsSoFar = (currentInput.designSummary.match(/## Latest Failure/g) ?? []).length;
-        if (attemptsSoFar >= maxRetries) {
-          log(`[retry] max_retries exceeded (no live deps to label/email)`);
-          return { status: 'max-retries-exceeded', reason: attempt.evalSummary };
-        }
-        log(`[retry] retrying without persistence (attempt ${attemptsSoFar + 1}/${maxRetries})`);
-        const destructivePaths = extractDestructivePaths(attempt.retryContext);
-        if (destructivePaths.length > 0) {
-          log(`[retry] augmenting moduleSource with ${destructivePaths.length} destroyed file(s): ${destructivePaths.join(', ')}`);
-        }
-        const augmentedBase = await augmentModuleSourceWithFiles(fixInputBase, destructivePaths, workspace);
-        const directive = computeFixFailureDirective(
-          attempt.retryContext,
-          fixInputBase.reproTest?.path,
-          fixInputBase.affectedModule
-        );
-        currentInput = {
-          ...augmentedBase,
-          designSummary:
-            `${designSummary}\n\n## Latest Failure (address this in your fix)\n\n${attempt.retryContext}`,
-          failureDirective: directive,
-        };
       }
+      return { status: 'max-retries-exceeded', reason: fixOutcome.message };
     }
 
-    prSummary = attempt!.fixSummary;
-    evalSummary = attempt!.evalSummary;
+    // ---- Verification gate (regression + usability) ---------------------
+    const verify = await runVerification({
+      manifest,
+      adapter,
+      token: deps.token,
+      forkFullName: fork.forkFullName,
+      branchName: fork.branchName,
+      upstreamRepo: repoFullName,
+      upstreamDefaultBranch: baseBranch,
+      workspace,
+      affectedModule: routing.result.affectedModule,
+      confirmedIssues,
+      log,
+    });
+    regressionSection = verify.regressionSection;
+    regressionLabels = verify.regressionLabels;
+    usabilitySection = verify.usabilitySection;
+    usabilityLabels = verify.usabilityLabels;
+
+    if (!verify.outcome.ok) {
+      log("[v2-fix] verification gate FAILED \u2014 halting (no outer retry on v2 path)");
+      if (deps.live) {
+        try {
+          await deps.live.failureNotifier.sendEmail(
+            manifest.pm_email,
+            "[oss-agent] verification failed for " + repoFullName + "#" + issueNumber,
+            [
+              "The v2 pipeline produced an approved fix but the verification gate failed.",
+              '',
+              "Retry context:",
+              verify.outcome.retryContext,
+              '',
+              "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber,
+              "Run: " + runId,
+            ].join('\n'),
+            manifest.pm_email
+          );
+        } catch (mailErr: any) {
+          log("[v2-fix] verification email send failed: " + (mailErr?.message ?? mailErr));
+        }
+      }
+      return {
+        status: 'max-retries-exceeded',
+        reason: summarizeVerificationFailure(verify.outcome.retryContext),
+      };
+    }
+
+    prSummary = fixOutcome.v2.criticVerdict?.reason ?? fixOutcome.message;
+    evalSummary = "v2: " + fixOutcome.status + " (" + fixOutcome.changedFiles.length + " file(s) changed)";
   }
 
   // ---------- Draft PR ----------
@@ -2574,3 +1883,35 @@ export function defaultWorkspaceRoot(): string {
 
 // formatDesignBriefEmail is re-exported for tests / external callers.
 export { formatDesignBriefEmail, summarizeAgreedDesign, detectApproval };
+
+/**
+ * Build the "## Reproduction Verification" PR-body section from the v2
+ * ReproV2Outcome. Renders plan info, critic verdict, and the latest analyst
+ * dossier summary.
+ */
+function buildReproPRSectionFromV2(v2: ReproV2Outcome): string {
+  const plan = v2.plan;
+  const verdict = v2.criticVerdict;
+  const dossierLatest = v2.dossier.latest();
+  const lines: string[] = ['## Reproduction Verification'];
+  if (plan) {
+    lines.push(
+      `A reproduction test was generated and independently verified by the Repro Critic before applying the fix:`
+    );
+    lines.push('');
+    lines.push(`- **Path**: \`${plan.candidateTestPath}\``);
+    lines.push(`- **Sentinel**: \`${plan.sentinelString}\``);
+    lines.push(`- **Approach**: ${plan.approach}`);
+  }
+  if (verdict) {
+    lines.push(`- **Critic verdict**: ${verdict.verdict} — ${verdict.reason}`);
+    lines.push(
+      `- **Reproduced reliably**: ${verdict.reproducedReliably}, sentinel matched: ${verdict.sentinelMatched}`
+    );
+  }
+  if (dossierLatest) {
+    lines.push('');
+    lines.push(`**Analyst summary**: ${dossierLatest.body.summary}`);
+  }
+  return lines.join('\n');
+}

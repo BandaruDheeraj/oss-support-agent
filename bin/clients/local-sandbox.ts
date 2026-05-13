@@ -66,7 +66,7 @@ async function checkServices(services: ServiceConfig[], log: (m: string) => void
  * (typically: continue without the venv and let pip fail naturally so the
  * halt-and-email machinery kicks in with a useful stderr).
  */
-async function ensurePythonVenv(
+export async function ensurePythonVenv(
   workspaceDir: string,
   log: (m: string) => void,
   perCommandTimeoutMs: number

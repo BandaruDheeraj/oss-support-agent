@@ -128,3 +128,35 @@ The webhook responds 202 immediately; the pipeline runs in the background and lo
 - GitHub Actions sandbox path (`core/sandbox.ts`) — replaced by local subprocess runner here
 - Cost guardrails enforcement at the live entrypoint
 - Multi-repo coordinator and regression-guard wiring
+
+## Phase E (v2) — tool-using agent loops
+
+The v2 stack replaces one-shot LLM repro/fix calls with bounded tool-using loops, structured evidence, and HITL.
+
+### Architecture
+
+- **Analyst** (read-only loop) → writes versioned, append-only `EvidenceDossier` snapshots.
+- **Repro loop**: Planner (one-shot) → Executor (tool loop, no `run_shell`) → AST preflight → mandatory Critic with independent re-run.
+- **Fix loop**: Investigator → Planner → Executor → Critic + orchestrator-level final gate (green evidence audit, hypothesis-consumption audit, HEAD-drift check).
+- **HITL**: `inbox_entries` state machine with CAS transitions, signed approval tokens, plus-addressed reply routing, eight typed email kinds (`triage_unrelated`, `need_credentials`, `repro_unreachable`, `fix_proposal`, `fix_failed`, `regression_blocker`, `human_decision_needed`, `pr_opened`).
+- **Observability**: dual OTEL export (Phoenix + Braintrust) with redaction, agent/tool span ownership, and a per-run eval-recorder row (sqlite/jsonl) for shadow-mode comparison.
+
+### Cutover
+
+V2 is opt-in behind environment flags (defaults stay one-shot):
+
+| Flag | Values |
+| --- | --- |
+| `REPRO_AGENT_MODE` | `oneshot` (default) / `shadow` / `loop` |
+| `FIX_AGENT_MODE` | `oneshot` (default) / `shadow` / `loop` |
+
+`shadow` runs the v2 loops dry alongside legacy and writes eval rows with `mode='shadow_loop'` for comparison. Promote to `loop` only after a green shadow baseline.
+
+### Ops
+
+- `npm run osa-admin -- inbox pending` — list outstanding decision-point emails.
+- `npm run osa-admin -- inbox set-action <id> <action> [--hint ...]` — force-resolve a stuck entry.
+- `npm run osa-admin -- inbox expire-sweep` — expire decision points past their TTL.
+- `npm run trace-smoke` — assert OTEL spans flush against the configured backends.
+
+See `.env.example` for the full v2 env table.
