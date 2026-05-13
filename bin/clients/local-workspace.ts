@@ -337,4 +337,29 @@ export class LocalWorkspace {
   async pushForceWithLease(): Promise<void> {
     await git(this.dir, ['push', '--force-with-lease', 'origin', this.branch]);
   }
+
+  /**
+   * Return the current HEAD commit SHA on the local checkout.
+   */
+  async headSha(): Promise<string> {
+    const r = await git(this.dir, ['rev-parse', 'HEAD']);
+    return r.stdout.trim();
+  }
+
+  /**
+   * Hard-reset the local branch to a specific SHA, drop untracked files
+   * (preserving .agent-venv as resetWorkingTree does), then force-push the
+   * reset to the remote with --force-with-lease.
+   *
+   * Used between fix retry attempts: each attempt's commit must be wiped
+   * before the next attempt so the LLM's `sourcePatches.oldText` (which is
+   * derived from the baseline file content) keeps matching the file on the
+   * branch. Without this, attempt N+1's patches reliably fail with
+   * `patch_not_found` because the file has already been modified by attempt N.
+   */
+  async resetToShaAndForcePush(sha: string): Promise<void> {
+    await git(this.dir, ['reset', '--hard', sha]);
+    await git(this.dir, ['clean', '-fd', '-e', '.agent-venv']);
+    await git(this.dir, ['push', '--force-with-lease', 'origin', this.branch]);
+  }
 }

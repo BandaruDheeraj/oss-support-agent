@@ -2329,8 +2329,25 @@ export async function runPipeline(args: {
     let attempt: FixAttemptOutcome | null = null;
     let currentInput = fixInputBase;
     let lastRetryContext: string | null = null;
+    // Branch tip after the repro commit. Each fix retry must reset to this
+    // SHA before invoking the LLM so its sourcePatches.oldText (derived from
+    // the baseline file content) keeps matching what's actually on the branch.
+    // Without this, attempt N+1 reliably fails with patch_not_found because
+    // attempt N already mutated the file.
+    let baselineSha: string;
+    try {
+      baselineSha = await workspace.headSha();
+      log(`[fix] captured baselineSha=${baselineSha.slice(0, 12)} for retry resets`);
+    } catch (err: any) {
+      log(`[fix] could not capture baselineSha (${err?.message ?? err}); retries will not reset branch`);
+      baselineSha = '';
+    }
 
     while (true) {
+      // Wipe any prior attempt's commit from local + remote so the LLM sees a
+      // fresh baseline on retry. No-op on the first iteration. Located here
+      // so the reset also fires before augmentModuleSourceWithFiles() reads
+      // from the workspace below.
       try {
         attempt = await runFixAttempt({
           fixInput: currentInput,
@@ -2400,6 +2417,25 @@ export async function runPipeline(args: {
       }
 
       lastRetryContext = attempt.retryContext;
+
+      // Wipe the failed attempt's commit from local + remote BEFORE we read
+      // anything from the workspace (augmentModuleSourceWithFiles below) and
+      // BEFORE the next runFixAttempt invokes the LLM. This ensures the LLM's
+      // sourcePatches.oldText (derived from the baseline file content) keeps
+      // matching what's actually on the branch — without this, attempt N+1
+      // reliably fails with patch_not_found because attempt N already mutated
+      // the file. Logs the failed SHA so production debugging can correlate.
+      if (baselineSha) {
+        try {
+          const failedSha = await workspace.headSha();
+          if (failedSha !== baselineSha) {
+            log(`[fix] resetting branch from failed attempt ${failedSha.slice(0, 12)} back to baselineSha=${baselineSha.slice(0, 12)} before retry`);
+            await workspace.resetToShaAndForcePush(baselineSha);
+          }
+        } catch (err: any) {
+          log(`[fix] baseline reset failed (continuing): ${err?.message ?? err}`);
+        }
+      }
 
       if (deps.live) {
         const retryConfig: RetryLoopConfig = {
