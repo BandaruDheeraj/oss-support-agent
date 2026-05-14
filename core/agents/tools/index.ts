@@ -59,7 +59,21 @@ export function makeAnalystRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry 
 
 export function makeFixInvestigatorRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
-    { budgets: defaultBudgets({ total: 50, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }), maxTurns: 18 },
+    {
+      budgets: defaultBudgets({ total: 50, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }),
+      maxTurns: 18,
+      abandonGate: (transcript) => {
+        const reads = transcript.filter((t) => t.tier === 'read' && t.ok).length;
+        const wroteNotes = transcript.some((t) => t.tool === 'write_investigation_notes' && t.ok);
+        if (reads < 4) {
+          return `abandon is forbidden before you have made at least 4 successful read-tier tool calls (you have ${reads}). Investigate the dossier suspects with grep/find_symbol/read_file first.`;
+        }
+        if (!wroteNotes) {
+          return 'abandon is forbidden before you have written investigation notes. Call write_investigation_notes with your best root-cause hypothesis (low confidence is acceptable) instead of abandoning.';
+        }
+        return null;
+      },
+    },
     ctx
   )
     .registerMany([...READ_TOOLS])
@@ -68,7 +82,21 @@ export function makeFixInvestigatorRegistry({ ctx }: RegistryFactoryArgs): ToolR
 
 export function makeFixPlannerRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
-    { budgets: defaultBudgets({ total: 35, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }), maxTurns: 10 },
+    {
+      budgets: defaultBudgets({ total: 35, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }),
+      maxTurns: 10,
+      abandonGate: (transcript) => {
+        const reads = transcript.filter((t) => t.tier === 'read' && t.ok).length;
+        const committed = transcript.some((t) => t.tool === 'commit_plan' && t.ok);
+        if (reads < 2) {
+          return `abandon is forbidden before you have made at least 2 successful read-tier tool calls (you have ${reads}). Read the dossier evidence first.`;
+        }
+        if (!committed) {
+          return 'abandon is forbidden before you have called commit_plan with at least one step. Author a minimal plan from the investigation notes — the executor and critic will refine it.';
+        }
+        return null;
+      },
+    },
     ctx
   )
     .registerMany([...READ_TOOLS])
@@ -77,7 +105,23 @@ export function makeFixPlannerRegistry({ ctx }: RegistryFactoryArgs): ToolRegist
 
 export function makeFixExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
-    { budgets: defaultBudgets({ total: 120 }), maxTurns: 30 },
+    {
+      budgets: defaultBudgets({ total: 120 }),
+      maxTurns: 30,
+      abandonGate: (transcript) => {
+        const patched = transcript.some((t) => t.tool === 'apply_patch' && t.ok);
+        const ranTests = transcript.filter(
+          (t) => t.ok && (t.tool === 'run_repro' || t.tool === 'run_tests'),
+        ).length;
+        if (!patched) {
+          return 'abandon is forbidden before you have applied at least one patch with apply_patch. Make your best attempt at the fix from the plan, then run_repro/run_tests to validate.';
+        }
+        if (ranTests < 1) {
+          return 'abandon is forbidden before you have run the tests at least once. Call run_repro or run_tests to observe the result of your patch.';
+        }
+        return null;
+      },
+    },
     ctx
   )
     .registerMany([...READ_TOOLS])
@@ -89,7 +133,17 @@ export function makeFixExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolRegis
 
 export function makeFixCriticRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
-    { budgets: defaultBudgets({ total: 40, perTier: { mutation: 0, 'write-test': 0 } }), maxTurns: 12 },
+    {
+      budgets: defaultBudgets({ total: 40, perTier: { mutation: 0, 'write-test': 0 } }),
+      maxTurns: 12,
+      abandonGate: (transcript) => {
+        const sawDiff = transcript.some((t) => t.tool === 'read_diff' && t.ok);
+        if (!sawDiff) {
+          return 'abandon is forbidden before you have called read_diff. Read the diff first — the orchestrator needs a verdict (reject/revise), not an abandon, even if the diff looks bad.';
+        }
+        return null;
+      },
+    },
     ctx
   )
     .registerMany([...READ_TOOLS])
@@ -135,7 +189,17 @@ export function makeReproExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolReg
 
 export function makeReproCriticRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
-    { budgets: defaultBudgets({ total: 25, perTier: { mutation: 0, 'write-test': 0 } }), maxTurns: 8 },
+    {
+      budgets: defaultBudgets({ total: 25, perTier: { mutation: 0, 'write-test': 0 } }),
+      maxTurns: 8,
+      abandonGate: (transcript) => {
+        const ranRepro = transcript.some((t) => t.tool === 'run_repro' && t.ok);
+        if (!ranRepro) {
+          return 'abandon is forbidden before you have called run_repro. The orchestrator needs a verdict on whether the test reproduces — run_repro at least once before considering abandon.';
+        }
+        return null;
+      },
+    },
     ctx
   )
     .registerMany([...READ_TOOLS])
