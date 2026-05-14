@@ -40,9 +40,13 @@ Rules:
 - Call run_repro repeatedly. The test must FAIL (exit != 0). If it passes you have not reproduced the issue — investigate more, then revise_test.
 - Before calling done you MUST have two consecutive run_repro results with non-zero exit AND containing the same sentinel-related text in stderr.
 - Do NOT call done in the same model turn as write_test/revise_test/run_repro. Observe the result in the next turn, then emit done.
-- If you cannot reproduce after substantial effort, call deepen_investigation or abandon. Do not call done.
 - You may not modify source files (apply_patch is not registered for you).
-- Each turn make ONE stateful tool call (sandbox/write-test/meta). Reads may be batched.`;
+- Each turn make ONE stateful tool call (sandbox/write-test/meta). Reads may be batched.
+
+Symbol discovery:
+- Third-party symbols (classes/functions from pip / npm / cargo dependencies — e.g. opentelemetry's NonRecordingSpan, pytest's MonkeyPatch) do NOT live in this repo. Import them directly by package path. Do NOT try to locate their source via find_symbol/read_file.
+- When the dossier mentions an in-repo symbol only by name (e.g. "called inside _StepWrapper"), use grep or find_symbol to locate it — it's almost always in the same file or directory as related cited symbols.
+- Only call abandon after you have (a) authored at least one test, (b) run_repro at least twice, and (c) exhausted grep/find_symbol/read_file for any blocking symbol. "Symbol not found in repo" alone is NEVER a sufficient reason to abandon — try importing it from its package first.`;
 
 export async function runReproExecutor(args: RunReproExecutorArgs): Promise<ReproExecutorResult> {
   const registry = makeReproExecutorRegistry({
