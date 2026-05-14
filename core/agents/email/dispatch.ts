@@ -12,6 +12,7 @@
 
 import { composeEmail, type EmailKind, type EmailPayload } from './composer';
 import type { EmailContext } from './context';
+import type { DossierSnapshot } from '../analyst/dossier';
 
 export interface FailureNotifierLike {
   sendEmail(to: string, subject: string, body: string, replyTo: string): Promise<void>;
@@ -52,6 +53,57 @@ export async function dispatchTypedHaltEmail(
 }
 
 /**
+ * buildSuccessContext — typed context for the `pr_opened` informational email.
+ * Includes dossier + fix details so the recipient can see what was changed
+ * and why without opening the PR.
+ */
+export function buildSuccessContext(args: {
+  attemptId: string;
+  recipient: string;
+  issueNumber: number;
+  issueUrl: string | null;
+  prNumber: number;
+  prUrl: string;
+  summary?: string;
+  fixApproach?: string;
+  diffSummary?: string;
+  changedFiles?: string[];
+  testsRunOutside?: string[];
+  failureSnippet?: string;
+  dossier?: DossierSnapshot | null;
+}): EmailContext {
+  return {
+    to: [args.recipient],
+    recipient: args.recipient,
+    attemptId: args.attemptId,
+    issueNumber: args.issueNumber,
+    issueUrl: args.issueUrl,
+    prNumber: args.prNumber,
+    prUrl: args.prUrl,
+    dossier: args.dossier ?? null,
+    fixNotes: null,
+    inboxEntryId: `${args.attemptId}-success`,
+    nonce: '',
+    replyTo: args.recipient,
+    expectedActions: ['review PR', 'merge or request changes'],
+    links: {
+      phoenix: null,
+      braintrust: null,
+      pr: args.prUrl,
+      issue: args.issueUrl,
+    },
+    context: {
+      summary: args.summary,
+      fixApproach: args.fixApproach,
+      diffSummary: args.diffSummary,
+      changedFiles: args.changedFiles,
+      testsRunOutside: args.testsRunOutside,
+      failureSnippet: args.failureSnippet,
+    },
+  };
+}
+
+/**
  * buildHaltContext — minimal EmailContext for informational halt emails.
  * inboxEntryId/nonce are placeholders (no reply expected); callers wanting
  * real reply binding should build the context themselves after
@@ -68,6 +120,9 @@ export function buildHaltContext(args: {
   missingCredential?: string;
   regressionStatus?: 'green' | 'red' | 'infra_error';
   failureKind?: string;
+  changedFiles?: string[];
+  fixApproach?: string;
+  dossier?: DossierSnapshot | null;
 }): EmailContext {
   return {
     to: [args.recipient],
@@ -77,7 +132,7 @@ export function buildHaltContext(args: {
     issueUrl: args.issueUrl,
     prNumber: null,
     prUrl: args.prUrl ?? null,
-    dossier: null,
+    dossier: args.dossier ?? null,
     fixNotes: null,
     inboxEntryId: `${args.attemptId}-halt`,
     nonce: '',
@@ -95,6 +150,8 @@ export function buildHaltContext(args: {
       missingCredential: args.missingCredential,
       regressionStatus: args.regressionStatus,
       failureKind: args.failureKind,
+      changedFiles: args.changedFiles,
+      fixApproach: args.fixApproach,
     },
   };
 }

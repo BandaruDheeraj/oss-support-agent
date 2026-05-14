@@ -34,8 +34,9 @@ import { createDefaultTriageClassifier } from '../core/llm/openrouter-triage-cla
 import type { IssueEvent } from '../core/webhook/types';
 
 import { runReproPipeline, runFixPipeline } from '../core/agents/run-v2';
-import { dispatchTypedHaltEmail, buildHaltContext } from '../core/agents/email/dispatch';
+import { dispatchTypedHaltEmail, buildHaltContext, buildSuccessContext } from '../core/agents/email/dispatch';
 import type { ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
+import type { FixV2Outcome } from '../core/agents/fix-loop/orchestrator';
 
 import { scoreDesign } from '../core/agents/pm';
 import {
@@ -1254,6 +1255,11 @@ export async function runPipeline(args: {
   let usabilitySection = '';
   let usabilityLabels: string[] = [];
   let reproPRSection: string | null = null;
+  let agentInvestigationSection: string | null = null;
+  let v2ReproOutcomeForEmail: import('../core/agents/run-v2').ReproPipelineOutcome | null = null;
+  let v2FixOutcomeForEmail: import('../core/agents/run-v2').FixPipelineOutcome | null = null;
+  let reproDossier: import('../core/agents/analyst/dossier').DossierSnapshot | null = null;
+  let fixDossier: import('../core/agents/analyst/dossier').DossierSnapshot | null = null;
 
   if (routing.action === 'route_docs') {
     // ---------- Docs path ----------
@@ -1411,6 +1417,11 @@ export async function runPipeline(args: {
       log("[v2] could not capture baselineSha (" + (err?.message ?? err) + "); continuing");
     }
 
+    // Captured after runReproPipeline / runFixPipeline run; threaded into
+    // typed halt/success emails so the recipient sees the agent's hypothesis,
+    // suspect symbols, and root-cause analysis without opening the PR.
+    // (Declared at function scope above so the success-email block can read them.)
+
     // ---- Halt helpers (used by repro stage on credentials / non-ok) -----
     const haltAndEmail = async (args: {
       label: string;
@@ -1493,6 +1504,7 @@ export async function runPipeline(args: {
           issueNumber,
           issueUrl,
           missingCredential: envNames.join(', '),
+          dossier: reproDossier,
         }),
         appendBody,
         commentBody: "\uD83D\uDD12 **Awaiting credentials.** The reproduction test needs " + envNames.length + " env var(s) (" + envNames.join(', ') + ") that aren't set on the agent runtime. The maintainer has been emailed with instructions; the run will be resumed after they're added.",
@@ -1534,6 +1546,7 @@ export async function runPipeline(args: {
           issueNumber,
           issueUrl,
           failureSnippet: args.reason,
+          dossier: reproDossier,
         }),
         appendBody,
         commentBody: "\u26D4 **Repro could not run.** " + args.reason + "\n\nNo PR has been opened \u2014 the maintainer has been emailed with details. Re-trigger after addressing the cause.",
@@ -1558,6 +1571,10 @@ export async function runPipeline(args: {
       language: 'python',
       log,
     });
+
+    // Capture for typed halt/success emails (before any halt return path).
+    reproDossier = reproOutcome.v2.dossier.latest() ?? null;
+    v2ReproOutcomeForEmail = reproOutcome;
 
     if (reproOutcome.status === 'credentials_required') {
       const term = reproOutcome.v2.credentialsTerminal;
@@ -1613,9 +1630,37 @@ export async function runPipeline(args: {
       log,
     });
 
+    fixDossier = fixOutcome.v2.dossier.latest() ?? reproDossier;
+    v2FixOutcomeForEmail = fixOutcome;
+
     if (!fixOutcome.ok) {
       log("[v2-fix] not approved: " + fixOutcome.status + " \u2014 " + fixOutcome.message);
       if (deps.live) {
+        const criticReason = fixOutcome.v2.criticVerdict?.reason;
+        const criticVerdict = fixOutcome.v2.criticVerdict?.verdict;
+        const suggestedRevision = fixOutcome.v2.criticVerdict?.suggestedRevision;
+        const planSummary = fixOutcome.v2.plan?.summary;
+        const planSteps = fixOutcome.v2.plan?.steps ?? [];
+        const appendLines = [
+          "The v2 fix pipeline terminated without an approved diff.",
+          '',
+          "Status: " + fixOutcome.status,
+          "Detail: " + fixOutcome.message,
+        ];
+        if (criticVerdict) appendLines.push('', "Critic verdict: " + criticVerdict + (criticReason ? " \u2014 " + criticReason : ''));
+        if (suggestedRevision) appendLines.push('', "Suggested revision: " + suggestedRevision);
+        if (planSummary) {
+          appendLines.push('', "Planner approach: " + planSummary);
+          if (planSteps.length) {
+            appendLines.push("Planner steps:");
+            for (const s of planSteps) appendLines.push("  - [" + s.stepId + "] " + s.goal);
+          }
+        }
+        if (fixOutcome.changedFiles.length) {
+          appendLines.push('', "Files the executor touched before halting:");
+          for (const f of fixOutcome.changedFiles) appendLines.push("  - " + f);
+        }
+        appendLines.push('', "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber, "Run: " + runId);
         await dispatchTypedHaltEmail({
           kind: 'fix_failed',
           context: buildHaltContext({
@@ -1623,19 +1668,14 @@ export async function runPipeline(args: {
             recipient: manifest.pm_email,
             issueNumber,
             issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
-            failureSnippet: fixOutcome.message,
+            failureSnippet: criticReason ?? fixOutcome.message,
             summary: "Status: " + fixOutcome.status,
+            fixApproach: planSummary,
+            changedFiles: fixOutcome.changedFiles,
+            dossier: fixDossier,
           }),
           notifier: deps.live.failureNotifier,
-          appendBody: [
-            "The v2 fix pipeline terminated without an approved diff.",
-            '',
-            "Status: " + fixOutcome.status,
-            "Detail: " + fixOutcome.message,
-            '',
-            "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber,
-            "Run: " + runId,
-          ].join('\n'),
+          appendBody: appendLines.join('\n'),
           log,
         });
       }
@@ -1664,6 +1704,20 @@ export async function runPipeline(args: {
     if (!verify.outcome.ok) {
       log("[v2-fix] verification gate FAILED \u2014 halting (no outer retry on v2 path)");
       if (deps.live) {
+        const appendLines = [
+          "The v2 pipeline produced an approved fix but the verification gate failed.",
+          '',
+          "Retry context:",
+          verify.outcome.retryContext,
+        ];
+        if (fixOutcome.v2.plan?.summary) {
+          appendLines.push('', "Planner approach: " + fixOutcome.v2.plan.summary);
+        }
+        if (fixOutcome.changedFiles.length) {
+          appendLines.push('', "Changed files:");
+          for (const f of fixOutcome.changedFiles) appendLines.push("  - " + f);
+        }
+        appendLines.push('', "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber, "Run: " + runId);
         await dispatchTypedHaltEmail({
           kind: 'regression_blocker',
           context: buildHaltContext({
@@ -1674,17 +1728,12 @@ export async function runPipeline(args: {
             failureSnippet: verify.outcome.retryContext,
             regressionStatus: 'red',
             failureKind: 'verification_gate',
+            changedFiles: fixOutcome.changedFiles,
+            fixApproach: fixOutcome.v2.plan?.summary,
+            dossier: fixDossier,
           }),
           notifier: deps.live.failureNotifier,
-          appendBody: [
-            "The v2 pipeline produced an approved fix but the verification gate failed.",
-            '',
-            "Retry context:",
-            verify.outcome.retryContext,
-            '',
-            "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber,
-            "Run: " + runId,
-          ].join('\n'),
+          appendBody: appendLines.join('\n'),
           log,
         });
       }
@@ -1696,6 +1745,7 @@ export async function runPipeline(args: {
 
     prSummary = fixOutcome.v2.criticVerdict?.reason ?? fixOutcome.message;
     evalSummary = "v2: " + fixOutcome.status + " (" + fixOutcome.changedFiles.length + " file(s) changed)";
+    agentInvestigationSection = buildAgentInvestigationSection(fixOutcome.v2);
   }
 
   // ---------- Draft PR ----------
@@ -1720,6 +1770,7 @@ export async function runPipeline(args: {
     `- ${evalSummary}`,
     ``,
     ...(reproPRSection ? [reproPRSection, ``] : []),
+    ...(agentInvestigationSection ? [agentInvestigationSection, ``] : []),
     ...(regressionSection ? [regressionSection, ``] : []),
     ...(usabilitySection ? [usabilitySection, ``] : []),
     ...(manifest.sandbox_runner === 'gha'
@@ -1750,6 +1801,34 @@ export async function runPipeline(args: {
     } catch (err: any) {
       log(`[pr] label apply failed (non-fatal): ${err?.message ?? err}`);
     }
+  }
+
+  // Informational success email — explains what was changed and why so the
+  // recipient doesn't have to open the PR to understand the agent's work.
+  if (deps.live && v2FixOutcomeForEmail) {
+    const fxo = v2FixOutcomeForEmail;
+    await dispatchTypedHaltEmail({
+      kind: 'pr_opened',
+      context: buildSuccessContext({
+        attemptId: runId,
+        recipient: manifest.pm_email,
+        issueNumber,
+        issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
+        prNumber: pr.number,
+        prUrl: pr.url,
+        summary: prSummary,
+        fixApproach: fxo.v2.plan?.summary,
+        diffSummary: evalSummary,
+        changedFiles: fxo.changedFiles,
+        failureSnippet: v2ReproOutcomeForEmail?.v2.criticVerdict?.reason,
+        dossier: fixDossier ?? reproDossier,
+      }),
+      notifier: deps.live.failureNotifier,
+      appendBody: agentInvestigationSection
+        ? agentInvestigationSection + "\n\nPR: " + pr.url
+        : "PR: " + pr.url,
+      log,
+    });
   }
 
   return { status: 'pr-opened', prUrl: pr.url, prNumber: pr.number };
@@ -1791,5 +1870,66 @@ function buildReproPRSectionFromV2(v2: ReproV2Outcome): string {
     lines.push('');
     lines.push(`**Analyst summary**: ${dossierLatest.body.summary}`);
   }
+  return lines.join('\n');
+}
+
+/**
+ * Build the "## Agent Investigation" PR-body section from the v2
+ * FixV2Outcome. Renders planner approach, plan steps, critic verdict,
+ * changed files, and the analyst's hypothesis/suspect symbols so
+ * reviewers can understand *why* the agent chose this fix without
+ * needing to open the dossier store.
+ */
+function buildAgentInvestigationSection(v2: FixV2Outcome): string {
+  const plan = v2.plan;
+  const verdict = v2.criticVerdict;
+  const dossierLatest = v2.dossier.latest();
+  const notesLatest = v2.notes.latest?.() ?? null;
+  const lines: string[] = ['## Agent Investigation'];
+
+  if (dossierLatest) {
+    lines.push(`**Hypothesis**: ${dossierLatest.body.summary}`);
+    lines.push(`**Confidence**: ${dossierLatest.body.confidence}`);
+    if (dossierLatest.body.suspectSymbols.length) {
+      lines.push('');
+      lines.push('**Suspect symbols:**');
+      for (const s of dossierLatest.body.suspectSymbols) {
+        lines.push(`- \`${s.file}::${s.symbol}\` — ${s.reasoning}`);
+      }
+    }
+  }
+
+  if (notesLatest) {
+    lines.push('');
+    lines.push(`**Root-cause hypothesis**: ${notesLatest.body.rootCauseHypothesis}`);
+    lines.push(`**Suggested approach**: ${notesLatest.body.suggestedApproach}`);
+    if (notesLatest.body.risks?.length) {
+      lines.push(`**Risks**: ${notesLatest.body.risks.join('; ')}`);
+    }
+  }
+
+  if (plan) {
+    lines.push('');
+    lines.push(`**Planner approach**: ${plan.summary}`);
+    if (plan.steps.length) {
+      lines.push('**Planner steps:**');
+      for (const s of plan.steps) lines.push(`- [${s.stepId}] ${s.goal}`);
+    }
+  }
+
+  if (verdict) {
+    lines.push('');
+    lines.push(`**Fix critic verdict**: \`${verdict.verdict}\` — ${verdict.reason}`);
+    if (verdict.suggestedRevision) {
+      lines.push(`**Critic suggested revision**: ${verdict.suggestedRevision}`);
+    }
+  }
+
+  if (v2.changedFiles.length) {
+    lines.push('');
+    lines.push('**Files changed by the executor:**');
+    for (const f of v2.changedFiles) lines.push(`- \`${f}\``);
+  }
+
   return lines.join('\n');
 }
