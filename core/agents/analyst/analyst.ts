@@ -39,6 +39,8 @@ Procedure:
 5. Form a list of suspect symbols, open questions, and confidence level.
 6. Terminate by calling record_evidence with a complete summary. record_evidence is the ONLY way to commit your findings.
 
+CRITICAL: You MUST end the session with either record_evidence or abandon. Returning a plain-text summary without calling record_evidence wastes the entire investigation — your findings are discarded. Always finalize via tool call.
+
 Do not call write_test, apply_patch, run_repro, or any sandbox tool — they are not registered for you.
 Do not include the issue body verbatim in evidence.detail; quote only the relevant excerpts.
 Confidence rules: 'high' requires a specific file:line cause hypothesis; 'medium' requires at least one suspect symbol; 'low' otherwise.`;
@@ -73,6 +75,28 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
     attemptId: args.attemptId,
     issueNumber: args.issue.number,
   });
+
+  // Some models stop emitting tool calls before recording the dossier (they
+  // narrate findings in plain text and exit). Give them exactly one forced
+  // retry with an explicit reminder before declaring analyst_failed.
+  if (!args.dossier.latest() && (result.terminated === 'finished' || result.terminated === 'max_turns')) {
+    const forcePrompt = `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous attempt ended without calling record_evidence. You MUST call record_evidence now to commit a dossier snapshot, or call abandon with a reason. Plain-text replies are ignored.`;
+    const retry = await runAgentLoop({
+      agent: 'ANALYST',
+      registry,
+      system: SYSTEM_PROMPT,
+      user: forcePrompt,
+      attemptId: args.attemptId,
+      issueNumber: args.issue.number,
+    });
+    return {
+      snapshot: args.dossier.latest(),
+      terminated: retry.terminated,
+      reason: retry.reason,
+      toolCalls: result.toolCalls + retry.toolCalls,
+      transcriptSummary: retry.transcriptSummary,
+    };
+  }
 
   return {
     snapshot: args.dossier.latest(),
