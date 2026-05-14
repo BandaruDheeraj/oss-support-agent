@@ -13,7 +13,7 @@
 import { z } from 'zod';
 import type { ToolDef } from './types';
 import { asHandles } from './handles';
-import { EvidenceSchema, SuspectSymbolSchema } from '../analyst/dossier';
+import { EvidenceInputSchema, SuspectSymbolSchema } from '../analyst/dossier';
 import { HypothesisSchema } from '../fix-loop/hypotheses';
 import { InvestigationFindingSchema } from '../fix-loop/investigation-notes';
 
@@ -46,7 +46,7 @@ export const stateHypothesis: ToolDef<z.infer<typeof StateHypothesisArgs>, unkno
 
 const RecordEvidence = z
   .object({
-    evidence: z.array(EvidenceSchema).default([]),
+    evidence: z.array(EvidenceInputSchema).default([]),
     suspectSymbols: z.array(SuspectSymbolSchema).default([]),
     openQuestions: z.array(z.string()).default([]),
     summary: z.string().min(1),
@@ -62,10 +62,12 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
   async execute(args, ctx) {
     const dossier = asHandles(ctx.handles).dossier;
     if (!dossier) return { error: 'dossier writer not available — caller is not the Analyst' };
+    const now = new Date().toISOString();
+    const evidence = args.evidence.map((e) => ({ ...e, recordedAt: e.recordedAt ?? now }));
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
-      evidence: args.evidence,
+      evidence,
       suspectSymbols: args.suspectSymbols,
       openQuestions: args.openQuestions,
       summary: args.summary,

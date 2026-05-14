@@ -35,6 +35,16 @@ export const EvidenceSchema = z.object({
 
 export type Evidence = z.infer<typeof EvidenceSchema>;
 
+/**
+ * Input variant accepted from LLM tool calls. `recordedAt` is stamped
+ * server-side because LLMs reliably forget to populate it, which would
+ * otherwise reject the entire `record_evidence` call.
+ */
+export const EvidenceInputSchema = EvidenceSchema.extend({
+  recordedAt: z.string().optional(),
+});
+export type EvidenceInput = z.infer<typeof EvidenceInputSchema>;
+
 export const SuspectSymbolSchema = z.object({
   file: z.string(),
   symbol: z.string(),
