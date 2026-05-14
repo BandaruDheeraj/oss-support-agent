@@ -77,13 +77,32 @@ export async function runReproExecutor(args: RunReproExecutorArgs): Promise<Repr
     dossierSnapshotId: args.dossierSnapshot.snapshotId,
   });
 
+  // If the model emitted plain text instead of calling done/abandon, retry
+  // once with an explicit reminder. The registry preserves state (turn counts,
+  // budgets, terminated flag) so the gate still applies.
+  let finalLoop = loop;
+  if (loop.terminated === 'finished' && registry.isTerminated() === null) {
+    const reproCalls = registry.getTranscript().filter((e) => e.tool === 'run_repro').length;
+    const wroteTest = registry.getTranscript().some((e) => (e.tool === 'write_test' || e.tool === 'revise_test') && e.ok);
+    const remind = `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous turn ended without calling done or abandon. State: wrote_test=${wroteTest}, run_repro_count=${reproCalls}. You MUST end the session with a tool call: done (after observing two consecutive failing run_repro results with the sentinel) or abandon (only if gate passes). Plain-text replies are discarded.`;
+    finalLoop = await runAgentLoop({
+      agent: 'REPRO_EXECUTOR',
+      registry,
+      system: SYSTEM,
+      user: remind,
+      attemptId: args.attemptId,
+      issueNumber: args.issue.number,
+      dossierSnapshotId: args.dossierSnapshot.snapshotId,
+    });
+  }
+
   const transcript = registry.getTranscript();
   const reproCalls = transcript.filter((e) => e.tool === 'run_repro');
   const last = reproCalls[reproCalls.length - 1];
   const lastExit = typeof (last?.result as any)?.exitCode === 'number' ? (last!.result as any).exitCode : null;
 
   return {
-    ...loop,
+    ...finalLoop,
     candidateTestPath: args.plan.candidateTestPath,
     sentinelString: args.plan.sentinelString,
     ranReproCount: reproCalls.length,
