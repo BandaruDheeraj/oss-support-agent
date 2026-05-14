@@ -219,6 +219,13 @@ export class ToolRegistry {
         );
       }
     }
+
+    if (def.name === 'abandon' && this.opts.abandonGate) {
+      const blockReason = this.opts.abandonGate(this.transcript.slice());
+      if (blockReason) {
+        throw new ToolGuardError('abandon_premature', blockReason, def.name);
+      }
+    }
   }
 }
 

@@ -92,7 +92,23 @@ export function makeReproPlannerRegistry({ ctx }: RegistryFactoryArgs): ToolRegi
 
 export function makeReproExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
-    { budgets: defaultBudgets({ total: 70, perTier: { mutation: 0 } }), maxTurns: 22 },
+    {
+      budgets: defaultBudgets({ total: 70, perTier: { mutation: 0 } }),
+      maxTurns: 22,
+      abandonGate: (transcript) => {
+        const wroteTest = transcript.some(
+          (t) => (t.tool === 'write_test' || t.tool === 'revise_test') && t.ok,
+        );
+        const ranRepro = transcript.filter((t) => t.tool === 'run_repro' && t.ok).length;
+        if (!wroteTest) {
+          return 'abandon is forbidden before you have authored a candidate test. Call write_test to create the candidate test file, then run_repro at least twice, before considering abandon.';
+        }
+        if (ranRepro < 2) {
+          return `abandon is forbidden before you have run_repro at least twice (you have ${ranRepro}). Revise the test and run_repro again before considering abandon.`;
+        }
+        return null;
+      },
+    },
     ctx
   )
     .registerMany([...READ_TOOLS])

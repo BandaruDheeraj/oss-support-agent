@@ -48,6 +48,13 @@ export interface RegistryOptions {
   budgets: RegistryBudgets;
   maxTurns: number;
   now?: () => Date;
+  /**
+   * Optional predicate evaluated when the model calls `abandon`. Receives the
+   * full transcript so far. Return null to allow the abandon, or a string
+   * explaining why the abandon is premature — the registry will throw a
+   * ToolGuardError with that message so the model keeps working.
+   */
+  abandonGate?: (transcript: TranscriptEntry[]) => string | null;
 }
 
 export class ToolGuardError extends Error {
@@ -60,7 +67,8 @@ export class ToolGuardError extends Error {
     | 'tool_unknown'
     | 'invalid_args'
     | 'hypothesis_required'
-    | 'patch_scope';
+    | 'patch_scope'
+    | 'abandon_premature';
   public readonly tool?: string;
 
   constructor(kind: ToolGuardError['kind'], message: string, tool?: string) {
