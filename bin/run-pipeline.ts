@@ -34,6 +34,7 @@ import { createDefaultTriageClassifier } from '../core/llm/openrouter-triage-cla
 import type { IssueEvent } from '../core/webhook/types';
 
 import { runReproPipeline, runFixPipeline } from '../core/agents/run-v2';
+import { dispatchTypedHaltEmail, buildHaltContext } from '../core/agents/email/dispatch';
 import type { ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
 
 import { scoreDesign } from '../core/agents/pm';
@@ -1413,8 +1414,9 @@ export async function runPipeline(args: {
     // ---- Halt helpers (used by repro stage on credentials / non-ok) -----
     const haltAndEmail = async (args: {
       label: string;
-      subject: string;
-      bodyLines: string[];
+      kind: 'need_credentials' | 'repro_unreachable';
+      context: import('../core/agents/email/context').EmailContext;
+      appendBody: string;
       commentBody: string;
       result: PipelineResult;
       logTag: string;
@@ -1426,17 +1428,13 @@ export async function runPipeline(args: {
       }
       log("[v2-halt] HALT (" + args.logTag + ")");
       if (deps.live) {
-        try {
-          await deps.live.failureNotifier.sendEmail(
-            manifest.pm_email,
-            args.subject,
-            args.bodyLines.join('\n'),
-            manifest.pm_email
-          );
-          log("[v2-halt] notification emailed to " + manifest.pm_email);
-        } catch (mailErr: any) {
-          log("[v2-halt] email send failed: " + (mailErr?.message ?? mailErr));
-        }
+        await dispatchTypedHaltEmail({
+          kind: args.kind,
+          context: args.context,
+          notifier: deps.live.failureNotifier,
+          appendBody: args.appendBody,
+          log,
+        });
         try {
           const issueCommenter = new GitHubIssueCommenter(deps.token);
           await issueCommenter.postComment(repoFullName, issueNumber, args.commentBody);
@@ -1449,7 +1447,7 @@ export async function runPipeline(args: {
           log("[v2-halt] label add failed: " + (labelErr?.message ?? labelErr));
         }
       } else {
-        log("[v2-halt] (no live deps) would have emailed " + manifest.pm_email + ": " + args.subject);
+        log("[v2-halt] (no live deps) would have dispatched kind=" + args.kind + " to " + manifest.pm_email);
       }
       return args.result;
     };
@@ -1471,24 +1469,32 @@ export async function runPipeline(args: {
         const where = c.whereToGet ? "\n    where: " + c.whereToGet : '';
         return "- " + c.envVar + "\n    purpose: " + c.purpose + where;
       });
+      const appendBody = [
+        "The repro stage needs " + creds.length + " credential(s) before it can prove the bug:",
+        '',
+        ...credLines,
+        '',
+        "Detection: " + detectionContext,
+        '',
+        renderUrl
+          ? "Add them at: " + renderUrl + "\nThen re-trigger this issue (e.g. by re-applying the trigger label) to resume."
+          : "Add them to the agent's runtime environment, then re-trigger this issue (e.g. by re-applying the trigger label) to resume.",
+        '',
+        "Issue: " + issueUrl,
+        '',
+        "Run: " + runId,
+      ].join('\n');
       return haltAndEmail({
         label: 'awaiting-credentials',
-        subject: "[oss-agent] credentials needed for " + repoFullName + "#" + issueNumber,
-        bodyLines: [
-          "The repro stage needs " + creds.length + " credential(s) before it can prove the bug:",
-          '',
-          ...credLines,
-          '',
-          "Detection: " + detectionContext,
-          '',
-          renderUrl
-            ? "Add them at: " + renderUrl + "\nThen re-trigger this issue (e.g. by re-applying the trigger label) to resume."
-            : "Add them to the agent's runtime environment, then re-trigger this issue (e.g. by re-applying the trigger label) to resume.",
-          '',
-          "Issue: " + issueUrl,
-          '',
-          "Run: " + runId,
-        ],
+        kind: 'need_credentials',
+        context: buildHaltContext({
+          attemptId: runId,
+          recipient: manifest.pm_email,
+          issueNumber,
+          issueUrl,
+          missingCredential: envNames.join(', '),
+        }),
+        appendBody,
         commentBody: "\uD83D\uDD12 **Awaiting credentials.** The reproduction test needs " + envNames.length + " env var(s) (" + envNames.join(', ') + ") that aren't set on the agent runtime. The maintainer has been emailed with instructions; the run will be resumed after they're added.",
         result: {
           status: 'awaiting-credentials',
@@ -1504,24 +1510,32 @@ export async function runPipeline(args: {
     }): Promise<PipelineResult> => {
       const issueUrl = "https://github.com/" + repoFullName + "/issues/" + issueNumber;
       const branchUrl = "https://github.com/" + fork.forkFullName + "/tree/" + fork.branchName;
+      const appendBody = [
+        "The reproduction test could not be established for this issue, so no PR will be opened.",
+        '',
+        "Reason: " + args.reason,
+        '',
+        "Inspect the agent branch: " + branchUrl,
+        '',
+        "What to do:",
+        "  1. If the repro is fundamentally wrong (asserts the wrong thing), close the issue or remove the agent label.",
+        "  2. Re-apply the trigger label to resume.",
+        '',
+        "Issue: " + issueUrl,
+        '',
+        "Run: " + runId,
+      ].join('\n');
       return haltAndEmail({
         label: 'awaiting-repro-fix',
-        subject: "[oss-agent] repro cannot run for " + repoFullName + "#" + issueNumber,
-        bodyLines: [
-          "The reproduction test could not be established for this issue, so no PR will be opened.",
-          '',
-          "Reason: " + args.reason,
-          '',
-          "Inspect the agent branch: " + branchUrl,
-          '',
-          "What to do:",
-          "  1. If the repro is fundamentally wrong (asserts the wrong thing), close the issue or remove the agent label.",
-          "  2. Re-apply the trigger label to resume.",
-          '',
-          "Issue: " + issueUrl,
-          '',
-          "Run: " + runId,
-        ],
+        kind: 'repro_unreachable',
+        context: buildHaltContext({
+          attemptId: runId,
+          recipient: manifest.pm_email,
+          issueNumber,
+          issueUrl,
+          failureSnippet: args.reason,
+        }),
+        appendBody,
         commentBody: "\u26D4 **Repro could not run.** " + args.reason + "\n\nNo PR has been opened \u2014 the maintainer has been emailed with details. Re-trigger after addressing the cause.",
         result: {
           status: 'repro-not-runnable',
@@ -1602,24 +1616,28 @@ export async function runPipeline(args: {
     if (!fixOutcome.ok) {
       log("[v2-fix] not approved: " + fixOutcome.status + " \u2014 " + fixOutcome.message);
       if (deps.live) {
-        try {
-          await deps.live.failureNotifier.sendEmail(
-            manifest.pm_email,
-            "[oss-agent] fix could not be approved for " + repoFullName + "#" + issueNumber,
-            [
-              "The v2 fix pipeline terminated without an approved diff.",
-              '',
-              "Status: " + fixOutcome.status,
-              "Detail: " + fixOutcome.message,
-              '',
-              "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber,
-              "Run: " + runId,
-            ].join('\n'),
-            manifest.pm_email
-          );
-        } catch (mailErr: any) {
-          log("[v2-fix] email send failed: " + (mailErr?.message ?? mailErr));
-        }
+        await dispatchTypedHaltEmail({
+          kind: 'fix_failed',
+          context: buildHaltContext({
+            attemptId: fixAttemptId,
+            recipient: manifest.pm_email,
+            issueNumber,
+            issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
+            failureSnippet: fixOutcome.message,
+            summary: "Status: " + fixOutcome.status,
+          }),
+          notifier: deps.live.failureNotifier,
+          appendBody: [
+            "The v2 fix pipeline terminated without an approved diff.",
+            '',
+            "Status: " + fixOutcome.status,
+            "Detail: " + fixOutcome.message,
+            '',
+            "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber,
+            "Run: " + runId,
+          ].join('\n'),
+          log,
+        });
       }
       return { status: 'max-retries-exceeded', reason: fixOutcome.message };
     }
@@ -1646,24 +1664,29 @@ export async function runPipeline(args: {
     if (!verify.outcome.ok) {
       log("[v2-fix] verification gate FAILED \u2014 halting (no outer retry on v2 path)");
       if (deps.live) {
-        try {
-          await deps.live.failureNotifier.sendEmail(
-            manifest.pm_email,
-            "[oss-agent] verification failed for " + repoFullName + "#" + issueNumber,
-            [
-              "The v2 pipeline produced an approved fix but the verification gate failed.",
-              '',
-              "Retry context:",
-              verify.outcome.retryContext,
-              '',
-              "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber,
-              "Run: " + runId,
-            ].join('\n'),
-            manifest.pm_email
-          );
-        } catch (mailErr: any) {
-          log("[v2-fix] verification email send failed: " + (mailErr?.message ?? mailErr));
-        }
+        await dispatchTypedHaltEmail({
+          kind: 'regression_blocker',
+          context: buildHaltContext({
+            attemptId: fixAttemptId,
+            recipient: manifest.pm_email,
+            issueNumber,
+            issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
+            failureSnippet: verify.outcome.retryContext,
+            regressionStatus: 'red',
+            failureKind: 'verification_gate',
+          }),
+          notifier: deps.live.failureNotifier,
+          appendBody: [
+            "The v2 pipeline produced an approved fix but the verification gate failed.",
+            '',
+            "Retry context:",
+            verify.outcome.retryContext,
+            '',
+            "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber,
+            "Run: " + runId,
+          ].join('\n'),
+          log,
+        });
       }
       return {
         status: 'max-retries-exceeded',
