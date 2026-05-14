@@ -34,7 +34,23 @@ function defaultBudgets(overrides: Partial<RegistryBudgets> = {}): RegistryBudge
 
 export function makeAnalystRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
-    { budgets: defaultBudgets({ total: 40, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }), maxTurns: 14 },
+    {
+      budgets: defaultBudgets({ total: 40, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }),
+      maxTurns: 14,
+      abandonGate: (transcript) => {
+        const readCalls = transcript.filter((t) => t.tier === 'read' && t.ok).length;
+        const usedSymbolSearch = transcript.some(
+          (t) => t.ok && (t.tool === 'grep' || t.tool === 'find_symbol' || t.tool === 'find_callers'),
+        );
+        if (readCalls < 4) {
+          return `abandon is forbidden before you have made at least 4 successful read-tier tool calls (you have ${readCalls}). Use gh_issue, grep, find_symbol, read_file to gather evidence first. record_evidence with low confidence is preferred over abandon.`;
+        }
+        if (!usedSymbolSearch) {
+          return 'abandon is forbidden before you have searched for symbols. Call grep or find_symbol to locate the code referenced in the issue. record_evidence with low confidence is preferred over abandon.';
+        }
+        return null;
+      },
+    },
     ctx
   )
     .registerMany([...READ_TOOLS])
