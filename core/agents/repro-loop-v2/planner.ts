@@ -10,6 +10,11 @@ import { z } from 'zod';
 import { getModel } from '../../llm/v2/client';
 import { withAgentSpan } from '../../observability/spans';
 import type { DossierSnapshot } from '../analyst/dossier';
+import {
+  renderEditableInstallsBlock,
+  renderIssueSnippetsBlock,
+  type IssueCodeSnippet,
+} from './repro-hints';
 
 export const ReproPlanSchema = z.object({
   approach: z.string().min(20),
@@ -35,6 +40,10 @@ export interface RunReproPlannerArgs {
   attemptId: string;
   dossier: DossierSnapshot;
   carryforwardSummary?: string;
+  /** Repo-relative dirs the executor can `pip install -e` if needed. */
+  editableInstallCandidates?: string[];
+  /** Verbatim fenced code blocks lifted from the issue body. */
+  issueSnippets?: IssueCodeSnippet[];
 }
 
 export async function runReproPlanner(args: RunReproPlannerArgs): Promise<ReproPlan> {
@@ -46,7 +55,7 @@ export async function runReproPlanner(args: RunReproPlannerArgs): Promise<ReproP
         model: getModel('REPRO_PLANNER'),
         schema: ReproPlanSchema,
         system: SYSTEM,
-        prompt: buildPrompt(args.dossier, args.carryforwardSummary),
+        prompt: buildPrompt(args.dossier, args.carryforwardSummary, args.editableInstallCandidates, args.issueSnippets),
         experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
       });
       return result.object;
@@ -54,12 +63,23 @@ export async function runReproPlanner(args: RunReproPlannerArgs): Promise<ReproP
   );
 }
 
-function buildPrompt(d: DossierSnapshot, carry?: string): string {
+function buildPrompt(
+  d: DossierSnapshot,
+  carry?: string,
+  editableInstallCandidates?: string[],
+  issueSnippets?: IssueCodeSnippet[]
+): string {
   const evidence = d.body.evidence
     .slice(0, 12)
     .map((e) => `- [${e.kind}] ${e.source}: ${e.summary}`)
     .join('\n');
   const suspects = d.body.suspectSymbols.map((s) => `- ${s.file} :: ${s.symbol} (${s.reasoning})`).join('\n');
   const carryBlock = carry ? `\n\nCarry-forward from prior attempt:\n${carry}` : '';
-  return `Issue: #${d.body.issueNumber}\nDossier summary: ${d.body.summary}\nConfidence: ${d.body.confidence}\n\nEvidence (top 12):\n${evidence}\n\nSuspect symbols:\n${suspects}\n\nOpen questions:\n${d.body.openQuestions.map((q) => `- ${q}`).join('\n')}${carryBlock}\n\nProduce a ReproPlan. candidateTestPath should be under tests/ or __tests__ or similar. sentinelString is a unique substring the failing test should print/raise so we can verify it later. expectedFailureSignature is a short string the test runner output will contain when the bug is reproduced.`;
+
+  const snippetBlock = renderIssueSnippetsBlock(issueSnippets ?? []);
+  const editableBlock = renderEditableInstallsBlock(editableInstallCandidates ?? []);
+  const hintsParts = [snippetBlock, editableBlock].filter((s): s is string => Boolean(s));
+  const hintsBlock = hintsParts.length > 0 ? `\n\n${hintsParts.join('\n\n')}` : '';
+
+  return `Issue: #${d.body.issueNumber}\nDossier summary: ${d.body.summary}\nConfidence: ${d.body.confidence}\n\nEvidence (top 12):\n${evidence}\n\nSuspect symbols:\n${suspects}\n\nOpen questions:\n${d.body.openQuestions.map((q) => `- ${q}`).join('\n')}${carryBlock}${hintsBlock}\n\nProduce a ReproPlan. candidateTestPath should be under tests/ or __tests__ or similar. sentinelString is a unique substring the failing test should print/raise so we can verify it later. expectedFailureSignature is a short string the test runner output will contain when the bug is reproduced. If verbatim issue snippets are provided above, your plan's first step should be to translate that snippet into the test almost as-is, only adding the assertion / sentinel scaffolding around it.`;
 }

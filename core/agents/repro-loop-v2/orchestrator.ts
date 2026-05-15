@@ -11,6 +11,7 @@ import { runReproExecutor, type ReproExecutorResult, reproAstPreflight } from '.
 import { runReproCritic, type ReproVerdict } from './critic';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
 import { detectCredentialError } from '../../credentials-check';
+import type { IssueCodeSnippet } from './repro-hints';
 
 export interface RunReproV2Args {
   attemptId: string;
@@ -23,6 +24,18 @@ export interface RunReproV2Args {
   carryforwardSummary?: string;
   /** Process env used to check whether detected credential vars are actually missing. Defaults to process.env. */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Repo-relative dirs containing a Python package manifest, surfaced to
+   * Planner + Executor so the executor can `pip install -e <dir>` for in-repo
+   * imports instead of getting stuck on ModuleNotFoundError.
+   */
+  editableInstallCandidates?: string[];
+  /**
+   * Verbatim fenced code blocks lifted from the issue body, surfaced to the
+   * Planner + Executor so the first repro draft can mirror the snippet
+   * exactly rather than paraphrasing it.
+   */
+  issueSnippets?: IssueCodeSnippet[];
 }
 
 export interface ReproV2Outcome {
@@ -83,6 +96,8 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       attemptId: args.attemptId,
       dossier: snapshot,
       carryforwardSummary: args.carryforwardSummary,
+      editableInstallCandidates: args.editableInstallCandidates,
+      issueSnippets: args.issueSnippets,
     });
   } catch (err) {
     return { status: 'planner_failed', dossier, message: err instanceof Error ? err.message : String(err) };
@@ -98,6 +113,8 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     repo: args.repo,
     workspace: args.workspace,
     sandbox: args.sandbox,
+    editableInstallCandidates: args.editableInstallCandidates,
+    issueSnippets: args.issueSnippets,
   });
 
   if (executor.terminated !== 'done') {

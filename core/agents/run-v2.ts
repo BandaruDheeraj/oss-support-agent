@@ -24,6 +24,10 @@ import type { GhActionsSandboxAdapterOptions } from './adapters/sandbox-gh-actio
 import { runReproV2, type ReproV2Outcome } from './repro-loop-v2/orchestrator';
 import { runFixV2, type FixV2Outcome } from './fix-loop/orchestrator';
 import { DossierStore } from './analyst/dossier';
+import {
+  discoverEditableInstallCandidates,
+  extractIssueCodeSnippets,
+} from './repro-loop-v2/repro-hints';
 
 import { execCommand } from '../../bin/clients/local-workspace';
 
@@ -96,6 +100,24 @@ export async function runReproPipeline(input: ReproPipelineInput): Promise<Repro
 
   log(`[v2-driver] runReproPipeline attemptId=${input.attemptId} module=${input.affectedModule}`);
 
+  // Derive editable-install candidates and verbatim issue snippets up front so
+  // the v2 Planner/Executor get them in their initial prompt. The model can't
+  // construct a working repro for in-repo Python packages without knowing
+  // which dir to `pip install -e`, and paraphrasing the issue's snippet is a
+  // common cause of "passes when it should fail".
+  const editableInstallCandidates = discoverEditableInstallCandidates(input.workspace.dir, {
+    affectedModule: input.affectedModule,
+  });
+  const issueSnippets = extractIssueCodeSnippets(input.payload.issue.body);
+  if (editableInstallCandidates.length > 0) {
+    log(
+      `[v2-driver] surfaced ${editableInstallCandidates.length} editableInstall candidate(s): ${editableInstallCandidates.join(', ')}`
+    );
+  }
+  if (issueSnippets.length > 0) {
+    log(`[v2-driver] surfaced ${issueSnippets.length} issue code snippet(s) to Planner/Executor`);
+  }
+
   const v2 = await runReproV2({
     attemptId: input.attemptId,
     issue: issueHandle,
@@ -103,6 +125,8 @@ export async function runReproPipeline(input: ReproPipelineInput): Promise<Repro
     workspace: workspaceAdapter,
     sandbox,
     carryforwardSummary: input.carryforwardSummary,
+    editableInstallCandidates,
+    issueSnippets,
   });
 
   const candidateTestPath = v2.plan?.candidateTestPath;

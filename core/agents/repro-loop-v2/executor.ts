@@ -11,6 +11,11 @@ import { runAgentLoop, type AgentLoopResult } from '../agent-loop';
 import { makeReproExecutorRegistry } from '../tools';
 import type { DossierStore, DossierSnapshot } from '../analyst/dossier';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
+import {
+  renderEditableInstallsBlock,
+  renderIssueSnippetsBlock,
+  type IssueCodeSnippet,
+} from './repro-hints';
 
 export interface RunReproExecutorArgs {
   attemptId: string;
@@ -21,6 +26,10 @@ export interface RunReproExecutorArgs {
   repo: RepoHandle;
   workspace: WorkspaceReader & WorkspaceWriter;
   sandbox: SandboxHandle;
+  /** Repo-relative dirs the executor can `pip install -e` to satisfy in-repo imports. */
+  editableInstallCandidates?: string[];
+  /** Verbatim fenced code blocks lifted from the issue body. */
+  issueSnippets?: IssueCodeSnippet[];
 }
 
 export interface ReproExecutorResult extends AgentLoopResult {
@@ -42,6 +51,11 @@ Rules:
 - Do NOT call done in the same model turn as write_test/revise_test/run_repro. Observe the result in the next turn, then emit done.
 - You may not modify source files (apply_patch is not registered for you).
 - Each turn make ONE stateful tool call (sandbox/write-test/meta). Reads may be batched.
+
+Setup hints:
+- If the user prompt lists "Verbatim code snippets from the issue body", your FIRST write_test call must encode the first preferred snippet almost verbatim (only wrap it with the sentinel assertion / output capture). Do NOT paraphrase before you have at least one observed run_repro result; subtle rewrites are how repros silently stop reproducing.
+- If a run_repro fails with ModuleNotFoundError (or ImportError) on an in-repo import, do NOT try to "fix" the test — the package isn't editable-installed yet. Use pip_install with \`-e <candidate-dir>\` (one of the candidates listed in the user prompt under "Candidate editable-install dirs") matching the failing import's package, then re-run run_repro.
+- pip_install accepts arbitrary requirement specs including \`-e <path>\` for editable installs.
 
 Symbol discovery:
 - Third-party symbols (classes/functions from pip / npm / cargo dependencies — e.g. opentelemetry's NonRecordingSpan, pytest's MonkeyPatch) do NOT live in this repo. Import them directly by package path. Do NOT try to locate their source via find_symbol/read_file.
@@ -65,7 +79,12 @@ export async function runReproExecutor(args: RunReproExecutorArgs): Promise<Repr
     },
   });
 
-  const userPrompt = `Plan approach: ${args.plan.approach}\nCandidate test path: ${args.plan.candidateTestPath}\nSentinel string: "${args.plan.sentinelString}"\nExpected failure signature: ${args.plan.expectedFailureSignature}\nSteps:\n${args.plan.steps.map((s) => `- [${s.stepId}] ${s.intent} (hint: ${s.toolHint})`).join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}\n\nConstruct the failing test and prove it fails twice with matching output, then call done with summary and changedFiles=["${args.plan.candidateTestPath}"].`;
+  const snippetBlock = renderIssueSnippetsBlock(args.issueSnippets ?? []);
+  const editableBlock = renderEditableInstallsBlock(args.editableInstallCandidates ?? []);
+  const hintsParts = [snippetBlock, editableBlock].filter((s): s is string => Boolean(s));
+  const hintsSection = hintsParts.length > 0 ? `\n\n${hintsParts.join('\n\n')}` : '';
+
+  const userPrompt = `Plan approach: ${args.plan.approach}\nCandidate test path: ${args.plan.candidateTestPath}\nSentinel string: "${args.plan.sentinelString}"\nExpected failure signature: ${args.plan.expectedFailureSignature}\nSteps:\n${args.plan.steps.map((s) => `- [${s.stepId}] ${s.intent} (hint: ${s.toolHint})`).join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}${hintsSection}\n\nConstruct the failing test and prove it fails twice with matching output, then call done with summary and changedFiles=["${args.plan.candidateTestPath}"].`;
 
   const loop = await runAgentLoop({
     agent: 'REPRO_EXECUTOR',
