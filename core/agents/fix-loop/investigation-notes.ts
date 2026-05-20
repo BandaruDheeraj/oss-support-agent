@@ -18,6 +18,16 @@ export const InvestigationFindingSchema = z.object({
 });
 export type InvestigationFinding = z.infer<typeof InvestigationFindingSchema>;
 
+/**
+ * Input variant accepted from LLM tool calls. `recordedAt` is stamped
+ * server-side because LLMs reliably forget to populate it. Matches the
+ * `EvidenceInputSchema` pattern.
+ */
+export const InvestigationFindingInputSchema = InvestigationFindingSchema.extend({
+  recordedAt: z.string().optional(),
+});
+export type InvestigationFindingInput = z.infer<typeof InvestigationFindingInputSchema>;
+
 export const InvestigationNotesBodySchema = z.object({
   issueNumber: z.number(),
   attemptId: z.string(),

@@ -36,12 +36,17 @@ export const EvidenceSchema = z.object({
 export type Evidence = z.infer<typeof EvidenceSchema>;
 
 /**
- * Input variant accepted from LLM tool calls. `recordedAt` is stamped
- * server-side because LLMs reliably forget to populate it, which would
- * otherwise reject the entire `record_evidence` call.
+ * Input variant accepted from LLM tool calls. `recordedAt` and `source` are
+ * both made optional because LLMs reliably forget to populate them, which
+ * would otherwise reject the entire `record_evidence` call as an
+ * InvalidToolArguments error inside the AI SDK (before our registry can
+ * surface a friendly in-band error). The server stamps sensible defaults
+ * inside `record_evidence.execute` so the canonical `EvidenceSchema`
+ * remains strict.
  */
 export const EvidenceInputSchema = EvidenceSchema.extend({
   recordedAt: z.string().optional(),
+  source: z.string().optional(),
 });
 export type EvidenceInput = z.infer<typeof EvidenceInputSchema>;
 

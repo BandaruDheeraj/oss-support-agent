@@ -15,9 +15,11 @@ import type { ToolDef } from './types';
 import { asHandles } from './handles';
 import { EvidenceInputSchema, SuspectSymbolSchema } from '../analyst/dossier';
 import { HypothesisSchema } from '../fix-loop/hypotheses';
-import { InvestigationFindingSchema } from '../fix-loop/investigation-notes';
+import {
+  InvestigationFindingInputSchema,
+} from '../fix-loop/investigation-notes';
 
-const Note = z.object({ note: z.string().min(1) }).strict();
+const Note = z.object({ note: z.string().min(1) }).passthrough();
 export const note: ToolDef<z.infer<typeof Note>, unknown> = {
   name: 'note',
   tier: 'note',
@@ -52,7 +54,7 @@ const RecordEvidence = z
     summary: z.string().min(1),
     confidence: z.enum(['low', 'medium', 'high']),
   })
-  .strict();
+  .passthrough();
 export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = {
   name: 'record_evidence',
   tier: 'note',
@@ -63,7 +65,11 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
     const dossier = asHandles(ctx.handles).dossier;
     if (!dossier) return { error: 'dossier writer not available — caller is not the Analyst' };
     const now = new Date().toISOString();
-    const evidence = args.evidence.map((e) => ({ ...e, recordedAt: e.recordedAt ?? now }));
+    const evidence = args.evidence.map((e) => ({
+      ...e,
+      source: e.source ?? defaultEvidenceSource(e, ctx.issueNumber),
+      recordedAt: e.recordedAt ?? now,
+    }));
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
@@ -77,15 +83,54 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
   },
 };
 
+/**
+ * Stamp a meaningful `source` when the LLM omits it. We avoid a bare
+ * "unknown" string because consumers (e.g. planner.ts) render `source` in
+ * the evidence list — a generic value degrades planner context. Prefer
+ * structured fallbacks derived from `kind` + `attrs`.
+ */
+function defaultEvidenceSource(
+  e: { kind: string; source?: string; attrs?: Record<string, unknown> | undefined },
+  issueNumber: number
+): string {
+  if (e.source && e.source.trim().length > 0) return e.source;
+  const attr = (k: string): string | undefined => {
+    const v = e.attrs?.[k];
+    return typeof v === 'string' && v.length > 0 ? v : undefined;
+  };
+  switch (e.kind) {
+    case 'issue_excerpt':
+      return `issue#${issueNumber}`;
+    case 'file_excerpt':
+    case 'symbol_definition':
+    case 'symbol_caller':
+      return attr('file') ?? attr('path') ?? `unknown:${e.kind}`;
+    case 'recent_commit':
+      return attr('sha') ?? attr('commit') ?? `unknown:commit`;
+    case 'web_reference':
+      return attr('url') ?? `unknown:web`;
+    case 'human_input':
+      return attr('source') ?? 'human';
+    case 'critic_finding':
+      return attr('agent') ?? 'critic';
+    case 'tool_observation':
+      return attr('tool') ?? 'tool';
+    case 'note':
+      return 'analyst-note';
+    default:
+      return `unknown:${e.kind}`;
+  }
+}
+
 const WriteInvestigationNotes = z
   .object({
-    findings: z.array(InvestigationFindingSchema).default([]),
+    findings: z.array(InvestigationFindingInputSchema).default([]),
     rootCauseHypothesis: z.string().min(1),
     suggestedApproach: z.string().min(1),
     risks: z.array(z.string()).default([]),
     confidence: z.enum(['low', 'medium', 'high']),
   })
-  .strict();
+  .passthrough();
 export const writeInvestigationNotes: ToolDef<z.infer<typeof WriteInvestigationNotes>, unknown> = {
   name: 'write_investigation_notes',
   tier: 'note',
@@ -96,11 +141,13 @@ export const writeInvestigationNotes: ToolDef<z.infer<typeof WriteInvestigationN
     const notes = asHandles(ctx.handles).notes;
     if (!notes) return { error: 'investigation notes writer not available — caller is not the Fix Investigator' };
     if (!ctx.dossierSnapshotId) return { error: 'no dossier_snapshot_id set on context' };
+    const now = new Date().toISOString();
+    const findings = args.findings.map((f) => ({ ...f, recordedAt: f.recordedAt ?? now }));
     const n = notes.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
       dossierSnapshotId: ctx.dossierSnapshotId,
-      findings: args.findings,
+      findings,
       rootCauseHypothesis: args.rootCauseHypothesis,
       suggestedApproach: args.suggestedApproach,
       risks: args.risks,
@@ -118,7 +165,7 @@ const PlanStepSchema = z.object({
   files: z.array(z.string()).min(1),
   risk: z.enum(['low', 'medium', 'high']),
 });
-const CommitPlan = z.object({ summary: z.string().min(1), steps: z.array(PlanStepSchema).min(1) }).strict();
+const CommitPlan = z.object({ summary: z.string().min(1), steps: z.array(PlanStepSchema).min(1) }).passthrough();
 export const commitPlan: ToolDef<z.infer<typeof CommitPlan>, unknown> = {
   name: 'commit_plan',
   tier: 'meta',
@@ -146,7 +193,7 @@ export const revisePlan: ToolDef<z.infer<typeof RevisePlan>, unknown> = {
   },
 };
 
-const Deepen = z.object({ reason: z.string().min(1) }).strict();
+const Deepen = z.object({ reason: z.string().min(1) }).passthrough();
 export const deepenInvestigation: ToolDef<z.infer<typeof Deepen>, unknown> = {
   name: 'deepen_investigation',
   tier: 'meta',
@@ -164,7 +211,7 @@ const Done = z
     changedFiles: z.array(z.string()).default([]),
     successCheckHits: z.array(z.string()).default([]),
   })
-  .strict();
+  .passthrough();
 export const done: ToolDef<z.infer<typeof Done>, unknown> = {
   name: 'done',
   tier: 'meta',
@@ -176,7 +223,7 @@ export const done: ToolDef<z.infer<typeof Done>, unknown> = {
   },
 };
 
-const Abandon = z.object({ reason: z.string().min(1) }).strict();
+const Abandon = z.object({ reason: z.string().min(1) }).passthrough();
 export const abandon: ToolDef<z.infer<typeof Abandon>, unknown> = {
   name: 'abandon',
   tier: 'meta',

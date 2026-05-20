@@ -42,6 +42,38 @@ export interface AgentLoopResult {
 }
 
 export async function runAgentLoop(args: RunAgentLoopArgs): Promise<AgentLoopResult> {
+  const first = await runAgentLoopOnce(args);
+
+  // SAFETY NET — when generateText throws (e.g. Vercel AI SDK's
+  // InvalidToolArgumentsError from a missing required field on a strict
+  // tool schema), the model never sees the error and can't self-correct.
+  // We retry exactly once, surfacing the error into the user prompt so the
+  // model has a concrete signal to fix its next tool call. This benefits
+  // ALL agents (analyst, planner, executor, critic) — every one of them
+  // has at least one strict structured tool that an LLM can mis-emit.
+  if (first.terminated !== 'error' || !first.reason) return first;
+
+  const corrective =
+    `${args.user}\n\n[ORCHESTRATOR REMINDER] Your previous attempt aborted with a tool-validation error:\n` +
+    `  ${truncate(first.reason, 1200)}\n\n` +
+    `Re-emit your terminal tool call with VALID arguments. Inspect the tool's parameter schema carefully — ` +
+    `all fields without an "optional" marker are required. Do NOT drop any required field. ` +
+    `If you need to record evidence, every evidence item needs id, kind, source, and summary at minimum.`;
+
+  const retry = await runAgentLoopOnce({ ...args, user: corrective });
+  return {
+    ...retry,
+    toolCalls: first.toolCalls + retry.toolCalls,
+    turns: first.turns + retry.turns,
+    transcriptSummary: retry.transcriptSummary,
+  };
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+async function runAgentLoopOnce(args: RunAgentLoopArgs): Promise<AgentLoopResult> {
   const { agent, registry } = args;
   const model = getModel(agent, args.modelOverride);
   const tools = registry.toAiSdkTools();
