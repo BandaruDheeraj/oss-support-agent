@@ -12,6 +12,7 @@ import { runReproCritic, type ReproVerdict } from './critic';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
 import { detectCredentialError } from '../../credentials-check';
 import type { IssueCodeSnippet } from './repro-hints';
+import { deriveEditableInstallsFromSuspectPaths, mergeEditableInstallCandidates } from './repro-hints';
 
 export interface RunReproV2Args {
   attemptId: string;
@@ -42,6 +43,15 @@ export interface RunReproV2Args {
    * a heavy 3rd-party framework in their reproduction steps.
    */
   issueBody?: string;
+  /**
+   * Absolute path to the cloned workspace directory. When provided AND the
+   * Analyst dossier surfaces suspect symbols, the orchestrator re-derives
+   * editable-install candidates by walking up each suspect file path to its
+   * nearest package manifest, prioritising those over the initial BFS list.
+   * Without this, BFS-derived candidates (alphabetic first-5) often miss the
+   * package the bug actually lives in for monorepos with many sub-packages.
+   */
+  workspaceDir?: string;
 }
 
 export interface ReproV2Outcome {
@@ -95,6 +105,25 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
 
   const snapshot = dossier.latest()!;
 
+  // Re-prioritise editable-install candidates using the dossier's suspect
+  // symbols. The initial list from run-v2 is BFS-derived (alphabetic) and
+  // often caps out before reaching the package the bug actually lives in.
+  // Suspect-path-derived candidates know exactly which in-repo package to
+  // `pip install -e`.
+  let effectiveEditableInstalls = args.editableInstallCandidates ?? [];
+  if (args.workspaceDir && (snapshot.body.suspectSymbols ?? []).length > 0) {
+    const suspectDerived = deriveEditableInstallsFromSuspectPaths(
+      args.workspaceDir,
+      snapshot.body.suspectSymbols.map((s) => s.file)
+    );
+    if (suspectDerived.length > 0) {
+      effectiveEditableInstalls = mergeEditableInstallCandidates(
+        suspectDerived,
+        args.editableInstallCandidates ?? []
+      );
+    }
+  }
+
   // Stage B: Planner
   let plan: ReproPlan;
   try {
@@ -102,7 +131,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       attemptId: args.attemptId,
       dossier: snapshot,
       carryforwardSummary: args.carryforwardSummary,
-      editableInstallCandidates: args.editableInstallCandidates,
+      editableInstallCandidates: effectiveEditableInstalls,
       issueSnippets: args.issueSnippets,
       issueBody: args.issueBody,
     });
@@ -127,7 +156,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     repo: args.repo,
     workspace: args.workspace,
     sandbox: args.sandbox,
-    editableInstallCandidates: args.editableInstallCandidates,
+    editableInstallCandidates: effectiveEditableInstalls,
     issueSnippets: args.issueSnippets,
   });
 

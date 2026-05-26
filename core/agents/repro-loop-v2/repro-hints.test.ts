@@ -4,6 +4,8 @@ import * as path from 'path';
 
 import {
   discoverEditableInstallCandidates,
+  deriveEditableInstallsFromSuspectPaths,
+  mergeEditableInstallCandidates,
   extractIssueCodeSnippets,
   renderEditableInstallsBlock,
   renderIssueSnippetsBlock,
@@ -210,5 +212,69 @@ describe('renderEditableInstallsBlock', () => {
     expect(out).toContain('pip install -e <dir>');
     expect(out).toContain('- python/instrumentation/openinference-instrumentation-smolagents');
     expect(out).toContain('- pkg/foo');
+  });
+});
+
+describe('deriveEditableInstallsFromSuspectPaths', () => {
+  let dir: string | null = null;
+  afterEach(() => {
+    if (dir) rmrf(dir);
+    dir = null;
+  });
+
+  it('returns [] when workspace does not exist', () => {
+    expect(deriveEditableInstallsFromSuspectPaths('/no/such/path/xyz', ['a/b.py'])).toEqual([]);
+  });
+
+  it('returns [] when filePaths is empty', () => {
+    dir = makeTempRepo({ 'pkg/pyproject.toml': '[tool]\n' });
+    expect(deriveEditableInstallsFromSuspectPaths(dir, [])).toEqual([]);
+  });
+
+  it('finds the nearest ancestor with a manifest for a suspect file', () => {
+    dir = makeTempRepo({
+      'python/instrumentation/openinference-instrumentation-smolagents/pyproject.toml': '[tool]\n',
+      'python/instrumentation/openinference-instrumentation-smolagents/src/openinference/instrumentation/smolagents/_wrappers.py': 'pass\n',
+    });
+    const got = deriveEditableInstallsFromSuspectPaths(dir, [
+      'python/instrumentation/openinference-instrumentation-smolagents/src/openinference/instrumentation/smolagents/_wrappers.py',
+    ]);
+    expect(got).toContain('python/instrumentation/openinference-instrumentation-smolagents');
+  });
+
+  it('de-duplicates across multiple suspect files in the same package', () => {
+    dir = makeTempRepo({
+      'pkg/pyproject.toml': '[tool]\n',
+      'pkg/a.py': 'pass\n',
+      'pkg/b.py': 'pass\n',
+    });
+    const got = deriveEditableInstallsFromSuspectPaths(dir, ['pkg/a.py', 'pkg/b.py']);
+    expect(got).toEqual(['pkg']);
+  });
+
+  it('skips suspect paths whose ancestors have no manifest', () => {
+    dir = makeTempRepo({ 'src/foo/bar.py': 'pass\n' });
+    expect(deriveEditableInstallsFromSuspectPaths(dir, ['src/foo/bar.py'])).toEqual([]);
+  });
+
+  it('normalises backslashes and leading slashes in paths', () => {
+    dir = makeTempRepo({ 'pkg/pyproject.toml': '[tool]\n', 'pkg/x.py': '' });
+    const got = deriveEditableInstallsFromSuspectPaths(dir, ['\\pkg\\x.py']);
+    expect(got).toEqual(['pkg']);
+  });
+});
+
+describe('mergeEditableInstallCandidates', () => {
+  it('prioritises prioritized entries first, de-duplicates, caps at 5', () => {
+    const out = mergeEditableInstallCandidates(['a', 'b', 'a'], ['b', 'c', 'd', 'e', 'f', 'g']);
+    expect(out).toEqual(['a', 'b', 'c', 'd', 'e']);
+  });
+
+  it('returns [] when both inputs are empty', () => {
+    expect(mergeEditableInstallCandidates([], [])).toEqual([]);
+  });
+
+  it('rejects "." and empty entries', () => {
+    expect(mergeEditableInstallCandidates(['.', '', 'pkg'], ['pkg2'])).toEqual(['pkg', 'pkg2']);
   });
 });

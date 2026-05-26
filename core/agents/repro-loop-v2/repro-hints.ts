@@ -137,6 +137,77 @@ function walkUpForManifests(workspaceDir: string, rel: string): string[] {
   return out;
 }
 
+/**
+ * Derive editable-install candidate dirs from a list of suspect file paths
+ * (typically dossier suspectSymbols[].file or precondition.appliesTo.file).
+ *
+ * For each file path, walks up looking for the nearest ancestor dir that
+ * contains a Python package manifest. Returns repo-relative POSIX paths,
+ * de-duped, with the inner-most (closest to the suspect file) listed first.
+ *
+ * This rescues snippet-less issues where `discoverEditableInstallCandidates`
+ * fell back to BFS and the alphabetic first-N capped out before reaching the
+ * package the bug actually lives in. The dossier knows which file is suspect;
+ * the resulting candidate list is the exact package to `pip install -e`.
+ */
+export function deriveEditableInstallsFromSuspectPaths(
+  workspaceDir: string,
+  filePaths: string[]
+): string[] {
+  if (!workspaceDir || !fs.existsSync(workspaceDir)) return [];
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const raw of filePaths) {
+    if (!raw || typeof raw !== 'string') continue;
+    const normalized = raw.replace(/\\+/g, '/').replace(/^[/]+/, '').replace(/\/+$/, '');
+    if (!normalized) continue;
+    const dir = normalized.includes('/') ? normalized.slice(0, normalized.lastIndexOf('/')) : '';
+    if (!dir) continue;
+    for (const cand of walkUpForManifests(workspaceDir, dir)) {
+      if (cand === '.' || cand === '') continue;
+      if (seen.has(cand)) continue;
+      seen.add(cand);
+      ordered.push(cand);
+    }
+  }
+  return ordered;
+}
+
+/**
+ * Merge two editable-install candidate lists, prioritising `prioritized`
+ * entries first, de-duplicating, validating each entry through
+ * `validateReproSetup`, and capping the result at `FINAL_RETURN_CAP`.
+ */
+export function mergeEditableInstallCandidates(
+  prioritized: string[],
+  fallback: string[]
+): string[] {
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const c of [...prioritized, ...fallback]) {
+    if (!c || c === '.' || c === '') continue;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    merged.push(c);
+    if (merged.length >= FINAL_RETURN_CAP) break;
+  }
+  try {
+    return validateReproSetup({ editableInstalls: merged }).editableInstalls;
+  } catch {
+    const out: string[] = [];
+    for (const c of merged) {
+      try {
+        validateReproSetup({ editableInstalls: [c] });
+        out.push(c);
+      } catch {
+        /* skip */
+      }
+    }
+    return out;
+  }
+}
+
+
 function bfsForManifests(workspaceDir: string, maxDepth: number, cap: number): string[] {
   const out: string[] = [];
   const queue: Array<{ rel: string; depth: number }> = [{ rel: '', depth: 0 }];

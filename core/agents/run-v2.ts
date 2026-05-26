@@ -128,6 +128,7 @@ export async function runReproPipeline(input: ReproPipelineInput): Promise<Repro
     editableInstallCandidates,
     issueSnippets,
     issueBody: input.payload.issue.body ?? undefined,
+    workspaceDir: input.workspace.dir,
   });
 
   const candidateTestPath = v2.plan?.candidateTestPath;
