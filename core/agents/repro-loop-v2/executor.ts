@@ -52,7 +52,11 @@ function renderPreconditionsBlockForExecutor(
   }
   if (verbatimIncompatible) {
     lines.push(
-      `VERBATIM SNIPPET INCOMPATIBLE = TRUE. The Planner determined the verbatim issue snippet CANNOT run in this sandbox (typically because it imports a heavy 3rd-party framework like smolagents/langchain that requires network access or unsharded transitive deps). DO NOT write the verbatim snippet — pip_install will fail repeatedly and waste budget. Instead, your FIRST write_test must be a DIRECT-CALL test that imports the suspect symbol straight from its underlying package (e.g. \`from opentelemetry.trace import NonRecordingSpan, INVALID_SPAN_CONTEXT\`) and constructs the inputs by hand. Any precondition satisfactionMode markers above SHOULD appear in your test source.`
+      `VERBATIM SNIPPET INCOMPATIBLE = TRUE. The Planner determined a heavy 3rd-party framework (smolagents / langchain / llama-index / autogen / crewai / haystack / guidance / dspy) is in play and the verbatim reproduction path cannot run in this sandbox (no network, no creds, transitive-dep storm). Constraints:\n` +
+        `  • DO NOT pip_install the heavy framework runtime itself (e.g. \`pip install smolagents\`). It will fail repeatedly and burn budget — the install-fatigue abandon gate will then terminate the run.\n` +
+        `  • You MAY (and usually should) pip_install -e the in-repo instrumentation package surfaced in "EditableInstall candidates" — that gives you the suspect wrapper module without pulling the heavy runtime.\n` +
+        `  • Your FIRST write_test must be a DIRECT-CALL test: import the suspect symbol straight from its underlying package (e.g. \`from opentelemetry.trace import NonRecordingSpan, INVALID_SPAN_CONTEXT\`) and the suspect wrapper from the editable-installed in-repo package, then construct the inputs by hand. Do NOT write a test that imports or instantiates the heavy framework.\n` +
+        `  • Any precondition satisfactionMode markers above SHOULD appear in your test source.`
     );
   } else {
     lines.push(

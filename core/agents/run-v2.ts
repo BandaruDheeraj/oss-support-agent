@@ -127,6 +127,7 @@ export async function runReproPipeline(input: ReproPipelineInput): Promise<Repro
     carryforwardSummary: input.carryforwardSummary,
     editableInstallCandidates,
     issueSnippets,
+    issueBody: input.payload.issue.body ?? undefined,
   });
 
   const candidateTestPath = v2.plan?.candidateTestPath;

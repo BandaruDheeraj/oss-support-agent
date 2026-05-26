@@ -36,6 +36,12 @@ export interface RunReproV2Args {
    * exactly rather than paraphrasing it.
    */
   issueSnippets?: IssueCodeSnippet[];
+  /**
+   * Raw issue body. Used by the deterministic heavy-framework detector to
+   * flip verbatimSnippetIncompatible=true on prose-only issues that name
+   * a heavy 3rd-party framework in their reproduction steps.
+   */
+  issueBody?: string;
 }
 
 export interface ReproV2Outcome {
@@ -98,6 +104,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       carryforwardSummary: args.carryforwardSummary,
       editableInstallCandidates: args.editableInstallCandidates,
       issueSnippets: args.issueSnippets,
+      issueBody: args.issueBody,
     });
   } catch (err) {
     return { status: 'planner_failed', dossier, message: err instanceof Error ? err.message : String(err) };
