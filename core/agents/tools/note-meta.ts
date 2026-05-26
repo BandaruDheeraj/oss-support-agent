@@ -13,7 +13,7 @@
 import { z } from 'zod';
 import type { ToolDef } from './types';
 import { asHandles } from './handles';
-import { EvidenceInputSchema, SuspectSymbolSchema } from '../analyst/dossier';
+import { EvidenceInputSchema, PreconditionInputSchema, SuspectSymbolSchema } from '../analyst/dossier';
 import { HypothesisSchema } from '../fix-loop/hypotheses';
 import {
   InvestigationFindingInputSchema,
@@ -50,6 +50,7 @@ const RecordEvidence = z
   .object({
     evidence: z.array(EvidenceInputSchema).default([]),
     suspectSymbols: z.array(SuspectSymbolSchema).default([]),
+    preconditions: z.array(PreconditionInputSchema).default([]),
     openQuestions: z.array(z.string()).default([]),
     summary: z.string().min(1),
     confidence: z.enum(['low', 'medium', 'high']),
@@ -70,11 +71,23 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       source: e.source ?? defaultEvidenceSource(e, ctx.issueNumber),
       recordedAt: e.recordedAt ?? now,
     }));
+    // Stamp precondition ids when the LLM omits them. The id must be
+    // stable within the snapshot (used by Planner's `preconditionsAddressed`
+    // links and Critic's structural checks), so we derive it from the
+    // input index.
+    const preconditions = args.preconditions.map((p, idx) => ({
+      ...p,
+      id: p.id ?? `pc-${idx}`,
+      evidenceRefs: p.evidenceRefs ?? [],
+      satisfactionModes: p.satisfactionModes ?? [],
+      threats: p.threats ?? [],
+    }));
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
       evidence,
       suspectSymbols: args.suspectSymbols,
+      preconditions,
       openQuestions: args.openQuestions,
       summary: args.summary,
       confidence: args.confidence,

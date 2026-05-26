@@ -9,13 +9,57 @@
 import type { ReproPlan } from './planner';
 import { runAgentLoop, type AgentLoopResult } from '../agent-loop';
 import { makeReproExecutorRegistry } from '../tools';
-import type { DossierStore, DossierSnapshot } from '../analyst/dossier';
+import type { DossierStore, DossierSnapshot, Precondition } from '../analyst/dossier';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
 import {
   renderEditableInstallsBlock,
   renderIssueSnippetsBlock,
   type IssueCodeSnippet,
 } from './repro-hints';
+
+/**
+ * Render dossier preconditions for the Executor's user prompt. This is the
+ * "test contract" the executor must enforce: every listed precondition has
+ * to be satisfied by the candidate test for the Critic to approve.
+ *
+ * The block also surfaces the Planner's verbatimSnippetIncompatible flag
+ * so the executor knows whether the verbatim-first invariant
+ * (commit 1ae5948) still applies.
+ */
+function renderPreconditionsBlockForExecutor(
+  preconditions: Precondition[],
+  verbatimIncompatible: boolean
+): string | null {
+  if (preconditions.length === 0) return null;
+  const lines: string[] = [`PRECONDITIONS THE TEST MUST ENFORCE:`];
+  for (const pc of preconditions) {
+    lines.push(`- [${pc.id}] (${pc.kind}) ${pc.condition}`);
+    if (pc.appliesTo) {
+      lines.push(`    target: ${pc.appliesTo.file}${pc.appliesTo.symbol ? ` :: ${pc.appliesTo.symbol}` : ''}`);
+    }
+    if (pc.satisfactionModes && pc.satisfactionModes.length > 0) {
+      lines.push(`    satisfaction modes (choose one and ensure its markers appear in the test):`);
+      for (const mode of pc.satisfactionModes) {
+        lines.push(`      • ${mode.description}${mode.markers.length > 0 ? ` — markers: ${mode.markers.map((m) => `\`${m}\``).join(', ')}` : ''}`);
+      }
+    }
+    if (pc.threats && pc.threats.length > 0) {
+      lines.push(`    threats to neutralize: ${pc.threats.join('; ')}`);
+    }
+  }
+  if (verbatimIncompatible) {
+    lines.push('');
+    lines.push(
+      `NOTE: The Planner set verbatimSnippetIncompatible=true. The verbatim issue snippet (if any) cannot satisfy one of the preconditions above (typically because it needs credentials or live services the sandbox lacks). You MAY proceed directly to a satisfactionMode path; the verbatim-first invariant is waived for this run.`
+    );
+  } else {
+    lines.push('');
+    lines.push(
+      `NOTE: The Planner kept verbatimSnippetIncompatible=false. If a verbatim snippet is provided, your FIRST write_test must mirror it. Switch to a satisfactionMode path only AFTER an observed run_repro fails for environmental (not behavioural) reasons.`
+    );
+  }
+  return lines.join('\n');
+}
 
 export interface RunReproExecutorArgs {
   attemptId: string;
@@ -52,8 +96,17 @@ Rules:
 - You may not modify source files (apply_patch is not registered for you).
 - Each turn make ONE stateful tool call (sandbox/write-test/meta). Reads may be batched.
 
-Setup hints:
-- If the user prompt lists "Verbatim code snippets from the issue body", your FIRST write_test call must encode the first preferred snippet almost verbatim (only wrap it with the sentinel assertion / output capture). Do NOT paraphrase before you have at least one observed run_repro result; subtle rewrites are how repros silently stop reproducing.
+Setup hints — verbatim-first invariant:
+- If the user prompt lists "Verbatim code snippets from the issue body" AND the plan's verbatimSnippetIncompatible flag is FALSE (the default), your FIRST write_test call MUST encode the first preferred snippet almost verbatim — only wrap it with the sentinel assertion / output capture. Do NOT paraphrase before you have at least one observed run_repro result; subtle rewrites are how repros silently stop reproducing. This invariant comes from commit 1ae5948 and is non-negotiable when the flag is false.
+- ONLY after observing run_repro on the verbatim test AND finding it fails for ENVIRONMENTAL reasons (missing credentials, unreachable model API, unavailable live service — NOT a behavioural mismatch) may you revise to a direct-call test that satisfies the SAME preconditions via one of the satisfactionModes listed in the dossier preconditions block.
+- If the plan's verbatimSnippetIncompatible flag is TRUE, the Planner has determined the verbatim snippet cannot satisfy a named precondition (typically because it requires credentials/services the sandbox lacks). In that case you MAY skip the verbatim step and proceed directly to a satisfactionMode path — but your test MUST enforce every precondition's chosen mode and the markers from that mode SHOULD appear in your test source.
+
+Preconditions enforcement:
+- The user prompt's "PRECONDITIONS THE TEST MUST ENFORCE" block lists conditions the failing test must guarantee. Treat them as test contracts.
+- When a precondition has kind: config_absence with non-empty threats, your test MUST either (a) reset the threatened global before exercising the suspect symbol (e.g. via monkeypatch.setattr on the framework's internal globals), OR (b) bypass the global entirely by importing the suspect symbol and calling it directly with hand-constructed inputs matching the satisfaction-mode markers.
+- Do NOT initialize the very component the precondition requires to be absent. If the dossier flags "no OTel tracer provider configured" as a threat, do not call set_tracer_provider in the test, even via an import that triggers SDK initialization.
+
+Module-install hints:
 - If a run_repro fails with ModuleNotFoundError (or ImportError) on an in-repo import, do NOT try to "fix" the test — the package isn't editable-installed yet. Use pip_install with \`-e <candidate-dir>\` (one of the candidates listed in the user prompt under "Candidate editable-install dirs") matching the failing import's package, then re-run run_repro.
 - pip_install accepts arbitrary requirement specs including \`-e <path>\` for editable installs.
 
@@ -81,10 +134,21 @@ export async function runReproExecutor(args: RunReproExecutorArgs): Promise<Repr
 
   const snippetBlock = renderIssueSnippetsBlock(args.issueSnippets ?? []);
   const editableBlock = renderEditableInstallsBlock(args.editableInstallCandidates ?? []);
-  const hintsParts = [snippetBlock, editableBlock].filter((s): s is string => Boolean(s));
+  const preconditionsBlock = renderPreconditionsBlockForExecutor(
+    args.dossierSnapshot.body.preconditions ?? [],
+    args.plan.verbatimSnippetIncompatible
+  );
+  const hintsParts = [snippetBlock, editableBlock, preconditionsBlock].filter((s): s is string => Boolean(s));
   const hintsSection = hintsParts.length > 0 ? `\n\n${hintsParts.join('\n\n')}` : '';
 
-  const userPrompt = `Plan approach: ${args.plan.approach}\nCandidate test path: ${args.plan.candidateTestPath}\nSentinel string: "${args.plan.sentinelString}"\nExpected failure signature: ${args.plan.expectedFailureSignature}\nSteps:\n${args.plan.steps.map((s) => `- [${s.stepId}] ${s.intent} (hint: ${s.toolHint})`).join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}${hintsSection}\n\nConstruct the failing test and prove it fails twice with matching output, then call done with summary and changedFiles=["${args.plan.candidateTestPath}"].`;
+  const userPrompt = `Plan approach: ${args.plan.approach}\nCandidate test path: ${args.plan.candidateTestPath}\nSentinel string: "${args.plan.sentinelString}"\nExpected failure signature: ${args.plan.expectedFailureSignature}\nVerbatim snippet incompatible: ${args.plan.verbatimSnippetIncompatible ? 'true (Planner determined snippet cannot satisfy a precondition — direct-call path permitted)' : 'false (verbatim-first invariant in force — first write_test must mirror the snippet)'}\nSteps:\n${args.plan.steps
+    .map((s) => {
+      const addr = s.preconditionsAddressed && s.preconditionsAddressed.length > 0
+        ? ` [addresses: ${s.preconditionsAddressed.join(', ')}]`
+        : '';
+      return `- [${s.stepId}] ${s.intent} (hint: ${s.toolHint})${addr}`;
+    })
+    .join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}${hintsSection}\n\nConstruct the failing test and prove it fails twice with matching output, then call done with summary and changedFiles=["${args.plan.candidateTestPath}"].`;
 
   const loop = await runAgentLoop({
     agent: 'REPRO_EXECUTOR',

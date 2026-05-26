@@ -58,12 +58,76 @@ export const SuspectSymbolSchema = z.object({
 
 export type SuspectSymbol = z.infer<typeof SuspectSymbolSchema>;
 
+/**
+ * A "satisfaction mode" is one concrete way a repro test can enforce a
+ * precondition. The `markers` array contains short substrings the Critic
+ * can grep for in the candidate test source as a structural redundancy
+ * check on the LLM's judgement.
+ */
+export const SatisfactionModeSchema = z.object({
+  description: z.string().min(1),
+  markers: z.array(z.string()).default([]),
+});
+export type SatisfactionMode = z.infer<typeof SatisfactionModeSchema>;
+
+/**
+ * Preconditions: the state of the world that must hold for the bug to
+ * manifest. Written by the Analyst, consumed by Planner/Executor/Critic.
+ *
+ * NEGATIVE preconditions ("X must NOT be configured") are the common
+ * failure mode for our agents — pytest fixtures often install the very
+ * state the bug requires to be absent. `threats` enumerates those
+ * fixtures/env-vars; `satisfactionModes` enumerates ways the test can
+ * still enforce the precondition (global reset OR direct injection, etc.).
+ */
+export const PreconditionSchema = z.object({
+  id: z.string().min(1),
+  condition: z.string().min(1),
+  kind: z.enum([
+    'global_state',
+    'config_absence',
+    'env_var',
+    'input_shape',
+    'timing',
+    'concurrency',
+    'version_pin',
+  ]),
+  appliesTo: z
+    .object({ file: z.string(), symbol: z.string().optional() })
+    .optional(),
+  /** Evidence ids from the dossier supporting this precondition. */
+  evidenceRefs: z.array(z.string()).default([]),
+  /** At least one mode must be enforced by the repro test. */
+  satisfactionModes: z.array(SatisfactionModeSchema).default([]),
+  /** Test-infrastructure items that may violate this precondition. */
+  threats: z.array(z.string()).default([]),
+});
+export type Precondition = z.infer<typeof PreconditionSchema>;
+
+/**
+ * Input variant: `id` and `evidenceRefs` are optional because LLMs forget
+ * them. Server stamps `id = pc-{idx}` and defaults arrays in
+ * `record_evidence.execute`.
+ */
+export const PreconditionInputSchema = PreconditionSchema.extend({
+  id: z.string().optional(),
+  evidenceRefs: z.array(z.string()).optional(),
+  satisfactionModes: z.array(SatisfactionModeSchema).optional(),
+  threats: z.array(z.string()).optional(),
+});
+export type PreconditionInput = z.infer<typeof PreconditionInputSchema>;
+
 export const DossierBodySchema = z.object({
   issueNumber: z.number(),
   attemptId: z.string(),
   parentSnapshotId: z.string().nullable(),
   evidence: z.array(EvidenceSchema),
   suspectSymbols: z.array(SuspectSymbolSchema),
+  /**
+   * Preconditions identified by the Analyst. Defaults to [] so legacy
+   * dossier snapshots (pre-feature) deserialize successfully.
+   */
+  preconditions: z.array(PreconditionSchema).default([]),
   openQuestions: z.array(z.string()),
   summary: z.string(),
   confidence: z.enum(['low', 'medium', 'high']),
@@ -84,8 +148,23 @@ function canonicalize(obj: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalize(v)}`).join(',')}}`;
 }
 
+/**
+ * Compute the snapshot id. CRITICAL backward-compat invariant: when the
+ * body has an empty `preconditions` array, we OMIT the key from the
+ * canonical bytes before hashing. This means legacy snapshots (persisted
+ * before the preconditions feature) rehydrate with the same snapshot id,
+ * preserving investigation-notes links bound to `dossierSnapshotId`.
+ *
+ * New snapshots that actually use preconditions hash differently from
+ * any legacy snapshot, which is correct: their content is distinct.
+ */
 export function snapshotIdFor(body: DossierBody): string {
-  return createHash('sha1').update(canonicalize(body)).digest('hex').slice(0, 16);
+  const forHash: Record<string, unknown> = { ...(body as unknown as Record<string, unknown>) };
+  const pcs = (body as { preconditions?: unknown[] }).preconditions;
+  if (!Array.isArray(pcs) || pcs.length === 0) {
+    delete forHash.preconditions;
+  }
+  return createHash('sha1').update(canonicalize(forHash)).digest('hex').slice(0, 16);
 }
 
 /**
@@ -101,9 +180,14 @@ export class DossierStore {
     const arr = JSON.parse(json) as DossierSnapshot[];
     const store = new DossierStore();
     for (const snap of arr) {
-      // Re-derive id to defend against tampering
-      const id = snapshotIdFor(snap.body);
-      store.snapshots.push({ ...snap, snapshotId: id });
+      // Normalize body through schema so legacy snapshots gain the default
+      // `preconditions: []` runtime field. snapshotIdFor omits empty
+      // preconditions from the canonical hash, so the recomputed id still
+      // matches the legacy stored id — preserving investigation-notes
+      // links bound to dossierSnapshotId.
+      const body = DossierBodySchema.parse(snap.body);
+      const id = snapshotIdFor(body);
+      store.snapshots.push({ ...snap, body, snapshotId: id });
     }
     return store;
   }
@@ -127,8 +211,16 @@ export class DossierStore {
   /**
    * Append a new snapshot. The body's parentSnapshotId is auto-set to the
    * current latest snapshot when not provided. Returns the new snapshot id.
+   *
+   * `preconditions` is optional on the input — the schema defaults to `[]`
+   * when omitted, preserving backward-compatible call sites.
    */
-  append(input: Omit<DossierBody, 'parentSnapshotId'> & { parentSnapshotId?: string | null }): DossierSnapshot {
+  append(
+    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions'> & {
+      parentSnapshotId?: string | null;
+      preconditions?: Precondition[];
+    }
+  ): DossierSnapshot {
     const parent = input.parentSnapshotId ?? this.latest()?.snapshotId ?? null;
     const body: DossierBody = DossierBodySchema.parse({
       ...input,

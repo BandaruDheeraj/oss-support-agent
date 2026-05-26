@@ -37,13 +37,37 @@ Procedure:
 3. Locate the affected symbols in the repo using grep/find_symbol/find_callers.
 4. Open the relevant files with read_file. Open recent commits with git_log/git_blame if behaviour changed.
 5. Form a list of suspect symbols, open questions, and confidence level.
-6. Terminate by calling record_evidence with a complete summary. record_evidence is the ONLY way to commit your findings.
+6. Identify PRECONDITIONS — see "Preconditions" section below.
+7. Terminate by calling record_evidence with a complete summary. record_evidence is the ONLY way to commit your findings.
 
 CRITICAL: You MUST end the session with either record_evidence or abandon. Returning a plain-text summary without calling record_evidence wastes the entire investigation — your findings are discarded. Always finalize via tool call.
 
 Do not call write_test, apply_patch, run_repro, or any sandbox tool — they are not registered for you.
 Do not include the issue body verbatim in evidence.detail; quote only the relevant excerpts.
-Confidence rules: 'high' requires a specific file:line cause hypothesis; 'medium' requires at least one suspect symbol; 'low' otherwise.`;
+Confidence rules: 'high' requires a specific file:line cause hypothesis; 'medium' requires at least one suspect symbol; 'low' otherwise.
+
+Preconditions:
+For each suspect symbol, identify the world-state required for the bug to manifest. Preconditions can be NEGATIVE ("no tracer provider configured", "env var FOO unset", "client created without retry middleware"). Many real bugs only fire in specific environmental conditions; downstream agents will use these to write a repro test that ACTUALLY triggers the bug.
+
+Each precondition needs:
+  - condition: one-sentence description of the required state
+  - kind: one of global_state, config_absence, env_var, input_shape, timing, concurrency, version_pin
+  - appliesTo: {file, symbol?} pointing at the suspect surface
+  - evidenceRefs: ids of dossier evidence items that support the precondition
+  - satisfactionModes: ways a test can enforce it. Each mode has a description and \`markers\` — short substrings that should appear in test source when the mode is in force (e.g. for direct injection: ["NonRecordingSpan(", "INVALID_SPAN_CONTEXT"]). List MULTIPLE modes when both global-reset and direct-injection paths exist — downstream agents prefer the simpler one.
+  - threats: test-infrastructure items that might VIOLATE the precondition. SEE "Test-infra scan" below.
+
+Test-infra scan (CRITICAL — this is what catches issues like NonRecordingSpan-masked-by-autouse-fixture):
+For each suspect source path, map it to its test mirror. Example:
+  src/openinference/instrumentation/smolagents/_wrappers.py
+  → tests/openinference/instrumentation/smolagents/conftest.py
+Walk \`tests/\` DOWNWARD from the package root to the matching test directory. Read EVERY conftest.py on that path with read_file. Also check setup.cfg, pytest.ini, pyproject.toml [tool.pytest.ini_options]. Look for:
+  - autouse fixtures (\`@pytest.fixture(autouse=True)\`)
+  - fixtures that call \`set_tracer_provider\`, \`instrument(\`, \`monkeypatch.setenv\`, \`set_global_handler\`, or similar
+  - fixtures named after suspect concepts (e.g. \`tracer_provider\`, \`event_loop\`, \`mock_openai\`)
+Each fixture that installs the state a precondition requires to be ABSENT becomes a \`threats\` entry. Walking ABOVE the source path won't find these — test infra mirrors source path under \`tests/\`.
+
+Empty preconditions: [] is acceptable for issues with no environmental subtlety. Do NOT fabricate baseline preconditions — that wastes downstream prompt context.`;
 
 export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
   const registry = makeAnalystRegistry({
