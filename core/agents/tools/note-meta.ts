@@ -13,7 +13,7 @@
 import { z } from 'zod';
 import type { ToolDef } from './types';
 import { asHandles } from './handles';
-import { EvidenceInputSchema, PreconditionInputSchema, SuspectSymbolSchema } from '../analyst/dossier';
+import { EvidenceInputSchema, PreconditionInputSchema, SuspectSymbolSchema, normalizePreconditionInput } from '../analyst/dossier';
 import { HypothesisSchema } from '../fix-loop/hypotheses';
 import {
   InvestigationFindingInputSchema,
@@ -71,17 +71,14 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       source: e.source ?? defaultEvidenceSource(e, ctx.issueNumber),
       recordedAt: e.recordedAt ?? now,
     }));
-    // Stamp precondition ids when the LLM omits them. The id must be
-    // stable within the snapshot (used by Planner's `preconditionsAddressed`
-    // links and Critic's structural checks), so we derive it from the
-    // input index.
-    const preconditions = args.preconditions.map((p, idx) => ({
-      ...p,
-      id: p.id ?? `pc-${idx}`,
-      evidenceRefs: p.evidenceRefs ?? [],
-      satisfactionModes: p.satisfactionModes ?? [],
-      threats: p.threats ?? [],
-    }));
+    // Stamp precondition ids when the LLM omits them, drop entries that
+    // even the loose normalizer can't make sense of. Preconditions are
+    // best-effort metadata; we MUST NOT fail the entire record_evidence
+    // call (and discard the dossier) just because the LLM mis-emitted a
+    // precondition field.
+    const preconditions = (args.preconditions ?? [])
+      .map((p, idx) => normalizePreconditionInput(p, idx))
+      .filter((p): p is NonNullable<typeof p> => p !== null);
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,

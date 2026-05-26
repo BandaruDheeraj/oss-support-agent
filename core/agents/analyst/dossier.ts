@@ -105,16 +105,97 @@ export const PreconditionSchema = z.object({
 export type Precondition = z.infer<typeof PreconditionSchema>;
 
 /**
- * Input variant: `id` and `evidenceRefs` are optional because LLMs forget
- * them. Server stamps `id = pc-{idx}` and defaults arrays in
- * `record_evidence.execute`.
+ * Input variant: deliberately LOOSE. LLMs frequently mis-spell the kind
+ * enum, drop required fields, or invent shapes. We accept any object with
+ * a non-empty `condition` string and coerce the rest in
+ * `record_evidence.execute`. Failing the whole tool call over a malformed
+ * precondition would discard the entire investigation — preconditions are
+ * best-effort metadata, not a load-bearing contract.
  */
-export const PreconditionInputSchema = PreconditionSchema.extend({
-  id: z.string().optional(),
-  evidenceRefs: z.array(z.string()).optional(),
-  satisfactionModes: z.array(SatisfactionModeSchema).optional(),
-  threats: z.array(z.string()).optional(),
-});
+export const PreconditionInputSchema = z
+  .object({
+    id: z.string().optional(),
+    condition: z.string().min(1),
+    kind: z.string().optional(),
+    appliesTo: z
+      .object({ file: z.string().optional(), symbol: z.string().optional() })
+      .passthrough()
+      .optional(),
+    evidenceRefs: z.array(z.string()).optional(),
+    satisfactionModes: z
+      .array(
+        z
+          .object({
+            description: z.string().optional(),
+            markers: z.array(z.string()).optional(),
+          })
+          .passthrough()
+      )
+      .optional(),
+    threats: z.array(z.string()).optional(),
+  })
+  .passthrough();
+
+const KNOWN_PRECONDITION_KINDS = [
+  'global_state',
+  'config_absence',
+  'env_var',
+  'input_shape',
+  'timing',
+  'concurrency',
+  'version_pin',
+] as const;
+
+/**
+ * Coerce a loose LLM-supplied precondition into a strict PreconditionSchema
+ * shape. Anything unrecognisable is dropped silently — caller is expected
+ * to map this over LLM-supplied entries and ignore nulls.
+ */
+export function normalizePreconditionInput(
+  raw: unknown,
+  idx: number
+): Precondition | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const condition = typeof r.condition === 'string' && r.condition.trim() ? r.condition : null;
+  if (!condition) return null;
+  const rawKind = typeof r.kind === 'string' ? r.kind.toLowerCase().replace(/[\s-]+/g, '_') : '';
+  const kind = (KNOWN_PRECONDITION_KINDS as readonly string[]).includes(rawKind)
+    ? (rawKind as Precondition['kind'])
+    : 'global_state';
+  const id = typeof r.id === 'string' && r.id.trim() ? r.id : `pc-${idx}`;
+  const appliesTo =
+    r.appliesTo && typeof r.appliesTo === 'object'
+      ? (() => {
+          const a = r.appliesTo as Record<string, unknown>;
+          const file = typeof a.file === 'string' ? a.file : undefined;
+          if (!file) return undefined;
+          const symbol = typeof a.symbol === 'string' ? a.symbol : undefined;
+          return symbol ? { file, symbol } : { file };
+        })()
+      : undefined;
+  const evidenceRefs = Array.isArray(r.evidenceRefs)
+    ? r.evidenceRefs.filter((x): x is string => typeof x === 'string')
+    : [];
+  const satisfactionModes = Array.isArray(r.satisfactionModes)
+    ? r.satisfactionModes
+        .map((m): SatisfactionMode | null => {
+          if (!m || typeof m !== 'object') return null;
+          const mm = m as Record<string, unknown>;
+          const description = typeof mm.description === 'string' && mm.description.trim() ? mm.description : null;
+          if (!description) return null;
+          const markers = Array.isArray(mm.markers)
+            ? mm.markers.filter((x): x is string => typeof x === 'string')
+            : [];
+          return { description, markers };
+        })
+        .filter((m): m is SatisfactionMode => m !== null)
+    : [];
+  const threats = Array.isArray(r.threats)
+    ? r.threats.filter((x): x is string => typeof x === 'string')
+    : [];
+  return { id, condition, kind, appliesTo, evidenceRefs, satisfactionModes, threats };
+}
 export type PreconditionInput = z.infer<typeof PreconditionInputSchema>;
 
 export const DossierBodySchema = z.object({

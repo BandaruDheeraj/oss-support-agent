@@ -67,7 +67,9 @@ Walk \`tests/\` DOWNWARD from the package root to the matching test directory. R
   - fixtures named after suspect concepts (e.g. \`tracer_provider\`, \`event_loop\`, \`mock_openai\`)
 Each fixture that installs the state a precondition requires to be ABSENT becomes a \`threats\` entry. Walking ABOVE the source path won't find these — test infra mirrors source path under \`tests/\`.
 
-Empty preconditions: [] is acceptable for issues with no environmental subtlety. Do NOT fabricate baseline preconditions — that wastes downstream prompt context.`;
+Empty preconditions: [] is acceptable for issues with no environmental subtlety. Do NOT fabricate baseline preconditions — that wastes downstream prompt context.
+
+FINAL REMINDER: regardless of how much you investigated or how confident you are, you MUST end this session by calling record_evidence (with whatever you have) OR abandon (with a reason). Plain-text summaries without a terminal tool call are discarded.`;
 
 export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
   const registry = makeAnalystRegistry({
