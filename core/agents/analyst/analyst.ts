@@ -57,19 +57,21 @@ Each precondition needs:
   - satisfactionModes: ways a test can enforce it. Each mode has a description and \`markers\` — short substrings that should appear in test source when the mode is in force (e.g. for direct injection: ["NonRecordingSpan(", "INVALID_SPAN_CONTEXT"]). List MULTIPLE modes when both global-reset and direct-injection paths exist — downstream agents prefer the simpler one.
   - threats: test-infrastructure items that might VIOLATE the precondition. SEE "Test-infra scan" below.
 
-Test-infra scan (CRITICAL — this is what catches issues like NonRecordingSpan-masked-by-autouse-fixture):
-For each suspect source path, map it to its test mirror. Example:
+Test-infra scan (best-effort — this is what catches issues like NonRecordingSpan-masked-by-autouse-fixture):
+For each suspect source path, MAP it to its likely test mirror and look for relevant fixtures. Example:
   src/openinference/instrumentation/smolagents/_wrappers.py
   → tests/openinference/instrumentation/smolagents/conftest.py
-Walk \`tests/\` DOWNWARD from the package root to the matching test directory. Read EVERY conftest.py on that path with read_file. Also check setup.cfg, pytest.ini, pyproject.toml [tool.pytest.ini_options]. Look for:
+Walk \`tests/\` DOWNWARD from the package root toward the matching test directory using list_dir / read_file. Also check setup.cfg, pytest.ini, pyproject.toml [tool.pytest.ini_options] when easily reachable. Look for:
   - autouse fixtures (\`@pytest.fixture(autouse=True)\`)
   - fixtures that call \`set_tracer_provider\`, \`instrument(\`, \`monkeypatch.setenv\`, \`set_global_handler\`, or similar
   - fixtures named after suspect concepts (e.g. \`tracer_provider\`, \`event_loop\`, \`mock_openai\`)
 Each fixture that installs the state a precondition requires to be ABSENT becomes a \`threats\` entry. Walking ABOVE the source path won't find these — test infra mirrors source path under \`tests/\`.
 
+IMPORTANT: This scan is BEST-EFFORT. If you cannot find a tests/ directory, or no conftest.py exists at the expected path, that is FINE — record_evidence with whatever preconditions you have (or none at all) and move on. NEVER call abandon just because the test-infra scan came up empty. "No relevant test files found" is the COMMON case, not an error condition; it just means there are no test-infra threats to enumerate.
+
 Empty preconditions: [] is acceptable for issues with no environmental subtlety. Do NOT fabricate baseline preconditions — that wastes downstream prompt context.
 
-FINAL REMINDER: regardless of how much you investigated or how confident you are, you MUST end this session by calling record_evidence (with whatever you have) OR abandon (with a reason). Plain-text summaries without a terminal tool call are discarded.`;
+FINAL REMINDER: regardless of how much you investigated or how confident you are, you MUST end this session by calling record_evidence (with whatever you have). Use abandon ONLY when the issue itself is contradictory or empty — NEVER as a way out of an incomplete investigation. Plain-text summaries without a terminal tool call are discarded.`;
 
 export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
   const registry = makeAnalystRegistry({
