@@ -146,22 +146,21 @@ const HEAVY_FRAMEWORK_IMPORTS = [
  * Decide whether to FORCE verbatimSnippetIncompatible=true regardless of
  * what the Planner LLM emitted. True when:
  *   1. There is at least one verbatim snippet, AND
- *   2. Some snippet imports a known heavy 3rd-party agent framework, AND
- *   3. The dossier has at least one precondition with a non-empty
- *      satisfactionMode (i.e. a direct-call fallback path exists).
- * Falling back is safe in this case because the verbatim path is
- * essentially guaranteed to fail in the sandbox.
+ *   2. Some snippet imports a known heavy 3rd-party agent framework.
+ *
+ * We deliberately do NOT require the dossier to carry an explicit
+ * satisfactionMode. Heavy-framework snippets are almost always futile in
+ * the sandbox (no network, no creds, transitive-dep storm), and the
+ * Executor's SYSTEM prompt already knows how to fall back to a
+ * direct-call test using its own reasoning when the flag is set. Gating
+ * on satisfactionMode presence meant a dossier-quality issue (Analyst
+ * forgot to fill in modes) silently broke the escape hatch.
  */
 export function shouldForceVerbatimIncompatible(
   snippets: IssueCodeSnippet[],
-  preconditions: Precondition[]
+  _preconditions: Precondition[]
 ): boolean {
   if (snippets.length === 0) return false;
-  if (preconditions.length === 0) return false;
-  const hasFallback = preconditions.some(
-    (pc) => Array.isArray(pc.satisfactionModes) && pc.satisfactionModes.length > 0
-  );
-  if (!hasFallback) return false;
   return snippets.some((s) => {
     const body = (s.code ?? '').toLowerCase();
     return HEAVY_FRAMEWORK_IMPORTS.some((fw) => {

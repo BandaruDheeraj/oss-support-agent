@@ -176,6 +176,23 @@ export function makeReproExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolReg
         if (ranRepro < 2) {
           return `abandon is forbidden before you have run_repro at least twice (you have ${ranRepro}). Revise the test and run_repro again before considering abandon.`;
         }
+        // Install-fatigue gate: if pip_install has failed 2+ times and the
+        // model has never revised the test, force it to try a different
+        // test approach (typically a direct-call satisfactionMode path
+        // that bypasses the heavy framework) before abandon is allowed.
+        const failedInstalls = transcript.filter(
+          (t) => t.tool === 'pip_install' && (!t.ok || (t.result as any)?.exitCode !== 0)
+        ).length;
+        const revisions = transcript.filter((t) => t.tool === 'revise_test' && t.ok).length;
+        if (failedInstalls >= 2 && revisions === 0) {
+          return (
+            `abandon is forbidden: you have ${failedInstalls} failed pip_install attempts but have NEVER called revise_test. ` +
+            `Install-fatigue is treated as environmental incompatibility — STOP trying to install the heavy framework and INSTEAD ` +
+            `revise_test to a direct-call path that imports the suspect symbol straight from its underlying package (e.g. ` +
+            `opentelemetry.trace.NonRecordingSpan instead of the framework wrapper). Re-run run_repro on the revised test, ` +
+            `then abandon becomes available.`
+          );
+        }
         return null;
       },
     },
