@@ -91,7 +91,7 @@ export async function runReproPlanner(args: RunReproPlannerArgs): Promise<ReproP
       // preconditions, give it one explicit corrective turn before failing.
       const correctivePrompt = `${basePrompt}\n\n[PLANNER RETRY] Your previous plan did not address the following dossier preconditions: ${missed
         .map((p) => `${p.id} (${p.condition})`)
-        .join('; ')}. Every precondition listed in the "Preconditions" block above MUST be named in at least one step's preconditionsAddressed array. If a precondition cannot be satisfied by the verbatim issue snippet (e.g. it needs credentials the sandbox lacks), set verbatimSnippetIncompatible:true AND name a satisfactionMode in a step intent.`;
+        .join('; ')}. Every precondition listed in the "Preconditions" block above MUST be named in at least one step's preconditionsAddressed array. If a precondition cannot be satisfied by the verbatim issue snippet (e.g. it needs credentials the sandbox lacks, OR the snippet imports a heavy third-party framework like smolagents/langchain/llama-index/autogen/crewai that requires network access or unsharded dependencies), set verbatimSnippetIncompatible:true AND name a satisfactionMode in a step intent.`;
       const retry = await generateObject({
         model: getModel('REPRO_PLANNER'),
         schema: ReproPlanSchema,

@@ -109,6 +109,7 @@ Preconditions enforcement:
 Module-install hints:
 - If a run_repro fails with ModuleNotFoundError (or ImportError) on an in-repo import, do NOT try to "fix" the test — the package isn't editable-installed yet. Use pip_install with \`-e <candidate-dir>\` (one of the candidates listed in the user prompt under "Candidate editable-install dirs") matching the failing import's package, then re-run run_repro.
 - pip_install accepts arbitrary requirement specs including \`-e <path>\` for editable installs.
+- Install-fatigue escape hatch: if pip_install fails 2+ times for the SAME third-party heavy framework (e.g. smolagents, langchain, llama-index, autogen, crewai) imported by a verbatim snippet, treat that as an ENVIRONMENTAL failure equivalent to the missing-credentials case. Stop trying to install. Instead, revise_test to a direct-call satisfactionMode path that imports the suspect symbol straight from its underlying package (e.g. opentelemetry.trace) and constructs the inputs by hand. The verbatim-first invariant is satisfied — you DID try verbatim, it failed environmentally, fallback is justified.
 
 Symbol discovery:
 - Third-party symbols (classes/functions from pip / npm / cargo dependencies — e.g. opentelemetry's NonRecordingSpan, pytest's MonkeyPatch) do NOT live in this repo. Import them directly by package path. Do NOT try to locate their source via find_symbol/read_file.
