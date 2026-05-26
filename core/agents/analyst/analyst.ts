@@ -108,7 +108,17 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
   // narrate findings in plain text and exit). Give them exactly one forced
   // retry with an explicit reminder before declaring analyst_failed.
   if (!args.dossier.latest() && (result.terminated === 'finished' || result.terminated === 'max_turns')) {
-    const forcePrompt = `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous attempt ended without calling record_evidence. You MUST call record_evidence now to commit a dossier snapshot, or call abandon with a reason. Plain-text replies are ignored.`;
+    const forcePrompt =
+      `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous attempt ended with a plain-text reply (no tool call). Plain-text replies are DISCARDED. You MUST call record_evidence NOW. Use this minimal template if you are stuck — fill in summary and confidence from what you have already investigated, and set every array to [] if you don't have specific entries:\n\n` +
+      `record_evidence({\n` +
+      `  summary: "<one-paragraph summary of what you found — even if incomplete, write what you have>",\n` +
+      `  confidence: "low",\n` +
+      `  evidence: [],\n` +
+      `  suspectSymbols: [],\n` +
+      `  preconditions: [],\n` +
+      `  openQuestions: []\n` +
+      `})\n\n` +
+      `Do NOT call abandon — abandon is reserved for contradictory or empty issues, not incomplete investigations. Just call record_evidence with whatever you have.`;
     const retry = await runAgentLoop({
       agent: 'ANALYST',
       registry,
