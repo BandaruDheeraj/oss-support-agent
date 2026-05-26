@@ -82,8 +82,25 @@ export async function runReproPlanner(args: RunReproPlannerArgs): Promise<ReproP
       });
 
       const preconditions = args.dossier.body.preconditions ?? [];
+
+      // Deterministic override: if the issue's verbatim snippet imports a
+      // heavy third-party framework AND the dossier already has a precondition
+      // with a non-empty satisfactionMode, the verbatim path is essentially
+      // guaranteed to fail in the sandbox (install-fatigue or env-mismatch).
+      // Force verbatimSnippetIncompatible=true regardless of what the model
+      // emitted. This rescues runs where the model defends the verbatim-first
+      // invariant past its useful range.
+      const forcedIncompatible = shouldForceVerbatimIncompatible(
+        args.issueSnippets ?? [],
+        preconditions
+      );
+      const applyForce = (plan: ReproPlan): ReproPlan =>
+        forcedIncompatible && !plan.verbatimSnippetIncompatible
+          ? { ...plan, verbatimSnippetIncompatible: true }
+          : plan;
+
       const missed = findUnaddressedPreconditions(first.object, preconditions);
-      if (missed.length === 0) return first.object;
+      if (missed.length === 0) return applyForce(first.object);
 
       // Forced retry: every precondition.id must appear in either
       // step.preconditionsAddressed or be substring-matched in step.intent.
@@ -107,9 +124,51 @@ export async function runReproPlanner(args: RunReproPlannerArgs): Promise<ReproP
             .join(', ')}`
         );
       }
-      return retry.object;
+      return applyForce(retry.object);
     }
   );
+}
+
+const HEAVY_FRAMEWORK_IMPORTS = [
+  'smolagents',
+  'langchain',
+  'llama_index',
+  'llamaindex',
+  'llama-index',
+  'autogen',
+  'crewai',
+  'haystack',
+  'guidance',
+  'dspy',
+];
+
+/**
+ * Decide whether to FORCE verbatimSnippetIncompatible=true regardless of
+ * what the Planner LLM emitted. True when:
+ *   1. There is at least one verbatim snippet, AND
+ *   2. Some snippet imports a known heavy 3rd-party agent framework, AND
+ *   3. The dossier has at least one precondition with a non-empty
+ *      satisfactionMode (i.e. a direct-call fallback path exists).
+ * Falling back is safe in this case because the verbatim path is
+ * essentially guaranteed to fail in the sandbox.
+ */
+export function shouldForceVerbatimIncompatible(
+  snippets: IssueCodeSnippet[],
+  preconditions: Precondition[]
+): boolean {
+  if (snippets.length === 0) return false;
+  if (preconditions.length === 0) return false;
+  const hasFallback = preconditions.some(
+    (pc) => Array.isArray(pc.satisfactionModes) && pc.satisfactionModes.length > 0
+  );
+  if (!hasFallback) return false;
+  return snippets.some((s) => {
+    const body = (s.code ?? '').toLowerCase();
+    return HEAVY_FRAMEWORK_IMPORTS.some((fw) => {
+      const tokens = [`import ${fw}`, `from ${fw}`];
+      return tokens.some((t) => body.includes(t));
+    });
+  });
 }
 
 /**
