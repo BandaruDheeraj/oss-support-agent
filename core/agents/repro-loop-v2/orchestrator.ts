@@ -103,6 +103,13 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     return { status: 'planner_failed', dossier, message: err instanceof Error ? err.message : String(err) };
   }
 
+  // Sandbox needs to know the candidate test path before the executor can
+  // call run_repro. Previously the sandbox was constructed (in run-v2.ts)
+  // before the Planner picked the path, so run_repro returned
+  // "reproTestPath not configured" and the executor abandoned. Setting it
+  // here closes that gap.
+  args.sandbox.setReproTestPath(plan.candidateTestPath);
+
   // Stage C: Executor
   const executor = await runReproExecutor({
     attemptId: args.attemptId,

@@ -71,6 +71,9 @@ export function createLocalSandboxAdapter(
   };
 
   const handle: SandboxHandle = {
+    setReproTestPath(p: string) {
+      opts.reproTestPath = p;
+    },
     async runRepro() {
       const reproPath = opts.reproTestPath;
       if (!reproPath) {

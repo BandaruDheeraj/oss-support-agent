@@ -61,6 +61,8 @@ export interface WorkspaceWriter {
 }
 
 export interface SandboxHandle {
+  /** Set the canonical repro test path AFTER it has been chosen (repro-loop). */
+  setReproTestPath(p: string): void;
   /** Run the recorded repro test. Returns full result. */
   runRepro(): Promise<SandboxRun>;
   /** Run the broader test command. */
