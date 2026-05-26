@@ -30,36 +30,38 @@ function renderPreconditionsBlockForExecutor(
   preconditions: Precondition[],
   verbatimIncompatible: boolean
 ): string | null {
-  if (preconditions.length === 0) return null;
-  const lines: string[] = [`PRECONDITIONS THE TEST MUST ENFORCE:`];
-  for (const pc of preconditions) {
-    lines.push(`- [${pc.id}] (${pc.kind}) ${pc.condition}`);
-    if (pc.appliesTo) {
-      lines.push(`    target: ${pc.appliesTo.file}${pc.appliesTo.symbol ? ` :: ${pc.appliesTo.symbol}` : ''}`);
-    }
-    if (pc.satisfactionModes && pc.satisfactionModes.length > 0) {
-      lines.push(`    satisfaction modes (choose one and ensure its markers appear in the test):`);
-      for (const mode of pc.satisfactionModes) {
-        lines.push(`      • ${mode.description}${mode.markers.length > 0 ? ` — markers: ${mode.markers.map((m) => `\`${m}\``).join(', ')}` : ''}`);
+  const lines: string[] = [];
+  if (preconditions.length > 0) {
+    lines.push(`PRECONDITIONS THE TEST MUST ENFORCE:`);
+    for (const pc of preconditions) {
+      lines.push(`- [${pc.id}] (${pc.kind}) ${pc.condition}`);
+      if (pc.appliesTo) {
+        lines.push(`    target: ${pc.appliesTo.file}${pc.appliesTo.symbol ? ` :: ${pc.appliesTo.symbol}` : ''}`);
+      }
+      if (pc.satisfactionModes && pc.satisfactionModes.length > 0) {
+        lines.push(`    satisfaction modes (choose one and ensure its markers appear in the test):`);
+        for (const mode of pc.satisfactionModes) {
+          lines.push(`      • ${mode.description}${mode.markers.length > 0 ? ` — markers: ${mode.markers.map((m) => `\`${m}\``).join(', ')}` : ''}`);
+        }
+      }
+      if (pc.threats && pc.threats.length > 0) {
+        lines.push(`    threats to neutralize: ${pc.threats.join('; ')}`);
       }
     }
-    if (pc.threats && pc.threats.length > 0) {
-      lines.push(`    threats to neutralize: ${pc.threats.join('; ')}`);
-    }
+    lines.push('');
   }
   if (verbatimIncompatible) {
-    lines.push('');
     lines.push(
-      `NOTE: The Planner set verbatimSnippetIncompatible=true. The verbatim issue snippet (if any) cannot satisfy one of the preconditions above (typically because it needs credentials or live services the sandbox lacks). You MAY proceed directly to a satisfactionMode path; the verbatim-first invariant is waived for this run.`
+      `VERBATIM SNIPPET INCOMPATIBLE = TRUE. The Planner determined the verbatim issue snippet CANNOT run in this sandbox (typically because it imports a heavy 3rd-party framework like smolagents/langchain that requires network access or unsharded transitive deps). DO NOT write the verbatim snippet — pip_install will fail repeatedly and waste budget. Instead, your FIRST write_test must be a DIRECT-CALL test that imports the suspect symbol straight from its underlying package (e.g. \`from opentelemetry.trace import NonRecordingSpan, INVALID_SPAN_CONTEXT\`) and constructs the inputs by hand. Any precondition satisfactionMode markers above SHOULD appear in your test source.`
     );
   } else {
-    lines.push('');
     lines.push(
-      `NOTE: The Planner kept verbatimSnippetIncompatible=false. If a verbatim snippet is provided, your FIRST write_test must mirror it. Switch to a satisfactionMode path only AFTER an observed run_repro fails for environmental (not behavioural) reasons.`
+      `Verbatim snippet incompatible = false. If a verbatim snippet is provided, your FIRST write_test must mirror it. Switch to a direct-call path only AFTER an observed run_repro fails for environmental (not behavioural) reasons.`
     );
   }
-  return lines.join('\n');
+  return lines.length > 0 ? lines.join('\n') : null;
 }
+
 
 export interface RunReproExecutorArgs {
   attemptId: string;

@@ -177,20 +177,31 @@ export function makeReproExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolReg
           return `abandon is forbidden before you have run_repro at least twice (you have ${ranRepro}). Revise the test and run_repro again before considering abandon.`;
         }
         // Install-fatigue gate: if pip_install has failed 2+ times and the
-        // model has never revised the test, force it to try a different
-        // test approach (typically a direct-call satisfactionMode path
-        // that bypasses the heavy framework) before abandon is allowed.
+        // model has never revised the test OR hasn't run_repro AFTER the
+        // most recent revise_test, block abandon. Forces an architectural
+        // pivot (typically a direct-call path that bypasses the heavy
+        // framework) before giving up. The previous gate only required
+        // write_test + 2*run_repro, which is satisfied by the failing
+        // verbatim attempt alone — and the next stricter version was
+        // bypassable by a trivial revise_test.
         const failedInstalls = transcript.filter(
           (t) => t.tool === 'pip_install' && (!t.ok || (t.result as any)?.exitCode !== 0)
         ).length;
-        const revisions = transcript.filter((t) => t.tool === 'revise_test' && t.ok).length;
-        if (failedInstalls >= 2 && revisions === 0) {
+        const lastRevise = transcript
+          .map((t, i) => ({ t, i }))
+          .filter(({ t }) => t.tool === 'revise_test' && t.ok)
+          .pop();
+        const ranReproAfterRevise = lastRevise
+          ? transcript.slice(lastRevise.i + 1).some((t) => t.tool === 'run_repro' && t.ok)
+          : false;
+        if (failedInstalls >= 2 && !ranReproAfterRevise) {
           return (
-            `abandon is forbidden: you have ${failedInstalls} failed pip_install attempts but have NEVER called revise_test. ` +
-            `Install-fatigue is treated as environmental incompatibility — STOP trying to install the heavy framework and INSTEAD ` +
-            `revise_test to a direct-call path that imports the suspect symbol straight from its underlying package (e.g. ` +
-            `opentelemetry.trace.NonRecordingSpan instead of the framework wrapper). Re-run run_repro on the revised test, ` +
-            `then abandon becomes available.`
+            `abandon is forbidden: you have ${failedInstalls} failed pip_install attempts ` +
+            `but no revise_test followed by a fresh run_repro. Install-fatigue is treated as environmental ` +
+            `incompatibility — STOP installing the heavy framework and instead revise_test to a direct-call ` +
+            `path that imports the suspect symbol straight from its underlying package (e.g. ` +
+            `opentelemetry.trace.NonRecordingSpan instead of the framework wrapper). Then run_repro on the ` +
+            `revised test. Abandon becomes available only after that observation.`
           );
         }
         return null;
