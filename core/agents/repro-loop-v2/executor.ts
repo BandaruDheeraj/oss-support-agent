@@ -191,6 +191,32 @@ export async function runReproExecutor(args: RunReproExecutorArgs): Promise<Repr
   const last = reproCalls[reproCalls.length - 1];
   const lastExit = typeof (last?.result as any)?.exitCode === 'number' ? (last!.result as any).exitCode : null;
 
+  // Diagnostic: surface the most recent run_repro stderr/stdout tail so
+  // when the model halts with terminated=finished or max_turns we have
+  // a clue what the test was actually doing on its last attempt.
+  const lastStderrTail = typeof (last?.result as any)?.stderr === 'string'
+    ? String((last!.result as any).stderr).slice(-400).replace(/\s+/g, ' ').trim()
+    : '';
+  const lastStdoutTail = typeof (last?.result as any)?.stdout === 'string'
+    ? String((last!.result as any).stdout).slice(-200).replace(/\s+/g, ' ').trim()
+    : '';
+  const toolCounts: Record<string, number> = {};
+  for (const e of transcript) toolCounts[e.tool] = (toolCounts[e.tool] ?? 0) + 1;
+  const toolsSummary = Object.entries(toolCounts)
+    .map(([k, v]) => `${k}(${v})`)
+    .join(' ');
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-executor] attempt=${args.attemptId} terminated=${finalLoop.terminated} turns=${finalLoop.turns}` +
+      ` toolCalls=${transcript.length} runReproCount=${reproCalls.length} lastExit=${lastExit}` +
+      ` verbatimIncompatible=${args.plan.verbatimSnippetIncompatible}` +
+      ` editableInstalls=${(args.editableInstallCandidates ?? []).join('|') || '(none)'}` +
+      ` tools=${toolsSummary || '(none)'}` +
+      (finalLoop.reason ? ` reason=${JSON.stringify(finalLoop.reason).slice(0, 240)}` : '') +
+      (lastStdoutTail ? ` lastStdoutTail=${JSON.stringify(lastStdoutTail)}` : '') +
+      (lastStderrTail ? ` lastStderrTail=${JSON.stringify(lastStderrTail)}` : '')
+  );
+
   return {
     ...finalLoop,
     candidateTestPath: args.plan.candidateTestPath,

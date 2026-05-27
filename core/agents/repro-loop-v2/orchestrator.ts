@@ -111,11 +111,13 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   // Suspect-path-derived candidates know exactly which in-repo package to
   // `pip install -e`.
   let effectiveEditableInstalls = args.editableInstallCandidates ?? [];
+  let suspectDerivedForLog: string[] = [];
   if (args.workspaceDir && (snapshot.body.suspectSymbols ?? []).length > 0) {
     const suspectDerived = deriveEditableInstallsFromSuspectPaths(
       args.workspaceDir,
       snapshot.body.suspectSymbols.map((s) => s.file)
     );
+    suspectDerivedForLog = suspectDerived;
     if (suspectDerived.length > 0) {
       effectiveEditableInstalls = mergeEditableInstallCandidates(
         suspectDerived,
@@ -123,6 +125,12 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       );
     }
   }
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-orchestrator] attempt=${args.attemptId} suspectSymbols=${(snapshot.body.suspectSymbols ?? []).length}` +
+      ` suspectDerivedInstalls=${suspectDerivedForLog.length > 0 ? suspectDerivedForLog.join('|') : '(none)'}` +
+      ` effectiveEditableInstalls=${effectiveEditableInstalls.length > 0 ? effectiveEditableInstalls.join('|') : '(none)'}`
+  );
 
   // Stage B: Planner
   let plan: ReproPlan;
