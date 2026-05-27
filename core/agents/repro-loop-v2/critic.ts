@@ -93,6 +93,33 @@ export function failureExercisesSuspectPath(
   return suspectSymbols.some((s) => s.symbol.length > 0 && allOutput.includes(s.symbol));
 }
 
+/**
+ * Returns true if AT LEAST TWO passing run_repro entries contain the
+ * expected failure signature in their combined stderr+stdout. Vacuously
+ * true if the plan didn't specify a signature (legacy plans).
+ *
+ * Sentinel proves the test failed; this proves it failed for the right
+ * reason. Mirrors the semantics of the sentinel "two hits" reliability
+ * check rather than requiring EVERY run — the Critic may do diagnostic
+ * runs that legitimately don't yet contain the signature.
+ *
+ * See Commit C of the iterative-build executor plan.
+ */
+export function expectedSignatureMatched(
+  reproRuns: Array<{ result: unknown }>,
+  expectedSignature: string
+): boolean {
+  const sig = expectedSignature.trim();
+  if (sig.length === 0) return true;
+  let hits = 0;
+  for (const r of reproRuns) {
+    const out = `${(r.result as any)?.stderr ?? ''}\n${(r.result as any)?.stdout ?? ''}`;
+    if (out.includes(sig)) hits += 1;
+    if (hits >= 2) return true;
+  }
+  return false;
+}
+
 export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdict: ReproVerdict; transcriptSummary: string }> {
   const registry = makeReproCriticRegistry({
     ctx: {
@@ -178,6 +205,13 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
   // New: failure must exercise suspect code path.
   const suspectPathHit = failureExercisesSuspectPath(reproRuns, suspectSymbols);
 
+  // Commit C: expectedFailureSignature must appear in BOTH passing
+  // run_repro outputs. Sentinel proves the test failed; signature proves it
+  // failed for the right reason. Vacuously true if the plan didn't specify
+  // a signature, so legacy plans don't regress.
+  const expectedSig = (args.plan.expectedFailureSignature ?? '').trim();
+  const expectedSigOk = expectedSignatureMatched(reproRuns, expectedSig);
+
   const verdict = await withAgentSpan(
     'REPRO_CRITIC',
     { attempt_id: args.attemptId, issue_number: args.issue.number, dossier_snapshot_id: args.dossierSnapshot.snapshotId, 'critic.phase': 'judge' },
@@ -202,6 +236,10 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
         suspectSymbols.length > 0
           ? `\nFailure path check: stderr references suspect symbol = ${suspectPathHit}`
           : '';
+      const signatureBlock =
+        expectedSig.length > 0
+          ? `\nExpected-signature check: both run_repro outputs contain "${expectedSig}" = ${expectedSigOk}`
+          : '';
       const judged = await generateObject({
         model: getModel('REPRO_CRITIC'),
         schema: ReproVerdictSchema,
@@ -211,7 +249,7 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
             (r) =>
               `- exit=${(r.result as any)?.exitCode}, stderr_head="${String((r.result as any)?.stderr ?? '').slice(0, 200)}"`
           )
-          .join('\n')}\n\nInvestigation tool summary: ${investigation.transcriptSummary}\n\nPlan expected signature: ${args.plan.expectedFailureSignature}\nSentinel: ${args.plan.sentinelString}\n\nStructural pre-check: reliable=${reliable}, sentinelMatchedTwice=${sentinelOk}${suspectBlock}${enforcementBlock}${candidateSourceBlock}`,
+          .join('\n')}\n\nInvestigation tool summary: ${investigation.transcriptSummary}\n\nPlan expected signature: ${args.plan.expectedFailureSignature}\nSentinel: ${args.plan.sentinelString}\n\nStructural pre-check: reliable=${reliable}, sentinelMatchedTwice=${sentinelOk}${suspectBlock}${signatureBlock}${enforcementBlock}${candidateSourceBlock}`,
         experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
       });
       return judged.object;
@@ -222,11 +260,14 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
   // (1) classic: reliable + sentinel
   // (2) new: at least one suspect symbol mentioned in stderr (unless none declared)
   // (3) new: every precondition with declared satisfactionModes is enforced
+  // (4) Commit C: expectedFailureSignature must appear in both passing runs
   if (verdict.verdict === 'approve') {
     const failures: string[] = [];
     if (!reliable) failures.push('not reliably failing');
     if (!sentinelOk) failures.push('sentinel missing');
     if (!suspectPathHit) failures.push('failure did not exercise suspect code path');
+    if (!expectedSigOk)
+      failures.push(`expectedFailureSignature "${expectedSig}" missing from one or both run_repro outputs`);
     if (realUnenforced.length > 0)
       failures.push(`preconditions unenforced: ${realUnenforced.map((e) => e.id).join(', ')}`);
     if (failures.length > 0) {

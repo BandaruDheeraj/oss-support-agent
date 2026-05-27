@@ -1,4 +1,4 @@
-import { evaluatePreconditionEnforcement, failureExercisesSuspectPath } from './critic';
+import { evaluatePreconditionEnforcement, expectedSignatureMatched, failureExercisesSuspectPath } from './critic';
 import type { Precondition } from '../analyst/dossier';
 
 function pcWithModes(modes: Array<{ description: string; markers: string[] }>): Precondition {
@@ -73,5 +73,60 @@ describe('failureExercisesSuspectPath', () => {
   it('checks both stderr and stdout', () => {
     const runs = [{ result: { stderr: '', stdout: 'traceback in _finalize_step_span' } }];
     expect(failureExercisesSuspectPath(runs, suspects)).toBe(true);
+  });
+});
+
+describe('expectedSignatureMatched', () => {
+  it('is vacuously true when no signature is specified', () => {
+    expect(expectedSignatureMatched([], '')).toBe(true);
+    expect(expectedSignatureMatched([], '   ')).toBe(true);
+  });
+
+  it('requires at least two runs containing the signature when specified', () => {
+    const runs = [{ result: { stderr: 'AttributeError: NoneType', stdout: '' } }];
+    expect(expectedSignatureMatched(runs, 'AttributeError')).toBe(false);
+  });
+
+  it('returns true when both runs contain the signature', () => {
+    const runs = [
+      { result: { stderr: 'AttributeError: NoneType has no attribute', stdout: '' } },
+      { result: { stderr: 'AttributeError: NoneType has no attribute', stdout: '' } },
+    ];
+    expect(expectedSignatureMatched(runs, 'AttributeError')).toBe(true);
+  });
+
+  it('returns false when only one of two runs contains the signature', () => {
+    const runs = [
+      { result: { stderr: 'AttributeError: NoneType', stdout: '' } },
+      { result: { stderr: 'TypeError: bad operand', stdout: '' } },
+    ];
+    expect(expectedSignatureMatched(runs, 'AttributeError')).toBe(false);
+  });
+
+  it('returns true when 2 of 3 runs contain the signature (diagnostic run tolerated)', () => {
+    // Mirrors sentinel reliability: "at least two hits", not "every run".
+    const runs = [
+      { result: { stderr: 'ImportError on first attempt', stdout: '' } },
+      { result: { stderr: 'AttributeError: NoneType', stdout: '' } },
+      { result: { stderr: 'AttributeError: NoneType', stdout: '' } },
+    ];
+    expect(expectedSignatureMatched(runs, 'AttributeError')).toBe(true);
+  });
+
+  it('returns false when only 1 of 3 runs contains the signature', () => {
+    const runs = [
+      { result: { stderr: 'ImportError on first attempt', stdout: '' } },
+      { result: { stderr: 'TypeError: bad operand', stdout: '' } },
+      { result: { stderr: 'AttributeError: NoneType', stdout: '' } },
+    ];
+    expect(expectedSignatureMatched(runs, 'AttributeError')).toBe(false);
+  });
+
+  it('checks stdout in addition to stderr', () => {
+    const runs = [
+      { result: { stderr: '', stdout: 'AttributeError on line 42' } },
+      { result: { stderr: 'AttributeError happened', stdout: '' } },
+    ];
+    expect(expectedSignatureMatched(runs, 'AttributeError')).toBe(true);
   });
 });
