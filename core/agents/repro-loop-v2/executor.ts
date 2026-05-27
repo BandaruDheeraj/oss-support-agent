@@ -16,6 +16,7 @@ import {
   renderIssueSnippetsBlock,
   type IssueCodeSnippet,
 } from './repro-hints';
+import { deriveVerifiedState, summariseVerifiedState, renderVerifiedState } from './verified-state';
 
 /**
  * Render dossier preconditions for the Executor's user prompt. This is the
@@ -205,6 +206,14 @@ export async function runReproExecutor(args: RunReproExecutorArgs): Promise<Repr
   const toolsSummary = Object.entries(toolCounts)
     .map(([k, v]) => `${k}(${v})`)
     .join(' ');
+  // Verified-state ledger (Commit A — inert observability). Pre-classified
+  // view of what tool calls have established in the stateful sandbox. The
+  // summary line goes into the existing diagnostic line for grep-ability;
+  // the full rendered ledger is logged separately for post-mortem review.
+  // Behaviourally inert: no prompts or gates consume this yet (Commits B/C).
+  const verifiedState = deriveVerifiedState(transcript);
+  const verifiedSummary = summariseVerifiedState(verifiedState);
+
   // eslint-disable-next-line no-console
   console.log(
     `[v2-executor] attempt=${args.attemptId} terminated=${finalLoop.terminated} turns=${finalLoop.turns}` +
@@ -212,9 +221,14 @@ export async function runReproExecutor(args: RunReproExecutorArgs): Promise<Repr
       ` verbatimIncompatible=${args.plan.verbatimSnippetIncompatible}` +
       ` editableInstalls=${(args.editableInstallCandidates ?? []).join('|') || '(none)'}` +
       ` tools=${toolsSummary || '(none)'}` +
+      ` verifiedState=[${verifiedSummary}]` +
       (finalLoop.reason ? ` reason=${JSON.stringify(finalLoop.reason).slice(0, 240)}` : '') +
       (lastStdoutTail ? ` lastStdoutTail=${JSON.stringify(lastStdoutTail)}` : '') +
       (lastStderrTail ? ` lastStderrTail=${JSON.stringify(lastStderrTail)}` : '')
+  );
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-executor-ledger] attempt=${args.attemptId}\n${renderVerifiedState(verifiedState)}`
   );
 
   return {
