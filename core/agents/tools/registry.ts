@@ -113,7 +113,25 @@ export class ToolRegistry {
     try {
       this.enforceGuards(def);
     } catch (err) {
-      if (err instanceof ToolGuardError) return errorReturn(err);
+      if (err instanceof ToolGuardError) {
+        // Record blocked attempts in the transcript with ok:false so
+        // post-mortems can see whether a gate fired and how often, without
+        // consuming tier/total budget (which only increments on actual
+        // execution). Verified-state derivation ignores !ok entries so
+        // gate-blocked attempts don't pollute the ledger.
+        this.transcript.push({
+          turn: this.turn,
+          tool: def.name,
+          tier: def.tier,
+          args: redactValue(parsed.data),
+          result: undefined,
+          ok: false,
+          error: `[${err.kind}] ${err.message}`.slice(0, 2000),
+          startedAt: ((this.opts.now ?? (() => new Date()))()).toISOString(),
+          durationMs: 0,
+        });
+        return errorReturn(err);
+      }
       throw err;
     }
 
@@ -224,6 +242,14 @@ export class ToolRegistry {
       const blockReason = this.opts.abandonGate(this.transcript.slice());
       if (blockReason) {
         throw new ToolGuardError('abandon_premature', blockReason, def.name);
+      }
+    }
+
+    const gate = this.opts.toolGates?.[def.name];
+    if (gate) {
+      const blockReason = gate(this.transcript.slice());
+      if (blockReason) {
+        throw new ToolGuardError('tool_gate_blocked', blockReason, def.name);
       }
     }
   }

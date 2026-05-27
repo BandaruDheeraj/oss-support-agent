@@ -23,48 +23,32 @@ import { deriveVerifiedState, summariseVerifiedState, renderVerifiedState } from
  * "test contract" the executor must enforce: every listed precondition has
  * to be satisfied by the candidate test for the Critic to approve.
  *
- * The block also surfaces the Planner's verbatimSnippetIncompatible flag
- * so the executor knows whether the verbatim-first invariant
- * (commit 1ae5948) still applies.
+ * Commit B drops the verbatim-incompatible branch — the new probe-first
+ * procedure makes the verbatim vs direct-call choice a consequence of what
+ * the sandbox proves importable, not a prompt-controlled flag. The
+ * `verbatimSnippetIncompatible` field stays on the plan struct (deletion
+ * is deferred to Commit D, gated on observing #46 with the new procedure)
+ * but the Executor no longer conditions its behaviour on it.
  */
-function renderPreconditionsBlockForExecutor(
-  preconditions: Precondition[],
-  verbatimIncompatible: boolean
-): string | null {
-  const lines: string[] = [];
-  if (preconditions.length > 0) {
-    lines.push(`PRECONDITIONS THE TEST MUST ENFORCE:`);
-    for (const pc of preconditions) {
-      lines.push(`- [${pc.id}] (${pc.kind}) ${pc.condition}`);
-      if (pc.appliesTo) {
-        lines.push(`    target: ${pc.appliesTo.file}${pc.appliesTo.symbol ? ` :: ${pc.appliesTo.symbol}` : ''}`);
-      }
-      if (pc.satisfactionModes && pc.satisfactionModes.length > 0) {
-        lines.push(`    satisfaction modes (choose one and ensure its markers appear in the test):`);
-        for (const mode of pc.satisfactionModes) {
-          lines.push(`      • ${mode.description}${mode.markers.length > 0 ? ` — markers: ${mode.markers.map((m) => `\`${m}\``).join(', ')}` : ''}`);
-        }
-      }
-      if (pc.threats && pc.threats.length > 0) {
-        lines.push(`    threats to neutralize: ${pc.threats.join('; ')}`);
+function renderPreconditionsBlockForExecutor(preconditions: Precondition[]): string | null {
+  if (preconditions.length === 0) return null;
+  const lines: string[] = ['PRECONDITIONS THE TEST MUST ENFORCE:'];
+  for (const pc of preconditions) {
+    lines.push(`- [${pc.id}] (${pc.kind}) ${pc.condition}`);
+    if (pc.appliesTo) {
+      lines.push(`    target: ${pc.appliesTo.file}${pc.appliesTo.symbol ? ` :: ${pc.appliesTo.symbol}` : ''}`);
+    }
+    if (pc.satisfactionModes && pc.satisfactionModes.length > 0) {
+      lines.push(`    satisfaction modes (choose one and ensure its markers appear in the test):`);
+      for (const mode of pc.satisfactionModes) {
+        lines.push(`      • ${mode.description}${mode.markers.length > 0 ? ` — markers: ${mode.markers.map((m) => `\`${m}\``).join(', ')}` : ''}`);
       }
     }
-    lines.push('');
+    if (pc.threats && pc.threats.length > 0) {
+      lines.push(`    threats to neutralize: ${pc.threats.join('; ')}`);
+    }
   }
-  if (verbatimIncompatible) {
-    lines.push(
-      `VERBATIM SNIPPET INCOMPATIBLE = TRUE. The Planner determined a heavy 3rd-party framework (smolagents / langchain / llama-index / autogen / crewai / haystack / guidance / dspy) is in play and the verbatim reproduction path cannot run in this sandbox (no network, no creds, transitive-dep storm). Constraints:\n` +
-        `  • DO NOT pip_install the heavy framework runtime itself (e.g. \`pip install smolagents\`). It will fail repeatedly and burn budget — the install-fatigue abandon gate will then terminate the run.\n` +
-        `  • You MAY (and usually should) pip_install -e the in-repo instrumentation package surfaced in "EditableInstall candidates" — that gives you the suspect wrapper module without pulling the heavy runtime.\n` +
-        `  • Your FIRST write_test must be a DIRECT-CALL test: import the suspect symbol straight from its underlying package (e.g. \`from opentelemetry.trace import NonRecordingSpan, INVALID_SPAN_CONTEXT\`) and the suspect wrapper from the editable-installed in-repo package, then construct the inputs by hand. Do NOT write a test that imports or instantiates the heavy framework.\n` +
-        `  • Any precondition satisfactionMode markers above SHOULD appear in your test source.`
-    );
-  } else {
-    lines.push(
-      `Verbatim snippet incompatible = false. If a verbatim snippet is provided, your FIRST write_test must mirror it. Switch to a direct-call path only AFTER an observed run_repro fails for environmental (not behavioural) reasons.`
-    );
-  }
-  return lines.length > 0 ? lines.join('\n') : null;
+  return lines.join('\n');
 }
 
 
@@ -92,36 +76,45 @@ export interface ReproExecutorResult extends AgentLoopResult {
   transcript: Array<{ tool: string; result: unknown; ok: boolean }>;
 }
 
-const SYSTEM = `You are the Repro Executor for an OSS bug pipeline. Use tools to construct a failing test at the candidateTestPath in the plan and prove it fails reproducibly.
+const SYSTEM = `You are the Repro Executor for an OSS bug pipeline. Your job is to construct a failing test at the candidateTestPath in the plan and prove it fails reproducibly. The sandbox is STATEFUL — pip_install, python_module_check and run_python persist across calls within this run. Use that.
 
-Rules:
-- Use write_test / revise_test to author the test. Path must be the candidateTestPath unless you have a strong reason.
-- Embed the sentinelString in your test's failure message (assertion message or print) so we can verify reproducibility.
-- Call run_repro repeatedly. The test must FAIL (exit != 0). If it passes you have not reproduced the issue — investigate more, then revise_test.
-- Before calling done you MUST have two consecutive run_repro results with non-zero exit AND containing the same sentinel-related text in stderr.
-- Do NOT call done in the same model turn as write_test/revise_test/run_repro. Observe the result in the next turn, then emit done.
+Procedure (follow in order; do not skip):
+
+1. PROBE imports. For each suspect symbol in the dossier and each import in the issue snippets:
+   - python_module_check("X") — fast importability check, no execution.
+   - run_python("from X import Y") — confirms the actual import statement works.
+   If an import fails: pip_install with \`-e <candidate-dir>\` from "Candidate editable-install dirs" if the failing module looks like an in-repo package, or grep / find_symbol to locate the correct import path. Repeat until you have a verified import block.
+
+2. PROBE the exercise. Use run_python to actually call the suspect symbols with hand-constructed inputs. Confirm the call executes (whether or not it raises). If it raises the expected failure signature, you already have a working repro skeleton — copy it into the test.
+
+3. COMMIT. ONE write_test call. The test contains: your verified imports, your verified exercise call, and \`assert False, "<sentinel>"\` (or equivalent) at the end so run_repro reports a failure containing the sentinel.
+
+4. VERIFY. run_repro twice. Require exit != 0, sentinel in stderr, AND the dossier's expectedFailureSignature in stderr/stdout.
+
+5. If verification fails because the test PASSED (exit == 0), the exercise didn't actually trigger the bug — go back to step 2, probe more, then revise_test.
+
+Hard rules:
+
+- Do NOT call write_test before step 3. Big-bang authoring burns budget on incorrect imports before any sandbox feedback. Probe first. The registry will block write_test until at least one import probe has succeeded — the error message will show you the verified-state ledger.
+- revise_test is allowed only after at least one run_repro call has produced output you can react to. The registry blocks blind revise loops.
+- Embed the sentinelString in your test's failure message so the orchestrator can verify reproducibility across runs.
+- Before calling done you MUST have two consecutive run_repro results with non-zero exit AND containing the sentinel in stderr.
+- Do NOT call done in the same model turn as write_test/revise_test/run_repro. Observe the result on the next turn, then emit done.
 - You may not modify source files (apply_patch is not registered for you).
 - Each turn make ONE stateful tool call (sandbox/write-test/meta). Reads may be batched.
 
-Setup hints — verbatim-first invariant:
-- If the user prompt lists "Verbatim code snippets from the issue body" AND the plan's verbatimSnippetIncompatible flag is FALSE (the default), your FIRST write_test call MUST encode the first preferred snippet almost verbatim — only wrap it with the sentinel assertion / output capture. Do NOT paraphrase before you have at least one observed run_repro result; subtle rewrites are how repros silently stop reproducing. This invariant comes from commit 1ae5948 and is non-negotiable when the flag is false.
-- ONLY after observing run_repro on the verbatim test AND finding it fails for ENVIRONMENTAL reasons (missing credentials, unreachable model API, unavailable live service — NOT a behavioural mismatch) may you revise to a direct-call test that satisfies the SAME preconditions via one of the satisfactionModes listed in the dossier preconditions block.
-- If the plan's verbatimSnippetIncompatible flag is TRUE, the Planner has determined the verbatim snippet cannot satisfy a named precondition (typically because it requires credentials/services the sandbox lacks). In that case you MAY skip the verbatim step and proceed directly to a satisfactionMode path — but your test MUST enforce every precondition's chosen mode and the markers from that mode SHOULD appear in your test source.
+Verbatim-snippet faithfulness:
+- If the user prompt includes "Verbatim code snippets from the issue body", your first write_test SHOULD preserve those snippets' imports and call sequence as faithfully as the probe-verified state allows — paraphrase only what the sandbox proved doesn't import or doesn't run. Subtle rewrites of the user's exercise code are how repros silently stop reproducing.
+- You may revise toward a direct-call path AFTER observing run_repro fail for ENVIRONMENTAL reasons (missing credentials, unreachable model API, install-fatigue on a heavy framework) — NOT for a behavioural mismatch.
 
 Preconditions enforcement:
-- The user prompt's "PRECONDITIONS THE TEST MUST ENFORCE" block lists conditions the failing test must guarantee. Treat them as test contracts.
-- When a precondition has kind: config_absence with non-empty threats, your test MUST either (a) reset the threatened global before exercising the suspect symbol (e.g. via monkeypatch.setattr on the framework's internal globals), OR (b) bypass the global entirely by importing the suspect symbol and calling it directly with hand-constructed inputs matching the satisfaction-mode markers.
-- Do NOT initialize the very component the precondition requires to be absent. If the dossier flags "no OTel tracer provider configured" as a threat, do not call set_tracer_provider in the test, even via an import that triggers SDK initialization.
+- The user prompt's "PRECONDITIONS THE TEST MUST ENFORCE" block lists conditions the failing test must guarantee. Treat them as test contracts. The Critic will reject any test that does not enforce them.
+- For preconditions with kind: config_absence and non-empty threats, your test MUST either (a) reset the threatened global before exercising the suspect symbol (e.g. via monkeypatch.setattr on the framework's internal globals), OR (b) bypass the global entirely by importing the suspect symbol and calling it directly with hand-constructed inputs. Either way, the chosen satisfactionMode's markers SHOULD appear in your test source.
+- Do NOT initialize the very component the precondition requires to be absent. If the dossier flags "no OTel tracer provider configured" as a threat, do not call set_tracer_provider in the test, even via a transitive import.
 
-Module-install hints:
-- If a run_repro fails with ModuleNotFoundError (or ImportError) on an in-repo import, do NOT try to "fix" the test — the package isn't editable-installed yet. Use pip_install with \`-e <candidate-dir>\` (one of the candidates listed in the user prompt under "Candidate editable-install dirs") matching the failing import's package, then re-run run_repro.
-- pip_install accepts arbitrary requirement specs including \`-e <path>\` for editable installs.
-- Install-fatigue escape hatch: if pip_install fails 2+ times for the SAME third-party heavy framework (e.g. smolagents, langchain, llama-index, autogen, crewai) imported by a verbatim snippet, treat that as an ENVIRONMENTAL failure equivalent to the missing-credentials case. Stop trying to install. Instead, revise_test to a direct-call satisfactionMode path that imports the suspect symbol straight from its underlying package (e.g. opentelemetry.trace) and constructs the inputs by hand. The verbatim-first invariant is satisfied — you DID try verbatim, it failed environmentally, fallback is justified.
-
-Symbol discovery:
-- Third-party symbols (classes/functions from pip / npm / cargo dependencies — e.g. opentelemetry's NonRecordingSpan, pytest's MonkeyPatch) do NOT live in this repo. Import them directly by package path. Do NOT try to locate their source via find_symbol/read_file.
-- When the dossier mentions an in-repo symbol only by name (e.g. "called inside _StepWrapper"), use grep or find_symbol to locate it — it's almost always in the same file or directory as related cited symbols.
-- Only call abandon after you have (a) authored at least one test, (b) run_repro at least twice, and (c) exhausted grep/find_symbol/read_file for any blocking symbol. "Symbol not found in repo" alone is NEVER a sufficient reason to abandon — try importing it from its package first.`;
+Abandon discipline:
+- Only call abandon after you have (a) authored at least one test, (b) run_repro at least twice, and (c) exhausted grep/find_symbol/read_file for any blocking symbol. "Symbol not found in repo" alone is NEVER a sufficient reason — third-party symbols (opentelemetry's NonRecordingSpan, pytest's MonkeyPatch, etc.) live in their package, not in this repo, so try importing them directly first.
+- Install-fatigue: if pip_install fails 2+ times for the same heavy framework (smolagents, langchain, llama-index, autogen, crewai), treat that as environmental incompatibility. Stop installing — pivot to a direct-call path that imports the suspect symbol straight from its underlying package (e.g. opentelemetry.trace), then run_repro on the revised test before considering abandon.`;
 
 export async function runReproExecutor(args: RunReproExecutorArgs): Promise<ReproExecutorResult> {
   const registry = makeReproExecutorRegistry({
@@ -143,20 +136,19 @@ export async function runReproExecutor(args: RunReproExecutorArgs): Promise<Repr
   const snippetBlock = renderIssueSnippetsBlock(args.issueSnippets ?? []);
   const editableBlock = renderEditableInstallsBlock(args.editableInstallCandidates ?? []);
   const preconditionsBlock = renderPreconditionsBlockForExecutor(
-    args.dossierSnapshot.body.preconditions ?? [],
-    args.plan.verbatimSnippetIncompatible
+    args.dossierSnapshot.body.preconditions ?? []
   );
   const hintsParts = [snippetBlock, editableBlock, preconditionsBlock].filter((s): s is string => Boolean(s));
   const hintsSection = hintsParts.length > 0 ? `\n\n${hintsParts.join('\n\n')}` : '';
 
-  const userPrompt = `Plan approach: ${args.plan.approach}\nCandidate test path: ${args.plan.candidateTestPath}\nSentinel string: "${args.plan.sentinelString}"\nExpected failure signature: ${args.plan.expectedFailureSignature}\nVerbatim snippet incompatible: ${args.plan.verbatimSnippetIncompatible ? 'true (Planner determined snippet cannot satisfy a precondition — direct-call path permitted)' : 'false (verbatim-first invariant in force — first write_test must mirror the snippet)'}\nSteps:\n${args.plan.steps
+  const userPrompt = `Plan approach: ${args.plan.approach}\nCandidate test path: ${args.plan.candidateTestPath}\nSentinel string: "${args.plan.sentinelString}"\nExpected failure signature: ${args.plan.expectedFailureSignature}\nSteps:\n${args.plan.steps
     .map((s) => {
       const addr = s.preconditionsAddressed && s.preconditionsAddressed.length > 0
         ? ` [addresses: ${s.preconditionsAddressed.join(', ')}]`
         : '';
       return `- [${s.stepId}] ${s.intent} (hint: ${s.toolHint})${addr}`;
     })
-    .join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}${hintsSection}\n\nConstruct the failing test and prove it fails twice with matching output, then call done with summary and changedFiles=["${args.plan.candidateTestPath}"].`;
+    .join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}${hintsSection}\n\nFollow the probe-first procedure: verify imports and exercise the suspect symbols via run_python / python_module_check FIRST. Only then write_test, then run_repro twice with matching output, then call done with summary and changedFiles=["${args.plan.candidateTestPath}"].`;
 
   const loop = await runAgentLoop({
     agent: 'REPRO_EXECUTOR',

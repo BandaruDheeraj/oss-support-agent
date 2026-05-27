@@ -83,6 +83,23 @@ describe('deriveVerifiedState', () => {
     expect(s.notImportable.map((n) => n.module)).toContain('smolagents');
   });
 
+  it('credits the imported module when run_python fails for a NON-import reason', () => {
+    // Strong probes that "import + exercise" the bug exit non-zero. The
+    // import itself succeeded — the failure surfaced after import. Without
+    // this credit, the gate would block write_test even though the model
+    // has actually found a working repro skeleton.
+    const s = deriveVerifiedState([
+      entry({ tool: 'run_python', tier: sandbox, ok: false,
+        args: { snippet: 'from openinference.instrumentation.smolagents._wrappers import _StepWrapper\n_StepWrapper(None)._finalize_step_span()' },
+        result: { exitCode: 1, stdout: '',
+          stderr: "Traceback (most recent call last):\n  ...\nAttributeError: 'NoneType' object has no attribute 'tracer'" } }),
+    ]);
+    expect(s.importable).toContain('openinference.instrumentation.smolagents._wrappers');
+    expect(s.notImportable.map((n) => n.module)).not.toContain(
+      'openinference.instrumentation.smolagents._wrappers'
+    );
+  });
+
   it('lets a later successful import promote a module out of not-importable', () => {
     const s = deriveVerifiedState([
       entry({ tool: 'python_module_check', tier: sandbox, ok: true,

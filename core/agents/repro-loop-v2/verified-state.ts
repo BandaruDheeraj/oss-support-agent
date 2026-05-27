@@ -101,22 +101,31 @@ export function deriveVerifiedState(transcript: TranscriptEntry[]): VerifiedSand
       const exit = typeof r?.exitCode === 'number' ? r.exitCode : (e.ok ? 0 : 1);
       const stderr = typeof r?.stderr === 'string' ? r.stderr : '';
       const snippet = typeof args?.snippet === 'string' ? args.snippet : '';
+      const importMatch = snippet.match(IMPORT_LINE_RE);
+      const importedModule = importMatch?.[1] ?? importMatch?.[2];
       if (e.ok && exit === 0) {
         runPythonSuccessCount += 1;
         // If the snippet was effectively an import probe, record the module.
-        const m = snippet.match(IMPORT_LINE_RE);
-        const mod = m?.[1] ?? m?.[2];
-        if (mod && !seenImportable.has(mod)) {
-          importable.push(mod);
-          seenImportable.add(mod);
-          notImportableMap.delete(mod);
+        if (importedModule && !seenImportable.has(importedModule)) {
+          importable.push(importedModule);
+          seenImportable.add(importedModule);
+          notImportableMap.delete(importedModule);
         }
       } else {
         runPythonFailureCount += 1;
         // Try to extract a failed import target from stderr.
-        const m = stderr.match(MODULE_NOT_FOUND_RE);
-        if (m?.[1]) {
-          notImportableMap.set(m[1], m[0].trim().slice(0, 200));
+        const modErr = stderr.match(MODULE_NOT_FOUND_RE);
+        if (modErr?.[1]) {
+          notImportableMap.set(modErr[1], modErr[0].trim().slice(0, 200));
+        } else if (importedModule && !seenImportable.has(importedModule)) {
+          // Non-import failure (e.g. the bug raised, AttributeError, etc.).
+          // The import line itself succeeded — Python parses+executes top-down
+          // and the failure surfaced after import. Credit the module as
+          // importable so a strong "probe + exercise" snippet that reaches
+          // the bug doesn't get classified as no-progress by the probe gate.
+          importable.push(importedModule);
+          seenImportable.add(importedModule);
+          notImportableMap.delete(importedModule);
         }
       }
       continue;

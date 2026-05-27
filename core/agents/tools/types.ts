@@ -55,6 +55,20 @@ export interface RegistryOptions {
    * ToolGuardError with that message so the model keeps working.
    */
   abandonGate?: (transcript: TranscriptEntry[]) => string | null;
+  /**
+   * Optional per-tool soft gates evaluated BEFORE the tool runs. Keyed by
+   * tool name. Each gate receives the transcript so far and returns null to
+   * allow the call, or a string error message — the registry throws a
+   * ToolGuardError so the model sees the message as an in-band tool response
+   * and can react on the next turn.
+   *
+   * Used by the Repro Executor registry to enforce a probe-first procedure:
+   *   - write_test: blocked until the verified-state ledger shows ≥1
+   *     successful probe (run_python or python_module_check importable=true).
+   *   - revise_test: blocked unless the most recent successful stateful tool
+   *     call was run_repro (forces an observation between rewrites).
+   */
+  toolGates?: Record<string, (transcript: TranscriptEntry[]) => string | null>;
 }
 
 export class ToolGuardError extends Error {
@@ -68,7 +82,8 @@ export class ToolGuardError extends Error {
     | 'invalid_args'
     | 'hypothesis_required'
     | 'patch_scope'
-    | 'abandon_premature';
+    | 'abandon_premature'
+    | 'tool_gate_blocked';
   public readonly tool?: string;
 
   constructor(kind: ToolGuardError['kind'], message: string, tool?: string) {

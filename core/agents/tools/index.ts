@@ -11,7 +11,8 @@ import { NOTE_META_TOOLS, note, stateHypothesis, recordEvidence, writeInvestigat
 import { WRITE_TEST_TOOLS } from './write-test';
 import { MUTATION_TOOLS } from './mutation';
 import { SANDBOX_TOOLS } from './sandbox';
-import type { ToolContext, RegistryBudgets } from './types';
+import { deriveVerifiedState, renderVerifiedState } from '../repro-loop-v2/verified-state';
+import type { ToolContext, RegistryBudgets, TranscriptEntry } from './types';
 
 export interface RegistryFactoryArgs {
   ctx: Omit<ToolContext, 'recordTranscript' | 'getTranscript'>;
@@ -165,6 +166,18 @@ export function makeReproExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolReg
     {
       budgets: defaultBudgets({ total: 70, perTier: { mutation: 0 } }),
       maxTurns: 22,
+      // Probe-first soft gates (Commit B). Forces the Executor to actually
+      // exercise its tools before authoring/revising a test, AND to observe
+      // a run_repro between rewrites — so it can't default to the legacy
+      // "write the whole test first, hope it works" pattern, nor blind-loop
+      // on write_test/revise_test. Rejection messages embed the rendered
+      // verified-state ledger so the model sees what's been established.
+      toolGates: {
+        write_test: (transcript) =>
+          gateRequirePriorProbe(transcript) ?? gateRequireRunReproSinceLastWrite(transcript),
+        revise_test: (transcript) =>
+          gateRequirePriorProbe(transcript) ?? gateRequireRunReproSinceLastWrite(transcript),
+      },
       abandonGate: (transcript) => {
         const wroteTest = transcript.some(
           (t) => (t.tool === 'write_test' || t.tool === 'revise_test') && t.ok,
@@ -239,3 +252,66 @@ export * from './types';
 export * from './handles';
 export { ToolRegistry } from './registry';
 export { READ_TOOLS, NOTE_META_TOOLS, WRITE_TEST_TOOLS, MUTATION_TOOLS, SANDBOX_TOOLS };
+
+/**
+ * write_test/revise_test probe gate: reject if the verified-state ledger
+ * shows no successfully importable module. We deliberately use
+ * `state.importable` (populated from python_module_check importable=true OR
+ * a successful run_python whose snippet contained `from X import …` or
+ * `import X`) instead of `runPythonSuccessCount`, because the latter would
+ * accept noise like `run_python("print(1)")` as a "probe". An import-shaped
+ * probe is the only thing that proves the sandbox can actually load the
+ * suspect symbols.
+ *
+ * verified-state.ts also credits the imports from a run_python that FAILS
+ * for non-import reasons (e.g. the bug itself raised) — so a strong probe
+ * that reaches the bug still satisfies the gate.
+ *
+ * The rendered ledger is embedded in the error message so the model sees
+ * exactly what's verified vs not when corrected.
+ */
+export function gateRequirePriorProbe(transcript: TranscriptEntry[]): string | null {
+  const state = deriveVerifiedState(transcript);
+  if (state.importable.length > 0) return null;
+  return (
+    `write_test/revise_test is blocked: no successful import probe yet. Probe at least one ` +
+    `import via python_module_check("X") OR run_python("from X import Y") so the verified-state ` +
+    `ledger shows the sandbox can actually load the suspect symbols before you commit the test. ` +
+    `print(1) and other non-import run_python calls do not count. Big-bang authoring is what ` +
+    `we are explicitly avoiding.\n\n${renderVerifiedState(state)}`
+  );
+}
+
+/**
+ * revise_test gate: reject if there has been a successful write_test or
+ * revise_test but no successful run_repro since the most recent of those.
+ * Forces an observation between rewrites — no "blind revise" loops.
+ *
+ * Allowed on the FIRST revise_test if no prior write succeeded (the model
+ * may be using revise_test as a write_test alias; the write_test gate will
+ * still apply on its own.) and allowed if the most recent commit was
+ * followed by a successful run_repro.
+ */
+export function gateRequireRunReproSinceLastWrite(
+  transcript: TranscriptEntry[]
+): string | null {
+  let lastWriteIdx = -1;
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    const e = transcript[i];
+    if ((e.tool === 'write_test' || e.tool === 'revise_test') && e.ok) {
+      lastWriteIdx = i;
+      break;
+    }
+  }
+  if (lastWriteIdx < 0) return null;
+  const ranReproSince = transcript
+    .slice(lastWriteIdx + 1)
+    .some((e) => e.tool === 'run_repro' && e.ok);
+  if (ranReproSince) return null;
+  const state = deriveVerifiedState(transcript);
+  return (
+    `revise_test is blocked: you have not run run_repro since your last successful ` +
+    `write_test/revise_test. Call run_repro first so you have an observation to react to — ` +
+    `blind revise loops burn budget without producing new evidence.\n\n${renderVerifiedState(state)}`
+  );
+}
