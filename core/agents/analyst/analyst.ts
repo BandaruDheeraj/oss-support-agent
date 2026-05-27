@@ -95,6 +95,13 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
 
   const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\n${args.issue.body}\n\nRepo: ${args.repo.fullName} (affected module: ${args.repo.affectedModule}, language: ${args.repo.language})${carry}\n\nInvestigate and produce an EvidenceDossier via record_evidence.`;
 
+  // Pin Analyst to a strong tool-calling model unless explicitly overridden.
+  // We bypass OPENROUTER_MODEL_DEFAULT here because some defaults (e.g.
+  // smaller/cheaper models) silently stop emitting tool calls and exit with
+  // a plain-text summary, which is then discarded — leading to repeated
+  // `terminated=finished` failures with no dossier.
+  const analystModel = process.env.OPENROUTER_MODEL_ANALYST || 'anthropic/claude-sonnet-4.5';
+
   const result = await runAgentLoop({
     agent: 'ANALYST',
     registry,
@@ -102,7 +109,10 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
     user: userPrompt,
     attemptId: args.attemptId,
     issueNumber: args.issue.number,
+    modelOverride: analystModel,
   });
+
+  logAnalystAttempt('initial', args.attemptId, analystModel, result, !!args.dossier.latest());
 
   // Some models stop emitting tool calls before recording the dossier (they
   // narrate findings in plain text and exit). Give them exactly one forced
@@ -126,7 +136,9 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
       user: forcePrompt,
       attemptId: args.attemptId,
       issueNumber: args.issue.number,
+      modelOverride: analystModel,
     });
+    logAnalystAttempt('retry', args.attemptId, analystModel, retry, !!args.dossier.latest());
     return {
       snapshot: args.dossier.latest(),
       terminated: retry.terminated,
@@ -143,4 +155,28 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
     toolCalls: result.toolCalls,
     transcriptSummary: result.transcriptSummary,
   };
+}
+
+/**
+ * Diagnostic logger for the Analyst stage. Emits a single line per attempt
+ * (initial + optional retry) so we can see WHY the Analyst halts when it
+ * fails to record a dossier — model id, turns, tool-call counts, terminated
+ * kind/reason, transcript summary, and a preview of any final plaintext.
+ */
+function logAnalystAttempt(
+  phase: 'initial' | 'retry',
+  attemptId: string,
+  model: string,
+  result: { terminated: string; reason?: string; turns: number; toolCalls: number; transcriptSummary: string; text: string },
+  dossierRecorded: boolean
+): void {
+  const textPreview = (result.text || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-analyst] attempt=${attemptId} phase=${phase} model=${model} terminated=${result.terminated}` +
+      ` turns=${result.turns} toolCalls=${result.toolCalls} dossierRecorded=${dossierRecorded}` +
+      (result.reason ? ` reason=${JSON.stringify(result.reason).slice(0, 240)}` : '') +
+      ` tools=${result.transcriptSummary}` +
+      (textPreview ? ` textPreview=${JSON.stringify(textPreview)}` : '')
+  );
 }
