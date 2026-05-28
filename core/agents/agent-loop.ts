@@ -112,6 +112,7 @@ async function runAgentLoopOnce(args: RunAgentLoopArgs): Promise<AgentLoopResult
           tools,
           toolChoice: 'auto',
           maxSteps: 30,
+          maxTokens: Number(process.env.AGENT_LOOP_MAX_TOKENS ?? 16000),
           experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
           onStepFinish: (step) => {
             totalTurns += 1;
