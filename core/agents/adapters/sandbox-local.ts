@@ -14,6 +14,27 @@ import { execCommand, LocalWorkspace } from '../../../bin/clients/local-workspac
 import { ensurePythonVenv } from '../../../bin/clients/local-sandbox';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
 
+/**
+ * Build a `pip install <args>` command from a free-form spec.
+ *
+ * The LLM hands us a single string like `-e python/instrumentation/foo` or
+ * `package==1.2.3`. Naively wrapping that in one JSON.stringify produces
+ * `pip install "-e python/instrumentation/foo"` — the shell then forwards
+ * `-e python/instrumentation/foo` as ONE argv token with an embedded space,
+ * which pip's argparse cannot split into flag + value, so pip falls back to
+ * treating ` python/instrumentation/foo` (leading space!) as the editable
+ * path and rejects it with "is not a valid editable requirement".
+ *
+ * Splitting on whitespace and quoting each token individually preserves the
+ * `-e <path>` shape pip expects while still being shell-safe.
+ *
+ * Exported for unit tests.
+ */
+export function buildPipInstallCommand(spec: string): string {
+  const tokens = spec.trim().split(/\s+/).filter((t) => t.length > 0);
+  return `pip install ${tokens.map((t) => JSON.stringify(t)).join(' ')}`;
+}
+
 export interface LocalSandboxAdapterOptions {
   /** Per-command timeout in milliseconds (default 600_000 = 10 min). */
   perCommandTimeoutMs?: number;
@@ -122,7 +143,7 @@ export function createLocalSandboxAdapter(
       };
     },
     async pipInstall(spec: string) {
-      return runShell(`pip install ${JSON.stringify(spec)}`);
+      return runShell(buildPipInstallCommand(spec));
     },
     async pythonModuleCheck(name: string) {
       const snippet = `import importlib, json\ntry:\n  m = importlib.import_module(${JSON.stringify(name)})\n  v = getattr(m, "__version__", None)\n  print(json.dumps({"importable": True, "version": v}))\nexcept Exception as e:\n  print(json.dumps({"importable": False, "error": str(e)}))\n`;

@@ -5,6 +5,7 @@
 import { runSandbox } from '../../sandbox';
 import type { ActionsClient, SandboxConfig } from '../../sandbox-types';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
+import { buildPipInstallCommand } from './sandbox-local';
 
 export interface GhActionsSandboxAdapterOptions {
   actionsClient: ActionsClient;
@@ -61,7 +62,7 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
       return runOne(`python -c '${escaped}'`);
     },
     async pipInstall(spec) {
-      return runOne(`pip install ${JSON.stringify(spec)}`);
+      return runOne(buildPipInstallCommand(spec));
     },
     async pythonModuleCheck(name) {
       const r = await handle.runPython(
