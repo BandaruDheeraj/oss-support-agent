@@ -53,12 +53,19 @@ export async function runAgentLoop(args: RunAgentLoopArgs): Promise<AgentLoopRes
   // has at least one strict structured tool that an LLM can mis-emit.
   if (first.terminated !== 'error' || !first.reason) return first;
 
-  const corrective =
-    `${args.user}\n\n[ORCHESTRATOR REMINDER] Your previous attempt aborted with a tool-validation error:\n` +
-    `  ${truncate(first.reason, 1200)}\n\n` +
-    `Re-emit your terminal tool call with VALID arguments. Inspect the tool's parameter schema carefully — ` +
-    `all fields without an "optional" marker are required. Do NOT drop any required field. ` +
-    `If you need to record evidence, every evidence item needs id, kind, source, and summary at minimum.`;
+  const isJsonParseFailure = first.reason.includes('JSON parsing failed');
+  const corrective = isJsonParseFailure
+    ? `${args.user}\n\n[ORCHESTRATOR REMINDER] Your previous terminal tool call failed JSON parsing:\n` +
+      `  ${truncate(first.reason, 800)}\n\n` +
+      `This usually happens when the model appends extra tokens after the JSON object (e.g. XML envelope tokens like </parameter></invoke>, prose, or partial duplicate keys). ` +
+      `Emit your tool call with VALID JSON arguments — ONE single JSON object, no trailing text, no XML tags, no commentary. ` +
+      `If your previous call was too large (>4KB), drop optional fields like \`candidateRepro\` and \`evidence[].detail\` text to slim it down. ` +
+      `When in doubt, omit candidateRepro entirely.`
+    : `${args.user}\n\n[ORCHESTRATOR REMINDER] Your previous attempt aborted with a tool-validation error:\n` +
+      `  ${truncate(first.reason, 1200)}\n\n` +
+      `Re-emit your terminal tool call with VALID arguments. Inspect the tool's parameter schema carefully — ` +
+      `all fields without an "optional" marker are required. Do NOT drop any required field. ` +
+      `If you need to record evidence, every evidence item needs id, kind, source, and summary at minimum.`;
 
   const retry = await runAgentLoopOnce({ ...args, user: corrective });
   return {
