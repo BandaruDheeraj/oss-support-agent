@@ -78,6 +78,38 @@ describe('dossier snapshot id', () => {
     });
     expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withPc));
   });
+
+  it('omits absent reproRecipe from the canonical hash (backward compat)', () => {
+    // Body literally lacking the reproRecipe key (pre-Prober pipeline)
+    const legacy = makeBody();
+    // Body where reproRecipe is explicitly undefined (post-Prober pipeline
+    // before Prober runs) — should hash identically
+    const explicitUndef = { ...makeBody(), reproRecipe: undefined } as DossierBody;
+    expect(snapshotIdFor(explicitUndef)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('changes when reproRecipe is present', () => {
+    const without = makeBody();
+    const recipe: NonNullable<DossierBody['reproRecipe']> = {
+      version: 1,
+      candidateTestPath: 'tests/repro_46.py',
+      testSource: 'def test_x():\n    assert False  # SENTINEL_46\n',
+      sentinelString: 'SENTINEL_46',
+      pipInstalls: [],
+      requiresCredentials: [],
+      verbatimSnippetIncompatible: false,
+      approach: '',
+      provenance: {
+        exerciseImports: [],
+        preconditionsSatisfied: [],
+        observedProbe: null,
+        proberAttempts: 0,
+        recordedAt: '2025-01-01T00:00:00.000Z',
+      },
+    };
+    const withRecipe = makeBody({ reproRecipe: recipe });
+    expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withRecipe));
+  });
 });
 
 describe('DossierStore.deserialize backward compat', () => {
@@ -145,5 +177,78 @@ describe('DossierStore.deserialize backward compat', () => {
     expect(rehydrated.latest()!.snapshotId).toBe(snap.snapshotId);
     expect(rehydrated.latest()!.body.preconditions).toHaveLength(1);
     expect(rehydrated.latest()!.body.preconditions[0].kind).toBe('config_absence');
+  });
+
+  it('round-trips a reproRecipe with observedProbe', () => {
+    const store = new DossierStore();
+    const snap = store.append({
+      issueNumber: 46,
+      attemptId: 'attempt-1',
+      evidence: [],
+      suspectSymbols: [],
+      openQuestions: [],
+      summary: 's',
+      confidence: 'high',
+      reproRecipe: {
+        version: 1,
+        candidateTestPath: 'tests/repro_46.py',
+        testSource:
+          'from opentelemetry import trace\nfrom openinference.instrumentation.smolagents import SmolagentsInstrumentor\n\ndef test_repro():\n    SmolagentsInstrumentor().instrument()\n    span = trace.get_current_span()\n    assert hasattr(span, "set_attribute")  # SENTINEL_46\n',
+        sentinelString: 'SENTINEL_46',
+        expectedFailureSignature: "AttributeError: 'NonRecordingSpan'",
+        pipInstalls: [
+          { package: 'openinference-instrumentation-smolagents', editable: true },
+        ],
+        requiresCredentials: [],
+        verbatimSnippetIncompatible: true,
+        approach: 'Trigger NonRecordingSpan in instrumented smolagents path.',
+        provenance: {
+          exerciseImports: ['openinference.instrumentation.smolagents'],
+          preconditionsSatisfied: ['pc-0'],
+          observedProbe: {
+            sentinelObserved: true,
+            signatureObserved: true,
+            exitCode: 1,
+            durationMs: 432,
+            stderrTail: "AttributeError: 'NonRecordingSpan' object has no attribute 'set_attribute'\n",
+            stdoutTail: 'SENTINEL_46\n',
+          },
+          proberAttempts: 2,
+          recordedAt: '2025-01-01T00:00:00.000Z',
+        },
+      },
+    });
+
+    const rehydrated = DossierStore.deserialize(store.serialize());
+    expect(rehydrated.latest()!.snapshotId).toBe(snap.snapshotId);
+    const recipe = rehydrated.latest()!.body.reproRecipe!;
+    expect(recipe.candidateTestPath).toBe('tests/repro_46.py');
+    expect(recipe.provenance.observedProbe?.sentinelObserved).toBe(true);
+    expect(recipe.provenance.observedProbe?.signatureObserved).toBe(true);
+    expect(recipe.pipInstalls[0]).toEqual({
+      package: 'openinference-instrumentation-smolagents',
+      editable: true,
+    });
+  });
+
+  it('legacy snapshots (no reproRecipe key) keep their id after deserialize', () => {
+    // Pre-Prober body: lacks both preconditions AND reproRecipe entirely.
+    const legacyBody = {
+      issueNumber: 46,
+      attemptId: 'attempt-1',
+      parentSnapshotId: null,
+      evidence: [],
+      suspectSymbols: [],
+      openQuestions: [],
+      summary: 's',
+      confidence: 'medium' as const,
+    };
+    const legacyId = snapshotIdFor(legacyBody as unknown as DossierBody);
+    const persisted = JSON.stringify([
+      { snapshotId: legacyId, createdAt: '2025-01-01T00:00:00.000Z', body: legacyBody },
+    ]);
+    const store = DossierStore.deserialize(persisted);
+    expect(store.latest()!.snapshotId).toBe(legacyId);
+    expect(store.latest()!.body.reproRecipe).toBeUndefined();
   });
 });

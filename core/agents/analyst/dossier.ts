@@ -198,6 +198,208 @@ export function normalizePreconditionInput(
 }
 export type PreconditionInput = z.infer<typeof PreconditionInputSchema>;
 
+/**
+ * ReproRecipe — the structured plan + observed proof emitted by the Prober
+ * stage. The deterministic Executor consumes this object to write the test
+ * and run it; it carries no LLM-authored side effects beyond what's in here.
+ *
+ * Storage contract: OPTIONAL at the schema layer so legacy snapshots (pre-
+ * recipe) deserialize successfully. The orchestrator enforces the
+ * execution-time invariant that a recipe MUST be present before the
+ * deterministic Executor runs.
+ *
+ * Size contract: `testSource` is capped at 4096 chars. Anything longer is
+ * almost certainly off-task scaffolding — the goal is a focused failing
+ * test, not a vendored module.
+ */
+export const REPRO_RECIPE_TEST_SOURCE_MAX = 4096;
+export const REPRO_RECIPE_OBSERVED_TAIL_MAX = 2048;
+
+export const ReproRecipePipInstallSchema = z.object({
+  package: z.string().min(1),
+  editable: z.boolean().default(false),
+});
+export type ReproRecipePipInstall = z.infer<typeof ReproRecipePipInstallSchema>;
+
+/**
+ * Observed-probe block: when the Prober actually ran the candidate test in
+ * its own sandbox, it records what it saw. The Critic uses these flags to
+ * decide whether `expectedFailureSignature` is a hard gate (when observed)
+ * or a soft signal (when not). `null` means the recipe was never probed —
+ * the orchestrator treats this as a Prober failure unless explicitly
+ * allowed.
+ */
+export const ReproRecipeObservedProbeSchema = z.object({
+  sentinelObserved: z.boolean(),
+  signatureObserved: z.boolean(),
+  exitCode: z.number().int(),
+  durationMs: z.number().int().nonnegative(),
+  stderrTail: z.string().max(REPRO_RECIPE_OBSERVED_TAIL_MAX),
+  stdoutTail: z.string().max(REPRO_RECIPE_OBSERVED_TAIL_MAX),
+});
+export type ReproRecipeObservedProbe = z.infer<typeof ReproRecipeObservedProbeSchema>;
+
+export const ReproRecipeSchema = z.object({
+  version: z.literal(1),
+  candidateTestPath: z.string().min(1),
+  testSource: z.string().min(1).max(REPRO_RECIPE_TEST_SOURCE_MAX),
+  sentinelString: z.string().min(1),
+  expectedFailureSignature: z.string().min(1).optional(),
+  pipInstalls: z.array(ReproRecipePipInstallSchema).default([]),
+  requiresCredentials: z.array(z.string().min(1)).default([]),
+  verbatimSnippetIncompatible: z.boolean().default(false),
+  approach: z.string().max(2000).default(''),
+  provenance: z.object({
+    exerciseImports: z.array(z.string()).default([]),
+    preconditionsSatisfied: z.array(z.string()).default([]),
+    observedProbe: ReproRecipeObservedProbeSchema.nullable().default(null),
+    proberAttempts: z.number().int().nonnegative().default(0),
+    recordedAt: z.string().min(1),
+  }),
+});
+export type ReproRecipe = z.infer<typeof ReproRecipeSchema>;
+
+/**
+ * Loose input shape accepted by the Prober's record_evidence call. LLM
+ * tooling reliably forgets defaultable fields; we coerce in the executor.
+ */
+export const ReproRecipeInputSchema = z
+  .object({
+    version: z.literal(1).optional(),
+    candidateTestPath: z.string().min(1),
+    testSource: z.string().min(1),
+    sentinelString: z.string().min(1),
+    expectedFailureSignature: z.string().optional(),
+    pipInstalls: z
+      .array(
+        z
+          .object({ package: z.string().min(1), editable: z.boolean().optional() })
+          .passthrough()
+      )
+      .optional(),
+    requiresCredentials: z.array(z.string()).optional(),
+    verbatimSnippetIncompatible: z.boolean().optional(),
+    approach: z.string().optional(),
+    provenance: z
+      .object({
+        exerciseImports: z.array(z.string()).optional(),
+        preconditionsSatisfied: z.array(z.string()).optional(),
+        observedProbe: z
+          .object({
+            sentinelObserved: z.boolean(),
+            signatureObserved: z.boolean(),
+            exitCode: z.number().int(),
+            durationMs: z.number().int().nonnegative(),
+            stderrTail: z.string(),
+            stdoutTail: z.string(),
+          })
+          .nullable()
+          .optional(),
+        proberAttempts: z.number().int().nonnegative().optional(),
+        recordedAt: z.string().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+export type ReproRecipeInput = z.infer<typeof ReproRecipeInputSchema>;
+
+/**
+ * Coerce a loose recipe input into a strict ReproRecipe, applying defaults
+ * + clipping testSource/stderrTail/stdoutTail to schema caps. Returns null
+ * if the input lacks the minimum required fields (path, source, sentinel).
+ */
+export function normalizeReproRecipeInput(raw: unknown): ReproRecipe | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const candidateTestPath = typeof r.candidateTestPath === 'string' && r.candidateTestPath.trim()
+    ? r.candidateTestPath.trim()
+    : null;
+  const testSourceRaw = typeof r.testSource === 'string' ? r.testSource : null;
+  const sentinelString = typeof r.sentinelString === 'string' && r.sentinelString.trim()
+    ? r.sentinelString
+    : null;
+  if (!candidateTestPath || !testSourceRaw || !sentinelString) return null;
+  const testSource = testSourceRaw.length > REPRO_RECIPE_TEST_SOURCE_MAX
+    ? testSourceRaw.slice(0, REPRO_RECIPE_TEST_SOURCE_MAX)
+    : testSourceRaw;
+  const expectedFailureSignature =
+    typeof r.expectedFailureSignature === 'string' && r.expectedFailureSignature.trim()
+      ? r.expectedFailureSignature
+      : undefined;
+  const pipInstalls = Array.isArray(r.pipInstalls)
+    ? r.pipInstalls
+        .map((p): ReproRecipePipInstall | null => {
+          if (!p || typeof p !== 'object') return null;
+          const pp = p as Record<string, unknown>;
+          const pkg = typeof pp.package === 'string' && pp.package.trim() ? pp.package : null;
+          if (!pkg) return null;
+          return { package: pkg, editable: pp.editable === true };
+        })
+        .filter((p): p is ReproRecipePipInstall => p !== null)
+    : [];
+  const requiresCredentials = Array.isArray(r.requiresCredentials)
+    ? r.requiresCredentials.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+    : [];
+  const verbatimSnippetIncompatible = r.verbatimSnippetIncompatible === true;
+  const approach = typeof r.approach === 'string' ? r.approach.slice(0, 2000) : '';
+  const provRaw = (r.provenance && typeof r.provenance === 'object'
+    ? (r.provenance as Record<string, unknown>)
+    : {});
+  const exerciseImports = Array.isArray(provRaw.exerciseImports)
+    ? provRaw.exerciseImports.filter((x): x is string => typeof x === 'string')
+    : [];
+  const preconditionsSatisfied = Array.isArray(provRaw.preconditionsSatisfied)
+    ? provRaw.preconditionsSatisfied.filter((x): x is string => typeof x === 'string')
+    : [];
+  let observedProbe: ReproRecipeObservedProbe | null = null;
+  if (provRaw.observedProbe && typeof provRaw.observedProbe === 'object') {
+    const op = provRaw.observedProbe as Record<string, unknown>;
+    const exitCode = typeof op.exitCode === 'number' ? Math.trunc(op.exitCode) : null;
+    const durationMs = typeof op.durationMs === 'number' ? Math.max(0, Math.trunc(op.durationMs)) : null;
+    if (exitCode !== null && durationMs !== null) {
+      const stderrTail = typeof op.stderrTail === 'string'
+        ? op.stderrTail.slice(0, REPRO_RECIPE_OBSERVED_TAIL_MAX)
+        : '';
+      const stdoutTail = typeof op.stdoutTail === 'string'
+        ? op.stdoutTail.slice(0, REPRO_RECIPE_OBSERVED_TAIL_MAX)
+        : '';
+      observedProbe = {
+        sentinelObserved: op.sentinelObserved === true,
+        signatureObserved: op.signatureObserved === true,
+        exitCode,
+        durationMs,
+        stderrTail,
+        stdoutTail,
+      };
+    }
+  }
+  const proberAttempts = typeof provRaw.proberAttempts === 'number' && provRaw.proberAttempts >= 0
+    ? Math.trunc(provRaw.proberAttempts)
+    : 0;
+  const recordedAt = typeof provRaw.recordedAt === 'string' && provRaw.recordedAt
+    ? provRaw.recordedAt
+    : new Date().toISOString();
+  return {
+    version: 1,
+    candidateTestPath,
+    testSource,
+    sentinelString,
+    ...(expectedFailureSignature ? { expectedFailureSignature } : {}),
+    pipInstalls,
+    requiresCredentials,
+    verbatimSnippetIncompatible,
+    approach,
+    provenance: {
+      exerciseImports,
+      preconditionsSatisfied,
+      observedProbe,
+      proberAttempts,
+      recordedAt,
+    },
+  };
+}
+
 export const DossierBodySchema = z.object({
   issueNumber: z.number(),
   attemptId: z.string(),
@@ -212,6 +414,13 @@ export const DossierBodySchema = z.object({
   openQuestions: z.array(z.string()),
   summary: z.string(),
   confidence: z.enum(['low', 'medium', 'high']),
+  /**
+   * Repro recipe written by the Prober stage. OPTIONAL at the schema
+   * layer to preserve back-compat with legacy snapshots (pre-Prober
+   * pipeline). The orchestrator enforces the execution-time invariant
+   * that a recipe MUST be present before the deterministic Executor runs.
+   */
+  reproRecipe: ReproRecipeSchema.optional(),
 });
 
 export type DossierBody = z.infer<typeof DossierBodySchema>;
@@ -244,6 +453,14 @@ export function snapshotIdFor(body: DossierBody): string {
   const pcs = (body as { preconditions?: unknown[] }).preconditions;
   if (!Array.isArray(pcs) || pcs.length === 0) {
     delete forHash.preconditions;
+  }
+  // Same trick for reproRecipe: legacy snapshots predate the field
+  // entirely, so omit it from the canonical bytes when absent. This
+  // preserves stored snapshot ids and any investigation-notes / orchestrator
+  // links bound to dossierSnapshotId.
+  const recipe = (body as { reproRecipe?: unknown }).reproRecipe;
+  if (recipe == null) {
+    delete forHash.reproRecipe;
   }
   return createHash('sha1').update(canonicalize(forHash)).digest('hex').slice(0, 16);
 }
@@ -297,9 +514,10 @@ export class DossierStore {
    * when omitted, preserving backward-compatible call sites.
    */
   append(
-    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions'> & {
+    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions' | 'reproRecipe'> & {
       parentSnapshotId?: string | null;
       preconditions?: Precondition[];
+      reproRecipe?: ReproRecipe;
     }
   ): DossierSnapshot {
     const parent = input.parentSnapshotId ?? this.latest()?.snapshotId ?? null;
