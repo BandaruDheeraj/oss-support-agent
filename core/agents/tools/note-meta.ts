@@ -18,6 +18,7 @@ import { HypothesisSchema } from '../fix-loop/hypotheses';
 import {
   InvestigationFindingInputSchema,
 } from '../fix-loop/investigation-notes';
+import { ensureTestRootScoped } from './write-test';
 
 const Note = z.object({ note: z.string().min(1) }).passthrough();
 export const note: ToolDef<z.infer<typeof Note>, unknown> = {
@@ -87,6 +88,15 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       .map((p, idx) => normalizePreconditionInput(p, idx))
       .filter((p): p is NonNullable<typeof p> => p !== null);
     const reproRecipe = args.reproRecipe ? normalizeReproRecipeInput(args.reproRecipe) ?? undefined : undefined;
+    if (reproRecipe) {
+      // Scope candidateTestPath against the same test roots write_test uses,
+      // so a recipe cannot trick the deterministic Executor into writing the
+      // recipe.testSource outside the configured test directories.
+      const workspace = asHandles(ctx.handles).workspace;
+      if (workspace && typeof workspace.testRoots === 'function') {
+        ensureTestRootScoped(reproRecipe.candidateTestPath, workspace.testRoots(), 'reproRecipe.candidateTestPath');
+      }
+    }
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,

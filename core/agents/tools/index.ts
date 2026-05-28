@@ -228,6 +228,142 @@ export function makeReproExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolReg
     .registerMany([...SANDBOX_TOOLS]);
 }
 
+/**
+ * Prober `done`-gate logic — exported for unit testing. Returns null when
+ * the transcript carries a structurally-valid recipe and the done call may
+ * proceed; otherwise returns a guidance string the registry surfaces as a
+ * ToolGuardError. The contract enforced:
+ *   1. There is a successful record_evidence call with recipe_recorded=true.
+ *   2. That call's args.reproRecipe has candidateTestPath + sentinelString.
+ *   3. Some prior successful write_test/revise_test wrote to that path.
+ *   4. After that write and before the record_evidence call, ≥2 successful
+ *      run_repro calls produced exit≠0 with sentinelString in stdout+stderr.
+ */
+export function reproProberDoneGate(transcript: TranscriptEntry[]): string | null {
+  type RecipeArgs = { reproRecipe?: { candidateTestPath?: string; sentinelString?: string } };
+  let recipeEntryIdx = -1;
+  let recipeArgs: RecipeArgs | undefined;
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    const e = transcript[i];
+    if (e.tool !== 'record_evidence' || !e.ok) continue;
+    if ((e.result as any)?.recipe_recorded !== true) continue;
+    recipeEntryIdx = i;
+    recipeArgs = (e.args ?? undefined) as RecipeArgs | undefined;
+    break;
+  }
+  if (recipeEntryIdx < 0 || !recipeArgs?.reproRecipe) {
+    return (
+      `done is blocked: you have not yet emitted a ReproRecipe via record_evidence. ` +
+      `Once your candidate test has produced two consecutive failing run_repro calls ` +
+      `with the sentinel in stderr/stdout, call record_evidence with the full reproRecipe ` +
+      `payload (candidateTestPath, testSource, sentinelString, expectedFailureSignature, ` +
+      `pipInstalls, requiresCredentials, verbatimSnippetIncompatible, and a provenance ` +
+      `block including observedProbe populated from your most recent run_repro). Only ` +
+      `then call done.`
+    );
+  }
+  const candidateTestPath = recipeArgs.reproRecipe.candidateTestPath;
+  const sentinelString = recipeArgs.reproRecipe.sentinelString;
+  if (!candidateTestPath || !sentinelString) {
+    return `done is blocked: the recorded reproRecipe is missing candidateTestPath or sentinelString. Re-emit record_evidence with a complete recipe payload before calling done.`;
+  }
+  let writeIdx = -1;
+  for (let i = recipeEntryIdx - 1; i >= 0; i--) {
+    const e = transcript[i];
+    if ((e.tool === 'write_test' || e.tool === 'revise_test') && e.ok) {
+      const path = (e.args as any)?.path;
+      if (typeof path === 'string' && path === candidateTestPath) {
+        writeIdx = i;
+        break;
+      }
+    }
+  }
+  if (writeIdx < 0) {
+    return `done is blocked: reproRecipe.candidateTestPath="${candidateTestPath}" does not match the path of any prior successful write_test/revise_test call. Either fix the recipe path or write the test at the recipe path, then re-emit record_evidence.`;
+  }
+  let failingWithSentinel = 0;
+  for (let i = writeIdx + 1; i < recipeEntryIdx; i++) {
+    const e = transcript[i];
+    if (e.tool !== 'run_repro' || !e.ok) continue;
+    const res = e.result as { exitCode?: number; stdout?: string; stderr?: string } | null;
+    if (!res || typeof res.exitCode !== 'number' || res.exitCode === 0) continue;
+    const combined = `${res.stdout ?? ''}\n${res.stderr ?? ''}`;
+    if (combined.includes(sentinelString)) failingWithSentinel += 1;
+  }
+  if (failingWithSentinel < 2) {
+    return (
+      `done is blocked: the reproRecipe requires two consecutive failing run_repro calls ` +
+      `with sentinel "${sentinelString}" in combined stdout+stderr after the write of ` +
+      `"${candidateTestPath}". Observed only ${failingWithSentinel} such call(s). Run run_repro ` +
+      `until you see two failing observations with the sentinel, then re-emit record_evidence ` +
+      `with provenance.observedProbe populated from the latest run.`
+    );
+  }
+  return null;
+}
+
+/**
+ * Repro Prober — same shape as the Executor (LLM loop with read + note +
+ * write-test + sandbox), plus `record_evidence` so it can emit the
+ * ReproRecipe that the deterministic Executor will transcribe. Done gate
+ * additionally requires a structurally-valid recipe (path + sentinel match
+ * a recent write_test + ≥2 failing run_repro calls) so the run cannot
+ * terminate with a hallucinated recipe.
+ */
+export function makeReproProberRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
+  return new ToolRegistry(
+    {
+      budgets: defaultBudgets({ total: 70, perTier: { mutation: 0 } }),
+      maxTurns: 22,
+      toolGates: {
+        write_test: (transcript) =>
+          gateRequirePriorProbe(transcript) ?? gateRequireRunReproSinceLastWrite(transcript),
+        revise_test: (transcript) =>
+          gateRequirePriorProbe(transcript) ?? gateRequireRunReproSinceLastWrite(transcript),
+        done: reproProberDoneGate,
+      },
+      abandonGate: (transcript) => {
+        const wroteTest = transcript.some(
+          (t) => (t.tool === 'write_test' || t.tool === 'revise_test') && t.ok,
+        );
+        const ranRepro = transcript.filter((t) => t.tool === 'run_repro' && t.ok).length;
+        if (!wroteTest) {
+          return 'abandon is forbidden before you have authored a candidate test. Call write_test to create the candidate test file, then run_repro at least twice, before considering abandon.';
+        }
+        if (ranRepro < 2) {
+          return `abandon is forbidden before you have run_repro at least twice (you have ${ranRepro}). Revise the test and run_repro again before considering abandon.`;
+        }
+        const failedInstalls = transcript.filter(
+          (t) => t.tool === 'pip_install' && (!t.ok || (t.result as any)?.exitCode !== 0)
+        ).length;
+        const lastRevise = transcript
+          .map((t, i) => ({ t, i }))
+          .filter(({ t }) => t.tool === 'revise_test' && t.ok)
+          .pop();
+        const ranReproAfterRevise = lastRevise
+          ? transcript.slice(lastRevise.i + 1).some((t) => t.tool === 'run_repro' && t.ok)
+          : false;
+        if (failedInstalls >= 2 && !ranReproAfterRevise) {
+          return (
+            `abandon is forbidden: you have ${failedInstalls} failed pip_install attempts ` +
+            `but no revise_test followed by a fresh run_repro. Install-fatigue is treated as environmental ` +
+            `incompatibility — STOP installing the heavy framework and instead revise_test to a direct-call ` +
+            `path that imports the suspect symbol straight from its underlying package (e.g. ` +
+            `opentelemetry.trace.NonRecordingSpan instead of the framework wrapper). Then run_repro on the ` +
+            `revised test. Abandon becomes available only after that observation.`
+          );
+        }
+        return null;
+      },
+    },
+    ctx
+  )
+    .registerMany([...READ_TOOLS])
+    .registerMany([note, recordEvidence, deepenInvestigation, done, abandon])
+    .registerMany([...WRITE_TEST_TOOLS])
+    .registerMany([...SANDBOX_TOOLS]);
+}
+
 export function makeReproCriticRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
     {

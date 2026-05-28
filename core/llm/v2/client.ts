@@ -40,6 +40,7 @@ export type PhaseEAgent =
   | 'ANALYST'
   | 'REPRO_PLANNER'
   | 'REPRO_EXECUTOR'
+  | 'REPRO_PROBER'
   | 'REPRO_CRITIC'
   | 'FIX_INVESTIGATOR'
   | 'FIX_PLANNER'

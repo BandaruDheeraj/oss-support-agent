@@ -13,6 +13,8 @@ import type { DossierSnapshot, Precondition, SuspectSymbol } from '../analyst/do
 import {
   renderEditableInstallsBlock,
   renderIssueSnippetsBlock,
+  detectHeavyFrameworkSignal,
+  HEAVY_FRAMEWORK_IMPORTS,
   type IssueCodeSnippet,
 } from './repro-hints';
 
@@ -137,39 +139,16 @@ export async function runReproPlanner(args: RunReproPlannerArgs): Promise<ReproP
   );
 }
 
-const HEAVY_FRAMEWORK_IMPORTS = [
-  'smolagents',
-  'langchain',
-  'llama_index',
-  'llamaindex',
-  'llama-index',
-  'autogen',
-  'crewai',
-  'haystack',
-  'guidance',
-  'dspy',
-];
+const _HEAVY_FRAMEWORK_IMPORTS_LEGACY_REEXPORT = HEAVY_FRAMEWORK_IMPORTS;
+void _HEAVY_FRAMEWORK_IMPORTS_LEGACY_REEXPORT;
 
 /**
  * Decide whether to FORCE verbatimSnippetIncompatible=true regardless of
- * what the Planner LLM emitted. True when ANY of:
- *   1. A verbatim issue snippet imports a known heavy 3rd-party agent
- *      framework (original signal, strongest).
- *   2. The issue body (prose, no fenced code) names a heavy framework
- *      within ~120 chars of an install/dependency token. Catches prose-
- *      only repro steps like "Install openinference-instrumentation-
- *      smolagents".
- *   3. Some dossier suspectSymbol's file path or precondition.appliesTo
- *      file path matches an instrumentation-library path for a heavy
- *      framework (e.g. python/instrumentation/openinference-
- *      instrumentation-smolagents/...). Path evidence alone is strong
- *      since the bug literally lives in that instrumentation package.
- *
- * Heavy-framework runtime installs almost always fail in the sandbox
- * (no network, no creds, transitive-dep storm). The Executor's
- * "DO NOT install the heavy framework runtime; editable-install the
- * in-repo instrumentation package + import the underlying primitive
- * directly" directive is gated on this flag.
+ * what the Planner LLM emitted. Thin shim around the canonical heuristic
+ * (`detectHeavyFrameworkSignal` in repro-hints.ts). The planner is
+ * scheduled for deletion in Phase 7 of the Prober redesign; until then
+ * this preserves the existing planner.test.ts contract while routing all
+ * heavy-framework detection through one implementation.
  */
 export function shouldForceVerbatimIncompatible(
   snippets: IssueCodeSnippet[],
@@ -177,53 +156,11 @@ export function shouldForceVerbatimIncompatible(
   issueBody?: string,
   suspectSymbols?: SuspectSymbol[]
 ): boolean {
-  // Signal 1: existing snippet-import signal.
-  const snippetHit = snippets.some((s) => {
-    const body = (s.code ?? '').toLowerCase();
-    return HEAVY_FRAMEWORK_IMPORTS.some((fw) => {
-      const tokens = [`import ${fw}`, `from ${fw}`];
-      return tokens.some((t) => body.includes(t));
-    });
+  return detectHeavyFrameworkSignal({
+    snippets,
+    issueBody,
+    suspectSymbols,
   });
-  if (snippetHit) return true;
-
-  // Signal 2: prose issue body mentions a heavy framework near an
-  // install/dependency token. ±120 char window. Token-boundary normalization
-  // collapses `_`, `-`, and whitespace so `llama_index`, `llama-index`, and
-  // `llamaindex` all match.
-  if (issueBody && typeof issueBody === 'string') {
-    const norm = issueBody.toLowerCase().replace(/[\s_-]+/g, '');
-    const installNeedles = ['install', 'pip ', 'pipinstall', 'dependency', 'modulenotfounderror', 'package'];
-    for (const fwRaw of HEAVY_FRAMEWORK_IMPORTS) {
-      const fw = fwRaw.replace(/[\s_-]+/g, '');
-      let idx = norm.indexOf(fw);
-      while (idx !== -1) {
-        const start = Math.max(0, idx - 120);
-        const end = Math.min(norm.length, idx + fw.length + 120);
-        const window = norm.slice(start, end);
-        if (installNeedles.some((n) => window.includes(n.replace(/[\s_-]+/g, '')))) {
-          return true;
-        }
-        idx = norm.indexOf(fw, idx + fw.length);
-      }
-    }
-  }
-
-  // Signal 3: instrumentation-library file path in dossier suspectSymbols.
-  // Path evidence alone is strong (no install/pip nearness required).
-  const paths = (suspectSymbols ?? []).map((s) => (s.file ?? '').toLowerCase()).filter(Boolean);
-  for (const p of paths) {
-    const normPath = p.replace(/[\s_-]+/g, '');
-    for (const fwRaw of HEAVY_FRAMEWORK_IMPORTS) {
-      const fw = fwRaw.replace(/[\s_-]+/g, '');
-      // Match path segments like /smolagents/ or instrumentation-smolagents/
-      if (normPath.includes(`/${fw}/`) || normPath.includes(`instrumentation${fw}`) || normPath.includes(`/${fw}.`)) {
-        return true;
-      }
-    }
-  }
-
-  return false;
 }
 
 /**
