@@ -11,6 +11,9 @@
 
 import { createHash } from 'crypto';
 import { z } from 'zod';
+import { CandidateReproSchema, type CandidateRepro } from './candidate-repro';
+export { CandidateReproSchema, CandidateReproInputSchema, normalizeCandidateReproInput, renderTestSource } from './candidate-repro';
+export type { CandidateRepro, CandidateReproInput, CandidateReproFailureMode, CandidateReproSource } from './candidate-repro';
 
 export const EvidenceSchema = z.object({
   id: z.string(),                          // stable id within the dossier
@@ -421,6 +424,15 @@ export const DossierBodySchema = z.object({
    * that a recipe MUST be present before the deterministic Executor runs.
    */
   reproRecipe: ReproRecipeSchema.optional(),
+  /**
+   * Structured repro spec authored by the Analyst (when confident enough)
+   * for the deterministic Builder to consume. OPTIONAL — the orchestrator
+   * falls through to the LLM Prober when absent or when the Builder
+   * rejects the candidate. Back-compat: snapshots predating this field
+   * deserialize without it; `snapshotIdFor` strips it from the canonical
+   * hash when absent so legacy snapshot ids remain stable.
+   */
+  candidateRepro: CandidateReproSchema.optional(),
 });
 
 export type DossierBody = z.infer<typeof DossierBodySchema>;
@@ -461,6 +473,13 @@ export function snapshotIdFor(body: DossierBody): string {
   const recipe = (body as { reproRecipe?: unknown }).reproRecipe;
   if (recipe == null) {
     delete forHash.reproRecipe;
+  }
+  // Same for candidateRepro (added with the deterministic Builder).
+  // Legacy snapshots have neither field, so absence MUST canonicalize-out
+  // identically.
+  const candidate = (body as { candidateRepro?: unknown }).candidateRepro;
+  if (candidate == null) {
+    delete forHash.candidateRepro;
   }
   return createHash('sha1').update(canonicalize(forHash)).digest('hex').slice(0, 16);
 }
@@ -514,10 +533,11 @@ export class DossierStore {
    * when omitted, preserving backward-compatible call sites.
    */
   append(
-    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions' | 'reproRecipe'> & {
+    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions' | 'reproRecipe' | 'candidateRepro'> & {
       parentSnapshotId?: string | null;
       preconditions?: Precondition[];
       reproRecipe?: ReproRecipe;
+      candidateRepro?: CandidateRepro;
     }
   ): DossierSnapshot {
     const parent = input.parentSnapshotId ?? this.latest()?.snapshotId ?? null;

@@ -18,6 +18,7 @@
 import { runAnalyst } from '../analyst/analyst';
 import { DossierStore, type ReproRecipe } from '../analyst/dossier';
 import { runReproProber, type ReproProberResult } from './prober';
+import { runReproBuilder, type ReproBuilderResult, type BuilderRejectStage } from './builder';
 import {
   runReproExecutorFromRecipe,
   reproAstPreflight,
@@ -93,6 +94,14 @@ export interface ReproV2Outcome {
     approach: string;
   };
   prober?: ReproProberResult;
+  /** Populated when the Builder ran (success or reject). */
+  builder?: ReproBuilderResult;
+  /**
+   * Granular Builder stage when the Builder rejected and we fell through to
+   * the Prober (or terminated for credentials). null when the Builder built
+   * the recipe.
+   */
+  builderRejectStage?: BuilderRejectStage;
   executor?: DeterministicExecutorResult;
   criticVerdict?: ReproVerdict;
   preflightReason?: string;
@@ -159,8 +168,85 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       ` effectiveEditableInstalls=${effectiveEditableInstalls.length > 0 ? effectiveEditableInstalls.join('|') : '(none)'}`
   );
 
+  // Stage B0: Deterministic Builder.
+  //
+  // If the Analyst supplied a `candidateRepro`, try to author the recipe
+  // without an LLM. Outcomes:
+  //   - success → skip Prober, drop the recipe in the dossier, continue
+  //     straight to Stage C (Executor).
+  //   - credentials missing → short-circuit with credentials_required
+  //     (consistent with the post-Executor credentials_required path).
+  //   - any other reject (or no candidate at all) → fall through to Prober
+  //     with a brief primer so the LLM doesn't re-make the same mistake.
+  let builder: ReproBuilderResult | undefined;
+  let builderRejectStage: BuilderRejectStage | undefined;
+  let builderRecipe: ReproRecipe | undefined;
+  try {
+    builder = await runReproBuilder({
+      attemptId: args.attemptId,
+      dossierSnapshot: snapshot,
+      repo: args.repo,
+      workspace: args.workspace,
+      sandbox: args.sandbox,
+      env: args.env,
+    });
+  } catch (err) {
+    // Builder is meant to be defensive; an unexpected throw should not
+    // tank the orchestrator. Log + fall through to Prober.
+    // eslint-disable-next-line no-console
+    console.log(
+      `[v2-orchestrator] attempt=${args.attemptId} builder_threw=${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  if (builder?.ok && builder.recipe) {
+    builderRecipe = builder.recipe;
+    // Persist the Builder-authored recipe onto the dossier so the rest of
+    // the pipeline (Executor, Critic) treats it identically to a
+    // Prober-authored recipe.
+    dossier.append({
+      issueNumber: args.issue.number,
+      attemptId: args.attemptId,
+      evidence: snapshot.body.evidence,
+      suspectSymbols: snapshot.body.suspectSymbols,
+      preconditions: snapshot.body.preconditions,
+      openQuestions: snapshot.body.openQuestions,
+      summary: snapshot.body.summary,
+      confidence: snapshot.body.confidence,
+      reproRecipe: builderRecipe,
+      ...(snapshot.body.candidateRepro ? { candidateRepro: snapshot.body.candidateRepro } : {}),
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[v2-orchestrator] attempt=${args.attemptId} builder_built_recipe=true skipped_prober=true`);
+  } else if (builder && !builder.ok) {
+    builderRejectStage = builder.rejectStage;
+    if (builder.missingCredentials && builder.missingCredentials.length > 0) {
+      return {
+        status: 'credentials_required',
+        dossier,
+        builder,
+        builderRejectStage,
+        credentialsTerminal: {
+          inferredEnvVars: builder.missingCredentials,
+          matchedPattern: 'builder:requiresCredentials',
+        },
+        message: `Builder halted on missing credentials: ${builder.missingCredentials.join(', ')}`,
+      };
+    }
+    // eslint-disable-next-line no-console
+    console.log(
+      `[v2-orchestrator] attempt=${args.attemptId} builder_rejected stage=${builderRejectStage} falling_through_to_prober=true`
+    );
+  } else {
+    // eslint-disable-next-line no-console
+    console.log(`[v2-orchestrator] attempt=${args.attemptId} builder_no_candidate=true falling_through_to_prober=true`);
+  }
+
   // Stage B: Prober — draft and probe-verify a recipe.
-  let prober: ReproProberResult;
+  //
+  // Skipped when the Builder produced a recipe. The Prober's output is
+  // null in that case and downstream stages read `builderRecipe`.
+  let prober: ReproProberResult | undefined;
+  if (!builderRecipe) {
   try {
     prober = await runReproProber({
       attemptId: args.attemptId,
@@ -178,34 +264,51 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     return {
       status: 'prober_failed',
       dossier,
+      ...(builder ? { builder } : {}),
+      ...(builderRejectStage ? { builderRejectStage } : {}),
       message: err instanceof Error ? err.message : String(err),
     };
   }
-
-  if (!prober.recipe) {
-    // Before declaring a generic prober failure, inspect run_repro transcript
-    // entries for credential errors. If any matched and the inferred env
-    // vars are not currently set, surface this as a structured
-    // credentials_required outcome.
-    const credResult = detectCredentialsFromTranscript(prober.transcript, args.env ?? process.env);
-    if (credResult) {
-      return {
-        status: 'credentials_required',
-        dossier,
-        prober,
-        credentialsTerminal: credResult,
-        message: `Repro halted on missing credentials (${credResult.matchedPattern ?? 'unknown pattern'}): ${credResult.inferredEnvVars.join(', ')}`,
-      };
-    }
-    return {
-      status: 'prober_failed',
-      dossier,
-      prober,
-      message: `Repro Prober terminated without producing a recipe (${prober.terminated}${prober.reason ? `: ${prober.reason}` : ''})`,
-    };
   }
 
-  const recipe = prober.recipe;
+  // Decide which recipe to run: Builder-authored or Prober-authored.
+  let recipe: ReproRecipe;
+  if (builderRecipe) {
+    recipe = builderRecipe;
+  } else {
+    if (!prober || !prober.recipe) {
+      // Before declaring a generic prober failure, inspect run_repro transcript
+      // entries for credential errors. If any matched and the inferred env
+      // vars are not currently set, surface this as a structured
+      // credentials_required outcome.
+      const credResult = prober
+        ? detectCredentialsFromTranscript(prober.transcript, args.env ?? process.env)
+        : null;
+      if (credResult) {
+        return {
+          status: 'credentials_required',
+          dossier,
+          prober,
+          ...(builder ? { builder } : {}),
+          ...(builderRejectStage ? { builderRejectStage } : {}),
+          credentialsTerminal: credResult,
+          message: `Repro halted on missing credentials (${credResult.matchedPattern ?? 'unknown pattern'}): ${credResult.inferredEnvVars.join(', ')}`,
+        };
+      }
+      return {
+        status: 'prober_failed',
+        dossier,
+        ...(prober ? { prober } : {}),
+        ...(builder ? { builder } : {}),
+        ...(builderRejectStage ? { builderRejectStage } : {}),
+        message: prober
+          ? `Repro Prober terminated without producing a recipe (${prober.terminated}${prober.reason ? `: ${prober.reason}` : ''})`
+          : `Builder rejected (${builderRejectStage}) and Prober was skipped`,
+      };
+    }
+    recipe = prober.recipe;
+  }
+
   const planProjection = {
     candidateTestPath: recipe.candidateTestPath,
     sentinelString: recipe.sentinelString,
@@ -231,7 +334,9 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       dossier,
       recipe,
       plan: planProjection,
-      prober,
+      ...(prober ? { prober } : {}),
+      ...(builder ? { builder } : {}),
+      ...(builderRejectStage ? { builderRejectStage } : {}),
       executor,
       credentialsTerminal: {
         inferredEnvVars: executor.missingCredentials,
@@ -245,14 +350,18 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   if (executor.outcome !== 'reproduced') {
     // After a non-reproduced run, also check Prober transcript for credential
     // errors that the recipe didn't statically declare.
-    const credResult = detectCredentialsFromTranscript(prober.transcript, args.env ?? process.env);
+    const credResult = prober
+      ? detectCredentialsFromTranscript(prober.transcript, args.env ?? process.env)
+      : null;
     if (credResult) {
       return {
         status: 'credentials_required',
         dossier,
         recipe,
         plan: planProjection,
-        prober,
+        ...(prober ? { prober } : {}),
+        ...(builder ? { builder } : {}),
+        ...(builderRejectStage ? { builderRejectStage } : {}),
         executor,
         credentialsTerminal: credResult,
         message: `Repro halted on missing credentials (${credResult.matchedPattern ?? 'unknown pattern'}): ${credResult.inferredEnvVars.join(', ')}`,
@@ -263,7 +372,9 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       dossier,
       recipe,
       plan: planProjection,
-      prober,
+      ...(prober ? { prober } : {}),
+      ...(builder ? { builder } : {}),
+      ...(builderRejectStage ? { builderRejectStage } : {}),
       executor,
       message: `Repro deterministic Executor outcome=${executor.outcome}: ${executor.reason}`,
     };
@@ -281,7 +392,9 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
         dossier,
         recipe,
         plan: planProjection,
-        prober,
+        ...(prober ? { prober } : {}),
+        ...(builder ? { builder } : {}),
+        ...(builderRejectStage ? { builderRejectStage } : {}),
         executor,
         preflightReason: pre.reason,
         message: `AST preflight rejected the candidate test: ${pre.reason}`,
@@ -307,7 +420,9 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       dossier,
       recipe,
       plan: planProjection,
-      prober,
+      ...(prober ? { prober } : {}),
+      ...(builder ? { builder } : {}),
+      ...(builderRejectStage ? { builderRejectStage } : {}),
       executor,
       criticVerdict: critic.verdict,
       message: `Repro Critic ${critic.verdict.verdict}: ${critic.verdict.reason}`,
@@ -319,10 +434,14 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     dossier,
     recipe,
     plan: planProjection,
-    prober,
+    ...(prober ? { prober } : {}),
+    ...(builder ? { builder } : {}),
+    ...(builderRejectStage ? { builderRejectStage } : {}),
     executor,
     criticVerdict: critic.verdict,
-    message: 'Repro reproduced reliably and approved by Critic.',
+    message: builderRecipe
+      ? 'Repro reproduced reliably (Builder-authored) and approved by Critic.'
+      : 'Repro reproduced reliably and approved by Critic.',
   };
 }
 

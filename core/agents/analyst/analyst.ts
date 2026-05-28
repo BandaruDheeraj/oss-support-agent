@@ -71,6 +71,31 @@ IMPORTANT: This scan is BEST-EFFORT. If you cannot find a tests/ directory, or n
 
 Empty preconditions: [] is acceptable for issues with no environmental subtlety. Do NOT fabricate baseline preconditions — that wastes downstream prompt context.
 
+CANDIDATE REPRO (optional, high-leverage):
+When your confidence is medium or high AND the failure mode fits one of two templates, you SHOULD include a \`candidateRepro\` field on record_evidence. A downstream deterministic Builder will use it to author the failing test WITHOUT another LLM round-trip — this dramatically reduces failed repros caused by Prober drift.
+
+Two supported failureMode templates:
+1. \`unexpected_exception\` — the exercise call raises an exception when it shouldn't (or a different exception type than expected). Specify \`expectedExceptionType\` either as the FQN of the exception that the buggy code raises (e.g. "AttributeError"), or "None" if the bug is that no exception is raised.
+2. \`wrong_return\` — the exercise call returns the wrong value. Specify \`expectedReturnRepr\` as a Python repr the actual return must equal (e.g. "True", "42", "'ok'").
+
+Required fields on candidateRepro:
+- failureMode: "unexpected_exception" | "wrong_return"
+- candidateTestPath: absolute path under tests/ — let the Builder pick one if you're unsure (e.g. "tests/repro/test_issue_<N>.py")
+- sentinelString: a short distinctive string the test will print on the failure path (e.g. "REPRO_46_SENTINEL_NONRECORDINGSPAN")
+- exerciseImports: list of \`{module, names?: string[]}\` — minimal imports to make the exercise call work
+- setupCode: optional Python preamble (kept short — assignments only)
+- exerciseCall: ONE Python expression that triggers the bug (must reference at least one suspectSymbol you also recorded)
+- expectedExceptionType OR expectedReturnRepr (depending on failureMode)
+- pipInstalls: list of \`{package, editable?: boolean}\` — third-party deps the test needs (do NOT include the repo's own package if it's already editable-installed)
+- preconditionsSatisfied: list of precondition IDs you've verified hold
+
+DO NOT include candidateRepro when:
+- Confidence is low
+- The bug is intermittent, race-conditional, or requires real network/credentials
+- You can't pin down a single exercise call
+
+When in doubt, omit candidateRepro — the Prober will handle it.
+
 FINAL REMINDER: regardless of how much you investigated or how confident you are, you MUST end this session by calling record_evidence (with whatever you have). Use abandon ONLY when the issue itself is contradictory or empty — NEVER as a way out of an incomplete investigation. Plain-text summaries without a terminal tool call are discarded.`;
 
 export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {

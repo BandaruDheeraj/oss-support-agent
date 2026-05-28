@@ -110,6 +110,33 @@ describe('dossier snapshot id', () => {
     const withRecipe = makeBody({ reproRecipe: recipe });
     expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withRecipe));
   });
+
+  it('omits absent candidateRepro from the canonical hash (backward compat)', () => {
+    const legacy = makeBody();
+    const explicitUndef = { ...makeBody(), candidateRepro: undefined } as DossierBody;
+    expect(snapshotIdFor(explicitUndef)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('changes when candidateRepro is present', () => {
+    const without = makeBody();
+    const withCand = makeBody({
+      candidateRepro: {
+        version: 1,
+        source: 'direct_call',
+        failureMode: 'unexpected_exception',
+        candidateTestPath: 'tests/test_repro_46.py',
+        imports: ['from x import y'],
+        setup: 'y = 1',
+        exerciseCall: 'y.crash()',
+        sentinel: 'SENTINEL_CR_46',
+        pipInstalls: [],
+        requiresCredentials: [],
+        preconditionsSatisfied: [],
+        rationale: '',
+      },
+    });
+    expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withCand));
+  });
 });
 
 describe('DossierStore.deserialize backward compat', () => {

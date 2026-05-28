@@ -13,7 +13,7 @@
 import { z } from 'zod';
 import type { ToolDef } from './types';
 import { asHandles } from './handles';
-import { EvidenceInputSchema, PreconditionInputSchema, ReproRecipeInputSchema, SuspectSymbolSchema, normalizePreconditionInput, normalizeReproRecipeInput } from '../analyst/dossier';
+import { EvidenceInputSchema, PreconditionInputSchema, ReproRecipeInputSchema, SuspectSymbolSchema, normalizePreconditionInput, normalizeReproRecipeInput, CandidateReproInputSchema, normalizeCandidateReproInput } from '../analyst/dossier';
 import { HypothesisSchema } from '../fix-loop/hypotheses';
 import {
   InvestigationFindingInputSchema,
@@ -62,6 +62,15 @@ const RecordEvidence = z
      * must exist before the deterministic Executor runs.
      */
     reproRecipe: ReproRecipeInputSchema.optional(),
+    /**
+     * Candidate repro — written by the Analyst when confident enough that
+     * the deterministic Builder can author the test without an LLM tool
+     * loop. The Builder validates this against the dossier (preconditions
+     * exist, suspect symbols referenced) and renders test source from a
+     * template. When absent or rejected, the orchestrator falls through
+     * to the LLM Prober.
+     */
+    candidateRepro: CandidateReproInputSchema.optional(),
   })
   .passthrough();
 export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = {
@@ -97,6 +106,30 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
         ensureTestRootScoped(reproRecipe.candidateTestPath, workspace.testRoots(), 'reproRecipe.candidateTestPath');
       }
     }
+    // Same path-scope guard for the Analyst-emitted candidateRepro. Bad
+    // candidates (unparseable, missing fields) are silently dropped — the
+    // Builder fallback path handles "no candidate" gracefully, but a
+    // record_evidence call should never be rejected just because the LLM
+    // garbled the optional field.
+    let candidateRepro = args.candidateRepro
+      ? normalizeCandidateReproInput(args.candidateRepro) ?? undefined
+      : undefined;
+    if (candidateRepro) {
+      try {
+        const workspace = asHandles(ctx.handles).workspace;
+        if (workspace && typeof workspace.testRoots === 'function') {
+          ensureTestRootScoped(
+            candidateRepro.candidateTestPath,
+            workspace.testRoots(),
+            'candidateRepro.candidateTestPath'
+          );
+        }
+      } catch {
+        // Drop the candidate but keep the rest of the dossier — Builder
+        // will skip and Prober fallback will take over.
+        candidateRepro = undefined;
+      }
+    }
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
@@ -107,8 +140,13 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       summary: args.summary,
       confidence: args.confidence,
       ...(reproRecipe ? { reproRecipe } : {}),
+      ...(candidateRepro ? { candidateRepro } : {}),
     });
-    return { snapshot_id: snap.snapshotId, recipe_recorded: reproRecipe ? true : false };
+    return {
+      snapshot_id: snap.snapshotId,
+      recipe_recorded: reproRecipe ? true : false,
+      candidate_recorded: candidateRepro ? true : false,
+    };
   },
 };
 
