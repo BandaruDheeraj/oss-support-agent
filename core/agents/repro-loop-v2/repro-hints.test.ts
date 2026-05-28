@@ -9,7 +9,10 @@ import {
   extractIssueCodeSnippets,
   renderEditableInstallsBlock,
   renderIssueSnippetsBlock,
+  detectHeavyFrameworkSignal,
+  type IssueCodeSnippet,
 } from './repro-hints';
+import type { SuspectSymbol } from '../analyst/dossier';
 
 function makeTempRepo(layout: Record<string, string>): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'repro-hints-'));
@@ -276,5 +279,67 @@ describe('mergeEditableInstallCandidates', () => {
 
   it('rejects "." and empty entries', () => {
     expect(mergeEditableInstallCandidates(['.', '', 'pkg'], ['pkg2'])).toEqual(['pkg', 'pkg2']);
+  });
+});
+
+function snip(code: string, language = 'python'): IssueCodeSnippet {
+  return { language, code };
+}
+function suspect(file: string, symbol = 'fn', reasoning = 'r'): SuspectSymbol {
+  return { file, symbol, reasoning };
+}
+
+describe('detectHeavyFrameworkSignal', () => {
+  it('returns true when a snippet imports a heavy framework (snippet signal)', () => {
+    expect(
+      detectHeavyFrameworkSignal({ snippets: [snip('from smolagents import CodeAgent')] })
+    ).toBe(true);
+  });
+
+  it('returns false when snippets have no heavy framework imports and no other signals', () => {
+    expect(detectHeavyFrameworkSignal({ snippets: [snip('import json\nprint(1)')] })).toBe(false);
+  });
+
+  it('returns true on prose-only issue body with framework name near "Install"', () => {
+    const body = `### Reproduction\n1. Install openinference-instrumentation-smolagents\n2. Do not configure OTel\n`;
+    expect(detectHeavyFrameworkSignal({ issueBody: body })).toBe(true);
+  });
+
+  it('returns true when issue body uses pip + heavy framework within window', () => {
+    const body = `Run \`pip install langchain\` then call the agent.`;
+    expect(detectHeavyFrameworkSignal({ issueBody: body })).toBe(true);
+  });
+
+  it('returns false on casual mention of langchain without install-adjacent token', () => {
+    const body = `I am using langchain in my stack but the bug is in our own router code at the /api/foo endpoint. The traceback was about JSON serialization.`;
+    expect(detectHeavyFrameworkSignal({ issueBody: body })).toBe(false);
+  });
+
+  it('normalises framework aliases (llama-index / llama_index / llamaindex)', () => {
+    for (const alias of ['llama-index', 'llama_index', 'llamaindex']) {
+      const body = `pip install ${alias} then run`;
+      expect(detectHeavyFrameworkSignal({ issueBody: body })).toBe(true);
+    }
+  });
+
+  it('returns true on dossier suspectSymbol path matching instrumentation-<framework>', () => {
+    const ss = [
+      suspect(
+        'python/instrumentation/openinference-instrumentation-smolagents/src/openinference/instrumentation/smolagents/_wrappers.py'
+      ),
+    ];
+    expect(detectHeavyFrameworkSignal({ suspectSymbols: ss })).toBe(true);
+  });
+
+  it('returns true on dossier suspectSymbol path containing /<framework>/ segment', () => {
+    const ss = [suspect('python/instrumentation/foo/src/openinference/instrumentation/autogen/wrappers.py')];
+    expect(detectHeavyFrameworkSignal({ suspectSymbols: ss })).toBe(true);
+  });
+
+  it('returns false on unrelated suspect paths and bland body', () => {
+    const ss = [suspect('src/router/handler.py')];
+    expect(
+      detectHeavyFrameworkSignal({ issueBody: 'plain bug, no frameworks', suspectSymbols: ss })
+    ).toBe(false);
   });
 });

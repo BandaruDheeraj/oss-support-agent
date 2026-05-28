@@ -1,252 +1,269 @@
 /**
- * Repro Executor — tool-using loop that constructs and verifies a failing
- * test. Terminates via `done` only after observing:
- *   - run_repro exited != 0,
- *   - two consecutive prior run_repro calls produced the same stderr (sentinel match),
- *   - AST preflight passed on the candidate test (Python only, best-effort).
- */
-
-import type { ReproPlan } from './planner';
-import { runAgentLoop, type AgentLoopResult } from '../agent-loop';
-import { makeReproExecutorRegistry } from '../tools';
-import type { DossierStore, DossierSnapshot, Precondition } from '../analyst/dossier';
-import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
-import {
-  renderEditableInstallsBlock,
-  renderIssueSnippetsBlock,
-  type IssueCodeSnippet,
-} from './repro-hints';
-import { deriveVerifiedState, summariseVerifiedState, renderVerifiedState } from './verified-state';
-
-/**
- * Render dossier preconditions for the Executor's user prompt. This is the
- * "test contract" the executor must enforce: every listed precondition has
- * to be satisfied by the candidate test for the Critic to approve.
+ * Repro Executor — DETERMINISTIC transcription of a ReproRecipe.
  *
- * Commit B drops the verbatim-incompatible branch — the new probe-first
- * procedure makes the verbatim vs direct-call choice a consequence of what
- * the sandbox proves importable, not a prompt-controlled flag. The
- * `verbatimSnippetIncompatible` field stays on the plan struct (deletion
- * is deferred to Commit D, gated on observing #46 with the new procedure)
- * but the Executor no longer conditions its behaviour on it.
+ * The LLM-using Executor has been replaced by the Prober (which authors and
+ * verifies the recipe in its own sandbox). This module re-applies the recipe
+ * deterministically: install required packages, write the test, run it twice,
+ * tally sentinel + signature hits. No model calls, no tool loops.
+ *
+ * The Critic still uses the result. `reproAstPreflight` is preserved (the
+ * orchestrator calls it as a sanity check on the candidate test source).
  */
-function renderPreconditionsBlockForExecutor(preconditions: Precondition[]): string | null {
-  if (preconditions.length === 0) return null;
-  const lines: string[] = ['PRECONDITIONS THE TEST MUST ENFORCE:'];
-  for (const pc of preconditions) {
-    lines.push(`- [${pc.id}] (${pc.kind}) ${pc.condition}`);
-    if (pc.appliesTo) {
-      lines.push(`    target: ${pc.appliesTo.file}${pc.appliesTo.symbol ? ` :: ${pc.appliesTo.symbol}` : ''}`);
-    }
-    if (pc.satisfactionModes && pc.satisfactionModes.length > 0) {
-      lines.push(`    satisfaction modes (choose one and ensure its markers appear in the test):`);
-      for (const mode of pc.satisfactionModes) {
-        lines.push(`      • ${mode.description}${mode.markers.length > 0 ? ` — markers: ${mode.markers.map((m) => `\`${m}\``).join(', ')}` : ''}`);
-      }
-    }
-    if (pc.threats && pc.threats.length > 0) {
-      lines.push(`    threats to neutralize: ${pc.threats.join('; ')}`);
-    }
-  }
-  return lines.join('\n');
-}
 
+import type { ReproRecipe } from '../analyst/dossier';
+import type { RepoHandle, SandboxHandle, SandboxRun, WorkspaceWriter } from '../tools/handles';
+import { ensureTestRootScoped } from '../tools/write-test';
 
-export interface RunReproExecutorArgs {
+export interface DeterministicExecutorArgs {
   attemptId: string;
-  plan: ReproPlan;
-  dossier: DossierStore;
-  dossierSnapshot: DossierSnapshot;
-  issue: IssueHandle;
-  repo: RepoHandle;
-  workspace: WorkspaceReader & WorkspaceWriter;
+  recipe: ReproRecipe;
+  workspace: WorkspaceWriter;
   sandbox: SandboxHandle;
-  /** Repo-relative dirs the executor can `pip install -e` to satisfy in-repo imports. */
-  editableInstallCandidates?: string[];
-  /** Verbatim fenced code blocks lifted from the issue body. */
-  issueSnippets?: IssueCodeSnippet[];
+  /**
+   * Process env consulted for the recipe.requiresCredentials check.
+   * Defaults to process.env. A credential is "missing" when the env var is
+   * undefined or zero-length.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
-export interface ReproExecutorResult extends AgentLoopResult {
+export interface DeterministicExecutorRun {
+  exitCode: number;
+  stdoutTail: string;
+  stderrTail: string;
+  durationMs: number;
+  sentinelObserved: boolean;
+  signatureObserved: boolean;
+}
+
+export type DeterministicExecutorOutcome =
+  | 'reproduced'
+  | 'unexpected_pass'
+  | 'install_failed'
+  | 'credentials_missing'
+  | 'write_failed'
+  | 'preflight_failed';
+
+export interface DeterministicExecutorResult {
+  outcome: DeterministicExecutorOutcome;
   candidateTestPath: string;
   sentinelString: string;
+  expectedFailureSignature: string | null;
   ranReproCount: number;
   lastReproExitCode: number | null;
-  /** Raw transcript entries from the executor's tool registry — used by the orchestrator for credential detection. */
-  transcript: Array<{ tool: string; result: unknown; ok: boolean }>;
+  /** Per-run observations. Length === ranReproCount. */
+  runs: DeterministicExecutorRun[];
+  /** True when ≥2 runs exited != 0 AND contained the sentinel in stdout+stderr. */
+  reproducedReliably: boolean;
+  /** True when ≥2 runs contained the signature; vacuously true with no signature. */
+  signatureMatched: boolean;
+  /** Missing credential env var names when outcome === 'credentials_missing'. */
+  missingCredentials: string[];
+  /**
+   * pip install failures (spec → stderr tail). Empty unless outcome ===
+   * 'install_failed'.
+   */
+  installFailures: Array<{ spec: string; exitCode: number; stderrTail: string }>;
+  /** Free-form diagnostic — surfaced in logs and in the orchestrator's message. */
+  reason: string;
 }
 
-const SYSTEM = `You are the Repro Executor for an OSS bug pipeline. Your job is to construct a failing test at the candidateTestPath in the plan and prove it fails reproducibly. The sandbox is STATEFUL — pip_install, python_module_check and run_python persist across calls within this run. Use that.
+const STDOUT_TAIL = 4000;
+const STDERR_TAIL = 4000;
 
-Procedure (follow in order; do not skip):
+/**
+ * Re-applies `recipe` against `sandbox` + `workspace` deterministically.
+ *
+ * Sequence:
+ *   1. Credentials check (short-circuit if any required env var is missing).
+ *   2. pip installs (stop on first failure → install_failed).
+ *   3. ensureTestRootScoped + workspace.writeTest (throw → write_failed).
+ *   4. sandbox.setReproTestPath.
+ *   5. sandbox.runRepro() × 2.
+ *   6. Tally sentinel + signature in combined stdout+stderr.
+ *
+ * `signatureMatched` is REPORTED for every run, regardless of whether the
+ * recipe's provenance.observedProbe says the signature was observed during
+ * probing. The Critic decides whether to treat it as a hard gate.
+ */
+export async function runReproExecutorFromRecipe(
+  args: DeterministicExecutorArgs
+): Promise<DeterministicExecutorResult> {
+  const { recipe } = args;
+  const env = args.env ?? process.env;
+  const candidateTestPath = recipe.candidateTestPath;
+  const sentinelString = recipe.sentinelString;
+  const expectedFailureSignature = (recipe.expectedFailureSignature ?? '').trim();
 
-1. PROBE imports. For each suspect symbol in the dossier and each import in the issue snippets:
-   - python_module_check("X") — fast importability check, no execution.
-   - run_python("from X import Y") — confirms the actual import statement works.
-   If an import fails: pip_install with \`-e <candidate-dir>\` from "Candidate editable-install dirs" if the failing module looks like an in-repo package, or grep / find_symbol to locate the correct import path. Repeat until you have a verified import block.
+  const baseResult: Omit<
+    DeterministicExecutorResult,
+    'outcome' | 'reason'
+  > = {
+    candidateTestPath,
+    sentinelString,
+    expectedFailureSignature: expectedFailureSignature.length > 0 ? expectedFailureSignature : null,
+    ranReproCount: 0,
+    lastReproExitCode: null,
+    runs: [],
+    reproducedReliably: false,
+    signatureMatched: expectedFailureSignature.length === 0,
+    missingCredentials: [],
+    installFailures: [],
+  };
 
-2. PROBE the exercise. Use run_python to actually call the suspect symbols with hand-constructed inputs. Confirm the call executes (whether or not it raises). If it raises the expected failure signature, you already have a working repro skeleton — copy it into the test.
-
-3. COMMIT. ONE write_test call. The test contains: your verified imports, your verified exercise call, and \`assert False, "<sentinel>"\` (or equivalent) at the end so run_repro reports a failure containing the sentinel.
-
-4. VERIFY. run_repro twice. Require exit != 0, sentinel in stderr, AND the dossier's expectedFailureSignature in stderr/stdout.
-
-5. If verification fails because the test PASSED (exit == 0), the exercise didn't actually trigger the bug — go back to step 2, probe more, then revise_test.
-
-Hard rules:
-
-- Do NOT call write_test before step 3. Big-bang authoring burns budget on incorrect imports before any sandbox feedback. Probe first. The registry will block write_test until at least one import probe has succeeded — the error message will show you the verified-state ledger.
-- revise_test is allowed only after at least one run_repro call has produced output you can react to. The registry blocks blind revise loops.
-- Embed the sentinelString in your test's failure message so the orchestrator can verify reproducibility across runs.
-- Before calling done you MUST have two consecutive run_repro results with non-zero exit AND containing the sentinel in stderr.
-- Do NOT call done in the same model turn as write_test/revise_test/run_repro. Observe the result on the next turn, then emit done.
-- You may not modify source files (apply_patch is not registered for you).
-- Each turn make ONE stateful tool call (sandbox/write-test/meta). Reads may be batched.
-
-Verbatim-snippet faithfulness:
-- If the user prompt includes "Verbatim code snippets from the issue body", your first write_test SHOULD preserve those snippets' imports and call sequence as faithfully as the probe-verified state allows — paraphrase only what the sandbox proved doesn't import or doesn't run. Subtle rewrites of the user's exercise code are how repros silently stop reproducing.
-- You may revise toward a direct-call path AFTER observing run_repro fail for ENVIRONMENTAL reasons (missing credentials, unreachable model API, install-fatigue on a heavy framework) — NOT for a behavioural mismatch.
-
-Preconditions enforcement:
-- The user prompt's "PRECONDITIONS THE TEST MUST ENFORCE" block lists conditions the failing test must guarantee. Treat them as test contracts. The Critic will reject any test that does not enforce them.
-- For preconditions with kind: config_absence and non-empty threats, your test MUST either (a) reset the threatened global before exercising the suspect symbol (e.g. via monkeypatch.setattr on the framework's internal globals), OR (b) bypass the global entirely by importing the suspect symbol and calling it directly with hand-constructed inputs. Either way, the chosen satisfactionMode's markers SHOULD appear in your test source.
-- Do NOT initialize the very component the precondition requires to be absent. If the dossier flags "no OTel tracer provider configured" as a threat, do not call set_tracer_provider in the test, even via a transitive import.
-
-Abandon discipline:
-- Only call abandon after you have (a) authored at least one test, (b) run_repro at least twice, and (c) exhausted grep/find_symbol/read_file for any blocking symbol. "Symbol not found in repo" alone is NEVER a sufficient reason — third-party symbols (opentelemetry's NonRecordingSpan, pytest's MonkeyPatch, etc.) live in their package, not in this repo, so try importing them directly first.
-- Install-fatigue: if pip_install fails 2+ times for the same heavy framework (smolagents, langchain, llama-index, autogen, crewai), treat that as environmental incompatibility. Stop installing — pivot to a direct-call path that imports the suspect symbol straight from its underlying package (e.g. opentelemetry.trace), then run_repro on the revised test before considering abandon.`;
-
-export async function runReproExecutor(args: RunReproExecutorArgs): Promise<ReproExecutorResult> {
-  const registry = makeReproExecutorRegistry({
-    ctx: {
-      agentName: 'REPRO_EXECUTOR',
-      attemptId: args.attemptId,
-      issueNumber: args.issue.number,
-      dossierSnapshotId: args.dossierSnapshot.snapshotId,
-      handles: {
-        workspace: args.workspace,
-        sandbox: args.sandbox,
-        issue: args.issue,
-        repo: args.repo,
-        dossier: args.dossier,
-      },
-    },
-  });
-
-  const snippetBlock = renderIssueSnippetsBlock(args.issueSnippets ?? []);
-  const editableBlock = renderEditableInstallsBlock(args.editableInstallCandidates ?? []);
-  const preconditionsBlock = renderPreconditionsBlockForExecutor(
-    args.dossierSnapshot.body.preconditions ?? []
+  // (1) Credentials check
+  const missing = (recipe.requiresCredentials ?? []).filter(
+    (name) => !env[name] || env[name]?.length === 0
   );
-  const hintsParts = [snippetBlock, editableBlock, preconditionsBlock].filter((s): s is string => Boolean(s));
-  const hintsSection = hintsParts.length > 0 ? `\n\n${hintsParts.join('\n\n')}` : '';
-
-  const userPrompt = `Plan approach: ${args.plan.approach}\nCandidate test path: ${args.plan.candidateTestPath}\nSentinel string: "${args.plan.sentinelString}"\nExpected failure signature: ${args.plan.expectedFailureSignature}\nSteps:\n${args.plan.steps
-    .map((s) => {
-      const addr = s.preconditionsAddressed && s.preconditionsAddressed.length > 0
-        ? ` [addresses: ${s.preconditionsAddressed.join(', ')}]`
-        : '';
-      return `- [${s.stepId}] ${s.intent} (hint: ${s.toolHint})${addr}`;
-    })
-    .join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}${hintsSection}\n\nFollow the probe-first procedure: verify imports and exercise the suspect symbols via run_python / python_module_check FIRST. Only then write_test, then run_repro twice with matching output, then call done with summary and changedFiles=["${args.plan.candidateTestPath}"].`;
-
-  const loop = await runAgentLoop({
-    agent: 'REPRO_EXECUTOR',
-    registry,
-    system: SYSTEM,
-    user: userPrompt,
-    attemptId: args.attemptId,
-    issueNumber: args.issue.number,
-    dossierSnapshotId: args.dossierSnapshot.snapshotId,
-  });
-
-  // If the model emitted plain text instead of calling done/abandon, retry
-  // once with an explicit reminder. The registry preserves state (turn counts,
-  // budgets, terminated flag) so the gate still applies.
-  let finalLoop = loop;
-  if (loop.terminated === 'finished' && registry.isTerminated() === null) {
-    const reproCalls = registry.getTranscript().filter((e) => e.tool === 'run_repro').length;
-    const wroteTest = registry.getTranscript().some((e) => (e.tool === 'write_test' || e.tool === 'revise_test') && e.ok);
-    const remind = `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous turn ended without calling done or abandon. State: wrote_test=${wroteTest}, run_repro_count=${reproCalls}. You MUST end the session with a tool call: done (after observing two consecutive failing run_repro results with the sentinel) or abandon (only if gate passes). Plain-text replies are discarded.`;
-    finalLoop = await runAgentLoop({
-      agent: 'REPRO_EXECUTOR',
-      registry,
-      system: SYSTEM,
-      user: remind,
-      attemptId: args.attemptId,
-      issueNumber: args.issue.number,
-      dossierSnapshotId: args.dossierSnapshot.snapshotId,
-    });
+  if (missing.length > 0) {
+    return {
+      ...baseResult,
+      missingCredentials: missing,
+      outcome: 'credentials_missing',
+      reason: `Required credentials not set in env: ${missing.join(', ')}`,
+    };
   }
 
-  const transcript = registry.getTranscript();
-  const reproCalls = transcript.filter((e) => e.tool === 'run_repro');
-  const last = reproCalls[reproCalls.length - 1];
-  const lastExit = typeof (last?.result as any)?.exitCode === 'number' ? (last!.result as any).exitCode : null;
+  // (2) pip installs
+  const installFailures: DeterministicExecutorResult['installFailures'] = [];
+  for (const inst of recipe.pipInstalls ?? []) {
+    const spec = inst.editable ? `-e ${inst.package}` : inst.package;
+    const run = await args.sandbox.pipInstall(spec);
+    if (run.exitCode !== 0) {
+      installFailures.push({
+        spec,
+        exitCode: run.exitCode,
+        stderrTail: tail(run.stderr, STDERR_TAIL),
+      });
+      // eslint-disable-next-line no-console
+      console.log(
+        `[v2-executor-det] attempt=${args.attemptId} install_failed spec=${JSON.stringify(spec)} exit=${run.exitCode}`
+      );
+      return {
+        ...baseResult,
+        installFailures,
+        outcome: 'install_failed',
+        reason: `pip install failed for ${spec} (exit ${run.exitCode}).`,
+      };
+    }
+  }
 
-  // Diagnostic: surface the most recent run_repro stderr/stdout tail so
-  // when the model halts with terminated=finished or max_turns we have
-  // a clue what the test was actually doing on its last attempt.
-  const lastStderrTail = typeof (last?.result as any)?.stderr === 'string'
-    ? String((last!.result as any).stderr).slice(-400).replace(/\s+/g, ' ').trim()
-    : '';
-  const lastStdoutTail = typeof (last?.result as any)?.stdout === 'string'
-    ? String((last!.result as any).stdout).slice(-200).replace(/\s+/g, ' ').trim()
-    : '';
-  const toolCounts: Record<string, number> = {};
-  for (const e of transcript) toolCounts[e.tool] = (toolCounts[e.tool] ?? 0) + 1;
-  const toolsSummary = Object.entries(toolCounts)
-    .map(([k, v]) => `${k}(${v})`)
-    .join(' ');
-  // Verified-state ledger (Commit A — inert observability). Pre-classified
-  // view of what tool calls have established in the stateful sandbox. The
-  // summary line goes into the existing diagnostic line for grep-ability;
-  // the full rendered ledger is logged separately for post-mortem review.
-  // Behaviourally inert: no prompts or gates consume this yet (Commits B/C).
-  const verifiedState = deriveVerifiedState(transcript);
-  const verifiedSummary = summariseVerifiedState(verifiedState);
+  // (3) write the test (path-scoped, then write through workspace)
+  try {
+    const roots = args.workspace.testRoots();
+    ensureTestRootScoped(candidateTestPath, roots, 'reproRecipe.candidateTestPath');
+    await args.workspace.writeTest(candidateTestPath, recipe.testSource);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.log(
+      `[v2-executor-det] attempt=${args.attemptId} write_failed path=${JSON.stringify(candidateTestPath)} err=${JSON.stringify(message).slice(0, 240)}`
+    );
+    return {
+      ...baseResult,
+      outcome: 'write_failed',
+      reason: `Failed to write candidate test at ${candidateTestPath}: ${message}`,
+    };
+  }
+
+  // (4) point the sandbox at the test
+  args.sandbox.setReproTestPath(candidateTestPath);
+
+  // (5) run × 2
+  const runs: DeterministicExecutorRun[] = [];
+  for (let i = 0; i < 2; i++) {
+    const r = await args.sandbox.runRepro();
+    runs.push(observe(r, sentinelString, expectedFailureSignature));
+  }
+
+  // (6) tally
+  const lastExit = runs[runs.length - 1]?.exitCode ?? null;
+  const failingWithSentinel = runs.filter(
+    (r) => r.exitCode !== 0 && r.sentinelObserved
+  ).length;
+  const reproducedReliably = failingWithSentinel >= 2;
+  const signatureMatched =
+    expectedFailureSignature.length === 0
+      ? true
+      : runs.filter((r) => r.signatureObserved).length >= 2;
 
   // eslint-disable-next-line no-console
   console.log(
-    `[v2-executor] attempt=${args.attemptId} terminated=${finalLoop.terminated} turns=${finalLoop.turns}` +
-      ` toolCalls=${transcript.length} runReproCount=${reproCalls.length} lastExit=${lastExit}` +
-      ` verbatimIncompatible=${args.plan.verbatimSnippetIncompatible}` +
-      ` editableInstalls=${(args.editableInstallCandidates ?? []).join('|') || '(none)'}` +
-      ` tools=${toolsSummary || '(none)'}` +
-      ` verifiedState=[${verifiedSummary}]` +
-      (finalLoop.reason ? ` reason=${JSON.stringify(finalLoop.reason).slice(0, 240)}` : '') +
-      (lastStdoutTail ? ` lastStdoutTail=${JSON.stringify(lastStdoutTail)}` : '') +
-      (lastStderrTail ? ` lastStderrTail=${JSON.stringify(lastStderrTail)}` : '')
+    `[v2-executor-det] attempt=${args.attemptId} ran=${runs.length} reliable=${reproducedReliably}` +
+      ` sigMatched=${signatureMatched} lastExit=${lastExit}` +
+      ` runs=${runs.map((r) => `${r.exitCode}/${r.sentinelObserved ? 'S' : '_'}${r.signatureObserved ? 'X' : '_'}`).join('|')}`
   );
-  // eslint-disable-next-line no-console
-  console.log(
-    `[v2-executor-ledger] attempt=${args.attemptId}\n${renderVerifiedState(verifiedState)}`
-  );
+
+  if (!reproducedReliably) {
+    const allPassed = runs.every((r) => r.exitCode === 0);
+    return {
+      ...baseResult,
+      ranReproCount: runs.length,
+      lastReproExitCode: lastExit,
+      runs,
+      reproducedReliably,
+      signatureMatched,
+      outcome: allPassed ? 'unexpected_pass' : 'reproduced',
+      reason: allPassed
+        ? `Recipe re-application: candidate test passed on both runs (expected failure).`
+        : `Recipe re-application: failing runs did not consistently emit sentinel.`,
+    };
+  }
 
   return {
-    ...finalLoop,
-    candidateTestPath: args.plan.candidateTestPath,
-    sentinelString: args.plan.sentinelString,
-    ranReproCount: reproCalls.length,
+    ...baseResult,
+    ranReproCount: runs.length,
     lastReproExitCode: lastExit,
-    transcript: transcript.map((e) => ({ tool: e.tool, result: e.result, ok: e.ok })),
+    runs,
+    reproducedReliably,
+    signatureMatched,
+    outcome: 'reproduced',
+    reason: 'Recipe re-applied successfully; candidate test failed reliably.',
   };
+}
+
+function observe(
+  run: SandboxRun,
+  sentinel: string,
+  signature: string
+): DeterministicExecutorRun {
+  const combined = `${run.stderr}\n${run.stdout}`;
+  return {
+    exitCode: run.exitCode,
+    stdoutTail: tail(run.stdout, STDOUT_TAIL),
+    stderrTail: tail(run.stderr, STDERR_TAIL),
+    durationMs: run.durationMs,
+    sentinelObserved: sentinel.length > 0 && combined.includes(sentinel),
+    signatureObserved: signature.length > 0 && combined.includes(signature),
+  };
+}
+
+function tail(s: string, n: number): string {
+  if (!s) return '';
+  return s.length <= n ? s : s.slice(-n);
 }
 
 /**
  * Best-effort AST preflight for Python repro candidates. Rejects tests that
  * trivially fail (assert False, sys.exit, raise without try, etc.) without
- * actually exercising the codebase.
+ * actually exercising the codebase. Used by the orchestrator as a sanity
+ * check against probe-authored recipes whose `testSource` slipped past the
+ * Prober's structural gate.
  */
-export function reproAstPreflight(language: RepoHandle['language'], src: string, suspectFiles: string[], suspectSymbols: string[]): { ok: boolean; reason?: string } {
+export function reproAstPreflight(
+  language: RepoHandle['language'],
+  src: string,
+  suspectFiles: string[],
+  suspectSymbols: string[]
+): { ok: boolean; reason?: string } {
   if (language !== 'python') return { ok: true };
   const stripped = src
     .replace(/"""[\s\S]*?"""/g, '')
     .replace(/'''[\s\S]*?'''/g, '')
-    .replace(/#[^\n]*\n/g, '\n');
+    .replace(/(^|\n)\s*#[^\n]*/g, '$1');
 
   const trivial =
-    /\bassert\s+False\b/.test(stripped) ||
+    /^\s*assert\s+False\s*[,;]?\s*$/m.test(stripped) ||
     /\bsys\.exit\s*\(/.test(stripped) ||
     /^\s*raise\b/m.test(stripped.replace(/^\s*try:[\s\S]*?except[\s\S]*?raise\b/g, '')) ||
     /^\s*print\(['"][^'"]*sentinel[^'"]*['"]\)\s*;?\s*assert\s+False/i.test(stripped);

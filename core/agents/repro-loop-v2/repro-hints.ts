@@ -361,3 +361,87 @@ export function renderEditableInstallsBlock(candidates: string[]): string | null
   for (const c of candidates) lines.push(`- ${c}`);
   return lines.join('\n');
 }
+
+/* -------------------------------------------------------------------------- */
+/* Heavy-framework heuristic                                                   */
+/*                                                                            */
+/* Surfaces evidence that the issue is reported against a heavy 3rd-party      */
+/* agent/instrumentation framework whose runtime is known-flaky in the         */
+/* sandbox (no network/credentials, large transitive dep storm). The Prober    */
+/* uses this signal to pivot toward a direct-call repro (importing the         */
+/* underlying primitive instead of going through the framework wrapper) and    */
+/* persists the boolean on the recipe so downstream consumers can reason       */
+/* about why the recipe took the shape it did. Moved here from planner.ts     */
+/* (Phase 7 deletes the planner entirely; the heuristic survives).            */
+/* -------------------------------------------------------------------------- */
+
+export const HEAVY_FRAMEWORK_IMPORTS = [
+  'smolagents',
+  'langchain',
+  'llama_index',
+  'llamaindex',
+  'llama-index',
+  'autogen',
+  'crewai',
+  'haystack',
+  'guidance',
+  'dspy',
+];
+
+export interface HeavyFrameworkSignals {
+  snippets?: IssueCodeSnippet[];
+  issueBody?: string;
+  suspectSymbols?: Array<{ file: string }>;
+}
+
+/**
+ * Returns true when ANY signal indicates the issue is rooted in a heavy
+ * 3rd-party agent/instrumentation framework. Signals:
+ *   1. A verbatim issue snippet imports a known heavy framework.
+ *   2. The prose issue body names a heavy framework within ~120 chars of an
+ *      install/dependency token.
+ *   3. A suspect symbol's file path matches an instrumentation-library path
+ *      for a heavy framework (e.g. .../instrumentation-smolagents/...).
+ */
+export function detectHeavyFrameworkSignal(signals: HeavyFrameworkSignals): boolean {
+  const snippets = signals.snippets ?? [];
+  const snippetHit = snippets.some((s) => {
+    const body = (s.code ?? '').toLowerCase();
+    return HEAVY_FRAMEWORK_IMPORTS.some((fw) => {
+      const tokens = [`import ${fw}`, `from ${fw}`];
+      return tokens.some((t) => body.includes(t));
+    });
+  });
+  if (snippetHit) return true;
+
+  const issueBody = signals.issueBody;
+  if (issueBody && typeof issueBody === 'string') {
+    const norm = issueBody.toLowerCase().replace(/[\s_-]+/g, '');
+    const installNeedles = ['install', 'pip ', 'pipinstall', 'dependency', 'modulenotfounderror', 'package'];
+    for (const fwRaw of HEAVY_FRAMEWORK_IMPORTS) {
+      const fw = fwRaw.replace(/[\s_-]+/g, '');
+      let idx = norm.indexOf(fw);
+      while (idx !== -1) {
+        const start = Math.max(0, idx - 120);
+        const end = Math.min(norm.length, idx + fw.length + 120);
+        const window = norm.slice(start, end);
+        if (installNeedles.some((n) => window.includes(n.replace(/[\s_-]+/g, '')))) {
+          return true;
+        }
+        idx = norm.indexOf(fw, idx + fw.length);
+      }
+    }
+  }
+
+  const paths = (signals.suspectSymbols ?? []).map((s) => (s.file ?? '').toLowerCase()).filter(Boolean);
+  for (const p of paths) {
+    const normPath = p.replace(/[\s_-]+/g, '');
+    for (const fwRaw of HEAVY_FRAMEWORK_IMPORTS) {
+      const fw = fwRaw.replace(/[\s_-]+/g, '');
+      if (normPath.includes(`/${fw}/`) || normPath.includes(`instrumentation${fw}`) || normPath.includes(`/${fw}.`)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}

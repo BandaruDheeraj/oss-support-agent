@@ -170,6 +170,117 @@ describe('record_evidence — server-stamped source defaults', () => {
   });
 });
 
+describe('record_evidence — reproRecipe passthrough', () => {
+  it('persists a well-formed recipe and stamps recordedAt when missing', async () => {
+    const dossier = new DossierStore();
+    const res = await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectSymbols: [],
+        openQuestions: [],
+        preconditions: [],
+        summary: 'prober result',
+        confidence: 'high',
+        reproRecipe: {
+          candidateTestPath: 'tests/repro_46.py',
+          testSource: 'def test_x():\n    assert False  # SENTINEL_46\n',
+          sentinelString: 'SENTINEL_46',
+          expectedFailureSignature: 'AssertionError',
+          pipInstalls: [{ package: 'openinference-instrumentation-smolagents', editable: true }],
+          requiresCredentials: ['OPENAI_API_KEY'],
+          verbatimSnippetIncompatible: true,
+          provenance: {
+            exerciseImports: ['openinference.instrumentation.smolagents'],
+            preconditionsSatisfied: ['pc-0'],
+            observedProbe: {
+              sentinelObserved: true,
+              signatureObserved: true,
+              exitCode: 1,
+              durationMs: 222,
+              stderrTail: 'AssertionError\n',
+              stdoutTail: 'SENTINEL_46\n',
+            },
+            proberAttempts: 1,
+          },
+        } as any,
+      },
+      ctxFor({ dossier })
+    );
+    expect((res as any).recipe_recorded).toBe(true);
+    const recipe = dossier.latest()!.body.reproRecipe!;
+    expect(recipe.candidateTestPath).toBe('tests/repro_46.py');
+    expect(recipe.sentinelString).toBe('SENTINEL_46');
+    expect(recipe.pipInstalls).toHaveLength(1);
+    expect(recipe.pipInstalls[0].editable).toBe(true);
+    expect(recipe.requiresCredentials).toEqual(['OPENAI_API_KEY']);
+    expect(recipe.provenance.observedProbe?.sentinelObserved).toBe(true);
+    expect(recipe.provenance.proberAttempts).toBe(1);
+    // recordedAt was missing in the input; executor stamped it
+    expect(recipe.provenance.recordedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('drops a recipe missing required fields without failing the call', async () => {
+    const dossier = new DossierStore();
+    const res = await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectSymbols: [],
+        openQuestions: [],
+        preconditions: [],
+        summary: 'analyst-only call',
+        confidence: 'medium',
+        reproRecipe: {
+          // Missing candidateTestPath / testSource / sentinelString -> dropped
+          approach: 'incomplete sketch',
+        } as any,
+      },
+      ctxFor({ dossier })
+    );
+    expect((res as any).snapshot_id).toBeTruthy();
+    expect((res as any).recipe_recorded).toBe(false);
+    expect(dossier.latest()!.body.reproRecipe).toBeUndefined();
+  });
+
+  it('clips an oversized testSource at the schema cap', async () => {
+    const dossier = new DossierStore();
+    const overflow = 'a'.repeat(8000);
+    await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectSymbols: [],
+        openQuestions: [],
+        preconditions: [],
+        summary: 'prober oversize',
+        confidence: 'medium',
+        reproRecipe: {
+          candidateTestPath: 'tests/repro.py',
+          testSource: overflow,
+          sentinelString: 'X',
+          provenance: { recordedAt: '2025-01-01T00:00:00.000Z' },
+        } as any,
+      },
+      ctxFor({ dossier })
+    );
+    expect(dossier.latest()!.body.reproRecipe!.testSource.length).toBe(4096);
+  });
+
+  it('omits the recipe entirely when none is supplied (Analyst path)', async () => {
+    const dossier = new DossierStore();
+    await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectSymbols: [],
+        openQuestions: [],
+        preconditions: [],
+        summary: 'analyst, no recipe',
+        confidence: 'medium',
+      },
+      ctxFor({ dossier })
+    );
+    expect(dossier.latest()!.body.reproRecipe).toBeUndefined();
+  });
+});
+
 describe('write_investigation_notes — server-stamped recordedAt on findings', () => {
   it('accepts findings with no recordedAt and stamps an ISO timestamp', async () => {
     const notes = new InvestigationNotesStore();

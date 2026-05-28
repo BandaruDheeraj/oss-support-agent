@@ -9,15 +9,19 @@ import { z } from 'zod';
 import type { ToolDef } from './types';
 import { asHandles } from './handles';
 
-function ensureScoped(path: string, roots: string[]): void {
+export function ensureTestRootScoped(path: string, roots: string[], label = 'write-test'): void {
   if (!path || path.includes('..') || path.startsWith('/') || path.match(/^[A-Za-z]:/)) {
-    throw new Error(`write-test path "${path}" must be repo-relative without ".."`);
+    throw new Error(`${label} path "${path}" must be repo-relative without ".."`);
   }
   const norm = path.replace(/\\/g, '/');
   const inRoot = roots.some((r) => norm.startsWith(r.replace(/\\/g, '/')));
   if (!inRoot) {
-    throw new Error(`write-test path "${path}" must be under one of: ${roots.join(', ')}`);
+    throw new Error(`${label} path "${path}" must be under one of: ${roots.join(', ')}`);
   }
+}
+
+function ensureScoped(path: string, roots: string[]): void {
+  ensureTestRootScoped(path, roots, 'write-test');
 }
 
 const WriteTest = z

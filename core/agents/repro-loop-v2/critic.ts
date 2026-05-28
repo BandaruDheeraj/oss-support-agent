@@ -9,8 +9,7 @@ import { getModel } from '../../llm/v2/client';
 import { withAgentSpan } from '../../observability/spans';
 import { makeReproCriticRegistry } from '../tools';
 import { runAgentLoop } from '../agent-loop';
-import type { ReproPlan } from './planner';
-import type { DossierStore, DossierSnapshot, Precondition } from '../analyst/dossier';
+import type { DossierStore, DossierSnapshot, Precondition, ReproRecipe } from '../analyst/dossier';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
 
 export const ReproVerdictSchema = z.object({
@@ -34,7 +33,7 @@ revise: the test almost reproduces but needs a small change (suggest one).`;
 
 export interface RunReproCriticArgs {
   attemptId: string;
-  plan: ReproPlan;
+  recipe: ReproRecipe;
   dossier: DossierStore;
   dossierSnapshot: DossierSnapshot;
   issue: IssueHandle;
@@ -164,7 +163,9 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
           .join('\n')}`
       : '';
 
-  const userPrompt = `Repro candidate at: ${args.plan.candidateTestPath}\nSentinel: "${args.plan.sentinelString}"\nExpected failure signature: ${args.plan.expectedFailureSignature}${preconditionsForPrompt}${suspectsForPrompt}\n\nInvestigate: read the candidate test, run run_repro twice, then summarise your findings with note() calls. After that I will ask you for a verdict.`;
+  const expectedSigForPrompt = (args.recipe.expectedFailureSignature ?? '').trim();
+  const sigObservedByProber = args.recipe.provenance.observedProbe?.signatureObserved === true;
+  const userPrompt = `Repro candidate at: ${args.recipe.candidateTestPath}\nSentinel: "${args.recipe.sentinelString}"\nExpected failure signature: ${expectedSigForPrompt || '(none specified)'}\nProber observed this signature during probing: ${sigObservedByProber}${preconditionsForPrompt}${suspectsForPrompt}\n\nInvestigate: read the candidate test, run run_repro twice, then summarise your findings with note() calls. After that I will ask you for a verdict.`;
 
   const investigation = await runAgentLoop({
     agent: 'REPRO_CRITIC',
@@ -182,7 +183,7 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
   const reliable = reproRuns.length >= 2 && reproRuns.every((r) => (r.result as any)?.exitCode !== 0);
   const sentinelHits = reproRuns.filter((r) => {
     const out = `${(r.result as any)?.stderr ?? ''}\n${(r.result as any)?.stdout ?? ''}`;
-    return out.includes(args.plan.sentinelString);
+    return out.includes(args.recipe.sentinelString);
   });
   const sentinelOk = sentinelHits.length >= 2;
 
@@ -190,7 +191,7 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
   // and OR-scan each precondition's satisfactionMode markers. Pass the
   // results directly into the judge prompt so the LLM doesn't have to
   // recover them from the investigation summary string.
-  const candidateSource = (await args.workspace.readFile(args.plan.candidateTestPath)) ?? '';
+  const candidateSource = (await args.workspace.readFile(args.recipe.candidateTestPath)) ?? '';
   const enforcement = evaluatePreconditionEnforcement(candidateSource, preconditions);
   const unenforcedPreconditions = enforcement.filter((e) => e.enforcedMode === null);
   // A precondition has at least one satisfactionMode AND none matched → real gap.
@@ -205,12 +206,20 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
   // New: failure must exercise suspect code path.
   const suspectPathHit = failureExercisesSuspectPath(reproRuns, suspectSymbols);
 
-  // Commit C: expectedFailureSignature must appear in BOTH passing
-  // run_repro outputs. Sentinel proves the test failed; signature proves it
-  // failed for the right reason. Vacuously true if the plan didn't specify
-  // a signature, so legacy plans don't regress.
-  const expectedSig = (args.plan.expectedFailureSignature ?? '').trim();
-  const expectedSigOk = expectedSignatureMatched(reproRuns, expectedSig);
+  // expectedFailureSignature must appear in BOTH passing run_repro outputs
+  // — IF it's a hard gate. It is a hard gate ONLY when the Prober actually
+  // observed the signature in its own probing (recipe.provenance.observedProbe
+  // .signatureObserved === true). Otherwise it's a soft advisory: the Critic
+  // surfaces the check result but does not block on it.
+  //
+  // Sentinel proves the test failed; signature proves it failed for the
+  // right reason. The hard-gate downgrade prevents the Critic from rejecting
+  // an otherwise-good recipe just because the Prober (or the issue author)
+  // guessed a slightly different signature string than what the deterministic
+  // re-run produced.
+  const expectedSig = (args.recipe.expectedFailureSignature ?? '').trim();
+  const expectedSigMatched = expectedSignatureMatched(reproRuns, expectedSig);
+  const expectedSigHardGate = sigObservedByProber && expectedSig.length > 0;
 
   const verdict = await withAgentSpan(
     'REPRO_CRITIC',
@@ -238,7 +247,7 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
           : '';
       const signatureBlock =
         expectedSig.length > 0
-          ? `\nExpected-signature check: both run_repro outputs contain "${expectedSig}" = ${expectedSigOk}`
+          ? `\nExpected-signature check: both run_repro outputs contain "${expectedSig}" = ${expectedSigMatched} (hard gate: ${expectedSigHardGate})`
           : '';
       const judged = await generateObject({
         model: getModel('REPRO_CRITIC'),
@@ -249,7 +258,7 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
             (r) =>
               `- exit=${(r.result as any)?.exitCode}, stderr_head="${String((r.result as any)?.stderr ?? '').slice(0, 200)}"`
           )
-          .join('\n')}\n\nInvestigation tool summary: ${investigation.transcriptSummary}\n\nPlan expected signature: ${args.plan.expectedFailureSignature}\nSentinel: ${args.plan.sentinelString}\n\nStructural pre-check: reliable=${reliable}, sentinelMatchedTwice=${sentinelOk}${suspectBlock}${signatureBlock}${enforcementBlock}${candidateSourceBlock}`,
+          .join('\n')}\n\nInvestigation tool summary: ${investigation.transcriptSummary}\n\nRecipe expected signature: ${args.recipe.expectedFailureSignature ?? '(none)'}\nSentinel: ${args.recipe.sentinelString}\n\nStructural pre-check: reliable=${reliable}, sentinelMatchedTwice=${sentinelOk}${suspectBlock}${signatureBlock}${enforcementBlock}${candidateSourceBlock}`,
         experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
       });
       return judged.object;
@@ -260,14 +269,16 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
   // (1) classic: reliable + sentinel
   // (2) new: at least one suspect symbol mentioned in stderr (unless none declared)
   // (3) new: every precondition with declared satisfactionModes is enforced
-  // (4) Commit C: expectedFailureSignature must appear in both passing runs
+  // (4) Recipe-aware: expectedFailureSignature must appear in both passing runs
+  //     IFF the Prober observed the signature during probing. Otherwise the
+  //     check is advisory (recorded in the judge prompt, but not a blocker).
   if (verdict.verdict === 'approve') {
     const failures: string[] = [];
     if (!reliable) failures.push('not reliably failing');
     if (!sentinelOk) failures.push('sentinel missing');
     if (!suspectPathHit) failures.push('failure did not exercise suspect code path');
-    if (!expectedSigOk)
-      failures.push(`expectedFailureSignature "${expectedSig}" missing from one or both run_repro outputs`);
+    if (expectedSigHardGate && !expectedSigMatched)
+      failures.push(`expectedFailureSignature "${expectedSig}" missing from one or both run_repro outputs (Prober-observed → hard gate)`);
     if (realUnenforced.length > 0)
       failures.push(`preconditions unenforced: ${realUnenforced.map((e) => e.id).join(', ')}`);
     if (failures.length > 0) {

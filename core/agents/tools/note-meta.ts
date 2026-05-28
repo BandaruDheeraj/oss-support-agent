@@ -13,11 +13,12 @@
 import { z } from 'zod';
 import type { ToolDef } from './types';
 import { asHandles } from './handles';
-import { EvidenceInputSchema, PreconditionInputSchema, SuspectSymbolSchema, normalizePreconditionInput } from '../analyst/dossier';
+import { EvidenceInputSchema, PreconditionInputSchema, ReproRecipeInputSchema, SuspectSymbolSchema, normalizePreconditionInput, normalizeReproRecipeInput } from '../analyst/dossier';
 import { HypothesisSchema } from '../fix-loop/hypotheses';
 import {
   InvestigationFindingInputSchema,
 } from '../fix-loop/investigation-notes';
+import { ensureTestRootScoped } from './write-test';
 
 const Note = z.object({ note: z.string().min(1) }).passthrough();
 export const note: ToolDef<z.infer<typeof Note>, unknown> = {
@@ -54,13 +55,20 @@ const RecordEvidence = z
     openQuestions: z.array(z.string()).default([]),
     summary: z.string().min(1),
     confidence: z.enum(['low', 'medium', 'high']),
+    /**
+     * Repro recipe — written by the Prober stage. Optional so the Analyst
+     * (read-only) can keep calling record_evidence without supplying one;
+     * the orchestrator enforces the execution-time invariant that a recipe
+     * must exist before the deterministic Executor runs.
+     */
+    reproRecipe: ReproRecipeInputSchema.optional(),
   })
   .passthrough();
 export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = {
   name: 'record_evidence',
   tier: 'note',
   description:
-    'Analyst-only: append a new EvidenceDossier snapshot summarising everything you have read so far. Call this to terminate the Analyst loop.',
+    'Analyst- and Prober-only: append a new EvidenceDossier snapshot summarising everything you have read so far. Call this to terminate the loop. Prober additionally supplies `reproRecipe` carrying the executable test + observed probe results.',
   parameters: RecordEvidence,
   async execute(args, ctx) {
     const dossier = asHandles(ctx.handles).dossier;
@@ -79,6 +87,16 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
     const preconditions = (args.preconditions ?? [])
       .map((p, idx) => normalizePreconditionInput(p, idx))
       .filter((p): p is NonNullable<typeof p> => p !== null);
+    const reproRecipe = args.reproRecipe ? normalizeReproRecipeInput(args.reproRecipe) ?? undefined : undefined;
+    if (reproRecipe) {
+      // Scope candidateTestPath against the same test roots write_test uses,
+      // so a recipe cannot trick the deterministic Executor into writing the
+      // recipe.testSource outside the configured test directories.
+      const workspace = asHandles(ctx.handles).workspace;
+      if (workspace && typeof workspace.testRoots === 'function') {
+        ensureTestRootScoped(reproRecipe.candidateTestPath, workspace.testRoots(), 'reproRecipe.candidateTestPath');
+      }
+    }
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
@@ -88,8 +106,9 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       openQuestions: args.openQuestions,
       summary: args.summary,
       confidence: args.confidence,
+      ...(reproRecipe ? { reproRecipe } : {}),
     });
-    return { snapshot_id: snap.snapshotId };
+    return { snapshot_id: snap.snapshotId, recipe_recorded: reproRecipe ? true : false };
   },
 };
 
