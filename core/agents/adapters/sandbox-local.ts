@@ -35,12 +35,19 @@ export function createLocalSandboxAdapter(
   const log = opts.log ?? noop;
   const timeoutMs = opts.perCommandTimeoutMs ?? 600_000;
 
-  let venvBinDir: string | null | undefined;
-  const venvOnce = async (): Promise<string | null> => {
-    if (venvBinDir !== undefined) return venvBinDir;
-    const v = await ensurePythonVenv(workspace.dir, log, timeoutMs);
-    venvBinDir = v ? v.binDir : null;
-    return venvBinDir;
+  // Cache the venv resolution PROMISE (not just the resolved value) so
+  // concurrent tool calls (e.g. two pip_install in flight at once) share a
+  // single ensurePythonVenv invocation. Without this both callers see
+  // `undefined`, both kick off `python3 -m venv` against the same dir, and
+  // the second one races into "Errno 17 File exists".
+  let venvPromise: Promise<string | null> | null = null;
+  const venvOnce = (): Promise<string | null> => {
+    if (!venvPromise) {
+      venvPromise = ensurePythonVenv(workspace.dir, log, timeoutMs).then(
+        (v) => (v ? v.binDir : null)
+      );
+    }
+    return venvPromise;
   };
 
   const buildEnv = async (extra?: Record<string, string>): Promise<NodeJS.ProcessEnv> => {
@@ -62,8 +69,13 @@ export function createLocalSandboxAdapter(
       timeoutMs,
       env: finalEnv,
     });
+    const exitCode = r.exitCode ?? 1;
+    if (exitCode !== 0) {
+      const tail = (r.stderr || r.stdout || '').slice(-400).replace(/\n/g, ' \\n ');
+      log(`[sandbox-v2] exit=${exitCode} tail=${tail}`);
+    }
     return {
-      exitCode: r.exitCode ?? 1,
+      exitCode,
       stdout: r.stdout,
       stderr: r.stderr,
       durationMs: r.durationMs,

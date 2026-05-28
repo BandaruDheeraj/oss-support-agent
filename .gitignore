@@ -11,3 +11,5 @@ data/state/
 data/inbox/
 
 report.*.json
+issues.json
+core/__tests__/tmp-adapter-loader-*/

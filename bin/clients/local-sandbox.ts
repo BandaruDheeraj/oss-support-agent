@@ -89,6 +89,19 @@ export async function ensurePythonVenv(
   // shows up in the captured output.
   const candidates = ['python3', 'python'];
   for (const py of candidates) {
+    // A partial/broken venv from a prior failed attempt (e.g. node-runtime
+    // deploy without python3-venv) leaves the dir in place without a working
+    // pip. `python3 -m venv` then fails with "Errno 17 File exists" or
+    // produces an inconsistent venv whose pip raises on first use. Nuke any
+    // dir that exists without a pip binary before retrying.
+    if (fs.existsSync(venvDir) && !fs.existsSync(pipPath)) {
+      log(`[sandbox] removing stale venv at ${venvDir}`);
+      try {
+        fs.rmSync(venvDir, { recursive: true, force: true });
+      } catch (e) {
+        log(`[sandbox] failed to remove stale venv: ${(e as Error).message}`);
+      }
+    }
     log(`[sandbox] creating venv with ${py} -m venv ${venvDir}`);
     const create = await execCommand(
       `${py} -m venv "${venvDir}"`,
