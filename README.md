@@ -160,3 +160,29 @@ V2 is opt-in behind environment flags (defaults stay one-shot):
 - `npm run trace-smoke` — assert OTEL spans flush against the configured backends.
 
 See `.env.example` for the full v2 env table.
+
+
+## Observability
+
+The harness ships a pluggable observability layer that emits one parent span per pipeline phase and one child span per LLM call. Exactly one backend is selected at process start via the `OBSERVABILITY_BACKEND` environment variable:
+
+| Value | Backend | Notes |
+| --- | --- | --- |
+| `none` (default) | No-op | No SDK loaded, zero runtime overhead. |
+| `langsmith` | LangSmith | Requires `LANGSMITH_API_KEY`. Spans appear in the LangSmith project named by `LANGSMITH_PROJECT` (default `oss-support-agent`). |
+| `arize` | Arize / Phoenix | OTLP/HTTP exporter; set `ARIZE_ENDPOINT` (Arize Cloud) or `PHOENIX_OTLP_ENDPOINT` (self-hosted). Add `ARIZE_API_KEY` + `ARIZE_SPACE_ID` for Arize Cloud. Spans carry OpenInference semantic conventions. |
+| `braintrust` | Braintrust | Requires `BRAINTRUST_API_KEY`. Project name comes from `BRAINTRUST_PROJECT` (default `oss-support-agent`). |
+
+### What gets traced
+
+- One `pipeline.repro` / `pipeline.fix` parent span around every `runReproPipeline` / `runFixPipeline` call, tagged with `attempt_id`, `issue_number`, `repo`, and `affected_module`.
+- One `llm.<model>` child span per `LLMClient.chat()` call, with `llm.model_name`, `llm.temperature`, prompt + completion token counts, latency, and retry attempt count.
+- Parent context flows through `AsyncLocalStorage`, so the LLM chokepoint automatically attaches to the enclosing phase span without threading anything through call signatures.
+
+### Redaction
+
+Set `OBSERVABILITY_REDACT_IO=true` to replace each span's input/output payload with `{ redacted, length, sha1 }` — latency and token counts stay observable but raw prompt/completion text never leaves the process. String-level secret scrubbing (API keys, tokens, `Authorization:` headers) always runs via `core/observability/redact.ts`.
+
+### Adding a backend
+
+Drop a new file under `core/observability/<backend>.ts` that exports a class implementing `Tracer` from `./tracer`, then add the lazy-require branch in the factory in `tracer.ts`. No call sites need to change.

@@ -30,6 +30,24 @@ import {
 } from './repro-loop-v2/repro-hints';
 
 import { execCommand } from '../../bin/clients/local-workspace';
+import { getTracer, runWithSpan, type Span } from '../observability';
+
+async function withPipelineSpan<T>(
+  name: string,
+  attrs: Record<string, unknown>,
+  fn: () => Promise<T>
+): Promise<T> {
+  const tracer = getTracer();
+  const span: Span = tracer.startSpan(name, { kind: 'phase', attributes: attrs });
+  try {
+    return await runWithSpan(span, fn);
+  } catch (err) {
+    span.recordError(err);
+    throw err;
+  } finally {
+    span.end();
+  }
+}
 
 /* -------------------------------------------------------------------------- */
 /* Common driver inputs                                                       */
@@ -74,6 +92,20 @@ export interface ReproPipelineOutcome {
 /* -------------------------------------------------------------------------- */
 
 export async function runReproPipeline(input: ReproPipelineInput): Promise<ReproPipelineOutcome> {
+  return withPipelineSpan(
+    'pipeline.repro',
+    {
+      attempt_id: input.attemptId,
+      issue_number: input.payload.issue?.number,
+      repo: input.payload.repository?.full_name,
+      affected_module: input.affectedModule,
+      language: input.language ?? 'python',
+    },
+    () => runReproPipelineImpl(input)
+  );
+}
+
+async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPipelineOutcome> {
   const log = input.log ?? (() => {});
   const language = input.language ?? 'python';
 
@@ -189,6 +221,21 @@ export interface FixPipelineOutcome {
 }
 
 export async function runFixPipeline(input: FixPipelineInput): Promise<FixPipelineOutcome> {
+  return withPipelineSpan(
+    'pipeline.fix',
+    {
+      attempt_id: input.attemptId,
+      issue_number: input.payload.issue?.number,
+      repo: input.payload.repository?.full_name,
+      affected_module: input.affectedModule,
+      language: input.language ?? 'python',
+      repro_test_path: input.reproTestPath,
+    },
+    () => runFixPipelineImpl(input)
+  );
+}
+
+async function runFixPipelineImpl(input: FixPipelineInput): Promise<FixPipelineOutcome> {
   const log = input.log ?? (() => {});
   const language = input.language ?? 'python';
 

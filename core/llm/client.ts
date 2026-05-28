@@ -8,6 +8,7 @@
  */
 
 import Ajv from 'ajv';
+import { currentSpan, getTracer } from '../observability';
 
 export type LLMRole = 'system' | 'user' | 'assistant';
 
@@ -195,6 +196,23 @@ export class LLMClient {
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
 
+    // Pluggable observability span — selected by OBSERVABILITY_BACKEND.
+    // Parent (phase) span flows via AsyncLocalStorage so we don't need to
+    // thread it through call sites.
+    const tracer = getTracer();
+    const span = tracer.startSpan(`llm.${model}`, {
+      kind: 'llm',
+      parent: currentSpan(),
+      attributes: {
+        'llm.model_name': model,
+        'llm.temperature': temperature,
+        'llm.agent': options.agent ?? null,
+        'llm.message_count': messages.length,
+      },
+    });
+    span.setInput({ messages });
+    const startMs = Date.now();
+
     const body: Record<string, unknown> = {
       model,
       messages: messages.map((m) => ({ role: m.role, content: m.content, ...(m.name ? { name: m.name } : {}) })),
@@ -257,6 +275,15 @@ export class LLMClient {
           options.onUsage(usage);
         }
 
+        span.setAttributes({
+          'llm.token_count.prompt': usage?.promptTokens ?? null,
+          'llm.token_count.completion': usage?.completionTokens ?? null,
+          'llm.token_count.total': usage?.totalTokens ?? null,
+          'llm.latency_ms': Date.now() - startMs,
+          'llm.attempt_count': attempt,
+        });
+        span.setOutput({ content });
+        span.end();
         return { content, usage, raw };
       } catch (err) {
         lastErr = err;
@@ -265,6 +292,9 @@ export class LLMClient {
           const status = err.status;
           const retryable = status === 429 || status >= 500;
           if (!retryable) {
+            span.recordError(err);
+            span.setAttributes({ 'llm.latency_ms': Date.now() - startMs, 'llm.attempt_count': attempt });
+            span.end();
             throw err;
           }
         }
@@ -278,6 +308,9 @@ export class LLMClient {
       }
     }
 
+    span.recordError(lastErr);
+    span.setAttributes({ 'llm.latency_ms': Date.now() - startMs, 'llm.attempt_count': maxAttempts });
+    span.end();
     throw lastErr instanceof Error ? lastErr : new Error('OpenRouter request failed');
   }
 
