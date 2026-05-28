@@ -303,6 +303,67 @@ export function reproProberDoneGate(transcript: TranscriptEntry[]): string | nul
 }
 
 /**
+ * Prober `abandon`-gate logic — exported for unit testing. Returns null when
+ * the registry should allow the abandon call to proceed; otherwise returns a
+ * guidance string the registry surfaces as a ToolGuardError. Contract:
+ *   1. Must have authored at least one test (write_test or revise_test).
+ *   2. Must have called run_repro at least twice (e.ok).
+ *   3. POSITIVE-signal gate: if the derived verified state shows ≥1
+ *      run_repro since the latest test write with exitCode!=0 AND the
+ *      sentinel present in stdout+stderr, abandon is forbidden — the
+ *      model must record_evidence (after one more confirming run if it
+ *      only has 1 positive observation) instead of bailing.
+ *   4. Install-fatigue fallback: if pip_install has failed ≥2 times and
+ *      there's been no revise_test+run_repro since, the model must pivot
+ *      to a direct-call path before considering abandon.
+ */
+export function reproProberAbandonGate(transcript: TranscriptEntry[]): string | null {
+  const wroteTest = transcript.some(
+    (t) => (t.tool === 'write_test' || t.tool === 'revise_test') && t.ok,
+  );
+  const ranRepro = transcript.filter((t) => t.tool === 'run_repro' && t.ok).length;
+  if (!wroteTest) {
+    return 'abandon is forbidden before you have authored a candidate test. Call write_test to create the candidate test file, then run_repro at least twice, before considering abandon.';
+  }
+  if (ranRepro < 2) {
+    return `abandon is forbidden before you have run_repro at least twice (you have ${ranRepro}). Revise the test and run_repro again before considering abandon.`;
+  }
+  const state = deriveVerifiedState(transcript);
+  if (state.runReproPositiveSinceWrite >= 1) {
+    return (
+      `abandon is forbidden: you have ${state.runReproPositiveSinceWrite} POSITIVE run_repro observation(s) ` +
+      `(exit!=0 AND sentinel "${state.derivedSentinel}" in stdout/stderr) since your last test write — ` +
+      `this PROVES the test triggers the bug. ` +
+      (state.runReproPositiveSinceWrite >= 2
+        ? `You have ≥2 positive observations — your NEXT tool call MUST be record_evidence with a complete reproRecipe (candidateTestPath, testSource, sentinelString, expectedFailureSignature, pipInstalls, provenance.observedProbe populated from your latest run_repro), then done on the following turn.`
+        : `Run run_repro once more to confirm consistency (you need 2 positive observations to record_evidence), then call record_evidence.`) +
+      ` Abandon is reserved for environmental dead-ends where no repro signal exists.\n\n${renderVerifiedState(state)}`
+    );
+  }
+  const failedInstalls = transcript.filter(
+    (t) => t.tool === 'pip_install' && (!t.ok || (t.result as any)?.exitCode !== 0)
+  ).length;
+  const lastRevise = transcript
+    .map((t, i) => ({ t, i }))
+    .filter(({ t }) => t.tool === 'revise_test' && t.ok)
+    .pop();
+  const ranReproAfterRevise = lastRevise
+    ? transcript.slice(lastRevise.i + 1).some((t) => t.tool === 'run_repro' && t.ok)
+    : false;
+  if (failedInstalls >= 2 && !ranReproAfterRevise) {
+    return (
+      `abandon is forbidden: you have ${failedInstalls} failed pip_install attempts ` +
+      `but no revise_test followed by a fresh run_repro. Install-fatigue is treated as environmental ` +
+      `incompatibility — STOP installing the heavy framework and instead revise_test to a direct-call ` +
+      `path that imports the suspect symbol straight from its underlying package (e.g. ` +
+      `opentelemetry.trace.NonRecordingSpan instead of the framework wrapper). Then run_repro on the ` +
+      `revised test. Abandon becomes available only after that observation.`
+    );
+  }
+  return null;
+}
+
+/**
  * Repro Prober — same shape as the Executor (LLM loop with read + note +
  * write-test + sandbox), plus `record_evidence` so it can emit the
  * ReproRecipe that the deterministic Executor will transcribe. Done gate
@@ -322,39 +383,7 @@ export function makeReproProberRegistry({ ctx }: RegistryFactoryArgs): ToolRegis
           gateRequirePriorProbe(transcript) ?? gateRequireRunReproSinceLastWrite(transcript),
         done: reproProberDoneGate,
       },
-      abandonGate: (transcript) => {
-        const wroteTest = transcript.some(
-          (t) => (t.tool === 'write_test' || t.tool === 'revise_test') && t.ok,
-        );
-        const ranRepro = transcript.filter((t) => t.tool === 'run_repro' && t.ok).length;
-        if (!wroteTest) {
-          return 'abandon is forbidden before you have authored a candidate test. Call write_test to create the candidate test file, then run_repro at least twice, before considering abandon.';
-        }
-        if (ranRepro < 2) {
-          return `abandon is forbidden before you have run_repro at least twice (you have ${ranRepro}). Revise the test and run_repro again before considering abandon.`;
-        }
-        const failedInstalls = transcript.filter(
-          (t) => t.tool === 'pip_install' && (!t.ok || (t.result as any)?.exitCode !== 0)
-        ).length;
-        const lastRevise = transcript
-          .map((t, i) => ({ t, i }))
-          .filter(({ t }) => t.tool === 'revise_test' && t.ok)
-          .pop();
-        const ranReproAfterRevise = lastRevise
-          ? transcript.slice(lastRevise.i + 1).some((t) => t.tool === 'run_repro' && t.ok)
-          : false;
-        if (failedInstalls >= 2 && !ranReproAfterRevise) {
-          return (
-            `abandon is forbidden: you have ${failedInstalls} failed pip_install attempts ` +
-            `but no revise_test followed by a fresh run_repro. Install-fatigue is treated as environmental ` +
-            `incompatibility — STOP installing the heavy framework and instead revise_test to a direct-call ` +
-            `path that imports the suspect symbol straight from its underlying package (e.g. ` +
-            `opentelemetry.trace.NonRecordingSpan instead of the framework wrapper). Then run_repro on the ` +
-            `revised test. Abandon becomes available only after that observation.`
-          );
-        }
-        return null;
-      },
+      abandonGate: reproProberAbandonGate,
     },
     ctx
   )

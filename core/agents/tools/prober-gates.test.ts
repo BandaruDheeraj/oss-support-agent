@@ -8,7 +8,7 @@
  *      escape the workspace test roots, mirroring write_test's scoping.
  */
 
-import { reproProberDoneGate } from './index';
+import { reproProberDoneGate, reproProberAbandonGate } from './index';
 import { recordEvidence } from './note-meta';
 import { DossierStore } from '../analyst/dossier';
 import type { TranscriptEntry, ToolContext } from './types';
@@ -137,6 +137,65 @@ describe('reproProberDoneGate', () => {
       entry({ tool: 'record_evidence', args: VALID_RECIPE_ARGS, result: { snapshot_id: 'snap-1', recipe_recorded: true } }),
     ];
     expect(reproProberDoneGate(transcript)).toContain('Observed only 0 such call');
+  });
+});
+
+describe('reproProberAbandonGate', () => {
+  it('blocks abandon before any test has been authored', () => {
+    const reason = reproProberAbandonGate([
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: '' } }),
+    ]);
+    expect(reason).toContain('before you have authored a candidate test');
+  });
+
+  it('blocks abandon when fewer than 2 run_repro calls have been made', () => {
+    const reason = reproProberAbandonGate([
+      entry({ tool: 'write_test', tier: 'write-test', args: { path: 'tests/test_repro.py', content: '...' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'REPRO_SENTINEL' } }),
+    ]);
+    expect(reason).toContain('run_repro at least twice');
+  });
+
+  it('allows abandon when test authored, ≥2 run_repro, no positive observation', () => {
+    const reason = reproProberAbandonGate([
+      entry({ tool: 'write_test', tier: 'write-test', args: { path: 'tests/test_repro.py', content: 'assert False, "REPRO_SENTINEL"' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 0, stdout: '', stderr: '' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 0, stdout: '', stderr: '' } }),
+    ]);
+    expect(reason).toBeNull();
+  });
+
+  it('blocks abandon when 1 positive observation exists, directing to confirm + record_evidence', () => {
+    const reason = reproProberAbandonGate([
+      entry({ tool: 'write_test', tier: 'write-test', args: { path: 'tests/test_repro.py', content: 'assert False, "REPRO_SENTINEL"' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 0, stdout: '', stderr: '' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'REPRO_SENTINEL trace' } }),
+    ]);
+    expect(reason).not.toBeNull();
+    expect(reason).toContain('1 POSITIVE run_repro observation');
+    expect(reason).toContain('Run run_repro once more');
+  });
+
+  it('blocks abandon when ≥2 positive observations exist, directing to record_evidence NOW', () => {
+    const reason = reproProberAbandonGate([
+      entry({ tool: 'write_test', tier: 'write-test', args: { path: 'tests/test_repro.py', content: 'assert False, "REPRO_SENTINEL"' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'REPRO_SENTINEL' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: 'REPRO_SENTINEL', stderr: '' } }),
+    ]);
+    expect(reason).not.toBeNull();
+    expect(reason).toContain('2 POSITIVE run_repro observation');
+    expect(reason).toContain('NEXT tool call MUST be record_evidence');
+  });
+
+  it('triggers install-fatigue clause when ≥2 failed pip_install with no positive observation', () => {
+    const reason = reproProberAbandonGate([
+      entry({ tool: 'write_test', tier: 'write-test', args: { path: 'tests/test_repro.py', content: 'x' } }),
+      entry({ tool: 'pip_install', tier: 'sandbox', ok: false, result: { exitCode: 1 } }),
+      entry({ tool: 'pip_install', tier: 'sandbox', ok: false, result: { exitCode: 1 } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'ModuleNotFoundError' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'ModuleNotFoundError' } }),
+    ]);
+    expect(reason).toContain('Install-fatigue');
   });
 });
 

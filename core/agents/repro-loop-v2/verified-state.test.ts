@@ -33,6 +33,11 @@ describe('deriveVerifiedState', () => {
       runPythonFailureCount: 0,
       testCommittedPath: null,
       runReproCount: 0,
+      runReproPassingCount: 0,
+      runReproFailingCount: 0,
+      runReproErrorCount: 0,
+      runReproPositiveSinceWrite: 0,
+      derivedSentinel: null,
     });
   });
 
@@ -146,6 +151,97 @@ describe('deriveVerifiedState', () => {
       ])
     ).not.toThrow();
   });
+
+  it('classifies run_repro into passing/failing/errored by exitCode', () => {
+    const s = deriveVerifiedState([
+      entry({ tool: 'run_repro', tier: sandbox, ok: true, result: { exitCode: 0, stdout: 'ok', stderr: '' } }),
+      entry({ tool: 'run_repro', tier: sandbox, ok: true, result: { exitCode: 1, stdout: '', stderr: 'AssertionError' } }),
+      entry({ tool: 'run_repro', tier: sandbox, ok: false, error: 'sandbox timeout' }),
+      entry({ tool: 'run_repro', tier: sandbox, ok: true, result: { exitCode: null as unknown as number, stdout: '', stderr: '' } }),
+    ]);
+    expect(s.runReproPassingCount).toBe(1);
+    expect(s.runReproFailingCount).toBe(1);
+    expect(s.runReproErrorCount).toBe(2);
+    expect(s.runReproCount).toBe(2);
+  });
+
+  it('extracts sentinel from latest write_test/revise_test (double-quote)', () => {
+    const s = deriveVerifiedState([
+      entry({ tool: 'write_test', tier: writeTier, ok: true,
+        args: { path: 'tests/t.py', content: 'def test_x():\n    assert False, "REPRO_46_NRS"\n' },
+        result: { written: 'tests/t.py' } }),
+    ]);
+    expect(s.derivedSentinel).toBe('REPRO_46_NRS');
+  });
+
+  it('extracts sentinel from revise_test single-quote with trailing colon variant', () => {
+    const s = deriveVerifiedState([
+      entry({ tool: 'write_test', tier: writeTier, ok: true,
+        args: { path: 'tests/t.py', content: 'def t():\n    assert False, "OLD_SENTINEL"\n' },
+        result: { written: 'tests/t.py' } }),
+      entry({ tool: 'revise_test', tier: writeTier, ok: true,
+        args: { path: 'tests/t.py', content: "def t():\n    try:\n        f()\n    except Exception as e:\n        assert False, 'NEW_SENTINEL: ' + str(e)\n    else:\n        assert False, 'NEW_SENTINEL: expected'\n" },
+        result: { revised: 'tests/t.py' } }),
+    ]);
+    expect(s.derivedSentinel).toBe('NEW_SENTINEL');
+  });
+
+  it('counts runReproPositiveSinceWrite only for runs after latest write with exit!=0 + sentinel', () => {
+    const transcript: TranscriptEntry[] = [
+      // Old test with old sentinel + 2 failing runs (should NOT count)
+      entry({ tool: 'write_test', tier: writeTier, ok: true,
+        args: { path: 'tests/t.py', content: 'assert False, "OLD"' },
+        result: { written: 'tests/t.py' } }),
+      entry({ tool: 'run_repro', tier: sandbox, ok: true,
+        result: { exitCode: 1, stdout: '', stderr: 'OLD trace' } }),
+      // Revise switches to new sentinel
+      entry({ tool: 'revise_test', tier: writeTier, ok: true,
+        args: { path: 'tests/t.py', content: 'assert False, "NEW_SENTINEL"' },
+        result: { revised: 'tests/t.py' } }),
+      // Passing run after revise (exit 0 -> not positive)
+      entry({ tool: 'run_repro', tier: sandbox, ok: true,
+        result: { exitCode: 0, stdout: 'NEW_SENTINEL', stderr: '' } }),
+      // Failing without sentinel -> not positive
+      entry({ tool: 'run_repro', tier: sandbox, ok: true,
+        result: { exitCode: 1, stdout: '', stderr: 'unrelated error' } }),
+      // Failing WITH sentinel -> positive (1)
+      entry({ tool: 'run_repro', tier: sandbox, ok: true,
+        result: { exitCode: 1, stdout: '', stderr: 'NEW_SENTINEL trace' } }),
+      // Failing WITH sentinel in stdout -> positive (2)
+      entry({ tool: 'run_repro', tier: sandbox, ok: true,
+        result: { exitCode: 1, stdout: 'NEW_SENTINEL', stderr: '' } }),
+    ];
+    const s = deriveVerifiedState(transcript);
+    expect(s.derivedSentinel).toBe('NEW_SENTINEL');
+    expect(s.runReproPositiveSinceWrite).toBe(2);
+  });
+
+  it('honours explicit sentinel override in opts', () => {
+    const s = deriveVerifiedState(
+      [
+        entry({ tool: 'write_test', tier: writeTier, ok: true,
+          args: { path: 'tests/t.py', content: 'no_assert_here' },
+          result: { written: 'tests/t.py' } }),
+        entry({ tool: 'run_repro', tier: sandbox, ok: true,
+          result: { exitCode: 1, stdout: '', stderr: 'MY_SENTINEL hit' } }),
+      ],
+      { sentinel: 'MY_SENTINEL' }
+    );
+    expect(s.derivedSentinel).toBe('MY_SENTINEL');
+    expect(s.runReproPositiveSinceWrite).toBe(1);
+  });
+
+  it('positive count is 0 when no sentinel derivable', () => {
+    const s = deriveVerifiedState([
+      entry({ tool: 'write_test', tier: writeTier, ok: true,
+        args: { path: 'tests/t.py', content: 'plain test, no assert False' },
+        result: { written: 'tests/t.py' } }),
+      entry({ tool: 'run_repro', tier: sandbox, ok: true,
+        result: { exitCode: 1, stdout: '', stderr: 'failed' } }),
+    ]);
+    expect(s.derivedSentinel).toBeNull();
+    expect(s.runReproPositiveSinceWrite).toBe(0);
+  });
 });
 
 describe('renderVerifiedState', () => {
@@ -159,6 +255,11 @@ describe('renderVerifiedState', () => {
       runPythonFailureCount: 1,
       testCommittedPath: null,
       runReproCount: 0,
+      runReproPassingCount: 0,
+      runReproFailingCount: 0,
+      runReproErrorCount: 0,
+      runReproPositiveSinceWrite: 0,
+      derivedSentinel: null,
     });
     expect(text).toContain('VERIFIED SANDBOX STATE');
     expect(text).toContain('-e python/foo');
@@ -179,9 +280,14 @@ describe('summariseVerifiedState', () => {
       runPythonFailureCount: 1,
       testCommittedPath: 'tests/test_repro.py',
       runReproCount: 2,
+      runReproPassingCount: 0,
+      runReproFailingCount: 2,
+      runReproErrorCount: 0,
+      runReproPositiveSinceWrite: 2,
+      derivedSentinel: 'SENTINEL_X',
     });
     expect(line).toBe(
-      'installs_ok=2 installs_failed=1 importable=2 not_importable=1 run_python_ok=4 run_python_err=1 test_committed=yes run_repro_ok=2'
+      'installs_ok=2 installs_failed=1 importable=2 not_importable=1 run_python_ok=4 run_python_err=1 test_committed=yes run_repro_ok=2 run_repro_failing=2 run_repro_passing=0 run_repro_errored=0 run_repro_positive_since_write=2'
     );
   });
 });

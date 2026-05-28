@@ -96,7 +96,12 @@ Procedure (follow in order; do not skip):
 
 4. COMMIT the test source. ONE write_test call. The test contains: your verified imports, your verified exercise call, and \`assert False, "<sentinel>"\` (or equivalent) at the end so run_repro reports a failure containing the sentinel.
 
-5. VERIFY twice. run_repro twice. Require exit != 0 AND the sentinel in stderr/stdout AND (ideally) the dossier's expectedFailureSignature in stderr/stdout. If the test PASSED (exit == 0), the exercise didn't trigger the bug — return to step 3, probe more, then revise_test.
+5. VERIFY twice. run_repro twice. After EACH run, classify the result by these rules:
+   - exit != 0 AND your sentinel appears in stdout/stderr → POSITIVE (the test triggered the bug). Count it.
+   - exit != 0 AND no sentinel → the test failed for the wrong reason (collection error, unrelated exception). revise_test to fix the exercise.
+   - exit == 0 → the test PASSED; the exercise did not trigger the bug. revise_test with a stronger exercise.
+
+   COMPLETION TRIGGER (NON-NEGOTIABLE): as soon as you have 2 POSITIVE observations since your latest test write, your VERY NEXT tool call MUST be record_evidence. Do not probe more. Do not read more files. Do not call abandon. The registry's abandon gate will reject abandon when a positive signal exists.
 
 6. RECORD the recipe. Call record_evidence with a complete \`reproRecipe\` object. The Critic and deterministic Executor will consume this exact object. Required fields:
    - candidateTestPath: the path you wrote to in step 4.
@@ -135,7 +140,9 @@ Preconditions enforcement:
 - For preconditions with kind: config_absence and non-empty threats, your test MUST either (a) reset the threatened global before exercising the suspect symbol (e.g. via monkeypatch.setattr on the framework's internal globals), OR (b) bypass the global entirely by importing the suspect symbol and calling it directly with hand-constructed inputs. Either way, the chosen satisfactionMode's markers SHOULD appear in your test source — then list the precondition id in provenance.preconditionsSatisfied.
 
 Abandon discipline:
-- Only call abandon after you have (a) authored at least one test, (b) run_repro at least twice, and (c) exhausted grep/find_symbol/read_file for any blocking symbol. "Symbol not found in repo" alone is NEVER a sufficient reason — third-party symbols (opentelemetry's NonRecordingSpan, pytest's MonkeyPatch, etc.) live in their package, not in this repo, so try importing them directly first.
+- abandon is reserved for ENVIRONMENTAL dead-ends — never for "running out of budget" (the registry tracks turns; you have plenty as long as you make focused progress) and never when you already have a positive run_repro observation since your last write.
+- Only call abandon after you have (a) authored at least one test, (b) run_repro at least twice, (c) exhausted grep/find_symbol/read_file for any blocking symbol, AND (d) the abandon gate confirms zero positive observations since your last write. "Symbol not found in repo" alone is NEVER a sufficient reason — third-party symbols (opentelemetry's NonRecordingSpan, pytest's MonkeyPatch, etc.) live in their package, not in this repo, so try importing them directly first.
+- The abandon gate will REJECT your abandon call if the verified-state ledger shows ≥1 POSITIVE run_repro observation (exit != 0 + sentinel) since your last test write. If you see that rejection, your next step is record_evidence (after one more run_repro if you only have 1 positive observation), not abandon.
 - Install-fatigue: if pip_install fails 2+ times for the same heavy framework (smolagents, langchain, llama-index, autogen, crewai), treat that as environmental incompatibility. Stop installing — pivot to a direct-call path that imports the suspect symbol straight from its underlying package (e.g. opentelemetry.trace), then run_repro on the revised test before considering abandon.`;
 
 export interface RunReproProberArgs {
