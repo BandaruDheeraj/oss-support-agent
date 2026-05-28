@@ -1,14 +1,18 @@
 services:
   - type: web
     name: oss-support-agent
-    runtime: node
+    runtime: docker
     plan: free
     region: oregon
     branch: main
     autoDeploy: true
 
-    buildCommand: npm ci && npm run build
-    startCommand: npm start
+    # Docker runtime: see ./Dockerfile. The custom image installs python3 +
+    # python3-venv + git, which Render's stock node runtime is missing and
+    # which the repro/fix sandbox needs to bootstrap `.agent-venv` per
+    # workspace. Without these the v2 Executor cannot run a single pip
+    # install and stalls every issue at "repro-not-runnable".
+    dockerfilePath: ./Dockerfile
 
     healthCheckPath: /healthz
 

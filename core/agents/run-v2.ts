@@ -92,7 +92,13 @@ export async function runReproPipeline(input: ReproPipelineInput): Promise<Repro
   const sandbox = createSandboxAdapter({
     driver: input.sandboxDriver,
     workspace: input.workspace,
-    localOptions: input.localSandboxOptions,
+    localOptions: {
+      ...(input.localSandboxOptions ?? {}),
+      // Surface venv-creation + per-command sandbox logs to the pipeline log
+      // unless the caller explicitly set their own. Without this we lose all
+      // visibility into `python3 -m venv` failures, pip stderr, etc.
+      log: input.localSandboxOptions?.log ?? log,
+    },
     ghActionsOptions: input.ghActionsSandboxOptions
       ? input.ghActionsSandboxOptions
       : undefined,
@@ -212,6 +218,9 @@ export async function runFixPipeline(input: FixPipelineInput): Promise<FixPipeli
     localOptions: {
       ...(input.localSandboxOptions ?? {}),
       reproTestPath: input.reproTestPath,
+      // Same logger pass-through as the repro pipeline — keep sandbox-level
+      // diagnostics visible in Render logs unless the caller opts out.
+      log: input.localSandboxOptions?.log ?? log,
     },
     ghActionsOptions: input.ghActionsSandboxOptions
       ? { ...input.ghActionsSandboxOptions, reproTestPath: input.reproTestPath }
