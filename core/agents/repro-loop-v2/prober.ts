@@ -193,11 +193,13 @@ export async function runReproProber(args: RunReproProberArgs): Promise<ReproPro
   const preconditions = args.dossierSnapshot.body.preconditions ?? [];
   const suspectSymbols = args.dossierSnapshot.body.suspectSymbols ?? [];
 
-  const verbatimIncompatibleHint = detectHeavyFrameworkSignal({
-    snippets: args.issueSnippets,
-    issueBody: args.issueBody,
-    suspectSymbols,
-  });
+  const verbatimIncompatibleHint =
+    (args.dossierSnapshot.body.reproTargets?.runtimeForbidden ?? []).length > 0 ||
+    detectHeavyFrameworkSignal({
+      snippets: args.issueSnippets,
+      issueBody: args.issueBody,
+      suspectSymbols,
+    });
 
   const snippetBlock = renderIssueSnippetsBlock(args.issueSnippets ?? []);
   const editableBlock = renderEditableInstallsBlock(args.editableInstallCandidates ?? []);

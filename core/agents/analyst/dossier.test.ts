@@ -1,4 +1,4 @@
-import { DossierStore, snapshotIdFor, DossierBodySchema, type DossierBody } from './dossier';
+import { DossierStore, snapshotIdFor, DossierBodySchema, normalizeReproTargetsInput, type DossierBody } from './dossier';
 
 function makeBody(overrides: Partial<DossierBody> = {}): DossierBody {
   return DossierBodySchema.parse({
@@ -115,6 +115,37 @@ describe('dossier snapshot id', () => {
     const legacy = makeBody();
     const explicitUndef = { ...makeBody(), candidateRepro: undefined } as DossierBody;
     expect(snapshotIdFor(explicitUndef)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('omits absent reproTargets from the canonical hash (backward compat)', () => {
+    const legacy = makeBody();
+    const explicitUndef = { ...makeBody(), reproTargets: undefined } as DossierBody;
+    expect(snapshotIdFor(explicitUndef)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('omits all-empty reproTargets from the canonical hash (back-compat with schema defaults)', () => {
+    // A body where the field is present but both arrays are empty MUST
+    // hash identically to a body literally lacking the field — otherwise
+    // schema-defaulted snapshots break links bound to legacy ids.
+    const legacy = makeBody();
+    const withEmpty = makeBody({ reproTargets: { editableInstall: [], runtimeForbidden: [] } });
+    expect(snapshotIdFor(withEmpty)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('changes when reproTargets has non-empty editableInstall', () => {
+    const without = makeBody();
+    const withTargets = makeBody({
+      reproTargets: { editableInstall: ['python/pkg-a'], runtimeForbidden: [] },
+    });
+    expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withTargets));
+  });
+
+  it('changes when reproTargets has non-empty runtimeForbidden', () => {
+    const without = makeBody();
+    const withTargets = makeBody({
+      reproTargets: { editableInstall: [], runtimeForbidden: ['smolagents'] },
+    });
+    expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withTargets));
   });
 
   it('changes when candidateRepro is present', () => {
@@ -277,5 +308,73 @@ describe('DossierStore.deserialize backward compat', () => {
     const store = DossierStore.deserialize(persisted);
     expect(store.latest()!.snapshotId).toBe(legacyId);
     expect(store.latest()!.body.reproRecipe).toBeUndefined();
+  });
+
+  it('round-trips a body with reproTargets', () => {
+    const store = new DossierStore();
+    const snap = store.append({
+      issueNumber: 46,
+      attemptId: 'attempt-1',
+      evidence: [],
+      suspectSymbols: [],
+      openQuestions: [],
+      summary: 's',
+      confidence: 'medium',
+      reproTargets: {
+        editableInstall: ['python/pkg-a', 'python/pkg-b'],
+        runtimeForbidden: ['smolagents'],
+      },
+    });
+    const rehydrated = DossierStore.deserialize(store.serialize());
+    expect(rehydrated.latest()!.snapshotId).toBe(snap.snapshotId);
+    expect(rehydrated.latest()!.body.reproTargets).toEqual({
+      editableInstall: ['python/pkg-a', 'python/pkg-b'],
+      runtimeForbidden: ['smolagents'],
+    });
+  });
+});
+
+describe('normalizeReproTargetsInput', () => {
+  it('returns null for nullish / non-object input', () => {
+    expect(normalizeReproTargetsInput(null)).toBeNull();
+    expect(normalizeReproTargetsInput(undefined)).toBeNull();
+    expect(normalizeReproTargetsInput('nope')).toBeNull();
+  });
+
+  it('returns null when both arrays are empty after cleaning', () => {
+    expect(normalizeReproTargetsInput({ editableInstall: [], runtimeForbidden: [] })).toBeNull();
+    // Non-string entries get dropped — same as empty.
+    expect(
+      normalizeReproTargetsInput({ editableInstall: [1, null, {}], runtimeForbidden: [true] })
+    ).toBeNull();
+  });
+
+  it('strips leading/trailing slashes + backslashes and de-dupes editableInstall', () => {
+    const r = normalizeReproTargetsInput({
+      editableInstall: ['/python/pkg/', 'python\\pkg', 'python/other', 'python/other'],
+    });
+    expect(r).toEqual({
+      editableInstall: ['python/pkg', 'python/other'],
+      runtimeForbidden: [],
+    });
+  });
+
+  it('lowercases + de-dupes runtimeForbidden', () => {
+    const r = normalizeReproTargetsInput({
+      runtimeForbidden: ['Smolagents', 'smolagents', 'LangChain'],
+    });
+    expect(r).toEqual({
+      editableInstall: [],
+      runtimeForbidden: ['smolagents', 'langchain'],
+    });
+  });
+
+  it('ignores unknown keys via passthrough', () => {
+    const r = normalizeReproTargetsInput({
+      editableInstall: ['a'],
+      runtimeForbidden: ['b'],
+      bogus: 'ignored',
+    });
+    expect(r).toEqual({ editableInstall: ['a'], runtimeForbidden: ['b'] });
   });
 });

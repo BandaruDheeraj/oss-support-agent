@@ -62,6 +62,79 @@ export const SuspectSymbolSchema = z.object({
 export type SuspectSymbol = z.infer<typeof SuspectSymbolSchema>;
 
 /**
+ * ReproTargets — structured hints the Analyst supplies to downstream Repro
+ * stages so they don't have to re-derive them via heuristics.
+ *
+ *   - `editableInstall`: repo-relative directory paths the Repro Executor
+ *     should `pip install -e <dir>` BEFORE running the candidate test. Each
+ *     dir must contain a Python package manifest (pyproject.toml /
+ *     setup.py / setup.cfg). Replaces the BFS-top-5 + suspect-path-walk-up
+ *     heuristic when the Analyst can identify the package directly.
+ *   - `runtimeForbidden`: import names (e.g. "smolagents", "langchain")
+ *     that the Prober should NOT try to install in the runtime sandbox;
+ *     they're known to either explode the dep tree or require network/
+ *     credentials. When non-empty, the Prober pivots to a direct-call
+ *     exercise of the underlying primitive (sets
+ *     `reproRecipe.verbatimSnippetIncompatible=true`).
+ *
+ * Both arrays default to []. The whole field is optional at the schema
+ * layer for back-compat — legacy snapshots predate the field entirely and
+ * must hash identically (see snapshotIdFor).
+ */
+export const ReproTargetsSchema = z.object({
+  editableInstall: z.array(z.string()).default([]),
+  runtimeForbidden: z.array(z.string()).default([]),
+});
+export type ReproTargets = z.infer<typeof ReproTargetsSchema>;
+
+/**
+ * Loose input variant. LLMs frequently emit either field with extraneous
+ * shape (objects instead of strings, leading slashes, etc.); we coerce in
+ * `normalizeReproTargetsInput`. Failing the whole `record_evidence` call
+ * over a malformed reproTargets entry would discard the entire dossier —
+ * reproTargets is a best-effort hint, not a load-bearing contract.
+ */
+export const ReproTargetsInputSchema = z
+  .object({
+    editableInstall: z.array(z.string()).optional(),
+    runtimeForbidden: z.array(z.string()).optional(),
+  })
+  .passthrough();
+export type ReproTargetsInput = z.infer<typeof ReproTargetsInputSchema>;
+
+/**
+ * Coerce a loose reproTargets input into a strict ReproTargets shape. Strips
+ * non-string entries, leading/trailing slashes on dirs, and de-dupes.
+ * Returns null when the input is absent or both fields end up empty — the
+ * caller treats null as "no reproTargets supplied" so the back-compat
+ * snapshot hash remains stable (snapshotIdFor omits the field when absent).
+ */
+export function normalizeReproTargetsInput(raw: unknown): ReproTargets | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  const dedup = (arr: unknown, cleaner: (s: string) => string): string[] => {
+    if (!Array.isArray(arr)) return [];
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const v of arr) {
+      if (typeof v !== 'string') continue;
+      const cleaned = cleaner(v).trim();
+      if (!cleaned) continue;
+      if (seen.has(cleaned)) continue;
+      seen.add(cleaned);
+      out.push(cleaned);
+    }
+    return out;
+  };
+  const editableInstall = dedup(r.editableInstall, (s) =>
+    s.replace(/\\+/g, '/').replace(/^[/]+/, '').replace(/\/+$/, '')
+  );
+  const runtimeForbidden = dedup(r.runtimeForbidden, (s) => s.toLowerCase());
+  if (editableInstall.length === 0 && runtimeForbidden.length === 0) return null;
+  return { editableInstall, runtimeForbidden };
+}
+
+/**
  * A "satisfaction mode" is one concrete way a repro test can enforce a
  * precondition. The `markers` array contains short substrings the Critic
  * can grep for in the candidate test source as a structural redundancy
@@ -433,6 +506,16 @@ export const DossierBodySchema = z.object({
    * hash when absent so legacy snapshot ids remain stable.
    */
   candidateRepro: CandidateReproSchema.optional(),
+  /**
+   * Repro targets authored by the Analyst — concrete package dirs to
+   * `pip install -e` and import names the Prober must NOT install in the
+   * runtime sandbox. OPTIONAL: when absent the orchestrator falls back to
+   * the BFS+suspect-path heuristic in repro-hints.ts. Back-compat:
+   * snapshots predating this field deserialize without it; `snapshotIdFor`
+   * strips it from the canonical hash when absent so legacy snapshot ids
+   * remain stable.
+   */
+  reproTargets: ReproTargetsSchema.optional(),
 });
 
 export type DossierBody = z.infer<typeof DossierBodySchema>;
@@ -480,6 +563,19 @@ export function snapshotIdFor(body: DossierBody): string {
   const candidate = (body as { candidateRepro?: unknown }).candidateRepro;
   if (candidate == null) {
     delete forHash.candidateRepro;
+  }
+  // Same for reproTargets (analyst-authored hints, added in Phase 8). Both
+  // absent and "present but both arrays empty" MUST canonicalize-out
+  // identically, otherwise a body that defaults the field through the
+  // schema would hash differently from a legacy snapshot literally lacking
+  // it.
+  const reproTargets = (body as { reproTargets?: ReproTargets }).reproTargets;
+  if (
+    reproTargets == null ||
+    ((reproTargets.editableInstall ?? []).length === 0 &&
+      (reproTargets.runtimeForbidden ?? []).length === 0)
+  ) {
+    delete forHash.reproTargets;
   }
   return createHash('sha1').update(canonicalize(forHash)).digest('hex').slice(0, 16);
 }
@@ -533,11 +629,12 @@ export class DossierStore {
    * when omitted, preserving backward-compatible call sites.
    */
   append(
-    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions' | 'reproRecipe' | 'candidateRepro'> & {
+    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions' | 'reproRecipe' | 'candidateRepro' | 'reproTargets'> & {
       parentSnapshotId?: string | null;
       preconditions?: Precondition[];
       reproRecipe?: ReproRecipe;
       candidateRepro?: CandidateRepro;
+      reproTargets?: ReproTargets;
     }
   ): DossierSnapshot {
     const parent = input.parentSnapshotId ?? this.latest()?.snapshotId ?? null;

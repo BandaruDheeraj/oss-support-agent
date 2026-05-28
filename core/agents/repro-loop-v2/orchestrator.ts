@@ -144,11 +144,18 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
 
   const snapshot = dossier.latest()!;
 
-  // Re-prioritise editable-install candidates using the dossier's suspect
-  // symbols (same heuristic as the prior Planner path).
+  // Editable-install candidates: prefer the Analyst's structured
+  // reproTargets.editableInstall when present (and non-empty). Falls back
+  // to the BFS+walk-up heuristic in repro-hints.ts when the Analyst did
+  // not populate the field (legacy dossiers, low-confidence runs).
   let effectiveEditableInstalls = args.editableInstallCandidates ?? [];
   let suspectDerivedForLog: string[] = [];
-  if (args.workspaceDir && (snapshot.body.suspectSymbols ?? []).length > 0) {
+  let installSource: 'analyst' | 'suspect-derived' | 'fallback' = 'fallback';
+  const analystInstalls = snapshot.body.reproTargets?.editableInstall ?? [];
+  if (analystInstalls.length > 0) {
+    effectiveEditableInstalls = mergeEditableInstallCandidates(analystInstalls, []);
+    installSource = 'analyst';
+  } else if (args.workspaceDir && (snapshot.body.suspectSymbols ?? []).length > 0) {
     const suspectDerived = deriveEditableInstallsFromSuspectPaths(
       args.workspaceDir,
       snapshot.body.suspectSymbols.map((s) => s.file)
@@ -159,13 +166,21 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
         suspectDerived,
         args.editableInstallCandidates ?? []
       );
+      installSource = 'suspect-derived';
     }
   }
   // eslint-disable-next-line no-console
   console.log(
     `[v2-orchestrator] attempt=${args.attemptId} suspectSymbols=${(snapshot.body.suspectSymbols ?? []).length}` +
+      ` installSource=${installSource}` +
+      ` analystInstalls=${analystInstalls.length > 0 ? analystInstalls.join('|') : '(none)'}` +
       ` suspectDerivedInstalls=${suspectDerivedForLog.length > 0 ? suspectDerivedForLog.join('|') : '(none)'}` +
-      ` effectiveEditableInstalls=${effectiveEditableInstalls.length > 0 ? effectiveEditableInstalls.join('|') : '(none)'}`
+      ` effectiveEditableInstalls=${effectiveEditableInstalls.length > 0 ? effectiveEditableInstalls.join('|') : '(none)'}` +
+      ` runtimeForbidden=${
+        (snapshot.body.reproTargets?.runtimeForbidden ?? []).length > 0
+          ? snapshot.body.reproTargets!.runtimeForbidden.join('|')
+          : '(none)'
+      }`
   );
 
   // Stage B0: Deterministic Builder.

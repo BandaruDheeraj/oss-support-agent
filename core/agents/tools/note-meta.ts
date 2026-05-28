@@ -13,7 +13,7 @@
 import { z } from 'zod';
 import type { ToolDef } from './types';
 import { asHandles } from './handles';
-import { EvidenceInputSchema, PreconditionInputSchema, ReproRecipeInputSchema, SuspectSymbolSchema, normalizePreconditionInput, normalizeReproRecipeInput, CandidateReproInputSchema, normalizeCandidateReproInput } from '../analyst/dossier';
+import { EvidenceInputSchema, PreconditionInputSchema, ReproRecipeInputSchema, ReproTargetsInputSchema, SuspectSymbolSchema, normalizePreconditionInput, normalizeReproRecipeInput, normalizeReproTargetsInput, CandidateReproInputSchema, normalizeCandidateReproInput } from '../analyst/dossier';
 import { HypothesisSchema } from '../fix-loop/hypotheses';
 import {
   InvestigationFindingInputSchema,
@@ -71,6 +71,11 @@ const RecordEvidence = z
      * to the LLM Prober.
      */
     candidateRepro: CandidateReproInputSchema.optional(),
+    /**
+     * Repro targets — Analyst-only structured hints for downstream Repro
+     * stages. Optional; absent on Prober/Investigator dossier writes.
+     */
+    reproTargets: ReproTargetsInputSchema.optional(),
   })
   .passthrough();
 export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = {
@@ -130,6 +135,12 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
         candidateRepro = undefined;
       }
     }
+    // Normalize reproTargets via the loose-input coercer. Returns null when
+    // both arrays are empty after cleaning — in that case omit the field so
+    // the snapshot hash matches a legacy body literally lacking it.
+    const reproTargets = args.reproTargets
+      ? normalizeReproTargetsInput(args.reproTargets) ?? undefined
+      : undefined;
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
@@ -141,11 +152,13 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       confidence: args.confidence,
       ...(reproRecipe ? { reproRecipe } : {}),
       ...(candidateRepro ? { candidateRepro } : {}),
+      ...(reproTargets ? { reproTargets } : {}),
     });
     return {
       snapshot_id: snap.snapshotId,
       recipe_recorded: reproRecipe ? true : false,
       candidate_recorded: candidateRepro ? true : false,
+      repro_targets_recorded: reproTargets ? true : false,
     };
   },
 };

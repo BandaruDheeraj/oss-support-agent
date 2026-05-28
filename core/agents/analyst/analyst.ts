@@ -100,6 +100,14 @@ DO NOT include candidateRepro when:
 
 When in doubt, omit candidateRepro — the Prober will handle it.
 
+REPRO TARGETS (optional, low-cost):
+Independent of candidateRepro, you SHOULD include a \`reproTargets\` field on record_evidence when you've identified the structural setup the repro needs:
+
+- \`reproTargets.editableInstall\`: array of repo-relative directory paths the Repro Executor should \`pip install -e <dir>\` BEFORE running the candidate test. Each entry MUST be a directory containing pyproject.toml / setup.py / setup.cfg (the in-repo package whose imports the test needs). This replaces a fragile BFS heuristic downstream. Example: ["python/openinference-instrumentation-smolagents", "python/openinference-instrumentation"]. Omit when the bug is in a single-package repo with no nested packages.
+- \`reproTargets.runtimeForbidden\`: array of import names (lowercase) the Prober must NOT try to install in the runtime sandbox — frameworks known to either explode the dep tree or require network/credentials. When non-empty, the Prober pivots to a direct-call exercise of the underlying primitive. Examples: "smolagents", "langchain", "llama_index", "autogen", "crewai". Populate this when the issue body, snippet, or suspect path involves one of these frameworks AND the bug can be reproduced by exercising the wrapped primitive directly.
+
+reproTargets is independent of confidence — even a low-confidence dossier benefits from naming the right package dir. Omit reproTargets entirely (or set both fields to []) when you cannot identify either.
+
 FINAL REMINDER: regardless of how much you investigated or how confident you are, you MUST end this session by calling record_evidence (with whatever you have). Use abandon ONLY when the issue itself is contradictory or empty — NEVER as a way out of an incomplete investigation. Plain-text summaries without a terminal tool call are discarded.`;
 
 export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
