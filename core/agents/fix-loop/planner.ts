@@ -84,6 +84,15 @@ export async function runFixPlanner(args: RunFixPlannerArgs): Promise<FixPlanner
     dossierSnapshotId: args.snapshot.snapshotId,
   });
 
+  const planCommitted = !!planState.getPlan();
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-fix-planner] attempt=${args.attemptId} terminated=${result.terminated}` +
+      ` turns=${result.turns} toolCalls=${result.toolCalls} planCommitted=${planCommitted}` +
+      (result.reason ? ` reason=${JSON.stringify(result.reason).slice(0, 240)}` : '') +
+      ` tools=${result.transcriptSummary}`
+  );
+
   return {
     plan: planState.getPlan(),
     terminated: result.terminated,

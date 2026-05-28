@@ -177,6 +177,14 @@ export async function runReproCritic(args: RunReproCriticArgs): Promise<{ verdic
     dossierSnapshotId: args.dossierSnapshot.snapshotId,
   });
 
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-critic] attempt=${args.attemptId} phase=investigate terminated=${investigation.terminated}` +
+      ` turns=${investigation.turns} toolCalls=${investigation.toolCalls}` +
+      (investigation.reason ? ` reason=${JSON.stringify(investigation.reason).slice(0, 240)}` : '') +
+      ` tools=${investigation.transcriptSummary}`
+  );
+
   // Structural pre-check: we need >=2 run_repro calls with exit != 0
   const transcript = registry.getTranscript();
   const reproRuns = transcript.filter((e) => e.tool === 'run_repro' && e.ok);

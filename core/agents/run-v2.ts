@@ -169,6 +169,10 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     workspaceDir: input.workspace.dir,
   });
 
+  log(
+    `[v2-driver] runReproPipeline DONE attemptId=${input.attemptId} status=${v2.status} ok=${v2.status === 'reproduced'} message=${JSON.stringify(v2.message).slice(0, 320)}`
+  );
+
   const candidateTestPath = v2.plan?.candidateTestPath;
   let candidateTestContent: string | undefined;
   if (candidateTestPath) {
@@ -292,6 +296,10 @@ async function runFixPipelineImpl(input: FixPipelineInput): Promise<FixPipelineO
       return r.stdout.trim();
     },
   });
+
+  log(
+    `[v2-driver] runFixPipeline DONE attemptId=${input.attemptId} status=${v2.status} ok=${v2.status === 'fix_approved'} changedFiles=${v2.changedFiles.length} message=${JSON.stringify(v2.message).slice(0, 320)}`
+  );
 
   return {
     ok: v2.status === 'fix_approved',

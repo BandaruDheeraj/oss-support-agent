@@ -85,6 +85,14 @@ export async function runFixCritic(args: RunFixCriticArgs): Promise<{ verdict: F
     dossierSnapshotId: args.snapshot.snapshotId,
   });
 
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-fix-critic] attempt=${args.attemptId} phase=investigate terminated=${investigation.terminated}` +
+      ` turns=${investigation.turns} toolCalls=${investigation.toolCalls}` +
+      (investigation.reason ? ` reason=${JSON.stringify(investigation.reason).slice(0, 240)}` : '') +
+      ` tools=${investigation.transcriptSummary}`
+  );
+
   // Structural pre-check
   const transcript = registry.getTranscript();
   const sawDiff = transcript.some((e) => e.tool === 'read_diff' && e.ok);

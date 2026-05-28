@@ -71,6 +71,15 @@ export async function runFixInvestigator(args: RunFixInvestigatorArgs): Promise<
     dossierSnapshotId: args.snapshot.snapshotId,
   });
 
+  const notesRecorded = !!args.notes.latest();
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-fix-investigator] attempt=${args.attemptId} terminated=${result.terminated}` +
+      ` turns=${result.turns} toolCalls=${result.toolCalls} notesRecorded=${notesRecorded}` +
+      (result.reason ? ` reason=${JSON.stringify(result.reason).slice(0, 240)}` : '') +
+      ` tools=${result.transcriptSummary}`
+  );
+
   return {
     notes: args.notes.latest(),
     terminated: result.terminated,

@@ -133,6 +133,16 @@ export async function runFixExecutor(args: RunFixExecutorArgs): Promise<FixExecu
 
   const hypothesisAudit = args.hypotheses.allChangedFilesConsumed(changed);
 
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-fix-executor] attempt=${args.attemptId} terminated=${loop.terminated}` +
+      ` turns=${loop.turns} toolCalls=${loop.toolCalls}` +
+      ` changedFiles=${changed.length} reproGreen=${reproGreen} testsGreen=${testsGreen}` +
+      ` unconsumedHypothesisFiles=${hypothesisAudit.missing.length}` +
+      (loop.reason ? ` reason=${JSON.stringify(loop.reason).slice(0, 240)}` : '') +
+      ` tools=${loop.transcriptSummary}`
+  );
+
   return {
     ...loop,
     greenEvidence: {

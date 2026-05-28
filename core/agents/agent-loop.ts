@@ -80,6 +80,40 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+/**
+ * Classify common upstream model-provider errors that the AI SDK rethrows
+ * as opaque strings. Tagging them up front makes the halt comment in
+ * GitHub (and the maintainer email) actionable instead of a generic
+ * stack-trace dump.
+ */
+function classifyAgentLoopError(raw: string): string {
+  const lower = raw.toLowerCase();
+  const tag = (kind: string) => `[${kind}] ${truncate(raw, 800)}`;
+  if (
+    lower.includes('insufficient credit') ||
+    lower.includes('out of credit') ||
+    lower.includes('credit balance') ||
+    lower.includes('quota exceeded') ||
+    lower.includes('payment required') ||
+    lower.includes('402')
+  ) {
+    return tag('credits-exhausted');
+  }
+  if (lower.includes('rate limit') || lower.includes('429') || lower.includes('too many requests')) {
+    return tag('rate-limited');
+  }
+  if (lower.includes('overloaded') || lower.includes('503') || lower.includes('upstream') || lower.includes('bad gateway') || lower.includes('502')) {
+    return tag('provider-unavailable');
+  }
+  if (lower.includes('timeout') || lower.includes('timed out') || lower.includes('etimedout')) {
+    return tag('timeout');
+  }
+  if (lower.includes('invalid_request') || lower.includes('invalid request') || lower.includes('400')) {
+    return tag('invalid-request');
+  }
+  return truncate(raw, 800);
+}
+
 async function runAgentLoopOnce(args: RunAgentLoopArgs): Promise<AgentLoopResult> {
   const { agent, registry } = args;
   const model = getModel(agent, args.modelOverride);
@@ -131,9 +165,22 @@ async function runAgentLoopOnce(args: RunAgentLoopArgs): Promise<AgentLoopResult
             terminated = 'max_turns';
           }
         }
+        // Even on terminated='finished' with finishReason='stop', the model
+        // may have abandoned silently (plain-text exit with no terminal tool
+        // call). Surface finishReason + a finalText preview into `reason` so
+        // downstream halt-comments and emails self-diagnose instead of
+        // rendering as a bare "(finished)".
+        if (!reason && (terminated === 'finished' || terminated === 'max_turns')) {
+          const preview = truncate((finalText || '').replace(/\s+/g, ' ').trim(), 320);
+          const fr = result.finishReason ?? 'unknown';
+          reason = preview
+            ? `finishReason=${fr}; finalText=${JSON.stringify(preview)}`
+            : `finishReason=${fr}; finalText=(empty)`;
+        }
       } catch (err) {
         terminated = 'error';
-        reason = err instanceof Error ? err.message : String(err);
+        const raw = err instanceof Error ? err.message : String(err);
+        reason = classifyAgentLoopError(raw);
         finalText = '';
       }
 
