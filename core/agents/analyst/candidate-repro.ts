@@ -130,14 +130,14 @@ export const CandidateReproInputSchema = z
   .object({
     version: z.literal(1).optional(),
     source: z.string().optional(),
-    failureMode: z.string(),
+    failureMode: z.string().optional(),
     expectedExceptionType: z.string().optional(),
     expectedValueExpression: z.string().optional(),
-    candidateTestPath: z.string().min(1),
+    candidateTestPath: z.string().optional(),
     imports: z.array(z.string()).optional(),
     setup: z.string().optional(),
-    exerciseCall: z.string().min(1),
-    sentinel: z.string().min(1),
+    exerciseCall: z.string().optional(),
+    sentinel: z.string().optional(),
     expectedFailureSignature: z.string().optional(),
     pipInstalls: z
       .array(
@@ -166,14 +166,26 @@ export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | nul
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
 
-  const failureMode = typeof r.failureMode === 'string' ? r.failureMode.toLowerCase().replace(/[\s-]+/g, '_') : '';
+  // Accept common LLM-emitted alias field names. These are intentionally
+  // narrow — the prompt asks for the canonical names; aliases are a
+  // belt-and-suspenders second chance to recover something usable.
+  const pick = (canonical: string, ...aliases: string[]): unknown => {
+    if (r[canonical] !== undefined) return r[canonical];
+    for (const a of aliases) if (r[a] !== undefined) return r[a];
+    return undefined;
+  };
+  const failureModeRaw = pick('failureMode', 'failure_mode', 'mode');
+  const failureMode = typeof failureModeRaw === 'string' ? failureModeRaw.toLowerCase().replace(/[\s-]+/g, '_') : '';
   if (!(KNOWN_FAILURE_MODES as readonly string[]).includes(failureMode)) return null;
 
-  const exerciseCall = typeof r.exerciseCall === 'string' ? r.exerciseCall.trim() : '';
+  const exerciseCallRaw = pick('exerciseCall', 'exercise_call', 'exerciseExpression', 'callExpression');
+  const exerciseCall = typeof exerciseCallRaw === 'string' ? exerciseCallRaw.trim() : '';
   if (!exerciseCall) return null;
-  const sentinel = typeof r.sentinel === 'string' ? r.sentinel.trim() : '';
+  const sentinelRaw = pick('sentinel', 'sentinelString', 'sentinel_string');
+  const sentinel = typeof sentinelRaw === 'string' ? sentinelRaw.trim() : '';
   if (sentinel.length < 8) return null;
-  const candidateTestPath = typeof r.candidateTestPath === 'string' ? r.candidateTestPath.trim() : '';
+  const candidateTestPathRaw = pick('candidateTestPath', 'candidate_test_path', 'testPath', 'path');
+  const candidateTestPath = typeof candidateTestPathRaw === 'string' ? candidateTestPathRaw.trim() : '';
   if (!candidateTestPath) return null;
 
   const sourceRaw = typeof r.source === 'string' ? r.source.toLowerCase().replace(/[\s-]+/g, '_') : '';
@@ -181,17 +193,35 @@ export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | nul
     ? (sourceRaw as CandidateReproSource)
     : 'direct_call';
 
-  const imports = Array.isArray(r.imports)
-    ? r.imports
-        .filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
-        .map((s) => s.trim())
+  // Allow imports to be either an array of strings (canonical) OR an array
+  // of {module, names?} objects (a common LLM emission shape). Coerce
+  // objects to `from <module> import <names...>` / `import <module>`.
+  const importsRawValue = pick('imports', 'exerciseImports', 'exercise_imports');
+  const imports = Array.isArray(importsRawValue)
+    ? importsRawValue
+        .map((x): string | null => {
+          if (typeof x === 'string') return x.trim() || null;
+          if (x && typeof x === 'object') {
+            const xx = x as Record<string, unknown>;
+            const mod = typeof xx.module === 'string' ? xx.module.trim() : '';
+            if (!mod) return null;
+            const names = Array.isArray(xx.names)
+              ? xx.names.filter((n): n is string => typeof n === 'string' && n.trim().length > 0).map((n) => n.trim())
+              : [];
+            return names.length > 0 ? `from ${mod} import ${names.join(', ')}` : `import ${mod}`;
+          }
+          return null;
+        })
+        .filter((s): s is string => !!s)
         .slice(0, CANDIDATE_REPRO_IMPORTS_MAX)
     : [];
 
-  const setup = typeof r.setup === 'string' ? r.setup : '';
+  const setupRaw = pick('setup', 'setupCode', 'setup_code');
+  const setup = typeof setupRaw === 'string' ? setupRaw : '';
 
-  const pipInstalls: ReproRecipePipInstall[] = Array.isArray(r.pipInstalls)
-    ? r.pipInstalls
+  const pipInstallsRaw = pick('pipInstalls', 'pip_installs');
+  const pipInstalls: ReproRecipePipInstall[] = Array.isArray(pipInstallsRaw)
+    ? pipInstallsRaw
         .map((p): ReproRecipePipInstall | null => {
           if (!p || typeof p !== 'object') return null;
           const pp = p as Record<string, unknown>;
@@ -207,20 +237,35 @@ export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | nul
         .filter((p): p is ReproRecipePipInstall => p !== null)
     : [];
 
-  const requiresCredentials = Array.isArray(r.requiresCredentials)
-    ? r.requiresCredentials.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+  const requiresCredentialsRaw = pick('requiresCredentials', 'requires_credentials');
+  const requiresCredentials = Array.isArray(requiresCredentialsRaw)
+    ? requiresCredentialsRaw.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
     : [];
-  const preconditionsSatisfied = Array.isArray(r.preconditionsSatisfied)
-    ? r.preconditionsSatisfied.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+  const preconditionsSatisfiedRaw = pick('preconditionsSatisfied', 'preconditions_satisfied');
+  const preconditionsSatisfied = Array.isArray(preconditionsSatisfiedRaw)
+    ? preconditionsSatisfiedRaw.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
     : [];
 
-  const expectedExceptionType =
-    typeof r.expectedExceptionType === 'string' && r.expectedExceptionType.trim()
-      ? r.expectedExceptionType.trim().slice(0, 80)
+  const expectedExceptionTypeRaw = pick('expectedExceptionType', 'expected_exception_type', 'expectedException');
+  let expectedExceptionType =
+    typeof expectedExceptionTypeRaw === 'string' && expectedExceptionTypeRaw.trim()
+      ? expectedExceptionTypeRaw.trim().slice(0, 80)
       : undefined;
+  // Treat literal "None" / "null" / "no exception" as absent — the
+  // unexpected_exception template requires a real exception class name.
+  if (expectedExceptionType && /^(none|null|no\s*exception|n\/a)$/i.test(expectedExceptionType)) {
+    expectedExceptionType = undefined;
+  }
+  const expectedValueExpressionRaw = pick(
+    'expectedValueExpression',
+    'expected_value_expression',
+    'expectedReturnRepr',
+    'expected_return_repr',
+    'expectedReturn'
+  );
   const expectedValueExpression =
-    typeof r.expectedValueExpression === 'string' && r.expectedValueExpression.trim()
-      ? r.expectedValueExpression.trim().slice(0, CANDIDATE_REPRO_EXPECTED_VALUE_MAX_LEN)
+    typeof expectedValueExpressionRaw === 'string' && expectedValueExpressionRaw.trim()
+      ? expectedValueExpressionRaw.trim().slice(0, CANDIDATE_REPRO_EXPECTED_VALUE_MAX_LEN)
       : undefined;
   const expectedFailureSignature =
     typeof r.expectedFailureSignature === 'string' && r.expectedFailureSignature.trim()
@@ -230,8 +275,11 @@ export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | nul
   const rationale = typeof r.rationale === 'string' ? r.rationale.slice(0, CANDIDATE_REPRO_RATIONALE_MAX_LEN) : '';
 
   // Surface contract: wrong_return REQUIRES expectedValueExpression — the
-  // template can't render without it.
+  // template can't render without it. unexpected_exception REQUIRES
+  // expectedExceptionType — the template asserts that exception type is
+  // raised; without it we can't render.
   if (failureMode === 'wrong_return' && !expectedValueExpression) return null;
+  if (failureMode === 'unexpected_exception' && !expectedExceptionType) return null;
 
   return {
     version: 1,

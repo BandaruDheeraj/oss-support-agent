@@ -66,6 +66,7 @@ describe('normalizeCandidateReproInput', () => {
       candidateTestPath: 'tests/test_x.py',
       exerciseCall: 'foo()',
       sentinel: 'SENTINEL_REPRO_X',
+      expectedExceptionType: 'AttributeError',
       pipInstalls: [{ package: '-e python/foo', editable: true }],
     });
     expect(result?.pipInstalls).toEqual([]);
@@ -77,6 +78,7 @@ describe('normalizeCandidateReproInput', () => {
       candidateTestPath: 'tests/test_x.py',
       exerciseCall: 'foo()',
       sentinel: 'SENTINEL_REPRO_X',
+      expectedExceptionType: 'AttributeError',
     });
     expect(result?.failureMode).toBe('unexpected_exception');
   });
@@ -111,9 +113,59 @@ describe('normalizeCandidateReproInput', () => {
       candidateTestPath: 'tests/test_x.py',
       exerciseCall: 'foo()',
       sentinel: 'SENTINEL_REPRO_X',
+      expectedExceptionType: 'AttributeError',
       source: 'made_up',
     });
     expect(result?.source).toBe('direct_call');
+  });
+
+  it('accepts common LLM-emitted alias field names (sentinelString, setupCode, exerciseImports, expectedReturnRepr)', () => {
+    // Mirrors the field names the Analyst emitted in the first live run
+    // of issue #46 before the prompt was tightened. Belt-and-suspenders
+    // path: even if the prompt drifts, normalize recovers.
+    const result = normalizeCandidateReproInput({
+      failureMode: 'unexpected_exception',
+      candidateTestPath: 'tests/test_x.py',
+      sentinelString: 'REPRO_46_SENTINEL_XYZ',
+      exerciseImports: [
+        { module: 'opentelemetry.trace', names: ['NonRecordingSpan', 'SpanContext'] },
+        { module: 'os' },
+      ],
+      setupCode: 'span = NonRecordingSpan(SpanContext(0,0,False))',
+      exerciseCall: '_finalize_step_span(span, None)',
+      expectedExceptionType: 'AttributeError',
+    });
+    expect(result).not.toBeNull();
+    expect(result?.sentinel).toBe('REPRO_46_SENTINEL_XYZ');
+    expect(result?.imports).toEqual([
+      'from opentelemetry.trace import NonRecordingSpan, SpanContext',
+      'import os',
+    ]);
+    expect(result?.setup).toContain('NonRecordingSpan');
+  });
+
+  it('rejects unexpected_exception when expectedExceptionType is missing or literal "None"', () => {
+    // No expectedExceptionType at all.
+    expect(
+      normalizeCandidateReproInput({
+        failureMode: 'unexpected_exception',
+        candidateTestPath: 'tests/test_x.py',
+        exerciseCall: 'foo()',
+        sentinel: 'SENTINEL_REPRO_X',
+      })
+    ).toBeNull();
+    // Literal "None" string — the Analyst meant "no exception expected",
+    // which is the FIXED state, not a reproducible bug. Reject so the
+    // Builder fallback (Prober) takes over.
+    expect(
+      normalizeCandidateReproInput({
+        failureMode: 'unexpected_exception',
+        candidateTestPath: 'tests/test_x.py',
+        exerciseCall: 'foo()',
+        sentinel: 'SENTINEL_REPRO_X',
+        expectedExceptionType: 'None',
+      })
+    ).toBeNull();
   });
 });
 

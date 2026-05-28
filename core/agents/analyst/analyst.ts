@@ -75,22 +75,26 @@ CANDIDATE REPRO (optional, high-leverage):
 When your confidence is medium or high AND the failure mode fits one of two templates, you SHOULD include a \`candidateRepro\` field on record_evidence. A downstream deterministic Builder will use it to author the failing test WITHOUT another LLM round-trip — this dramatically reduces failed repros caused by Prober drift.
 
 Two supported failureMode templates:
-1. \`unexpected_exception\` — the exercise call raises an exception when it shouldn't (or a different exception type than expected). Specify \`expectedExceptionType\` either as the FQN of the exception that the buggy code raises (e.g. "AttributeError"), or "None" if the bug is that no exception is raised.
-2. \`wrong_return\` — the exercise call returns the wrong value. Specify \`expectedReturnRepr\` as a Python repr the actual return must equal (e.g. "True", "42", "'ok'").
+1. \`unexpected_exception\` — the exercise call raises an exception when it shouldn't (or a different exception type than expected). Set \`expectedExceptionType\` to the FQN or short name of the exception type that the BUGGY code raises (e.g. "AttributeError"). The Builder will assert that calling \`exerciseCall\` raises an exception of that type; if no exception is raised, the test passes (meaning the bug is fixed) — DO NOT emit candidateRepro when you've established the bug is already fixed.
+2. \`wrong_return\` — the exercise call returns the wrong value. Set \`expectedValueExpression\` to a Python expression the actual return must equal (e.g. "True", "42", "'ok'"). The Builder asserts \`actual == <expectedValueExpression>\`; if the bug is present, the assert fails.
 
-Required fields on candidateRepro:
-- failureMode: "unexpected_exception" | "wrong_return"
-- candidateTestPath: absolute path under tests/ — let the Builder pick one if you're unsure (e.g. "tests/repro/test_issue_<N>.py")
-- sentinelString: a short distinctive string the test will print on the failure path (e.g. "REPRO_46_SENTINEL_NONRECORDINGSPAN")
-- exerciseImports: list of \`{module, names?: string[]}\` — minimal imports to make the exercise call work
-- setupCode: optional Python preamble (kept short — assignments only)
-- exerciseCall: ONE Python expression that triggers the bug (must reference at least one suspectSymbol you also recorded)
-- expectedExceptionType OR expectedReturnRepr (depending on failureMode)
-- pipInstalls: list of \`{package, editable?: boolean}\` — third-party deps the test needs (do NOT include the repo's own package if it's already editable-installed)
-- preconditionsSatisfied: list of precondition IDs you've verified hold
+EXACT field names (the Builder schema is strict):
+- \`failureMode\`: "unexpected_exception" | "wrong_return"
+- \`candidateTestPath\`: relative path under tests/ (e.g. "tests/repro/test_issue_<N>.py")
+- \`sentinel\`: a short distinctive string (8-80 chars, no quotes / newlines / backslashes), e.g. "REPRO_46_NONRECORDINGSPAN_SENTINEL"
+- \`imports\`: ARRAY OF STRINGS — each entry is a full Python import line, e.g. ["from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags", "from openinference.instrumentation.smolagents._wrappers import _finalize_step_span"]
+- \`setup\`: optional Python preamble (string, may contain newlines). Used for variable assignments and helper objects before the exercise call.
+- \`exerciseCall\`: ONE Python expression that triggers the bug. Must reference at least one of the suspectSymbols you also recorded.
+- \`expectedExceptionType\` (for unexpected_exception) OR \`expectedValueExpression\` (for wrong_return) — exactly one of these.
+- \`pipInstalls\`: array of \`{package, editable?: boolean}\` for third-party deps the test needs.
+- \`preconditionsSatisfied\`: array of precondition condition strings (must match \`condition\` text of an entry in your preconditions list)
+- \`rationale\` (optional): 1-2 sentence justification.
+
+DO NOT emit a \`testSource\` or \`sentinelString\` field — the Builder renders the test source itself from the template + your fields.
 
 DO NOT include candidateRepro when:
 - Confidence is low
+- The bug has already been fixed in the current checkout (the test would pass, not fail)
 - The bug is intermittent, race-conditional, or requires real network/credentials
 - You can't pin down a single exercise call
 
