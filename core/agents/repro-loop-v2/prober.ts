@@ -94,10 +94,20 @@ Procedure (follow in order; do not skip):
 
 3. PROBE the exercise. Use run_python to actually call the suspect symbols with hand-constructed inputs. Confirm the call executes (whether or not it raises). If it raises the expected failure signature, you already have a working repro skeleton — copy it into the test.
 
-4. COMMIT the test source. ONE write_test call. The test contains: your verified imports, your verified exercise call, and \`assert False, "<sentinel>"\` (or equivalent) at the end so run_repro reports a failure containing the sentinel.
+4. COMMIT the test source. ONE write_test call. The test contains: your verified imports, your verified exercise call, and a final assertion that fails with YOUR chosen sentinel string. PICK a unique 12+ character sentinel (e.g. \`REPRO_NONRECORDINGSPAN_CRASH_a3f9\`) and embed it as a LITERAL string in the failure message. Example:
+   \`\`\`python
+   SENTINEL = "REPRO_NONRECORDINGSPAN_CRASH_a3f9"
+   try:
+       suspect_call(bad_input)
+   except SomeError as exc:
+       assert False, SENTINEL + ": " + str(exc)
+   else:
+       raise AssertionError(SENTINEL + ": expected SomeError but call succeeded")
+   \`\`\`
+   Do NOT write the literal text \`<sentinel>\` — that is a placeholder in these instructions, not the value to embed. You must invent a unique string and use IT.
 
 5. VERIFY twice. run_repro twice. After EACH run, classify the result by these rules:
-   - exit != 0 AND your sentinel appears in stdout/stderr → POSITIVE (the test triggered the bug). Count it.
+   - exit != 0 AND your chosen sentinel string appears in stdout/stderr → POSITIVE (the test triggered the bug). Count it.
    - exit != 0 AND no sentinel → the test failed for the wrong reason (collection error, unrelated exception). revise_test to fix the exercise.
    - exit == 0 → the test PASSED; the exercise did not trigger the bug. revise_test with a stronger exercise.
 

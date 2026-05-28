@@ -25,6 +25,15 @@ export interface DeterministicExecutorArgs {
    * undefined or zero-length.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Repo-relative editable-install paths the orchestrator resolved (typically
+   * from the Analyst's reproTargets.editableInstall or BFS fallback). Used
+   * to rewrite recipe.pipInstalls entries whose `package` is a bare name
+   * (no path segment) when a known editable install ends with that name.
+   * This handles the common Prober failure where the recipe records the
+   * package name without its `python/instrumentation/` repo prefix.
+   */
+  editableInstallFallbacks?: string[];
 }
 
 export interface DeterministicExecutorRun {
@@ -127,7 +136,16 @@ export async function runReproExecutorFromRecipe(
   // (2) pip installs
   const installFailures: DeterministicExecutorResult['installFailures'] = [];
   for (const inst of recipe.pipInstalls ?? []) {
-    const spec = inst.editable ? `-e ${inst.package}` : inst.package;
+    const rewrittenPackage = inst.editable
+      ? resolveEditableInstallPackage(inst.package, args.editableInstallFallbacks ?? [])
+      : inst.package;
+    const spec = inst.editable ? `-e ${rewrittenPackage}` : rewrittenPackage;
+    if (inst.editable && rewrittenPackage !== inst.package) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[v2-executor-det] attempt=${args.attemptId} install_spec_rewritten from=${JSON.stringify(inst.package)} to=${JSON.stringify(rewrittenPackage)} via=editableInstallFallbacks`
+      );
+    }
     const run = await args.sandbox.pipInstall(spec);
     if (run.exitCode !== 0) {
       installFailures.push({
@@ -241,6 +259,34 @@ function observe(
 function tail(s: string, n: number): string {
   if (!s) return '';
   return s.length <= n ? s : s.slice(-n);
+}
+
+/**
+ * Rewrite a bare editable-install package name (e.g.
+ * `openinference-instrumentation-smolagents`) to the full repo-relative path
+ * (e.g. `python/instrumentation/openinference-instrumentation-smolagents`) when
+ * one of the provided fallback paths ends with that name. Pip will reject a
+ * bare name as "not a valid editable requirement" without a local path or VCS
+ * URL — this rewriter covers the common Prober failure where the recorded
+ * recipe omits the `python/instrumentation/` prefix that the orchestrator
+ * already resolved upstream.
+ *
+ * Returns `pkg` unchanged when:
+ *   - it already contains a path separator, `.`, `:`, `@`, or `=` (suggesting
+ *     a path, VCS URL, version constraint, or PEP 440 extras spec).
+ *   - no fallback path's final segment matches `pkg`.
+ *   - multiple fallback paths match (ambiguous — leave it to pip).
+ */
+export function resolveEditableInstallPackage(pkg: string, fallbacks: string[]): string {
+  const trimmed = pkg.trim();
+  if (trimmed.length === 0) return pkg;
+  if (/[/\\.:@=]/.test(trimmed)) return pkg;
+  const matches = fallbacks.filter((p) => {
+    const lastSeg = p.replace(/[/\\]+$/, '').split(/[/\\]/).pop();
+    return lastSeg === trimmed;
+  });
+  if (matches.length !== 1) return pkg;
+  return matches[0];
 }
 
 /**

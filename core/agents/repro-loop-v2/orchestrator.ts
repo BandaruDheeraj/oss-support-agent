@@ -341,6 +341,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     workspace: args.workspace,
     sandbox: args.sandbox,
     env: args.env,
+    editableInstallFallbacks: effectiveEditableInstalls,
   });
 
   if (executor.outcome === 'credentials_missing') {
