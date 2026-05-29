@@ -4,7 +4,83 @@
 
 import { z } from 'zod';
 import type { ToolDef } from './types';
-import { asHandles } from './handles';
+import { asHandles, type GrepMatch } from './handles';
+
+const SYMBOL_TOKEN_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SYMBOL_KEYWORDS = new Set([
+  'class',
+  'def',
+  'function',
+  'const',
+  'let',
+  'var',
+  'fn',
+  'interface',
+  'type',
+  'from',
+  'import',
+  'as',
+  'self',
+]);
+
+function escapeRegexLiteral(value: string): string {
+  return value.replace(/[\\.^$|?*+()[\]{}]/g, '\\$&');
+}
+
+function dedupeMatches(matches: GrepMatch[]): GrepMatch[] {
+  const seen = new Set<string>();
+  const out: GrepMatch[] = [];
+  for (const match of matches) {
+    const key = `${match.path}:${match.line}:${match.text}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(match);
+  }
+  return out;
+}
+
+function buildAlternation(candidates: string[]): string {
+  return candidates.map((candidate) => escapeRegexLiteral(candidate)).join('|');
+}
+
+/**
+ * Convert free-form symbol text (qualified names, call-form snippets) into
+ * identifier candidates suitable for grep -E lookup.
+ */
+export function extractSymbolSearchCandidates(rawSymbol: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const add = (token: string): void => {
+    const value = token.trim();
+    if (!SYMBOL_TOKEN_RE.test(value)) return;
+    if (SYMBOL_KEYWORDS.has(value.toLowerCase())) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    out.push(value);
+  };
+
+  const stripped = rawSymbol.trim().replace(/^["'`]+|["'`]+$/g, '');
+  if (!stripped) return [];
+
+  // If input looks like a call expression, strip argument tail.
+  const noArgs = stripped.replace(/\(.*$/, '');
+  const roughTokens = noArgs
+    .split(/[\s,=:+\-*/\\<>!~]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  for (const token of roughTokens) {
+    const normalized = token.replace(/::/g, '.').replace(/->/g, '.');
+    const pieces = normalized
+      .split('.')
+      .map((piece) => piece.replace(/^[^A-Za-z_]+|[^A-Za-z0-9_]+$/g, ''))
+      .filter(Boolean);
+    for (let i = pieces.length - 1; i >= 0; i -= 1) add(pieces[i]);
+  }
+
+  const identifiers = stripped.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? [];
+  for (let i = identifiers.length - 1; i >= 0; i -= 1) add(identifiers[i]);
+  return out.slice(0, 10);
+}
 
 const FilePath = z.object({ path: z.string().min(1) }).strict();
 
@@ -106,9 +182,21 @@ export const findSymbol: ToolDef<z.infer<typeof FindSymbol>, unknown> = {
   description: 'Find a symbol definition (regex search for class/def/function/const).',
   parameters: FindSymbol,
   async execute({ symbol, paths }, ctx) {
-    const pattern = `(?:^|\\s)(class|def|function|const|let|var|fn|interface|type)\\s+${symbol}\\b`;
-    const matches = await asHandles(ctx.handles).workspace.grep(pattern, paths, { caseInsensitive: false });
-    return { matches };
+    const candidates = extractSymbolSearchCandidates(symbol);
+    if (candidates.length === 0) return { matches: [] };
+    const alternation = buildAlternation(candidates);
+    // Use grep -E compatible syntax (POSIX classes) — no PCRE \b/\s/non-capturing groups.
+    const pattern =
+      `(^|[[:space:]])(class|def|function|const|let|var|fn|interface|type)` +
+      `[[:space:]]+(${alternation})([^[:alnum:]_]|$)`;
+    const defs = await asHandles(ctx.handles).workspace.grep(pattern, paths, { caseInsensitive: false });
+    if (defs.length > 0) return { matches: dedupeMatches(defs) };
+
+    const fallbackPattern = `(^|[^[:alnum:]_])(${alternation})([^[:alnum:]_]|$)`;
+    const fallback = await asHandles(ctx.handles).workspace.grep(fallbackPattern, paths, {
+      caseInsensitive: false,
+    });
+    return { matches: dedupeMatches(fallback) };
   },
 };
 
@@ -119,9 +207,18 @@ export const findCallers: ToolDef<z.infer<typeof FindCallers>, unknown> = {
   description: 'Find call sites for a symbol (regex search for `symbol(`).',
   parameters: FindCallers,
   async execute({ symbol, paths }, ctx) {
-    const pattern = `\\b${symbol}\\s*\\(`;
-    const matches = await asHandles(ctx.handles).workspace.grep(pattern, paths, { caseInsensitive: false });
-    return { matches };
+    const candidates = extractSymbolSearchCandidates(symbol);
+    if (candidates.length === 0) return { matches: [] };
+    const alternation = buildAlternation(candidates);
+    const pattern = `(^|[^[:alnum:]_])(${alternation})[[:space:]]*\\(`;
+    const callers = await asHandles(ctx.handles).workspace.grep(pattern, paths, { caseInsensitive: false });
+    if (callers.length > 0) return { matches: dedupeMatches(callers) };
+
+    const fallbackPattern = `(^|[^[:alnum:]_])(${alternation})([^[:alnum:]_]|$)`;
+    const fallback = await asHandles(ctx.handles).workspace.grep(fallbackPattern, paths, {
+      caseInsensitive: false,
+    });
+    return { matches: dedupeMatches(fallback) };
   },
 };
 
