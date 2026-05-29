@@ -193,6 +193,8 @@ export interface ReproProberResult extends AgentLoopResult {
   transcript: Array<{ tool: string; result: unknown; ok: boolean }>;
   ranReproCount: number;
   lastReproExitCode: number | null;
+  /** Compact one-line ledger summary (e.g. "installs_ok=4 ... run_repro_positive_since_write=0"). */
+  verifiedSummary: string;
 }
 
 export async function runReproProber(args: RunReproProberArgs): Promise<ReproProberResult> {
@@ -354,5 +356,6 @@ export async function runReproProber(args: RunReproProberArgs): Promise<ReproPro
     transcript: transcript.map((e) => ({ tool: e.tool, result: e.result, ok: e.ok })),
     ranReproCount: reproCalls.length,
     lastReproExitCode: lastExit,
+    verifiedSummary,
   };
 }

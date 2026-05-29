@@ -291,11 +291,21 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   if (builderRecipe) {
     recipe = builderRecipe;
   } else {
-    if (!prober || !prober.recipe) {
-      // Before declaring a generic prober failure, inspect run_repro transcript
-      // entries for credential errors. If any matched and the inferred env
-      // vars are not currently set, surface this as a structured
-      // credentials_required outcome.
+    // Two failure paths for the Prober-authored branch:
+    //   (a) no recipe at all (never called record_evidence), OR
+    //   (b) recipe exists but Prober didn't terminate via `done` — meaning
+    //       the registry's done-gate never approved it. `terminated === 'done'`
+    //       is the *only* signal that proves the recipe self-verified (≥2 failing
+    //       run_repro since last write + sentinel match). Any other termination
+    //       (abandon / max_turns / error / finished) means the recipe is
+    //       unverified and almost guaranteed to fail in the deterministic
+    //       Executor — surface a structured failure with the verified-state
+    //       ledger so the operator sees what was actually established.
+    const proberAuthoritative = prober?.terminated === 'done' && !!prober.recipe;
+    if (!prober || !proberAuthoritative) {
+      // Credential detection takes precedence — a missing-creds failure is
+      // actionable and shouldn't be masked by a generic "prober didn't finish"
+      // message. Check transcript patterns first.
       const credResult = prober
         ? detectCredentialsFromTranscript(prober.transcript, args.env ?? process.env)
         : null;
@@ -310,18 +320,34 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
           message: `Repro halted on missing credentials (${credResult.matchedPattern ?? 'unknown pattern'}): ${credResult.inferredEnvVars.join(', ')}`,
         };
       }
+      // Build a precise failure message that distinguishes "no recipe" from
+      // "recipe exists but Prober didn't approve it via done". The latter
+      // includes the verified-state ledger so the operator sees why.
+      let message: string;
+      if (!prober) {
+        message = `Builder rejected (${builderRejectStage}) and Prober was skipped`;
+      } else if (!prober.recipe) {
+        message = `Repro Prober terminated without producing a recipe (${prober.terminated}${prober.reason ? `: ${prober.reason}` : ''})`;
+      } else {
+        // recipe exists but terminated !== 'done' — most common: abandon.
+        message =
+          `Repro Prober produced a recipe but did not self-verify it ` +
+          `(terminated=${prober.terminated}${prober.reason ? `, reason="${prober.reason}"` : ''}). ` +
+          `verifiedState=[${prober.verifiedSummary}]. ` +
+          `The done-gate requires ≥2 failing run_repro since last write with the recipe's sentinel observed — ` +
+          `running an unverified recipe through the deterministic Executor would predictably fail.`;
+      }
       return {
         status: 'prober_failed',
         dossier,
         ...(prober ? { prober } : {}),
         ...(builder ? { builder } : {}),
         ...(builderRejectStage ? { builderRejectStage } : {}),
-        message: prober
-          ? `Repro Prober terminated without producing a recipe (${prober.terminated}${prober.reason ? `: ${prober.reason}` : ''})`
-          : `Builder rejected (${builderRejectStage}) and Prober was skipped`,
+        message,
       };
     }
-    recipe = prober.recipe;
+    // Past the gate: prober exists, terminated='done', recipe is non-null.
+    recipe = prober.recipe as ReproRecipe;
   }
 
   const planProjection = {
