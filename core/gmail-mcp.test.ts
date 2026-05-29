@@ -254,6 +254,38 @@ describe('Gmail MCP Integration (US-011)', () => {
       expect(result.matchedKeyword).toBe('approved');
     });
 
+    it('detects implied approval phrase "yes proceed"', () => {
+      const result = detectApproval('Yes, proceed.', keywords);
+      expect(result.approved).toBe(true);
+      expect(result.matchedKeyword).toBe('yes proceed');
+    });
+
+    it('detects implied approval phrase "go ahead"', () => {
+      const result = detectApproval('Please go ahead with this plan.', keywords);
+      expect(result.approved).toBe(true);
+      expect(result.matchedKeyword).toBe('go ahead');
+    });
+
+    it('ignores approval keywords in quoted reply sections', () => {
+      const result = detectApproval(
+        [
+          'I still have one question before we proceed.',
+          '',
+          'On Tue, bot wrote:',
+          '> LGTM, ship it',
+        ].join('\n'),
+        keywords
+      );
+      expect(result.approved).toBe(false);
+      expect(result.matchedKeyword).toBeNull();
+    });
+
+    it('does not treat negated phrases as approval', () => {
+      const result = detectApproval('Please do not proceed yet.', keywords);
+      expect(result.approved).toBe(false);
+      expect(result.matchedKeyword).toBeNull();
+    });
+
     it('includes reply body in result', () => {
       const body = 'Some reply text';
       const result = detectApproval(body, keywords);

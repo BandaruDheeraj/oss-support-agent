@@ -33,7 +33,11 @@ import { OpenRouterScaffoldGenerator } from '../core/llm/openrouter-scaffold-gen
 import { createDefaultTriageClassifier } from '../core/llm/openrouter-triage-classifier';
 import type { IssueEvent } from '../core/webhook/types';
 
-import { runReproPipeline, runFixPipeline } from '../core/agents/run-v2';
+import {
+  runReproPipeline,
+  runFixPipeline,
+  type ReproPipelineOutcome,
+} from '../core/agents/run-v2';
 import { dispatchTypedHaltEmail, buildHaltContext, buildSuccessContext } from '../core/agents/email/dispatch';
 import type { ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
 import type { FixV2Outcome } from '../core/agents/fix-loop/orchestrator';
@@ -51,7 +55,7 @@ import {
 import { OpenRouterPMFollowUpGenerator } from '../core/llm/openrouter-pm-followup-generator';
 import type { FollowUpGenerator } from '../core/pm-email-types';
 import type { PMEmailLoopConfig, DesignBriefInput } from '../core/pm-email-types';
-import { detectApproval } from '../core/gmail-mcp';
+import { appendReplyToThread, detectApproval } from '../core/gmail-mcp';
 import { extractFilePathsFromAll } from '../core/issue-file-extractor';
 import type { RequiredCredential } from '../core/agents/repro-types';
 
@@ -92,6 +96,7 @@ import {
 import type { UsabilityAgentInput } from '../core/agents/usability-types';
 import { GHAUsabilityExerciser } from './clients/gha-usability-exerciser';
 import { inferUsabilityIntrospection } from './clients/usability-introspect';
+import { emitOnlineEvaluation } from '../core/observability/evaluator';
 
 /** Module-level sweep state store. Keyed by per-run sweep runId; no cross-run conflicts. */
 const sweepStateStore = new InMemorySweepStateStore();
@@ -120,6 +125,10 @@ export type PipelineResult =
     }
   | {
       status: 'repro-not-runnable';
+      reason: string;
+    }
+  | {
+      status: 'already-fixed-on-main';
       reason: string;
     }
   | { status: 'pr-opened'; prUrl: string; prNumber: number };
@@ -518,6 +527,8 @@ async function runPMDesignLoop(args: {
     log(`[pm] waiting for PM reply on thread ${thread.threadId} (runId=${runId})`);
     const { reply } = await live.replyWaiter.waitForEmailReply(runId);
     log(`[pm] received reply (${reply.body.length} chars) from ${reply.from}`);
+    thread = appendReplyToThread(thread, reply);
+    live.watcher.registerThread(thread);
 
     const result = await processReply(
       live.gmail,
@@ -539,13 +550,19 @@ async function runPMDesignLoop(args: {
 
     // result.action === 'reply_processed' -- update local state and keep waiting
     thread = result.thread;
-    const newDecisions = extractDecisions(reply.body);
-    resolvedDecisions = [...resolvedDecisions, ...newDecisions];
-    // best-effort: trim resolved questions from unresolvedQuestions
-    const replyLower = reply.body.toLowerCase();
-    unresolvedQuestions = unresolvedQuestions.filter(
-      (q) => !replyLower.includes(q.toLowerCase().split(' ').slice(0, 3).join(' '))
-    );
+    const persisted = live.pmEmailStateStore.loadThreadState(runId);
+    if (persisted) {
+      resolvedDecisions = persisted.resolvedDecisions;
+      unresolvedQuestions = persisted.unresolvedQuestions;
+    } else {
+      const newDecisions = extractDecisions(reply.body);
+      resolvedDecisions = [...resolvedDecisions, ...newDecisions];
+      // best-effort fallback if persistence unexpectedly fails
+      const replyLower = reply.body.toLowerCase();
+      unresolvedQuestions = unresolvedQuestions.filter(
+        (q) => !replyLower.includes(q.toLowerCase().split(' ').slice(0, 3).join(' '))
+      );
+    }
   }
 }
 
@@ -615,6 +632,38 @@ export function summarizeVerificationFailure(retryContext: string): string {
   return `verification-failed: ${sections.join(', ')}`;
 }
 
+/**
+ * Detects terminal repro outcomes that indicate the reported failure is no
+ * longer reproducible on the current default branch.
+ */
+export function classifyAlreadyFixedOnMain(outcome: ReproPipelineOutcome): {
+  alreadyFixedOnMain: boolean;
+  reason?: string;
+} {
+  if (
+    outcome.status === 'executor_failed' &&
+    outcome.v2.executor?.outcome === 'unexpected_pass'
+  ) {
+    return {
+      alreadyFixedOnMain: true,
+      reason:
+        outcome.v2.executor.reason ||
+        'deterministic replay passed unexpectedly (candidate repro no longer fails)',
+    };
+  }
+
+  if (outcome.status === 'prober_failed' && outcome.v2.builderRejectStage === 'run_repro_pass') {
+    return {
+      alreadyFixedOnMain: true,
+      reason:
+        outcome.message ||
+        'candidate repro passed during builder validation and no failing recipe could be established',
+    };
+  }
+
+  return { alreadyFixedOnMain: false };
+}
+
 interface VerificationResult {
   /** Aggregate gate outcome. ok=false means feed retryContext back to the fix agent. */
   outcome: { ok: boolean; retryContext: string };
@@ -645,6 +694,8 @@ async function runVerification(args: {
   branchName: string;
   upstreamRepo: string;
   upstreamDefaultBranch: string;
+  issueNumber: number;
+  runId: string;
   workspace: LocalWorkspace;
   affectedModule: string;
   confirmedIssues: ConfirmedIssue[];
@@ -658,6 +709,8 @@ async function runVerification(args: {
     branchName,
     upstreamRepo,
     upstreamDefaultBranch,
+    issueNumber,
+    runId,
     workspace,
     affectedModule,
     confirmedIssues,
@@ -666,6 +719,26 @@ async function runVerification(args: {
 
   // Verification is GHA-only; in local sandbox mode skip silently with ok=true.
   if (manifest.sandbox_runner !== 'gha') {
+    await emitOnlineEvaluation({
+      metric: 'verification_gate_passed',
+      stage: 'verification',
+      score: 1,
+      issueNumber,
+      runId,
+      repo: upstreamRepo,
+      status: 'skipped_non_gha',
+      input: {
+        issue_number: issueNumber,
+        run_id: runId,
+        repo: upstreamRepo,
+        sandbox_runner: manifest.sandbox_runner,
+      },
+      output: {
+        ok: true,
+        retry_context: '',
+        skipped: true,
+      },
+    });
     return {
       outcome: { ok: true, retryContext: '' },
       regressionSection: '',
@@ -774,6 +847,29 @@ async function runVerification(args: {
     regressionDetected,
     regressionDiffs,
     blockers: usabilityBlockers,
+  });
+
+  await emitOnlineEvaluation({
+    metric: 'verification_gate_passed',
+    stage: 'verification',
+    score: outcome.ok ? 1 : 0,
+    issueNumber,
+    runId,
+    repo: upstreamRepo,
+    status: outcome.ok ? 'passed' : 'failed',
+    input: {
+      issue_number: issueNumber,
+      run_id: runId,
+      repo: upstreamRepo,
+      branch: branchName,
+    },
+    output: {
+      ok: outcome.ok,
+      regression_detected: regressionDetected,
+      regression_diff_count: regressionDiffs.length,
+      usability_blocker_count: usabilityBlockers.length,
+      retry_context: outcome.retryContext,
+    },
   });
 
   return {
@@ -929,6 +1025,7 @@ async function runBuildAttempt(args: {
   adapter: RepoAdapter;
   manifest: Manifest;
   payload: IssueEvent;
+  runId: string;
   forkFullName: string;
   branchName: string;
   ghClient: GitHubRestClient;
@@ -983,6 +1080,28 @@ async function runBuildAttempt(args: {
 
   const evalResult = await adapter.runCustomEval(sandboxArtifact.commands);
   log(`[eval] passed=${evalResult.passed} summary=${evalResult.summary}`);
+  await emitOnlineEvaluation({
+    metric: 'build_eval_passed',
+    stage: 'build',
+    score: evalResult.passed ? 1 : 0,
+    issueNumber: payload.issue.number,
+    runId: args.runId,
+    repo: payload.repository.full_name,
+    status: evalResult.passed ? 'passed' : 'failed',
+    input: {
+      issue_number: payload.issue.number,
+      run_id: args.runId,
+      repo: payload.repository.full_name,
+      module: buildInput.affectedModule,
+      test_command_count: testCommands.length,
+      sandbox_service_count: sandboxServices.length,
+    },
+    output: {
+      passed: evalResult.passed,
+      summary: evalResult.summary,
+      retry_context_count: evalResult.retryContext.length,
+    },
+  });
 
   if (evalResult.passed) {
     return {
@@ -1256,7 +1375,7 @@ export async function runPipeline(args: {
   let usabilityLabels: string[] = [];
   let reproPRSection: string | null = null;
   let agentInvestigationSection: string | null = null;
-  let v2ReproOutcomeForEmail: import('../core/agents/run-v2').ReproPipelineOutcome | null = null;
+  let v2ReproOutcomeForEmail: ReproPipelineOutcome | null = null;
   let v2FixOutcomeForEmail: import('../core/agents/run-v2').FixPipelineOutcome | null = null;
   let reproDossier: import('../core/agents/analyst/dossier').DossierSnapshot | null = null;
   let fixDossier: import('../core/agents/analyst/dossier').DossierSnapshot | null = null;
@@ -1309,6 +1428,7 @@ export async function runPipeline(args: {
           adapter,
           manifest,
           payload,
+          runId,
           forkFullName: fork.forkFullName,
           branchName: fork.branchName,
           ghClient,
@@ -1334,6 +1454,8 @@ export async function runPipeline(args: {
           branchName: fork.branchName,
           upstreamRepo: repoFullName,
           upstreamDefaultBranch: baseBranch,
+          issueNumber,
+          runId,
           workspace,
           affectedModule: routing.result.affectedModule,
           confirmedIssues,
@@ -1424,7 +1546,7 @@ export async function runPipeline(args: {
 
     // ---- Halt helpers (used by repro stage on credentials / non-ok) -----
     const haltAndEmail = async (args: {
-      label: string;
+      label?: string;
       kind: 'need_credentials' | 'repro_unreachable';
       context: import('../core/agents/email/context').EmailContext;
       appendBody: string;
@@ -1452,10 +1574,12 @@ export async function runPipeline(args: {
         } catch (commentErr: any) {
           log("[v2-halt] issue comment failed: " + (commentErr?.message ?? commentErr));
         }
-        try {
-          await ghClient.addLabelsToPR(repoFullName, issueNumber, [args.label]);
-        } catch (labelErr: any) {
-          log("[v2-halt] label add failed: " + (labelErr?.message ?? labelErr));
+        if (args.label) {
+          try {
+            await ghClient.addLabelsToPR(repoFullName, issueNumber, [args.label]);
+          } catch (labelErr: any) {
+            log("[v2-halt] label add failed: " + (labelErr?.message ?? labelErr));
+          }
         }
       } else {
         log("[v2-halt] (no live deps) would have dispatched kind=" + args.kind + " to " + manifest.pm_email);
@@ -1558,6 +1682,47 @@ export async function runPipeline(args: {
       });
     };
 
+    const haltForAlreadyFixedOnMain = async (args: {
+      reason: string;
+    }): Promise<PipelineResult> => {
+      const issueUrl = "https://github.com/" + repoFullName + "/issues/" + issueNumber;
+      const appendBody = [
+        "The repro stage did not produce a failing test on the current default branch.",
+        '',
+        "Signal: deterministic/prober replay passed where a failure was expected.",
+        "Reason: " + args.reason,
+        '',
+        "Interpretation: this issue appears to already be fixed on main (or the issue repro steps have drifted).",
+        '',
+        "What to do:",
+        "  1. If the bug still reproduces, update the issue with exact current commands and a commit SHA.",
+        "  2. Re-apply the trigger label to run the pipeline again.",
+        '',
+        "Issue: " + issueUrl,
+        '',
+        "Run: " + runId,
+      ].join('\n');
+
+      return haltAndEmail({
+        kind: 'repro_unreachable',
+        context: buildHaltContext({
+          attemptId: runId,
+          recipient: manifest.pm_email,
+          issueNumber,
+          issueUrl,
+          failureSnippet: args.reason,
+          dossier: reproDossier,
+        }),
+        appendBody,
+        commentBody: "✅ **Not reproducible on current main.** " + args.reason + "\n\nNo PR was opened because the generated repro test passed consistently. If this still reproduces for you, please share updated repro steps and re-trigger the pipeline.",
+        result: {
+          status: 'already-fixed-on-main',
+          reason: args.reason,
+        },
+        logTag: "already-fixed-on-main: " + args.reason,
+      });
+    };
+
     // ---- Repro stage (v2) -----------------------------------------------
     const reproAttemptId = runId + "-repro";
     const reproOutcome = await runReproPipeline({
@@ -1587,6 +1752,13 @@ export async function runPipeline(args: {
         creds,
         term?.matchedPattern ?? 'credentials terminal'
       );
+    }
+
+    const alreadyFixed = classifyAlreadyFixedOnMain(reproOutcome);
+    if (alreadyFixed.alreadyFixedOnMain) {
+      return await haltForAlreadyFixedOnMain({
+        reason: alreadyFixed.reason ?? reproOutcome.message,
+      });
     }
 
     if (!reproOutcome.ok || !reproOutcome.candidateTestPath || !reproOutcome.candidateTestContent) {
@@ -1691,6 +1863,8 @@ export async function runPipeline(args: {
       branchName: fork.branchName,
       upstreamRepo: repoFullName,
       upstreamDefaultBranch: baseBranch,
+      issueNumber,
+      runId,
       workspace,
       affectedModule: routing.result.affectedModule,
       confirmedIssues,

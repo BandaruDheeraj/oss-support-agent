@@ -715,6 +715,43 @@ describe('processReply', () => {
     expect(call.threadId).toBe('thread-456');
   });
 
+  it('threads follow-ups against the latest user message-id when available', async () => {
+    const client = createMockGmailClient();
+    const watcher = createMockWatcher(client);
+    const config = createTestConfig();
+    const thread = createTestThread({
+      conversationHistory: [
+        {
+          role: 'agent',
+          body: '## Design Brief\n**Issue Summary:** Fix crash\n...',
+          timestamp: '2026-05-06T10:00:00Z',
+          messageId: '<agent-1@resend>',
+        },
+        {
+          role: 'user',
+          body: 'Can we proceed with option 1?',
+          timestamp: '2026-05-06T10:05:00Z',
+          messageId: '<user-1@example.com>',
+        },
+      ],
+    });
+    const stateStore = createMockStateStore();
+    stateStore.saveThreadState('run-001', thread, [], ['Q?']);
+    watcher.registerThread(thread);
+
+    await processReply(
+      client, watcher, config, thread,
+      'Please clarify one more thing',
+      [], ['Q?'],
+      createTestBriefInput(),
+      new HeuristicFollowUpGenerator(),
+      stateStore
+    );
+
+    const call = (client.sendEmail as jest.Mock).mock.calls[0][0];
+    expect(call.threadId).toBe('<user-1@example.com>');
+  });
+
   it('does not send email on approval', async () => {
     const client = createMockGmailClient();
     const watcher = createMockWatcher(client);

@@ -197,6 +197,18 @@ export interface ReproProberResult extends AgentLoopResult {
   verifiedSummary: string;
 }
 
+const TOOL_CALLS_EMPTY_TERMINATION = /finishReason=tool-calls;\s*finalText=\(empty\)/i;
+const MAX_TOOL_CALLS_EMPTY_RECOVERY_PASSES = 2;
+
+/**
+ * The AI SDK can occasionally return `finishReason=tool-calls` with empty
+ * final text even though no terminal tool call was observed. Treat that as a
+ * transport/step-boundary artifact and continue the same registry state.
+ */
+export function shouldRecoverFromToolCallsEmptyTermination(loop: AgentLoopResult): boolean {
+  return loop.terminated === 'finished' && TOOL_CALLS_EMPTY_TERMINATION.test(loop.reason ?? '');
+}
+
 export async function runReproProber(args: RunReproProberArgs): Promise<ReproProberResult> {
   const snapshotIdBeforeProber = args.dossierSnapshot.snapshotId;
   const registry = makeReproProberRegistry({
@@ -252,15 +264,18 @@ export async function runReproProber(args: RunReproProberArgs): Promise<ReproPro
 
   const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\nDossier summary: ${args.dossierSnapshot.body.summary}\nConfidence: ${args.dossierSnapshot.body.confidence}${hintsSection}${openQsBlock}\n\nProcedure: probe imports + exercise (steps 2-3), write_test (step 4), run_repro twice (step 5), record_evidence with reproRecipe (step 6), done (step 7). The registry blocks done until record_evidence has been called with recipe_recorded=true.`;
 
-  const loop = await runAgentLoop({
-    agent: 'REPRO_PROBER',
-    registry,
-    system: SYSTEM,
-    user: userPrompt,
-    attemptId: args.attemptId,
-    issueNumber: args.issue.number,
-    dossierSnapshotId: snapshotIdBeforeProber,
-  });
+  const runLoop = (user: string) =>
+    runAgentLoop({
+      agent: 'REPRO_PROBER',
+      registry,
+      system: SYSTEM,
+      user,
+      attemptId: args.attemptId,
+      issueNumber: args.issue.number,
+      dossierSnapshotId: snapshotIdBeforeProber,
+    });
+
+  const loop = await runLoop(userPrompt);
 
   // If the model emitted plain text instead of calling done/abandon, retry
   // once with an explicit reminder. The registry preserves state.
@@ -274,15 +289,28 @@ export async function runReproProber(args: RunReproProberArgs): Promise<ReproPro
       .getTranscript()
       .some((e) => e.tool === 'record_evidence' && e.ok && (e.result as any)?.recipe_recorded === true);
     const remind = `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous turn ended without calling done or abandon. State: wrote_test=${wroteTest}, run_repro_count=${reproCalls}, recipe_recorded=${recipeRecorded}. You MUST end the session with a tool call. If recipe_recorded=false, you also need to call record_evidence with a complete reproRecipe before done — the registry will reject done until that is recorded. Plain-text replies are discarded.`;
-    finalLoop = await runAgentLoop({
-      agent: 'REPRO_PROBER',
-      registry,
-      system: SYSTEM,
-      user: remind,
-      attemptId: args.attemptId,
-      issueNumber: args.issue.number,
-      dossierSnapshotId: snapshotIdBeforeProber,
-    });
+    finalLoop = await runLoop(remind);
+  }
+
+  for (let pass = 0; pass < MAX_TOOL_CALLS_EMPTY_RECOVERY_PASSES; pass++) {
+    if (registry.isTerminated() !== null || !shouldRecoverFromToolCallsEmptyTermination(finalLoop)) {
+      break;
+    }
+    const reproCalls = registry.getTranscript().filter((e) => e.tool === 'run_repro').length;
+    const wroteTest = registry
+      .getTranscript()
+      .some((e) => (e.tool === 'write_test' || e.tool === 'revise_test') && e.ok);
+    const recipeRecorded = registry
+      .getTranscript()
+      .some((e) => e.tool === 'record_evidence' && e.ok && (e.result as any)?.recipe_recorded === true);
+    const recoverPrompt =
+      `${userPrompt}\n\n` +
+      `[ORCHESTRATOR RECOVERY] The previous attempt ended with "${finalLoop.reason ?? 'unknown'}" ` +
+      `and no terminal tool call was observed. Continue from the current registry state. ` +
+      `State: wrote_test=${wroteTest}, run_repro_count=${reproCalls}, recipe_recorded=${recipeRecorded}. ` +
+      `Your NEXT response must be a tool call (no plain text). ` +
+      `If recipe_recorded=true, call done. Otherwise continue the procedure and record_evidence before done.`;
+    finalLoop = await runLoop(recoverPrompt);
   }
 
   const transcript = registry.getTranscript();

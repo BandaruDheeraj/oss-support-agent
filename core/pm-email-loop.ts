@@ -35,9 +35,6 @@ import {
   sendAndTrack,
   detectApproval,
   GmailWatcher,
-  appendAgentMessageToThread,
-  sendEmail,
-  buildEmailMessage,
 } from './gmail-mcp';
 
 /**
@@ -415,30 +412,21 @@ export async function processReply(
 
   const followUp = await followUpGenerator.generateFollowUp(followUpInput);
 
-  // Send the follow-up response
-  const message = buildEmailMessage({
+  // Send the follow-up response and keep watcher/state thread identity stable.
+  const updatedThread = await sendAndTrack(client, watcher, {
+    runId: config.runId,
     to: config.pmEmail,
     repo: config.repo,
     issueNumber: config.issueNumber,
     issueTitle: config.issueTitle,
     body: followUp.responseBody,
     replyTo: config.replyToAddress,
-    threadId: thread.threadId,
+    existingThreadId: thread.threadId,
+    // Prefer threading against the latest PM-authored message-id when present.
+    // Some providers don't expose stable RFC message-ids for outbound sends, but
+    // PM replies do, and replying to those keeps clients on a single thread.
+    replyReferenceId: getLatestUserMessageId(thread) ?? thread.threadId,
   });
-
-  const sendResult = await sendEmail(client, message);
-  const timestamp = new Date().toISOString();
-
-  // Update the thread with the agent's response
-  const updatedThread = appendAgentMessageToThread(
-    thread,
-    followUp.responseBody,
-    sendResult.messageId,
-    timestamp
-  );
-
-  // Update the watcher's copy
-  watcher.registerThread(updatedThread);
 
   // Persist updated state for restart-resume
   stateStore.saveThreadState(
@@ -453,6 +441,16 @@ export async function processReply(
     thread: updatedThread,
     approved: false,
   };
+}
+
+function getLatestUserMessageId(thread: EmailThread): string | null {
+  for (let i = thread.conversationHistory.length - 1; i >= 0; i--) {
+    const entry = thread.conversationHistory[i];
+    if (entry.role === 'user' && entry.messageId) {
+      return entry.messageId;
+    }
+  }
+  return null;
 }
 
 /**
@@ -559,5 +557,4 @@ export function createPMReplyHandler(
     }
   };
 }
-
 

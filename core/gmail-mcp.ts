@@ -87,10 +87,10 @@ export function detectApproval(
   replyBody: string,
   approvalKeywords: string[]
 ): ApprovalDetectionResult {
-  const bodyLower = replyBody.toLowerCase();
+  const normalizedBody = stripQuotedReplyText(replyBody).toLowerCase();
 
   for (const keyword of approvalKeywords) {
-    if (bodyLower.includes(keyword.toLowerCase())) {
+    if (normalizedBody.includes(keyword.toLowerCase())) {
       return {
         approved: true,
         matchedKeyword: keyword,
@@ -99,11 +99,66 @@ export function detectApproval(
     }
   }
 
+  const impliedApproval = detectImpliedApproval(normalizedBody);
+  if (impliedApproval) {
+    return {
+      approved: true,
+      matchedKeyword: impliedApproval,
+      replyBody,
+    };
+  }
+
   return {
     approved: false,
     matchedKeyword: null,
     replyBody,
   };
+}
+
+function stripQuotedReplyText(replyBody: string): string {
+  const lines = replyBody.split(/\r?\n/);
+  const visible: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (
+      /^on .+wrote:$/i.test(trimmed) ||
+      /^from:\s/i.test(trimmed) ||
+      /^sent:\s/i.test(trimmed) ||
+      /^to:\s/i.test(trimmed) ||
+      /^subject:\s/i.test(trimmed) ||
+      /^>+/.test(trimmed)
+    ) {
+      break;
+    }
+    visible.push(line);
+  }
+  return visible.join('\n').trim();
+}
+
+function detectImpliedApproval(bodyLower: string): string | null {
+  if (!bodyLower) return null;
+
+  if (/\b(do not|don't|dont|not)\s+(approve|proceed|ship|merge|go ahead)\b/.test(bodyLower)) {
+    return null;
+  }
+
+  const impliedPatterns: Array<{ regex: RegExp; token: string }> = [
+    {
+      regex: /\b(go ahead|please proceed|proceed please|proceed with it|proceed with this)\b/,
+      token: 'go ahead',
+    },
+    {
+      regex: /\b(yes|yep|yeah|ok|okay|sure|sounds good)\b[\s,:-]{0,8}\b(proceed|go ahead|ship it|merge)\b/,
+      token: 'yes proceed',
+    },
+  ];
+
+  for (const pattern of impliedPatterns) {
+    if (pattern.regex.test(bodyLower)) {
+      return pattern.token;
+    }
+  }
+  return null;
 }
 
 /**
@@ -330,8 +385,18 @@ export async function sendAndTrack(
     body: string;
     replyTo: string;
     existingThreadId?: string;
+    replyReferenceId?: string;
   }
 ): Promise<EmailThread> {
+  // Check if we're continuing an existing thread.
+  const existingThread = options.existingThreadId
+    ? watcher.getThread(options.existingThreadId)
+    : undefined;
+  const inferredReplyReferenceId =
+    options.replyReferenceId
+    ?? getLatestUserMessageId(existingThread)
+    ?? options.existingThreadId;
+
   const message = buildEmailMessage({
     to: options.to,
     repo: options.repo,
@@ -339,16 +404,11 @@ export async function sendAndTrack(
     issueTitle: options.issueTitle,
     body: options.body,
     replyTo: options.replyTo,
-    threadId: options.existingThreadId,
+    threadId: inferredReplyReferenceId,
   });
 
   const result = await sendEmail(client, message);
   const timestamp = new Date().toISOString();
-
-  // Check if we're continuing an existing thread
-  const existingThread = options.existingThreadId
-    ? watcher.getThread(options.existingThreadId)
-    : undefined;
 
   if (existingThread) {
     const updated = appendAgentMessageToThread(
@@ -372,4 +432,15 @@ export async function sendAndTrack(
   );
   watcher.registerThread(thread);
   return thread;
+}
+
+function getLatestUserMessageId(thread: EmailThread | undefined): string | undefined {
+  if (!thread) return undefined;
+  for (let i = thread.conversationHistory.length - 1; i >= 0; i--) {
+    const entry = thread.conversationHistory[i];
+    if (entry.role === 'user' && entry.messageId) {
+      return entry.messageId;
+    }
+  }
+  return undefined;
 }
