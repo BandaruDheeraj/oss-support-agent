@@ -6,8 +6,27 @@
  */
 
 import { z } from 'zod';
-import type { ToolDef } from './types';
+import type { ToolContext, ToolDef } from './types';
 import { asHandles } from './handles';
+
+/**
+ * When the Prober (REPRO_PROBER) authors or revises its candidate repro
+ * test, automatically point the sandbox's `run_repro` at that path. Without
+ * this, run_repro returns exit=2 ("reproTestPath not configured") because
+ * setReproTestPath is otherwise only called by the Builder / deterministic
+ * Executor — neither of which runs in the Prober's no-candidate path.
+ *
+ * Scoped to the Prober so the Fix Executor's coverage-extending write_test
+ * calls don't clobber an already-set canonical repro path.
+ */
+function maybeAutoSetReproTestPath(ctx: ToolContext, path: string): void {
+  if (ctx.agentName !== 'REPRO_PROBER') return;
+  const handles = ctx.handles as Record<string, unknown>;
+  const sandbox = handles?.sandbox as { setReproTestPath?: (p: string) => void } | undefined;
+  if (sandbox && typeof sandbox.setReproTestPath === 'function') {
+    sandbox.setReproTestPath(path);
+  }
+}
 
 export function ensureTestRootScoped(path: string, roots: string[], label = 'write-test'): void {
   if (!path || path.includes('..') || path.startsWith('/') || path.match(/^[A-Za-z]:/)) {
@@ -37,6 +56,7 @@ export const writeTest: ToolDef<z.infer<typeof WriteTest>, unknown> = {
     const ws = asHandles(ctx.handles).workspace;
     ensureScoped(path, ws.testRoots());
     await ws.writeTest(path, content);
+    maybeAutoSetReproTestPath(ctx, path);
     return { written: path, bytes: Buffer.byteLength(content, 'utf8') };
   },
 };
@@ -51,6 +71,7 @@ export const reviseTest: ToolDef<z.infer<typeof ReviseTest>, unknown> = {
     const ws = asHandles(ctx.handles).workspace;
     ensureScoped(path, ws.testRoots());
     await ws.writeTest(path, content);
+    maybeAutoSetReproTestPath(ctx, path);
     return { revised: path };
   },
 };
