@@ -394,6 +394,7 @@ export function makeReproProberRegistry({ ctx }: RegistryFactoryArgs): ToolRegis
         done: reproProberDoneGate,
       },
       abandonGate: reproProberAbandonGate,
+      responseAugmenter: proberWriteTestNudge,
     },
     ctx
   )
@@ -489,4 +490,59 @@ export function gateRequireRunReproSinceLastWrite(
     `write_test/revise_test. Call run_repro first so you have an observation to react to — ` +
     `blind revise loops burn budget without producing new evidence.\n\n${renderVerifiedState(state)}`
   );
+}
+
+/**
+ * Prober responseAugmenter: detect "research-spiral" state and inject a
+ * non-blocking nudge into read-tier tool results telling the model to write
+ * its best-guess test now.
+ *
+ * Fires when:
+ *   - the tool that just ran was grep/find_symbol/find_callers/read_file/read_test, AND
+ *   - the verified-state ledger shows write_test is unblocked (importable ≥ 1
+ *     OR run_python errored ≥ 2 times — pytest stderr will diagnose the call
+ *     faster than more grep), AND
+ *   - no write_test has succeeded yet, AND
+ *   - at least 8 cumulative grep/find_symbol/find_callers calls have happened.
+ *
+ * Hint is added as a `_proberHint` field on the result object so it doesn't
+ * change the shape of what the tool returns. Nudge appears at most once per
+ * 3 research calls to avoid spamming the model context.
+ */
+const RESEARCH_TOOLS = new Set(['grep', 'find_symbol', 'find_callers', 'read_file', 'read_test']);
+const NUDGE_HINT =
+  'Prober nudge: you have made ≥8 read-tier research calls and the verified-state ledger ' +
+  'shows write_test is no longer blocked (importable≥1 or run_python errored ≥2x). Per the ' +
+  'ESCAPE HATCH in your system prompt, your VERY NEXT tool call should be write_test with ' +
+  'your best-guess exercise. pytest stderr from run_repro will pinpoint a wrong call ' +
+  'signature in one iteration; another grep cannot. revise_test is allowed afterward.';
+
+export function proberWriteTestNudge(args: {
+  def: { name: string; tier: string };
+  result: unknown;
+  transcript: TranscriptEntry[];
+}): unknown {
+  if (!RESEARCH_TOOLS.has(args.def.name)) return args.result;
+  if (!args.result || typeof args.result !== 'object' || Array.isArray(args.result)) {
+    return args.result;
+  }
+  let researchCalls = 0;
+  let writeTestOk = 0;
+  let runPythonErr = 0;
+  for (const e of args.transcript) {
+    if (!e.ok) continue;
+    if (e.tool === 'grep' || e.tool === 'find_symbol' || e.tool === 'find_callers') researchCalls++;
+    if (e.tool === 'write_test') writeTestOk++;
+  }
+  for (const e of args.transcript) {
+    if (e.tool === 'run_python' && !e.ok) runPythonErr++;
+  }
+  if (writeTestOk > 0) return args.result;
+  if (researchCalls < 8) return args.result;
+  const state = deriveVerifiedState(args.transcript);
+  const writeTestUnblocked = state.importable.length > 0 || runPythonErr >= 2;
+  if (!writeTestUnblocked) return args.result;
+  // Throttle: only nudge every 3rd research call after threshold to avoid spam.
+  if ((researchCalls - 8) % 3 !== 0) return args.result;
+  return { ...(args.result as Record<string, unknown>), _proberHint: NUDGE_HINT };
 }

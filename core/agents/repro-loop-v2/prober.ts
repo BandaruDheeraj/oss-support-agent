@@ -94,6 +94,12 @@ Procedure (follow in order; do not skip):
 
 3. PROBE the exercise. Use run_python to actually call the suspect symbols with hand-constructed inputs. Confirm the call executes (whether or not it raises). If it raises the expected failure signature, you already have a working repro skeleton — copy it into the test.
 
+ESCAPE HATCH (NON-NEGOTIABLE — read this before grepping a 6th time): the moment ANY of these is true, your VERY NEXT tool call MUST be write_test:
+   - run_python has errored 2+ times trying to construct the exercise call, OR
+   - you have made 8+ combined grep/find_symbol/find_callers calls and the verified-state ledger shows importable >= 1, OR
+   - you have spent a turn doing nothing but read-tier research after a probe phase that already established at least one working import.
+Rationale: pytest stderr from run_repro will pinpoint a wrong call signature in ONE iteration. Continuing to grep cannot. write_test is NOT a one-shot commitment — revise_test corrects course as many times as your sandbox budget allows, and a failing-for-the-wrong-reason test is strictly more information than another grep result. Big-bang authoring is not the failure mode here; analysis-paralysis is.
+
 4. COMMIT the test source. ONE write_test call. The test contains: your verified imports, your verified exercise call, and a final assertion that fails with YOUR chosen sentinel string. PICK a unique 12+ character sentinel (e.g. \`REPRO_NONRECORDINGSPAN_CRASH_a3f9\`) and embed it as a LITERAL string in the failure message. Example:
    \`\`\`python
    SENTINEL = "REPRO_NONRECORDINGSPAN_CRASH_a3f9"

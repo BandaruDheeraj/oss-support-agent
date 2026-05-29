@@ -165,6 +165,17 @@ export class ToolRegistry {
         let errorMsg: string | undefined;
         try {
           result = await def.execute(parsed.data as TArgs, this.ctx);
+          if (this.opts.responseAugmenter) {
+            try {
+              result = this.opts.responseAugmenter({
+                def: { name: def.name, tier: def.tier },
+                result,
+                transcript: this.transcript,
+              });
+            } catch {
+              /* swallow — never let an augmenter break a tool call */
+            }
+          }
           if (def.name === 'done') this.terminated = { kind: 'done' };
           if (def.name === 'abandon') {
             const reason = (parsed.data as any)?.reason;

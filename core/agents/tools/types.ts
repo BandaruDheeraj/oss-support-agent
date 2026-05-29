@@ -69,6 +69,23 @@ export interface RegistryOptions {
    *     call was run_repro (forces an observation between rewrites).
    */
   toolGates?: Record<string, (transcript: TranscriptEntry[]) => string | null>;
+  /**
+   * Optional post-execution hook that can wrap successful tool results before
+   * they are returned to the model. Receives the tool def, the original
+   * result, and the transcript-so-far (NOT yet including the in-flight call).
+   * Return the original result to pass through, or a wrapped/augmented value
+   * to surface additional hints to the model.
+   *
+   * Used by the Repro Prober registry to nudge the model out of research
+   * spirals when the verified-state ledger shows write_test is unblocked but
+   * the model keeps grepping. Errors thrown here are swallowed (the original
+   * result is returned) so a bad augmenter cannot break a tool call.
+   */
+  responseAugmenter?: (args: {
+    def: { name: string; tier: ToolTier };
+    result: unknown;
+    transcript: TranscriptEntry[];
+  }) => unknown;
 }
 
 export class ToolGuardError extends Error {
