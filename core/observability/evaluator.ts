@@ -33,7 +33,7 @@ export async function emitOnlineEvaluation(event: OnlineEvaluationEvent): Promis
 
     const tracer = getTracer();
     const span = tracer.startSpan(`evaluator.${event.stage}`, {
-      kind: 'evaluator',
+      kind: 'tool',
       parent: currentSpan(),
       attributes: {
         'openinference.span.kind': 'EVALUATOR',
