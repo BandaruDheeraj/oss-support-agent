@@ -40,6 +40,17 @@ export class ToolRegistry {
     };
   }
 
+  /**
+   * Per-registry hard cap on model turns. Used by `agent-loop.ts` to size
+   * the Vercel AI SDK `maxSteps` so a Critic (maxTurns: 8) doesn't get the
+   * same 40-step budget as a Repro Executor (maxTurns: 22). Historically
+   * `maxSteps` was hardcoded to 40 across every agent — burning ~80% extra
+   * tokens on the shorter-lived stages.
+   */
+  maxTurns(): number {
+    return this.opts.maxTurns;
+  }
+
   register(def: AnyToolDef): this {
     if (this.tools.has(def.name)) throw new Error(`Tool already registered: ${def.name}`);
     this.tools.set(def.name, def);
