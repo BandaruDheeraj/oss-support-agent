@@ -164,7 +164,13 @@ export function makeReproPlannerRegistry({ ctx }: RegistryFactoryArgs): ToolRegi
 export function makeReproExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
     {
-      budgets: defaultBudgets({ total: 70, perTier: { mutation: 0 } }),
+      // sandbox cap raised from default 12 → 30: the Prober/Executor
+      // legitimately needs probes (python_module_check, run_python, pip_install)
+      // PLUS many run_repro iterations against the candidate test. At 12 the
+      // probe phase alone exhausts the budget and every subsequent run_repro
+      // is rejected with budget_exhausted (result.exitCode undefined → counted
+      // as run_repro_errored), so pytest never actually runs.
+      budgets: defaultBudgets({ total: 70, perTier: { mutation: 0, sandbox: 30 } }),
       maxTurns: 22,
       // Probe-first soft gates (Commit B). Forces the Executor to actually
       // exercise its tools before authoring/revising a test, AND to observe
@@ -374,7 +380,11 @@ export function reproProberAbandonGate(transcript: TranscriptEntry[]): string | 
 export function makeReproProberRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
     {
-      budgets: defaultBudgets({ total: 70, perTier: { mutation: 0 } }),
+      // sandbox cap raised from default 12 → 30 (same reason as Repro Executor).
+      // The Prober's probe phase + candidate run_repro iterations comfortably
+      // exceed 12 sandbox calls; rejected calls would otherwise look like
+      // run_repro_errored to the verified-state classifier.
+      budgets: defaultBudgets({ total: 70, perTier: { mutation: 0, sandbox: 30 } }),
       maxTurns: 22,
       toolGates: {
         write_test: (transcript) =>
