@@ -13,6 +13,7 @@ import * as path from 'path';
 import { execCommand, LocalWorkspace } from '../../../bin/clients/local-workspace';
 import { ensurePythonVenv } from '../../../bin/clients/local-sandbox';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
+import { resolveSkippablePipInstall } from './pip-spec';
 
 /**
  * Build a `pip install <args>` command from a free-form spec.
@@ -143,6 +144,14 @@ export function createLocalSandboxAdapter(
       };
     },
     async pipInstall(spec: string) {
+      const skippable = await resolveSkippablePipInstall(spec, (name) =>
+        handle.pythonModuleCheck(name)
+      );
+      if (skippable) {
+        const msg = `[sandbox-v2] pip_install skipped: "${skippable}" is already importable`;
+        log(msg);
+        return { exitCode: 0, stdout: `${msg}\n`, stderr: '', durationMs: 0 };
+      }
       return runShell(buildPipInstallCommand(spec));
     },
     async pythonModuleCheck(name: string) {

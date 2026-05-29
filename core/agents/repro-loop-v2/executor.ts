@@ -301,7 +301,9 @@ export function reproAstPreflight(
   src: string,
   suspectFiles: string[],
   suspectSymbols: string[]
-): { ok: boolean; reason?: string } {
+):
+  | { ok: true }
+  | { ok: false; code: 'missing_suspect_reference' | 'trivial_failure'; reason: string } {
   if (language !== 'python') return { ok: true };
   const stripped = src
     .replace(/"""[\s\S]*?"""/g, '')
@@ -312,7 +314,11 @@ export function reproAstPreflight(
     suspectFiles.some((f) => stripped.includes(f.replace(/[\\/]/g, '.').replace(/\.py$/, ''))) ||
     suspectSymbols.some((s) => new RegExp(`\\b${s}\\b`).test(stripped));
   if (!exercises) {
-    return { ok: false, reason: 'test does not reference any suspect file or symbol from the dossier' };
+    return {
+      ok: false,
+      code: 'missing_suspect_reference',
+      reason: 'test does not reference any suspect file or symbol from the dossier',
+    };
   }
 
   // A top-level `raise` without a try/except wrapper is usually a synthetic
@@ -325,7 +331,11 @@ export function reproAstPreflight(
     hasStandaloneRaise ||
     /^\s*print\(['"][^'"]*sentinel[^'"]*['"]\)\s*;?\s*assert\s+False/i.test(stripped);
   if (trivial) {
-    return { ok: false, reason: 'test trivially fails without exercising suspect code paths' };
+    return {
+      ok: false,
+      code: 'trivial_failure',
+      reason: 'test trivially fails without exercising suspect code paths',
+    };
   }
   return { ok: true };
 }

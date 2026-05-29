@@ -429,18 +429,25 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     const suspectSymbols = snapshot.body.suspectSymbols.map((s) => s.symbol);
     const pre = reproAstPreflight(args.repo.language, src, suspectFiles, suspectSymbols);
     if (!pre.ok) {
-      return {
-        status: 'preflight_failed',
-        dossier,
-        recipe,
-        plan: planProjection,
-        ...(prober ? { prober } : {}),
-        ...(builder ? { builder } : {}),
-        ...(builderRejectStage ? { builderRejectStage } : {}),
-        executor,
-        preflightReason: pre.reason,
-        message: `AST preflight rejected the candidate test: ${pre.reason}`,
-      };
+      if (pre.code === 'missing_suspect_reference') {
+        // eslint-disable-next-line no-console
+        console.log(
+          `[v2-driver] AST preflight warning (non-terminal): ${pre.reason}; proceeding because deterministic replay already reproduced`
+        );
+      } else {
+        return {
+          status: 'preflight_failed',
+          dossier,
+          recipe,
+          plan: planProjection,
+          ...(prober ? { prober } : {}),
+          ...(builder ? { builder } : {}),
+          ...(builderRejectStage ? { builderRejectStage } : {}),
+          executor,
+          preflightReason: pre.reason,
+          message: `AST preflight rejected the candidate test: ${pre.reason}`,
+        };
+      }
     }
   }
 

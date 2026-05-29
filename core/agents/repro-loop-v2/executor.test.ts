@@ -94,6 +94,21 @@ def test_repro():
 `;
     const out = reproAstPreflight('python', src, [], ['trigger_google_genai_failure']);
     expect(out.ok).toBe(false);
+    if (out.ok) throw new Error('expected preflight failure');
+    expect(out.code).toBe('trivial_failure');
     expect(out.reason).toContain('trivially fails');
+  });
+
+  it('returns a dedicated code for missing suspect references', () => {
+    const src = `
+def test_repro():
+    import json
+    assert json.loads('{"ok": true}')["ok"] is True
+`;
+    const out = reproAstPreflight('python', src, ['src/foo.py'], ['missing_symbol']);
+    expect(out.ok).toBe(false);
+    if (out.ok) throw new Error('expected preflight failure');
+    expect(out.code).toBe('missing_suspect_reference');
+    expect(out.reason).toContain('does not reference any suspect file or symbol');
   });
 });

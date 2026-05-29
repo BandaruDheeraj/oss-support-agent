@@ -5,6 +5,7 @@
 import { runSandbox } from '../../sandbox';
 import type { ActionsClient, SandboxConfig } from '../../sandbox-types';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
+import { resolveSkippablePipInstall } from './pip-spec';
 import { buildPipInstallCommand } from './sandbox-local';
 
 export interface GhActionsSandboxAdapterOptions {
@@ -62,6 +63,14 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
       return runOne(`python -c '${escaped}'`);
     },
     async pipInstall(spec) {
+      const skippable = await resolveSkippablePipInstall(spec, (name) =>
+        handle.pythonModuleCheck(name)
+      );
+      if (skippable) {
+        const msg = `[sandbox-gh] pip_install skipped: "${skippable}" is already importable`;
+        log(msg);
+        return asRun(`${msg}\n`, '', 0, 0);
+      }
       return runOne(buildPipInstallCommand(spec));
     },
     async pythonModuleCheck(name) {
