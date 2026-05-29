@@ -153,19 +153,42 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
 
   // Some models stop emitting tool calls before recording the dossier (they
   // narrate findings in plain text and exit). Give them exactly one forced
-  // retry with an explicit reminder before declaring analyst_failed.
-  if (!args.dossier.latest() && (result.terminated === 'finished' || result.terminated === 'max_turns')) {
-    const forcePrompt =
-      `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous attempt ended with a plain-text reply (no tool call). Plain-text replies are DISCARDED. You MUST call record_evidence NOW. Use this minimal template if you are stuck — fill in summary and confidence from what you have already investigated, and set every array to [] if you don't have specific entries:\n\n` +
-      `record_evidence({\n` +
-      `  summary: "<one-paragraph summary of what you found — even if incomplete, write what you have>",\n` +
-      `  confidence: "low",\n` +
-      `  evidence: [],\n` +
-      `  suspectSymbols: [],\n` +
-      `  preconditions: [],\n` +
-      `  openQuestions: []\n` +
-      `})\n\n` +
-      `Do NOT call abandon — abandon is reserved for contradictory or empty issues, not incomplete investigations. Just call record_evidence with whatever you have.`;
+  // retry with an explicit reminder before declaring analyst_failed. We also
+  // recover once from a terminal record_evidence JSON-parse failure because
+  // this is usually model formatting noise (extra trailing tokens), not a
+  // true investigation dead-end.
+  const recoverableJsonParseFailure = isRecoverableRecordEvidenceJsonParseFailure(result);
+  if (
+    !args.dossier.latest() &&
+    (result.terminated === 'finished' ||
+      result.terminated === 'max_turns' ||
+      recoverableJsonParseFailure)
+  ) {
+    const forcePrompt = recoverableJsonParseFailure
+      ? `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous terminal tool call failed JSON parsing:\n` +
+        `${result.reason ?? '(unknown parse failure)'}\n\n` +
+        `Re-emit ONE valid JSON object for record_evidence. No XML envelope tokens, no prose before/after the JSON, no trailing text. ` +
+        `Keep it minimal and omit optional fields (especially candidateRepro/reproTargets) for this recovery attempt.\n\n` +
+        `Use this exact minimal shape if needed:\n` +
+        `record_evidence({\n` +
+        `  "summary": "<one-paragraph summary of what you found>",\n` +
+        `  "confidence": "low",\n` +
+        `  "evidence": [],\n` +
+        `  "suspectSymbols": [],\n` +
+        `  "preconditions": [],\n` +
+        `  "openQuestions": []\n` +
+        `})\n\n` +
+        `Do NOT call abandon — just emit a valid record_evidence tool call with what you have.`
+      : `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous attempt ended with a plain-text reply (no tool call). Plain-text replies are DISCARDED. You MUST call record_evidence NOW. Use this minimal template if you are stuck — fill in summary and confidence from what you have already investigated, and set every array to [] if you don't have specific entries:\n\n` +
+        `record_evidence({\n` +
+        `  summary: "<one-paragraph summary of what you found — even if incomplete, write what you have>",\n` +
+        `  confidence: "low",\n` +
+        `  evidence: [],\n` +
+        `  suspectSymbols: [],\n` +
+        `  preconditions: [],\n` +
+        `  openQuestions: []\n` +
+        `})\n\n` +
+        `Do NOT call abandon — abandon is reserved for contradictory or empty issues, not incomplete investigations. Just call record_evidence with whatever you have.`;
     const retry = await runAgentLoop({
       agent: 'ANALYST',
       registry,
@@ -192,6 +215,12 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
     toolCalls: result.toolCalls,
     transcriptSummary: result.transcriptSummary,
   };
+}
+
+function isRecoverableRecordEvidenceJsonParseFailure(result: Pick<AnalystResult, 'terminated' | 'reason'>): boolean {
+  if (result.terminated !== 'error' || !result.reason) return false;
+  const reason = result.reason.toLowerCase();
+  return reason.includes('record_evidence') && reason.includes('json parsing failed');
 }
 
 /**

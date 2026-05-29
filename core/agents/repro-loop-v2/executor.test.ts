@@ -5,7 +5,7 @@
  * Prober-records-bare-package-name failure (see fix(prober) commit).
  */
 
-import { resolveEditableInstallPackage } from './executor';
+import { resolveEditableInstallPackage, reproAstPreflight } from './executor';
 
 describe('resolveEditableInstallPackage', () => {
   it('rewrites a bare package name to the matching fallback path', () => {
@@ -63,5 +63,37 @@ describe('resolveEditableInstallPackage', () => {
 
   it('returns input unchanged when fallbacks list is empty', () => {
     expect(resolveEditableInstallPackage('foo', [])).toBe('foo');
+  });
+});
+
+describe('reproAstPreflight', () => {
+  it('allows try/except repro templates that use else: raise AssertionError', () => {
+    const src = `
+def test_repro():
+    try:
+        trigger_google_genai_failure()
+    except TypeError as exc:
+        assert False, "REPRO_GOOGLE_GENAI: " + str(exc)
+    else:
+        raise AssertionError("REPRO_GOOGLE_GENAI: expected TypeError")
+`;
+    const out = reproAstPreflight(
+      'python',
+      src,
+      ['python/instrumentation/openinference-instrumentation-google-genai/src/openinference/instrumentation/google_genai/_wrapper.py'],
+      ['trigger_google_genai_failure']
+    );
+    expect(out).toEqual({ ok: true });
+  });
+
+  it('rejects standalone top-level raises as trivial failures', () => {
+    const src = `
+def test_repro():
+    trigger_google_genai_failure = None
+    raise AssertionError("REPRO_GOOGLE_GENAI: forced failure")
+`;
+    const out = reproAstPreflight('python', src, [], ['trigger_google_genai_failure']);
+    expect(out.ok).toBe(false);
+    expect(out.reason).toContain('trivially fails');
   });
 });

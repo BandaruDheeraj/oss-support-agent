@@ -308,20 +308,24 @@ export function reproAstPreflight(
     .replace(/'''[\s\S]*?'''/g, '')
     .replace(/(^|\n)\s*#[^\n]*/g, '$1');
 
-  const trivial =
-    /^\s*assert\s+False\s*[,;]?\s*$/m.test(stripped) ||
-    /\bsys\.exit\s*\(/.test(stripped) ||
-    /^\s*raise\b/m.test(stripped.replace(/^\s*try:[\s\S]*?except[\s\S]*?raise\b/g, '')) ||
-    /^\s*print\(['"][^'"]*sentinel[^'"]*['"]\)\s*;?\s*assert\s+False/i.test(stripped);
-  if (trivial) {
-    return { ok: false, reason: 'test trivially fails without exercising suspect code paths' };
-  }
-
   const exercises =
     suspectFiles.some((f) => stripped.includes(f.replace(/[\\/]/g, '.').replace(/\.py$/, ''))) ||
     suspectSymbols.some((s) => new RegExp(`\\b${s}\\b`).test(stripped));
   if (!exercises) {
     return { ok: false, reason: 'test does not reference any suspect file or symbol from the dossier' };
+  }
+
+  // A top-level `raise` without a try/except wrapper is usually a synthetic
+  // always-fail test. But allow wrapped `else: raise AssertionError(...)`
+  // patterns since those are common in valid repro templates.
+  const hasStandaloneRaise = /^\s*raise\b/m.test(stripped) && !/^\s*try:/m.test(stripped);
+  const trivial =
+    /^\s*assert\s+False\s*[,;]?\s*$/m.test(stripped) ||
+    /\bsys\.exit\s*\(/.test(stripped) ||
+    hasStandaloneRaise ||
+    /^\s*print\(['"][^'"]*sentinel[^'"]*['"]\)\s*;?\s*assert\s+False/i.test(stripped);
+  if (trivial) {
+    return { ok: false, reason: 'test trivially fails without exercising suspect code paths' };
   }
   return { ok: true };
 }
