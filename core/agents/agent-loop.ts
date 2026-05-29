@@ -201,15 +201,31 @@ async function runAgentLoopOnce(args: RunAgentLoopArgs): Promise<AgentLoopResult
   );
 }
 
-function summariseTranscript(transcript: { tool: string; tier: string; ok: boolean }[]): string {
+function summariseTranscript(
+  transcript: { tool: string; tier: string; ok: boolean; error?: string }[],
+): string {
   if (transcript.length === 0) return '(no tool calls)';
-  const counts: Record<string, { ok: number; err: number }> = {};
+  const counts: Record<string, { ok: number; err: number; lastError?: string }> = {};
   for (const e of transcript) {
     counts[e.tool] = counts[e.tool] || { ok: 0, err: 0 };
     if (e.ok) counts[e.tool].ok += 1;
-    else counts[e.tool].err += 1;
+    else {
+      counts[e.tool].err += 1;
+      if (e.error) counts[e.tool].lastError = e.error;
+    }
   }
-  return Object.entries(counts)
+  const counts_line = Object.entries(counts)
     .map(([k, v]) => `${k}(${v.ok}${v.err ? `/${v.err}err` : ''})`)
     .join(' ');
+  // Surface last error message for any tool that errored. Crucial for debugging
+  // when a model can't make progress because its terminal tool (record_evidence,
+  // abandon, commit_test) keeps getting rejected — without this, logs only show
+  // "0/1err" with no clue why.
+  const errorLines = Object.entries(counts)
+    .filter(([, v]) => v.err > 0 && v.lastError)
+    .map(([k, v]) => {
+      const msg = (v.lastError ?? '').replace(/\s+/g, ' ').trim().slice(0, 240);
+      return `${k}:err="${msg}"`;
+    });
+  return errorLines.length ? `${counts_line} | ${errorLines.join(' | ')}` : counts_line;
 }

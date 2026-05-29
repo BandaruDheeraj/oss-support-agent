@@ -37,7 +37,7 @@ export function makeAnalystRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry 
   return new ToolRegistry(
     {
       budgets: defaultBudgets({ total: 40, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }),
-      maxTurns: 25,
+      maxTurns: 30,
       abandonGate: (transcript) => {
         const readCalls = transcript.filter((t) => t.tier === 'read' && t.ok).length;
         const usedSymbolSearch = transcript.some(
