@@ -1,5 +1,8 @@
 node_modules/
 dist/
+.env
+.env.local
+evals/results/
 *.js
 !jest.config.ts
 *.d.ts

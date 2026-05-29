@@ -55,18 +55,20 @@ export class LangSmithTracer implements Tracer {
   private initError: Error | null = null;
 
   constructor() {
-    this.project = process.env.LANGSMITH_PROJECT || 'oss-support-agent';
+    this.project =
+      process.env.LANGSMITH_PROJECT || process.env.LANGCHAIN_PROJECT || 'oss-support-agent';
     try {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const ls = require('langsmith') as { Client: new (cfg?: Record<string, unknown>) => LangSmithClient };
-      if (!process.env.LANGSMITH_API_KEY) {
+      const apiKey = process.env.LANGSMITH_API_KEY || process.env.LANGCHAIN_API_KEY;
+      if (!apiKey) {
         throw new Error(
-          'OBSERVABILITY_BACKEND=langsmith requires LANGSMITH_API_KEY in the environment.'
+          'OBSERVABILITY_BACKEND=langsmith requires LANGSMITH_API_KEY (or LANGCHAIN_API_KEY) in the environment.'
         );
       }
       this.client = new ls.Client({
-        apiKey: process.env.LANGSMITH_API_KEY,
-        apiUrl: process.env.LANGSMITH_ENDPOINT,
+        apiKey,
+        apiUrl: process.env.LANGSMITH_ENDPOINT || process.env.LANGCHAIN_ENDPOINT,
       });
     } catch (err) {
       this.initError = err instanceof Error ? err : new Error(String(err));

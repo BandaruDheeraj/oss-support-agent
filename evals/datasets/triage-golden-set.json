@@ -1,0 +1,202 @@
+[
+  {
+    "issue_number": 1001,
+    "title": "openinference-instrumentation-anthropic: streaming responses emit zero output tokens",
+    "body": "When using `client.messages.stream(...)` with the Anthropic Python SDK and openinference-instrumentation-anthropic enabled, the resulting span has `llm.token_count.completion = 0` even though the stream returned ~400 tokens of text. Non-streaming `messages.create()` reports correct token counts. Reproduces against anthropic==0.34.2 and openinference-instrumentation-anthropic==0.1.10.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": "python/instrumentation/openinference-instrumentation-anthropic",
+    "expected_design_needed": false,
+    "difficulty": "easy",
+    "notes": "Clear bug, clear module from package name in title. Triage should pick this up from the title alone; PM should not flag for design review."
+  },
+  {
+    "issue_number": 1002,
+    "title": "openinference-instrumentation-openai: missing input.value attribute when tools are passed",
+    "body": "Calls that include a `tools=[...]` argument generate spans without the `input.value` attribute set. Without `tools`, `input.value` is populated correctly. The Phoenix UI shows the span as empty, making it impossible to debug tool-call flows. Affects openinference-instrumentation-openai 0.1.21.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": "python/instrumentation/openinference-instrumentation-openai",
+    "expected_design_needed": false,
+    "difficulty": "easy",
+    "notes": "Clear single-package bug. Module path obvious from title."
+  },
+  {
+    "issue_number": 1003,
+    "title": "Wrong span kind for streaming chat in LlamaIndex instrumentation",
+    "body": "openinference-instrumentation-llama-index sets `openinference.span.kind = CHAIN` for streamed `chat` calls; it should be `LLM` per the OpenInference spec. Non-streamed calls correctly emit `LLM`. Discovered while debugging a RAG pipeline whose token counts weren't aggregating into the LLM-cost panel.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": "python/instrumentation/openinference-instrumentation-llama-index",
+    "expected_design_needed": false,
+    "difficulty": "easy",
+    "notes": "Clear bug, clear module. Useful baseline for triage accuracy."
+  },
+  {
+    "issue_number": 1004,
+    "title": "JS openinference-instrumentation-langchain: child spans not nested when using RunnableSequence",
+    "body": "In Node 20 with @langchain/core 0.2.x and @arizeai/openinference-instrumentation-langchain 1.0.4, child spans emitted inside a RunnableSequence appear as siblings of the parent rather than children in Phoenix. The OTel context appears to be lost across the async boundary. Repro repo attached.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": "js/packages/openinference-instrumentation-langchain",
+    "expected_design_needed": false,
+    "difficulty": "easy",
+    "notes": "Clear JS-side bug, module path obvious."
+  },
+  {
+    "issue_number": 1005,
+    "title": "[JS] openinference-instrumentation-openai stops capturing spans after a 429",
+    "body": "After the OpenAI client receives a single 429, no further calls are captured by the OpenInference instrumentation until the process is restarted. The instrumentation appears to swallow the exception path and leave the patched function in a half-detached state. Repro with @arizeai/openinference-instrumentation-openai 1.1.0.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": "js/packages/openinference-instrumentation-openai",
+    "expected_design_needed": false,
+    "difficulty": "medium",
+    "notes": "Clear module, but the failure mode (state corruption after error) hints at a non-trivial fix; PM might consider design review on this one."
+  },
+  {
+    "issue_number": 1006,
+    "title": "Add `llm.provider` semantic convention attribute name to JS package",
+    "body": "The Python semantic-conventions package exports `LLM_PROVIDER = 'llm.provider'`, but `@arizeai/openinference-semantic-conventions` 0.14.0 does not export this constant. We need parity between the language packages so downstream instrumentation can tag the provider consistently.",
+    "expected_issue_type": "new_feature",
+    "expected_module": "js/packages/openinference-semantic-conventions",
+    "expected_design_needed": false,
+    "difficulty": "medium",
+    "notes": "Sounds like a small addition but it's a public-API addition to a shared spec package — borderline design-review territory."
+  },
+  {
+    "issue_number": 1007,
+    "title": "Semantic conventions: clarify `input.value` vs `llm.input_messages` precedence",
+    "body": "The current spec is ambiguous about which attribute Phoenix should prefer when both `input.value` (string) and `llm.input_messages` (structured) are present on the same LLM span. Different instrumentations populate one, the other, or both, which makes the UI rendering inconsistent. Could the spec define a precedence rule and a `mime_type` expectation?",
+    "expected_issue_type": "new_feature",
+    "expected_module": "python/openinference-semantic-conventions",
+    "expected_design_needed": true,
+    "difficulty": "hard",
+    "notes": "Cross-cutting semantic conventions change — touches every instrumentation. Should ABSOLUTELY trigger design_needed. Good 'hard' test for both triage (module choice) and PM (design flag)."
+  },
+  {
+    "issue_number": 1008,
+    "title": "Add OpenInference instrumentation for Cohere",
+    "body": "We'd like to use Phoenix to trace Cohere Generate, Embed, and Rerank calls. Today the only path is generic Python OTel which doesn't tag the spans with OpenInference conventions. A dedicated `openinference-instrumentation-cohere` package (matching the structure of -anthropic / -openai) would unblock us.",
+    "expected_issue_type": "new_feature",
+    "expected_module": "python/instrumentation",
+    "expected_design_needed": true,
+    "difficulty": "medium",
+    "notes": "New package = public-API surface = design review. Module is the parent because the package does not yet exist; triage should NOT invent a leaf path."
+  },
+  {
+    "issue_number": 1009,
+    "title": "Instrument Mistral AI (Python) with OpenInference",
+    "body": "Mistral's official Python SDK (`mistralai>=1.0`) is widely used and currently has no OpenInference instrumentation. We'd contribute a PR following the `-anthropic` package's structure if the maintainers are open to it.",
+    "expected_issue_type": "new_feature",
+    "expected_module": "python/instrumentation",
+    "expected_design_needed": true,
+    "difficulty": "medium",
+    "notes": "Similar to 1008 — new SDK instrumentation request. Triage should route to the parent path."
+  },
+  {
+    "issue_number": 1010,
+    "title": "Support OpenInference tracing for Vercel AI SDK (JS)",
+    "body": "The Vercel AI SDK (`ai` package v4) is the de facto JS LLM SDK in many React/Next.js apps. A `@arizeai/openinference-instrumentation-vercel-ai-sdk` package would let those apps light up in Phoenix without rewriting their LLM call sites.",
+    "expected_issue_type": "new_feature",
+    "expected_module": "js/packages",
+    "expected_design_needed": true,
+    "difficulty": "medium",
+    "notes": "JS equivalent of 1008/1009. Parent module; design review for new public package."
+  },
+  {
+    "issue_number": 1011,
+    "title": "Fix typo: 'instrumetnation' in README quick-start",
+    "body": "The top-level README quick-start section has `pip install openinference-instrumetnation-openai` (note the swapped 't' and 'n'). This trips up copy-paste users.",
+    "expected_issue_type": "docs",
+    "expected_module": ".",
+    "expected_design_needed": false,
+    "difficulty": "easy",
+    "notes": "Pure docs. Triage should route to docs and pick the repo root as the module."
+  },
+  {
+    "issue_number": 1012,
+    "title": "Document how to disable specific attribute capture via env vars",
+    "body": "The `OPENINFERENCE_HIDE_INPUT_MESSAGES` / `OPENINFERENCE_HIDE_OUTPUTS` env vars exist (I found them in the source) but aren't documented anywhere in the README or per-package READMEs. Could we get a single docs page that lists all `OPENINFERENCE_*` env vars and what they do?",
+    "expected_issue_type": "docs",
+    "expected_module": ".",
+    "expected_design_needed": false,
+    "difficulty": "medium",
+    "notes": "Docs but specifically about openinference-core env vars. Module is ambiguous — repo root is the right answer; module-specific docs would be wrong."
+  },
+  {
+    "issue_number": 1013,
+    "title": "Span attributes not showing up",
+    "body": "I'm setting span attributes manually but they don't show up in Phoenix. Using Python.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": ".",
+    "expected_design_needed": false,
+    "difficulty": "hard",
+    "notes": "Ambiguous title, almost no info, no module clue. Triage should pick repo root rather than guess a leaf module. PM should not flag for design (it's likely user error or under-specified)."
+  },
+  {
+    "issue_number": 1014,
+    "title": "Token counts are wrong",
+    "body": "Token counts in Phoenix don't match what my provider's dashboard shows. Off by ~5%. Could be any provider — I use a few.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": ".",
+    "expected_design_needed": false,
+    "difficulty": "hard",
+    "notes": "Could be ANY instrumentation package. Triage should NOT guess a leaf path. Useful test of 'don't hallucinate a module'."
+  },
+  {
+    "issue_number": 1015,
+    "title": "Inconsistent `llm.input_messages` shape between Python and JS packages",
+    "body": "The Python `openinference-instrumentation-openai` package emits `llm.input_messages.<i>.message.content` as a JSON-encoded string, while the JS equivalent emits it as a plain string. Anyone consuming both ends up with conditional parsing logic. This is technically a semantic-conventions concern AND requires changes to multiple instrumentation packages.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": "python/instrumentation",
+    "expected_design_needed": true,
+    "difficulty": "hard",
+    "notes": "Cross-module (Python + JS + semantic-conventions). Triage should pick one anchor module (the larger Python tree) and PM should flag for design — it's a coordinated change."
+  },
+  {
+    "issue_number": 1016,
+    "title": "Trace context propagation across `asyncio.gather` calls in Python",
+    "body": "When `asyncio.gather(*coros)` is used to fan out concurrent LLM calls in instrumented Python code, only the first coroutine's spans appear under the parent. Sibling coroutines emit detached spans. Affects every Python instrumentation package since the issue is in the shared context-propagation helper.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": "python/instrumentation",
+    "expected_design_needed": true,
+    "difficulty": "hard",
+    "notes": "Single bug but cross-package fix in shared infra. Triage should route to parent. PM should flag — multi-package change."
+  },
+  {
+    "issue_number": 1017,
+    "title": "Rename `llm.token_count.prompt` to `llm.token_count.input`",
+    "body": "The OpenAI and Anthropic provider docs now consistently say 'input tokens' rather than 'prompt tokens'. Could we rename `llm.token_count.prompt` to `llm.token_count.input` to match? It's a small change and the new name is clearer.",
+    "expected_issue_type": "new_feature",
+    "expected_module": "python/openinference-semantic-conventions",
+    "expected_design_needed": true,
+    "difficulty": "hard",
+    "notes": "Looks trivial but is a BREAKING change to a public conventions name used by every downstream tracer. PM must flag design_needed. Triage easy; PM hard."
+  },
+  {
+    "issue_number": 1018,
+    "title": "Drop Python 3.8 support in the next release",
+    "body": "Python 3.8 reached EOL last year and several upstream dependencies have already dropped it. Could we drop 3.8 from the test matrix and update the package metadata for the next minor release?",
+    "expected_issue_type": "new_feature",
+    "expected_module": "python/instrumentation",
+    "expected_design_needed": true,
+    "difficulty": "hard",
+    "notes": "Phrased as a small chore but it's a breaking change for downstream users on 3.8. Design review required. Triage may struggle to pick a module since this is repo-wide; parent path is the honest answer."
+  },
+  {
+    "issue_number": 1019,
+    "title": "How do I use Phoenix with my self-hosted LLM?",
+    "body": "I have an in-house Llama-3 70B fine-tune served via vLLM behind a custom OpenAI-compatible endpoint. Will openinference-instrumentation-openai work if I point the OpenAI client at the custom base_url? Or do I need a different instrumentation? Couldn't find this in the docs.",
+    "expected_issue_type": "bug_fix",
+    "expected_module": ".",
+    "expected_design_needed": false,
+    "difficulty": "medium",
+    "notes": "This is a SUPPORT QUESTION, not a bug. Heuristic triage will likely classify as bug_fix; better triage would recognize 'How do I' as a question. Module unclear. Good test case for handling questions-as-issues."
+  },
+  {
+    "issue_number": 1020,
+    "title": "Is OpenInference compatible with the OpenTelemetry GenAI spec?",
+    "body": "OpenTelemetry's upstream GenAI semantic conventions are stabilizing. Will OpenInference adopt them, or will the two specs continue to diverge? Asking before we commit to one or the other in our platform.",
+    "expected_issue_type": "new_feature",
+    "expected_module": ".",
+    "expected_design_needed": true,
+    "difficulty": "medium",
+    "notes": "Question about strategy / direction. Not a bug, not really a feature request — but if treated as a feature it should DEFINITELY flag design_needed. Module is the repo root."
+  }
+]
