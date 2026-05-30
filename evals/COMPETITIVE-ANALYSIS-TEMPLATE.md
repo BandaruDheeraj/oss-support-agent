@@ -2,7 +2,7 @@
 
 > Test subject: the OSS Fix Loop multi-agent harness (`BandaruDheeraj/oss-support-agent`). The eval ran 20 real-looking openinference issues through the triage and PM scoring stages, fanning every span out to all three platforms in parallel using a single shared wrapper at `core/telemetry.ts`.
 
-> Run `run-1780006794103` — 2026-05-28T22:19:54.103Z
+> Run `run-1780034709711` — 2026-05-29T06:05:09.711Z
 
 ## 1. Test methodology
 
@@ -36,7 +36,7 @@ We measured:
   - easy: 80.0%
   - medium: 25.0%
   - hard: 50.0%
-- **Avg latency:** triage 19.6 ms, PM 11.7 ms
+- **Avg latency:** triage 6.0 ms, PM 4.3 ms
 - **Total tokens:** 0 input / 0 output
 
 ## 3. Setup experience — by platform
@@ -50,20 +50,19 @@ _Auto-generated from each platform adapter's `getSetupNotes()` after the eval ru
 - No local Phoenix endpoint configured — skipped dataset auto-create. Cloud Arize requires dataset creation via the dashboard or its tabular API; there is no symmetrical local/cloud "create dataset" call.
 - Arize/Phoenix needed FOUR OTel + OpenInference packages to manually instrument: @opentelemetry/sdk-trace-base, @opentelemetry/exporter-trace-otlp-http, @opentelemetry/resources, @arizeai/openinference-semantic-conventions. No single "phoenix-sdk" package wraps these.
 - Cloud Phoenix expected the auth header name "api_key" (snake_case) — different from the typical "Authorization: Bearer …" convention. Discovered via 401 responses, not from a single canonical doc page.
-- Cloud Phoenix additionally requires a "space_id" header — ARIZE_SPACE_KEY in env. Local Phoenix has no concept of a space; setup divergence between cloud and local is not a one-line config change.
-- Pipeline RunSummary fanned out as a single OTel CHAIN span. Phoenix's "Experiments" view aggregates them, but there is no first-class "logRun" SDK call analogous to Braintrust's experiment.summarize() or LangSmith's evaluator results.
+- Cloud Phoenix additionally requires a "space_id" header — ARIZE_SPACE_KEY in env. This adapter accepts ARIZE_SPACE_ID as an alias. Local Phoenix has no concept of a space; setup divergence between cloud and local is not a one-line config change.
+- Pipeline RunSummary is emitted as one OTel CHAIN span plus per-issue EVALUATOR spans. Phoenix's experiments UI can aggregate these metrics, but the JS ecosystem still lacks a first-class "log evaluation row" helper comparable to Braintrust's Eval().
 
 ## langsmith
 
 - LangSmith SDK has no .ping() / .health() — verifying credentials required iterating listProjects(). Discovered after a TypeError when treating it as a Promise.
 - LangSmith's official tracing surface assumes LangChain code: most docs examples wrap a RunnableLambda with traceable(). For non-LangChain code (like ours), the SDK works but every trace requires explicit RunTree construction or explicit Client.createRun + Client.updateRun pairs. Parent/child must be passed via parent_run_id every time.
 - Dataset evaluation (running an evaluator against a dataset) is a separate code path from tracing. There is no "while tracing this run, also score it against dataset X" — you must call client.evaluate() or use the Eval SDK as a post-pass.
-- LangSmith built-in correctness evaluator could not be triggered programmatically against the just-completed run: No-op: LangSmith evaluate() would re-run the pipeline; see SETUP-FRICTION.md.. The supported flow is client.evaluate(target, { data, evaluators }), which re-runs the target — there is no "score the run I already produced" call.
 
 ## braintrust
 
 - Braintrust scorers are evaluated INSIDE Eval() — they take expected/output and return a score. To log a custom score for an arbitrary already-recorded span, the only path is span.log({ scores: { ... } }) on the span you created. There's no separate "addScore" API for an external reviewer to attach scores to existing experiment rows.
-- Braintrust experiment URL: https://www.braintrust.dev/app/OSS-Support-Bot/p/oss-fix-loop/experiments/oss-fix-loop-2026-05-28T22-19-45-319Z
+- Braintrust experiment URL: https://www.braintrust.dev/app/OSS-Support-Bot/p/oss-fix-loop/experiments/oss-fix-loop-2026-05-29T06-05-02-898Z
 
 ## Cross-platform observations
 
@@ -103,14 +102,46 @@ _Auto-generated from each platform adapter's `getSetupNotes()` after the eval ru
 - **Documentation quality and completeness:** [MANUAL]
 - **Missing features I wanted but couldn't find:** [MANUAL]
 
-## 5. Summary comparison
+## 5. Systematic evaluator review (keep this updated each run)
 
-| Platform | Traces sent | Errors | Avg trace latency | UI for multi-agent | Eval workflow | Docs |
-|----------|------------:|-------:|------------------:|--------------------|---------------|------|
-| arize | 41 | 0 | 0.0 ms | [MANUAL] | [MANUAL] | [MANUAL] |
-| langsmith | 41 | 0 | 0.0 ms | [MANUAL] | [MANUAL] | [MANUAL] |
-| braintrust | 41 | 0 | 0.0 ms | [MANUAL] | [MANUAL] | [MANUAL] |
+### 5.1 Weighted scorecard for this run
 
-## 6. Recommendation
+Scoring scale: 1 (poor) to 5 (excellent). Keep these weights stable across runs so platform trends remain comparable.
+
+| Criterion | Weight (%) | Arize | LangSmith | Braintrust | Winner | Evidence / notes |
+|-----------|-----------:|------:|----------:|-----------:|--------|------------------|
+| Multi-agent trace readability | 20 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| Evaluator authoring + execution workflow | 20 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| Discrepancy debugging speed | 15 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| Dataset/experiment management | 15 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| API/SDK ergonomics | 15 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| Documentation quality | 15 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| **Weighted total (0-5)** | **100** | **[MANUAL]** | **[MANUAL]** | **[MANUAL]** | **[MANUAL]** | **[MANUAL]** |
+
+### 5.2 Run-over-run leaderboard
+
+| Run ID | Arize weighted total | LangSmith weighted total | Braintrust weighted total | Best overall | Biggest change vs previous run | Notes |
+|--------|---------------------:|-------------------------:|--------------------------:|--------------|--------------------------------|------|
+| `run-1780034709711` | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+
+### 5.3 Discrepancy register (how evaluators differ)
+
+Record every meaningful mismatch in evaluator behavior, not just outright failures.
+
+| Run ID | Issue / scenario | Expected evaluator behavior | Arize observed | LangSmith observed | Braintrust observed | Discrepancy type | Severity | Follow-up |
+|--------|------------------|-----------------------------|----------------|--------------------|---------------------|------------------|----------|-----------|
+| `run-1780034709711` | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+
+Discrepancy type taxonomy (recommended): `scoring`, `trace-model`, `dataset-eval`, `metadata/tokens`, `UI/ux`, `API/SDK`, `latency/reliability`.
+
+## 6. Summary comparison
+
+| Platform | Traces sent | Errors | Avg trace latency | UI for multi-agent | Eval workflow | Docs | Weighted total | Wins this run | Main discrepancy risk |
+|----------|------------:|-------:|------------------:|--------------------|---------------|------|---------------:|--------------:|-----------------------|
+| arize | 41 | 0 | 0.0 ms | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| langsmith | 41 | 0 | 0.0 ms | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| braintrust | 41 | 0 | 0.0 ms | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+
+## 7. Recommendation
 
 [MANUAL] Recommendation for a team building multi-agent pipelines in 2026.

@@ -17,6 +17,11 @@ import { redactIo } from './io-redact';
 type LangSmithClient = {
   createRun: (input: Record<string, unknown>) => Promise<void>;
   updateRun: (runId: string, patch: Record<string, unknown>) => Promise<void>;
+  createFeedback?: (
+    runId: string,
+    key: string,
+    feedback: Record<string, unknown>
+  ) => Promise<void>;
   awaitPendingTraceBatches?: () => Promise<unknown>;
 };
 
@@ -41,11 +46,28 @@ function runTypeFor(kind: StartSpanOpts['kind']): string {
       return 'llm';
     case 'tool':
       return 'tool';
+    case 'evaluator':
+      return 'chain';
     case 'phase':
       return 'chain';
     default:
       return 'chain';
   }
+}
+
+function extractEvaluation(
+  attrs: Record<string, unknown>
+): { key: string; score: number; label: string } | null {
+  const rawKey = attrs['evaluation.name'];
+  const rawScore = attrs['evaluation.score'];
+  if (typeof rawKey !== 'string') return null;
+  if (typeof rawScore !== 'number' || !Number.isFinite(rawScore)) return null;
+  const rawLabel = attrs['evaluation.label'];
+  return {
+    key: rawKey,
+    score: rawScore,
+    label: typeof rawLabel === 'string' ? rawLabel : rawScore >= 1 ? 'pass' : 'fail',
+  };
 }
 
 export class LangSmithTracer implements Tracer {
@@ -149,6 +171,32 @@ export class LangSmithTracer implements Tracer {
             console.warn(`[observability:langsmith] updateRun failed: ${err instanceof Error ? err.message : String(err)}`);
           });
         tracer.track(upd);
+
+        const evaluation = extractEvaluation(state.attrs);
+        if (evaluation && client.createFeedback) {
+          const feedback = client
+            .createFeedback(state.id, evaluation.key, {
+              score: evaluation.score,
+              value: evaluation.label,
+              sourceInfo: {
+                stage: state.attrs['evaluation.stage'] ?? null,
+                issue_number: state.attrs['evaluation.issue_number'] ?? null,
+                attempt_id: state.attrs['evaluation.attempt_id'] ?? null,
+                run_id: state.attrs['evaluation.run_id'] ?? null,
+                repo: state.attrs['evaluation.repo'] ?? null,
+                status: state.attrs['evaluation.status'] ?? null,
+              },
+            })
+            .catch((err) => {
+              // eslint-disable-next-line no-console
+              console.warn(
+                `[observability:langsmith] createFeedback failed: ${
+                  err instanceof Error ? err.message : String(err)
+                }`
+              );
+            });
+          tracer.track(feedback);
+        }
       },
     };
     return span;

@@ -16,10 +16,18 @@ export interface EvalRow {
   ts: string;
   issue_number: number;
   attempt_id: string;
-  mode: 'loop' | 'oneshot' | 'shadow_loop';
+  mode: 'loop' | 'oneshot' | 'shadow_loop' | 'pipeline';
+  /** Observability backend active for this run (arize/langsmith/braintrust/all/none). */
+  backend: string;
   agent: 'repro' | 'fix' | 'pipeline';
   repro_passed: boolean | null;
   fix_passed: boolean | null;
+  verification_gate_passed: boolean | null;
+  verification_stage?: 'pass' | 'fail' | 'skipped_non_gha' | 'not_reached' | null;
+  /**
+   * Legacy field retained for backward compatibility with existing dashboards.
+   * New pipeline rows should prefer verification_gate_passed.
+   */
   regression_passed: boolean | null;
   tool_call_counts: Record<string, number>;
   total_cost_usd: number | null;
@@ -69,9 +77,12 @@ class SqliteRecorder implements EvalRecorder {
         issue_number INTEGER NOT NULL,
         attempt_id TEXT NOT NULL,
         mode TEXT NOT NULL,
+        backend TEXT,
         agent TEXT NOT NULL,
         repro_passed INTEGER,
         fix_passed INTEGER,
+        verification_gate_passed INTEGER,
+        verification_stage TEXT,
         regression_passed INTEGER,
         tool_call_counts TEXT NOT NULL,
         total_cost_usd REAL,
@@ -84,9 +95,12 @@ class SqliteRecorder implements EvalRecorder {
       CREATE INDEX IF NOT EXISTS idx_evals_attempt ON evals(issue_number, attempt_id);
       CREATE INDEX IF NOT EXISTS idx_evals_mode ON evals(mode);
     `);
+    this.ensureColumn('backend', 'TEXT');
+    this.ensureColumn('verification_gate_passed', 'INTEGER');
+    this.ensureColumn('verification_stage', 'TEXT');
     this.stmt = this.db.prepare(
-      `INSERT INTO evals (ts, issue_number, attempt_id, mode, agent, repro_passed, fix_passed, regression_passed, tool_call_counts, total_cost_usd, final_disposition, dossier_snapshot_id, notes_id, trace_id, error_kind)
-       VALUES (@ts, @issue_number, @attempt_id, @mode, @agent, @repro_passed, @fix_passed, @regression_passed, @tool_call_counts, @total_cost_usd, @final_disposition, @dossier_snapshot_id, @notes_id, @trace_id, @error_kind)`
+      `INSERT INTO evals (ts, issue_number, attempt_id, mode, backend, agent, repro_passed, fix_passed, verification_gate_passed, verification_stage, regression_passed, tool_call_counts, total_cost_usd, final_disposition, dossier_snapshot_id, notes_id, trace_id, error_kind)
+       VALUES (@ts, @issue_number, @attempt_id, @mode, @backend, @agent, @repro_passed, @fix_passed, @verification_gate_passed, @verification_stage, @regression_passed, @tool_call_counts, @total_cost_usd, @final_disposition, @dossier_snapshot_id, @notes_id, @trace_id, @error_kind)`
     );
   }
 
@@ -96,9 +110,13 @@ class SqliteRecorder implements EvalRecorder {
       issue_number: row.issue_number,
       attempt_id: row.attempt_id,
       mode: row.mode,
+      backend: row.backend,
       agent: row.agent,
       repro_passed: row.repro_passed === null ? null : row.repro_passed ? 1 : 0,
       fix_passed: row.fix_passed === null ? null : row.fix_passed ? 1 : 0,
+      verification_gate_passed:
+        row.verification_gate_passed === null ? null : row.verification_gate_passed ? 1 : 0,
+      verification_stage: row.verification_stage ?? null,
       regression_passed: row.regression_passed === null ? null : row.regression_passed ? 1 : 0,
       tool_call_counts: JSON.stringify(row.tool_call_counts ?? {}),
       total_cost_usd: row.total_cost_usd,
@@ -112,6 +130,14 @@ class SqliteRecorder implements EvalRecorder {
 
   close(): void {
     this.db.close();
+  }
+
+  private ensureColumn(name: string, typeDecl: string): void {
+    const exists = this.db
+      .prepare("SELECT 1 FROM pragma_table_info('evals') WHERE name = ? LIMIT 1")
+      .get(name);
+    if (exists) return;
+    this.db.exec(`ALTER TABLE evals ADD COLUMN ${name} ${typeDecl}`);
   }
 }
 

@@ -22,6 +22,7 @@ type AnyToolDef = ToolDef<any, any>;
 export class ToolRegistry {
   private readonly tools = new Map<string, AnyToolDef>();
   private readonly tierCounts = new Map<ToolTier, number>();
+  private readonly toolCounts = new Map<string, number>();
   private totalCalls = 0;
   private turn = 0;
   private currentTurnCalls: { name: string; tier: ToolTier }[] = [];
@@ -195,6 +196,7 @@ export class ToolRegistry {
         } finally {
           this.totalCalls += 1;
           this.tierCounts.set(tier, (this.tierCounts.get(tier) ?? 0) + 1);
+          this.toolCounts.set(def.name, (this.toolCounts.get(def.name) ?? 0) + 1);
           this.currentTurnCalls.push({ name: def.name, tier });
           const entry: TranscriptEntry = {
             turn: this.turn,
@@ -215,6 +217,18 @@ export class ToolRegistry {
   }
 
   private enforceGuards(def: AnyToolDef): void {
+    const reserve = this.opts.finalizationReserve;
+    if (reserve && reserve.calls > 0) {
+      const remaining = this.opts.budgets.total - this.totalCalls;
+      const allowInReserve = reserve.allowTools.includes(def.name);
+      if (remaining <= reserve.calls && !allowInReserve) {
+        throw new ToolGuardError(
+          'budget_exhausted',
+          `Finalization reserve active (${reserve.calls} calls left). Only terminal tools may run: ${reserve.allowTools.join(', ')}.`,
+          def.name
+        );
+      }
+    }
     if (this.totalCalls >= this.opts.budgets.total) {
       throw new ToolGuardError(
         'budget_exhausted',
@@ -227,6 +241,18 @@ export class ToolRegistry {
       throw new ToolGuardError(
         'budget_exhausted',
         `Tier "${def.tier}" budget exhausted (${cap}). Emit abandon.`,
+        def.name
+      );
+    }
+    const perToolCap = this.opts.perToolCaps?.[def.name];
+    if (
+      typeof perToolCap === 'number' &&
+      Number.isFinite(perToolCap) &&
+      (this.toolCounts.get(def.name) ?? 0) >= perToolCap
+    ) {
+      throw new ToolGuardError(
+        'budget_exhausted',
+        `Tool "${def.name}" budget exhausted (${perToolCap}). Choose a different tool or finalize.`,
         def.name
       );
     }

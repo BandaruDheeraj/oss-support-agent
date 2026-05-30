@@ -20,10 +20,12 @@
 
 import * as http from 'http';
 import * as path from 'path';
+import 'dotenv/config';
 
 import { verifySignature } from '../core/webhook/signature';
 import type { IssueEvent } from '../core/webhook/types';
 import { loadAdapter } from '../core/adapter-loader';
+import { assertObservabilityConfigured, getTracer } from '../core/observability';
 
 import { FsManifestRegistry } from './clients/manifest-registry';
 import { runPipeline, defaultWorkspaceRoot } from './run-pipeline';
@@ -197,6 +199,13 @@ async function processIssueEvent(
     .catch((err: any) => {
       log(`[pipeline] FATAL: ${err?.message ?? err}`);
       if (err?.stack) log(err.stack);
+    })
+    .finally(async () => {
+      try {
+        await getTracer().flush();
+      } catch (err: any) {
+        log(`[pipeline] tracer flush failed: ${err?.message ?? err}`);
+      }
     });
 
   return {
@@ -207,6 +216,16 @@ async function processIssueEvent(
 
 function startServer(): void {
   const env = loadEnv();
+  try {
+    assertObservabilityConfigured();
+    // Prime the tracer once at startup so configuration problems surface before
+    // we accept webhook traffic.
+    getTracer();
+  } catch (err: any) {
+    // eslint-disable-next-line no-console
+    console.error(`[fatal] ${err?.message ?? err}`);
+    process.exit(1);
+  }
   const registry = new FsManifestRegistry(env.REPO_ROOT);
 
   const baseLog = (msg: string) => {

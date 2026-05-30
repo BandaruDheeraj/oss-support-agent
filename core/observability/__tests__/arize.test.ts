@@ -65,14 +65,15 @@ describe('ArizeTracer', () => {
     expect(forceFlush).toHaveBeenCalled();
   });
 
-  it('maps phase span kind to CHAIN and tool to TOOL', () => {
+  it('maps phase/tool/evaluator span kinds to CHAIN/TOOL/EVALUATOR', () => {
     const tracer = new ArizeTracer();
     tracer.startSpan('phase.repro', { kind: 'phase' }).end();
     tracer.startSpan('tool.read_file', { kind: 'tool' }).end();
+    tracer.startSpan('evaluator.fix', { kind: 'evaluator' }).end();
     const kinds = setAttribute.mock.calls
       .filter((c) => c[0] === 'openinference.span.kind')
       .map((c) => c[1]);
-    expect(kinds).toEqual(['CHAIN', 'TOOL']);
+    expect(kinds).toEqual(['CHAIN', 'TOOL', 'EVALUATOR']);
   });
 
   it('records exception + ERROR status when recordError is called', () => {

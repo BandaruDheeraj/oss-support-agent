@@ -53,6 +53,8 @@ function openinferenceKind(kind: StartSpanOpts['kind']): string {
       return 'LLM';
     case 'tool':
       return 'TOOL';
+    case 'evaluator':
+      return 'EVALUATOR';
     case 'phase':
       return 'CHAIN';
     default:

@@ -4,12 +4,14 @@
  */
 const createRunMock = jest.fn().mockResolvedValue(undefined);
 const updateRunMock = jest.fn().mockResolvedValue(undefined);
+const createFeedbackMock = jest.fn().mockResolvedValue(undefined);
 const awaitPendingMock = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('langsmith', () => ({
   Client: jest.fn().mockImplementation(() => ({
     createRun: createRunMock,
     updateRun: updateRunMock,
+    createFeedback: createFeedbackMock,
     awaitPendingTraceBatches: awaitPendingMock,
   })),
 }));
@@ -21,6 +23,7 @@ describe('LangSmithTracer', () => {
     createRunMock.mockClear();
     createRunMock.mockResolvedValue(undefined);
     updateRunMock.mockClear();
+    createFeedbackMock.mockClear();
     awaitPendingMock.mockClear();
     process.env.LANGSMITH_API_KEY = 'test-key';
     process.env.LANGSMITH_PROJECT = 'test-proj';
@@ -54,6 +57,33 @@ describe('LangSmithTracer', () => {
     expect((patch.extra as any).metadata['llm.token_count.prompt']).toBe(10);
 
     expect(awaitPendingMock).toHaveBeenCalled();
+  });
+
+  it('emits LangSmith feedback entries for evaluator spans', async () => {
+    const tracer = new LangSmithTracer();
+    const span = tracer.startSpan('evaluator.repro', {
+      kind: 'evaluator',
+      attributes: {
+        'evaluation.name': 'repro_passed',
+        'evaluation.stage': 'repro',
+        'evaluation.score': 1,
+        'evaluation.label': 'pass',
+      },
+    });
+    span.end();
+
+    await tracer.flush();
+
+    expect(createFeedbackMock).toHaveBeenCalledTimes(1);
+    const [runId, key, payload] = createFeedbackMock.mock.calls[0];
+    expect(runId).toBe(createRunMock.mock.calls[0][0].id);
+    expect(key).toBe('repro_passed');
+    expect(payload).toEqual(
+      expect.objectContaining({
+        score: 1,
+        value: 'pass',
+      })
+    );
   });
 
   it('threads parent_run_id when a parent span is provided', () => {

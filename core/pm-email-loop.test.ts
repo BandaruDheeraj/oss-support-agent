@@ -88,6 +88,7 @@ function createTestBriefInput(overrides: Partial<DesignBriefInput> = {}): Design
     ],
     issueTitle: 'Crash on empty array input',
     issueBody: 'When parsing [], the parser throws a null reference error.',
+    issueMentionedPaths: ['src/parser/index.ts', 'src/parser/parser.test.ts'],
     issueLabels: ['bug', 'parser'],
     scoringResult: {
       designNeeded: true,
@@ -139,7 +140,7 @@ function createTestThread(overrides: Partial<EmailThread> = {}): EmailThread {
 describe('HeuristicBriefGenerator', () => {
   const generator = new HeuristicBriefGenerator();
 
-  it('generates a brief with all 6 required fields', () => {
+  it('generates a brief with required context and concrete plan fields', () => {
     const input = createTestBriefInput();
     const brief = generator.generateBrief(input);
 
@@ -147,6 +148,9 @@ describe('HeuristicBriefGenerator', () => {
     expect(brief.affectedModule).toBeDefined();
     expect(brief.relatedOpenIssues).toBeDefined();
     expect(brief.recentPRContext).toBeDefined();
+    expect(brief.rootCauseAnalysis).toBeDefined();
+    expect(brief.plannedFileChanges.length).toBeGreaterThan(0);
+    expect(brief.proposedCodeChanges.length).toBeGreaterThan(0);
     expect(brief.proposedApproaches).toBeDefined();
     expect(brief.openQuestions).toBeDefined();
   });
@@ -202,6 +206,7 @@ describe('HeuristicBriefGenerator', () => {
     expect(brief.openQuestions.length).toBeGreaterThan(0);
     // The related_issues_count signal is triggered, so should ask about scope
     expect(brief.openQuestions.some((q) => q.includes('related issues'))).toBe(true);
+    expect(brief.openQuestions.some((q) => q.includes('file touch plan'))).toBe(true);
   });
 
   it('handles no related issues gracefully', () => {
@@ -240,15 +245,41 @@ describe('HeuristicBriefGenerator', () => {
     const brief = generator.generateBrief(input);
     expect(brief.proposedApproaches.some((a) => a.name.includes('refactor'))).toBe(true);
   });
+
+  it('builds dependency-focused RCA and file plan for conflict reports', () => {
+    const input = createTestBriefInput({
+      issueSummary: 'google-genai + sentry-sdk dependency conflict blocks installation',
+      issueTitle: 'Dependency conflict between google-genai and sentry-sdk',
+      issueBody: 'pip install fails due to incompatible constraints in pyproject.toml',
+      affectedModule: 'python/instrumentation/openinference-instrumentation-smolagents',
+      relatedIssues: [],
+      recentPRs: [],
+      issueMentionedPaths: ['python/instrumentation/openinference-instrumentation-smolagents/pyproject.toml'],
+    });
+
+    const brief = generator.generateBrief(input);
+    expect(brief.rootCauseAnalysis.toLowerCase()).toContain('dependency');
+    expect(brief.plannedFileChanges.some((f) => f.path.endsWith('pyproject.toml'))).toBe(true);
+  });
 });
 
 describe('formatDesignBriefEmail', () => {
-  it('includes all 6 sections', () => {
+  it('includes summary, RCA, file plan, and approaches', () => {
     const brief: DesignBrief = {
       issueSummary: 'Fix parser crash',
       affectedModule: 'src/parser',
       relatedOpenIssues: '#100: crash issue',
       recentPRContext: 'PR #50: fix edge case',
+      rootCauseAnalysis: 'Null handling bug in parser fast path.',
+      plannedFileChanges: [
+        { path: 'src/parser/index.ts', plannedChange: 'Add null guard before element access.' },
+        { path: 'src/parser/parser.test.ts', plannedChange: 'Add regression test for empty arrays.' },
+      ],
+      proposedCodeChanges: [
+        'Reproduce empty-array failure in parser module.',
+        'Patch parser fast path to handle empty input safely.',
+        'Add regression coverage and run parser tests.',
+      ],
       proposedApproaches: [
         { name: 'Minimal fix', description: 'Small change', pros: ['Low risk'], cons: ['Partial'] },
         { name: 'Full refactor', description: 'Big change', pros: ['Complete'], cons: ['Risky'] },
@@ -261,6 +292,10 @@ describe('formatDesignBriefEmail', () => {
     expect(email).toContain('src/parser');
     expect(email).toContain('#100: crash issue');
     expect(email).toContain('PR #50: fix edge case');
+    expect(email).toContain('Suspected Root Cause (Working Hypothesis)');
+    expect(email).toContain('Planned File Touches (first pass)');
+    expect(email).toContain('`src/parser/index.ts`');
+    expect(email).toContain('Proposed Code Change Plan');
     expect(email).toContain('Minimal fix');
     expect(email).toContain('Full refactor');
     expect(email).toContain('What scope is acceptable?');
@@ -272,6 +307,9 @@ describe('formatDesignBriefEmail', () => {
       affectedModule: 'test',
       relatedOpenIssues: 'none',
       recentPRContext: 'none',
+      rootCauseAnalysis: 'Working hypothesis.',
+      plannedFileChanges: [{ path: 'src/test.ts', plannedChange: 'Apply focused fix.' }],
+      proposedCodeChanges: ['Implement fix', 'Add test'],
       proposedApproaches: [{ name: 'A', description: 'B', pros: ['C'], cons: ['D'] }],
       openQuestions: ['Q?'],
     };
@@ -285,6 +323,9 @@ describe('formatDesignBriefEmail', () => {
       affectedModule: 'test',
       relatedOpenIssues: 'none',
       recentPRContext: 'none',
+      rootCauseAnalysis: 'Working hypothesis.',
+      plannedFileChanges: [{ path: 'src/test.ts', plannedChange: 'Apply focused fix.' }],
+      proposedCodeChanges: ['Implement fix', 'Add test'],
       proposedApproaches: [
         { name: 'First', description: 'desc1', pros: ['a'], cons: ['b'] },
         { name: 'Second', description: 'desc2', pros: ['c'], cons: ['d'] },
@@ -483,6 +524,9 @@ describe('sendDesignBrief', () => {
     expect(call.body).toContain('Design Brief');
     expect(call.body).toContain('Issue Summary');
     expect(call.body).toContain('Affected Module');
+    expect(call.body).toContain('Suspected Root Cause (Working Hypothesis)');
+    expect(call.body).toContain('Planned File Touches (first pass)');
+    expect(call.body).toContain('Proposed Code Change Plan');
     expect(call.body).toContain('Proposed Approaches');
     expect(call.body).toContain('Open Questions');
   });
@@ -845,6 +889,36 @@ describe('summarizeAgreedDesign', () => {
 
     const summary = summarizeAgreedDesign(history, []);
     expect(summary).toContain('Fix parser crash');
+  });
+
+  it('carries RCA and planned changes into agreed design summary', () => {
+    const history: ConversationEntry[] = [
+      {
+        role: 'agent',
+        body: [
+          '## Design Brief',
+          '**Issue Summary:** Fix parser crash',
+          '**Suspected Root Cause (Working Hypothesis):**',
+          'Null handling bug in parser fast path.',
+          '**Planned File Touches (first pass):**',
+          '- `src/parser/index.ts` — Add null guard',
+          '- `src/parser/parser.test.ts` — Add regression coverage',
+          '**Proposed Code Change Plan:**',
+          '1. Reproduce failure',
+          '2. Patch parser fast path',
+          '3. Add tests',
+          '',
+        ].join('\n'),
+        timestamp: '2026-05-06T10:00:00Z',
+        messageId: 'msg-1',
+      },
+    ];
+
+    const summary = summarizeAgreedDesign(history, []);
+    expect(summary).toContain('Root cause hypothesis');
+    expect(summary).toContain('Planned file touches');
+    expect(summary).toContain('src/parser/index.ts');
+    expect(summary).toContain('Proposed code changes');
   });
 
   it('includes conversation turn count', () => {

@@ -31,6 +31,7 @@ import {
 
 import { execCommand } from '../../bin/clients/local-workspace';
 import { getTracer, runWithSpan, type Span } from '../observability';
+import { emitOnlineEvaluation } from '../observability/evaluator';
 
 async function withPipelineSpan<T>(
   name: string,
@@ -180,6 +181,29 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     if (c) candidateTestContent = c;
   }
 
+  await emitOnlineEvaluation({
+    metric: 'repro_passed',
+    stage: 'repro',
+    score: v2.status === 'reproduced' ? 1 : 0,
+    issueNumber: input.payload.issue?.number,
+    attemptId: input.attemptId,
+    repo: input.payload.repository?.full_name,
+    status: v2.status,
+    input: {
+      issue_number: input.payload.issue?.number,
+      attempt_id: input.attemptId,
+      repo: input.payload.repository?.full_name,
+      affected_module: input.affectedModule,
+    },
+    output: {
+      status: v2.status,
+      message: v2.message,
+      candidate_test_path: candidateTestPath ?? null,
+      builder_reject_stage: v2.builderRejectStage ?? null,
+      executor_outcome: v2.executor?.outcome ?? null,
+    },
+  });
+
   return {
     ok: v2.status === 'reproduced',
     status: v2.status,
@@ -300,6 +324,30 @@ async function runFixPipelineImpl(input: FixPipelineInput): Promise<FixPipelineO
   log(
     `[v2-driver] runFixPipeline DONE attemptId=${input.attemptId} status=${v2.status} ok=${v2.status === 'fix_approved'} changedFiles=${v2.changedFiles.length} message=${JSON.stringify(v2.message).slice(0, 320)}`
   );
+
+  await emitOnlineEvaluation({
+    metric: 'fix_passed',
+    stage: 'fix',
+    score: v2.status === 'fix_approved' ? 1 : 0,
+    issueNumber: input.payload.issue?.number,
+    attemptId: input.attemptId,
+    repo: input.payload.repository?.full_name,
+    status: v2.status,
+    input: {
+      issue_number: input.payload.issue?.number,
+      attempt_id: input.attemptId,
+      repo: input.payload.repository?.full_name,
+      affected_module: input.affectedModule,
+      repro_test_path: input.reproTestPath,
+    },
+    output: {
+      status: v2.status,
+      message: v2.message,
+      changed_files: v2.changedFiles,
+      critic_verdict: v2.criticVerdict?.verdict ?? null,
+      critic_reason: v2.criticVerdict?.reason ?? null,
+    },
+  });
 
   return {
     ok: v2.status === 'fix_approved',

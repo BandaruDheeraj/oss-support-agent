@@ -8,4 +8,13 @@
  * wrappers in core/agents/run-v2.ts) import getTracer from here.
  */
 export type { Tracer, Span, StartSpanOpts, SpanKind, BackendName } from './tracer';
-export { getTracer, currentSpan, runWithSpan, NoopTracer, activeBackend, _resetTracer } from './tracer';
+export {
+  getTracer,
+  currentSpan,
+  runWithSpan,
+  NoopTracer,
+  activeBackend,
+  getObservabilityConfigErrors,
+  assertObservabilityConfigured,
+  _resetTracer,
+} from './tracer';

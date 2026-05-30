@@ -220,6 +220,32 @@ export class BraintrustAdapter implements PlatformAdapter {
     }
 
     try {
+      const summarySpan = this.experiment.startSpan({
+        name: `run.${run.run_id}.summary`,
+        type: 'task',
+      });
+      summarySpan.log({
+        input: { run_id: run.run_id, total_issues: run.total_issues },
+        output: { aggregate: run.aggregate },
+        scores: {
+          triage_accuracy_overall: run.aggregate.triage_accuracy_overall,
+          pm_design_score_accuracy_overall: run.aggregate.pm_accuracy_overall,
+        },
+        metadata: {
+          repo: run.repo_name,
+          duration_ms: run.duration_ms,
+          kind: 'run_summary',
+        },
+      });
+      summarySpan.end?.() ?? summarySpan.close?.();
+    } catch (err) {
+      this.notes.push(
+        `Braintrust aggregate score logging failed for run ${run.run_id}: ` +
+          `${err instanceof Error ? err.message : String(err)}.`
+      );
+    }
+
+    try {
       const summary = await this.experiment.summarize();
       // summarize() returns a URL to the experiment view in some SDK builds.
       const url = typeof summary === 'object' && summary && (summary as any).experimentUrl;

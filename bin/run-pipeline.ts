@@ -97,6 +97,8 @@ import type { UsabilityAgentInput } from '../core/agents/usability-types';
 import { GHAUsabilityExerciser } from './clients/gha-usability-exerciser';
 import { inferUsabilityIntrospection } from './clients/usability-introspect';
 import { emitOnlineEvaluation } from '../core/observability/evaluator';
+import { activeBackend } from '../core/observability';
+import { getEvalRecorder } from '../core/observability/eval-recorder';
 
 /** Module-level sweep state store. Keyed by per-run sweep runId; no cross-run conflicts. */
 const sweepStateStore = new InMemorySweepStateStore();
@@ -474,6 +476,11 @@ async function runPMDesignLoop(args: {
     return { approved: true, agreedDesign: scoring.reasoning };
   }
 
+  const issueMentionedPaths = extractFilePathsFromAll([
+    payload.issue.title ?? '',
+    payload.issue.body ?? '',
+  ]).slice(0, 10);
+
   const briefInput: DesignBriefInput = {
     issueSummary: triageSummary,
     affectedModule,
@@ -484,6 +491,7 @@ async function runPMDesignLoop(args: {
     issueBody: payload.issue.body ?? null,
     issueLabels: labels,
     scoringResult: scoring,
+    issueMentionedPaths,
   };
 
   const config: PMEmailLoopConfig = {
@@ -667,6 +675,8 @@ export function classifyAlreadyFixedOnMain(outcome: ReproPipelineOutcome): {
 interface VerificationResult {
   /** Aggregate gate outcome. ok=false means feed retryContext back to the fix agent. */
   outcome: { ok: boolean; retryContext: string };
+  /** True when verification was intentionally skipped (for example, non-GHA runs). */
+  verificationSkipped: boolean;
   /** PR-body section for the regression guard run (may be empty). */
   regressionSection: string;
   /** Labels to apply to the PR for regression findings. */
@@ -722,7 +732,8 @@ async function runVerification(args: {
     await emitOnlineEvaluation({
       metric: 'verification_gate_passed',
       stage: 'verification',
-      score: 1,
+      score: 0,
+      label: 'skipped',
       issueNumber,
       runId,
       repo: upstreamRepo,
@@ -734,13 +745,14 @@ async function runVerification(args: {
         sandbox_runner: manifest.sandbox_runner,
       },
       output: {
-        ok: true,
+        ok: null,
         retry_context: '',
         skipped: true,
       },
     });
     return {
       outcome: { ok: true, retryContext: '' },
+      verificationSkipped: true,
       regressionSection: '',
       regressionLabels: [],
       usabilitySection: '',
@@ -874,11 +886,19 @@ async function runVerification(args: {
 
   return {
     outcome,
+    verificationSkipped: false,
     regressionSection,
     regressionLabels,
     usabilitySection,
     usabilityLabels,
   };
+}
+
+function resolveRecordedBackend(): string {
+  const active = activeBackend();
+  if (active) return active;
+  const configured = (process.env.OBSERVABILITY_BACKEND ?? 'none').trim().toLowerCase();
+  return configured || 'none';
 }
 
 /**
@@ -1183,6 +1203,21 @@ export async function runPipeline(args: {
   const repoFullName = payload.repository.full_name;
   const issueNumber = payload.issue.number;
   const runId = `${repoFullName}#${issueNumber}-${Date.now()}`;
+  const evalRecorder = getEvalRecorder();
+  const recordedBackend = resolveRecordedBackend();
+  let reproPassed: boolean | null = null;
+  let fixPassed: boolean | null = null;
+  let verificationGatePassed: boolean | null = null;
+  let verificationStage: 'pass' | 'fail' | 'skipped_non_gha' | 'not_reached' = 'not_reached';
+  let finalDisposition: string = 'runtime-error';
+  let errorKind: string | null = null;
+
+  const finish = (result: PipelineResult): PipelineResult => {
+    finalDisposition = result.status;
+    return result;
+  };
+
+  try {
 
   // ---------- Triage ----------
   // Triage uncertainty (clarify / not_applicable) is delivered to the maintainer
@@ -1232,11 +1267,11 @@ export async function runPipeline(args: {
 
   if (routing.action === 'route_not_applicable') {
     log(`[triage] not_applicable: ${routing.result.relevanceReason}`);
-    return { status: 'commented', reason: 'not-applicable-emailed-maintainer' };
+    return finish({ status: 'commented', reason: 'not-applicable-emailed-maintainer' });
   }
 
   if (routing.action === 'clarify') {
-    return { status: 'commented', reason: 'low-confidence-emailed-maintainer' };
+    return finish({ status: 'commented', reason: 'low-confidence-emailed-maintainer' });
   }
 
   // route_pm requires live deps for the Gmail design loop.
@@ -1245,7 +1280,7 @@ export async function runPipeline(args: {
       `[skip] issue routed to PM design loop but Gmail/PM deps not configured. ` +
         `Add the manifest skip_pm_gate label to bypass, or set Gmail env vars.`
     );
-    return { status: 'skipped', reason: 'pm-design-loop-deps-missing' };
+    return finish({ status: 'skipped', reason: 'pm-design-loop-deps-missing' });
   }
 
   // ---------- Optional PM design loop ----------
@@ -1445,6 +1480,7 @@ export async function runPipeline(args: {
       }
 
       if (attempt.ok) {
+        fixPassed = true;
         log(`[build] attempt passed eval; running verification (regression + usability)`);
         const verify = await runVerification({
           manifest,
@@ -1465,6 +1501,12 @@ export async function runPipeline(args: {
         regressionLabels = verify.regressionLabels;
         usabilitySection = verify.usabilitySection;
         usabilityLabels = verify.usabilityLabels;
+        verificationGatePassed = verify.verificationSkipped ? null : verify.outcome.ok;
+        verificationStage = verify.verificationSkipped
+          ? 'skipped_non_gha'
+          : verify.outcome.ok
+            ? 'pass'
+            : 'fail';
 
         if (verify.outcome.ok) break;
 
@@ -1499,7 +1541,8 @@ export async function runPipeline(args: {
         );
         if (decision.action === 'max_retries_exceeded') {
           log(`[retry] max_retries exceeded; labeled agent-failed and emailed PM`);
-          return { status: 'max-retries-exceeded', reason: attempt.evalSummary };
+          fixPassed = false;
+          return finish({ status: 'max-retries-exceeded', reason: attempt.evalSummary });
         }
         log(`[retry] retrying build (attempt ${decision.dispatch.retryCount}/${maxRetries})`);
         currentInput = {
@@ -1510,7 +1553,8 @@ export async function runPipeline(args: {
         const attemptsSoFar = (currentInput.designSummary.match(/## Latest Failure/g) ?? []).length;
         if (attemptsSoFar >= maxRetries) {
           log(`[retry] max_retries exceeded (no live deps to label/email)`);
-          return { status: 'max-retries-exceeded', reason: attempt.evalSummary };
+          fixPassed = false;
+          return finish({ status: 'max-retries-exceeded', reason: attempt.evalSummary });
         }
         log(`[retry] retrying build without persistence (attempt ${attemptsSoFar + 1}/${maxRetries})`);
         currentInput = {
@@ -1740,6 +1784,7 @@ export async function runPipeline(args: {
     // Capture for typed halt/success emails (before any halt return path).
     reproDossier = reproOutcome.v2.dossier.latest() ?? null;
     v2ReproOutcomeForEmail = reproOutcome;
+    reproPassed = reproOutcome.ok;
 
     if (reproOutcome.status === 'credentials_required') {
       const term = reproOutcome.v2.credentialsTerminal;
@@ -1748,23 +1793,29 @@ export async function runPipeline(args: {
         envVar,
         purpose: 'inferred from repro baseline output',
       }));
-      return await haltForCredentials(
-        creds,
-        term?.matchedPattern ?? 'credentials terminal'
+      return finish(
+        await haltForCredentials(
+          creds,
+          term?.matchedPattern ?? 'credentials terminal'
+        )
       );
     }
 
     const alreadyFixed = classifyAlreadyFixedOnMain(reproOutcome);
     if (alreadyFixed.alreadyFixedOnMain) {
-      return await haltForAlreadyFixedOnMain({
-        reason: alreadyFixed.reason ?? reproOutcome.message,
-      });
+      return finish(
+        await haltForAlreadyFixedOnMain({
+          reason: alreadyFixed.reason ?? reproOutcome.message,
+        })
+      );
     }
 
     if (!reproOutcome.ok || !reproOutcome.candidateTestPath || !reproOutcome.candidateTestContent) {
-      return await haltForReproNotRunnable({
-        reason: reproOutcome.message,
-      });
+      return finish(
+        await haltForReproNotRunnable({
+          reason: reproOutcome.message,
+        })
+      );
     }
 
     // Commit ONLY the verified repro file (clean) and push.
@@ -1804,6 +1855,7 @@ export async function runPipeline(args: {
 
     fixDossier = fixOutcome.v2.dossier.latest() ?? reproDossier;
     v2FixOutcomeForEmail = fixOutcome;
+    fixPassed = fixOutcome.ok;
 
     if (!fixOutcome.ok) {
       log("[v2-fix] not approved: " + fixOutcome.status + " \u2014 " + fixOutcome.message);
@@ -1851,7 +1903,7 @@ export async function runPipeline(args: {
           log,
         });
       }
-      return { status: 'max-retries-exceeded', reason: fixOutcome.message };
+      return finish({ status: 'max-retries-exceeded', reason: fixOutcome.message });
     }
 
     // ---- Verification gate (regression + usability) ---------------------
@@ -1874,6 +1926,12 @@ export async function runPipeline(args: {
     regressionLabels = verify.regressionLabels;
     usabilitySection = verify.usabilitySection;
     usabilityLabels = verify.usabilityLabels;
+    verificationGatePassed = verify.verificationSkipped ? null : verify.outcome.ok;
+    verificationStage = verify.verificationSkipped
+      ? 'skipped_non_gha'
+      : verify.outcome.ok
+        ? 'pass'
+        : 'fail';
 
     if (!verify.outcome.ok) {
       log("[v2-fix] verification gate FAILED \u2014 halting (no outer retry on v2 path)");
@@ -1911,10 +1969,10 @@ export async function runPipeline(args: {
           log,
         });
       }
-      return {
+      return finish({
         status: 'max-retries-exceeded',
         reason: summarizeVerificationFailure(verify.outcome.retryContext),
-      };
+      });
     }
 
     prSummary = fixOutcome.v2.criticVerdict?.reason ?? fixOutcome.message;
@@ -2005,7 +2063,39 @@ export async function runPipeline(args: {
     });
   }
 
-  return { status: 'pr-opened', prUrl: pr.url, prNumber: pr.number };
+  return finish({ status: 'pr-opened', prUrl: pr.url, prNumber: pr.number });
+  } catch (err) {
+    errorKind = err instanceof Error ? err.name || 'Error' : typeof err;
+    throw err;
+  } finally {
+    try {
+      evalRecorder.record({
+        issue_number: issueNumber,
+        attempt_id: runId,
+        mode: 'pipeline',
+        backend: recordedBackend,
+        agent: 'pipeline',
+        repro_passed: reproPassed,
+        fix_passed: fixPassed,
+        verification_gate_passed: verificationGatePassed,
+        verification_stage: verificationStage,
+        regression_passed: null,
+        tool_call_counts: {},
+        total_cost_usd: null,
+        final_disposition: finalDisposition,
+        dossier_snapshot_id: null,
+        notes_id: null,
+        trace_id: runId,
+        error_kind: errorKind,
+      });
+    } catch (recordErr) {
+      log(
+        `[eval-recorder] failed to persist pipeline outcome: ${
+          recordErr instanceof Error ? recordErr.message : String(recordErr)
+        }`
+      );
+    }
+  }
 }
 
 export function defaultWorkspaceRoot(): string {

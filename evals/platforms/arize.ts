@@ -21,11 +21,17 @@ import {
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import {
+  context,
   SpanKind,
   SpanStatusCode,
+  trace,
+  type SpanContext,
   type Tracer,
 } from '@opentelemetry/api';
-import { SemanticConventions } from '@arizeai/openinference-semantic-conventions';
+import {
+  OpenInferenceSpanKind,
+  SemanticConventions,
+} from '@arizeai/openinference-semantic-conventions';
 
 import type {
   PlatformAdapter,
@@ -53,6 +59,7 @@ export class ArizeAdapter implements PlatformAdapter {
   private notes: string[] = [];
   private targets: ExporterTarget[] = [];
   private datasetReady = false;
+  private issueSpanContexts = new Map<string, SpanContext>();
 
   async connect(): Promise<void> {
     const targets = this.resolveTargets();
@@ -132,11 +139,13 @@ export class ArizeAdapter implements PlatformAdapter {
       if (cloud.headers['space_id']) {
         this.notes.push(
           `Cloud Phoenix additionally requires a "space_id" header — ARIZE_SPACE_KEY in env. ` +
+            `This adapter accepts ARIZE_SPACE_ID as an alias. ` +
             `Local Phoenix has no concept of a space; setup divergence between cloud and local is ` +
             `not a one-line config change.`
         );
       }
     }
+
   }
 
   async ping(): Promise<PingResult> {
@@ -190,6 +199,7 @@ export class ArizeAdapter implements PlatformAdapter {
       startTime: t.start_time_ms,
       attributes: this.buildAttributes(t),
     });
+    this.issueSpanContexts.set(this.issueKey(t.ctx.run_id, t.ctx.issue_number), span.spanContext());
     if (t.error) {
       span.recordException(t.error.message);
       span.setStatus({ code: SpanStatusCode.ERROR, message: t.error.message });
@@ -201,11 +211,12 @@ export class ArizeAdapter implements PlatformAdapter {
 
   async logRun(run: RunSummary): Promise<void> {
     if (!this.tracer) throw new Error('Arize adapter not connected');
-    const span = this.tracer.startSpan('pipeline.run', {
+    const runSpan = this.tracer.startSpan('pipeline.run', {
       kind: SpanKind.INTERNAL,
       startTime: run.start_time_ms,
       attributes: {
-        [SemanticConventions.OPENINFERENCE_SPAN_KIND ?? 'openinference.span.kind']: 'CHAIN',
+        [SemanticConventions.OPENINFERENCE_SPAN_KIND ?? 'openinference.span.kind']:
+          OpenInferenceSpanKind.CHAIN,
         [SemanticConventions.INPUT_VALUE]: JSON.stringify({
           run_id: run.run_id,
           repo: run.repo_name,
@@ -221,14 +232,80 @@ export class ArizeAdapter implements PlatformAdapter {
         'pipeline.total_output_tokens': run.aggregate.total_output_tokens,
       },
     });
-    span.setStatus({ code: SpanStatusCode.OK });
-    span.end(run.end_time_ms);
+    const runContext = trace.setSpanContext(context.active(), runSpan.spanContext());
+
+    for (const issue of run.per_issue) {
+      const issueContext = this.getIssueContext(run.run_id, issue.issue_number);
+      const evaluatorIssueSpan = this.tracer.startSpan(
+        `evaluator.issue.${issue.issue_number}`,
+        {
+          kind: SpanKind.INTERNAL,
+          startTime: run.end_time_ms,
+          attributes: {
+            [SemanticConventions.OPENINFERENCE_SPAN_KIND ?? 'openinference.span.kind']:
+              OpenInferenceSpanKind.EVALUATOR,
+            [SemanticConventions.INPUT_VALUE]: JSON.stringify({
+              issue_number: issue.issue_number,
+              title: issue.title,
+              difficulty: issue.difficulty,
+            }),
+            [SemanticConventions.INPUT_MIME_TYPE]: 'application/json',
+            [SemanticConventions.OUTPUT_VALUE]: JSON.stringify({
+              triage: issue.triage_result,
+              pm: issue.pm_result,
+              scores: issue.scores,
+            }),
+            [SemanticConventions.OUTPUT_MIME_TYPE]: 'application/json',
+            'evaluation.key.triage_accuracy': issue.scores.triage_accuracy,
+            'evaluation.key.pm_design_score_accuracy': issue.scores.pm_accuracy,
+            'evaluation.issue_number': issue.issue_number,
+            'evaluation.repo': run.repo_name,
+          },
+        },
+        issueContext
+      );
+      evaluatorIssueSpan.setStatus({ code: SpanStatusCode.OK });
+      evaluatorIssueSpan.end(run.end_time_ms);
+    }
+
+    const evaluatorSummarySpan = this.tracer.startSpan(
+      'evaluator.run',
+      {
+        kind: SpanKind.INTERNAL,
+        startTime: run.end_time_ms,
+        attributes: {
+          [SemanticConventions.OPENINFERENCE_SPAN_KIND ?? 'openinference.span.kind']:
+            OpenInferenceSpanKind.EVALUATOR,
+          [SemanticConventions.INPUT_VALUE]: JSON.stringify({
+            run_id: run.run_id,
+            repo: run.repo_name,
+          }),
+          [SemanticConventions.INPUT_MIME_TYPE]: 'application/json',
+          [SemanticConventions.OUTPUT_VALUE]: JSON.stringify({
+            triage_accuracy_overall: run.aggregate.triage_accuracy_overall,
+            pm_design_score_accuracy_overall: run.aggregate.pm_accuracy_overall,
+          }),
+          [SemanticConventions.OUTPUT_MIME_TYPE]: 'application/json',
+          'evaluation.key.triage_accuracy_overall': run.aggregate.triage_accuracy_overall,
+          'evaluation.key.pm_design_score_accuracy_overall': run.aggregate.pm_accuracy_overall,
+          'evaluation.total_issues': run.total_issues,
+          'evaluation.repo': run.repo_name,
+        },
+      },
+      runContext
+    );
+    evaluatorSummarySpan.setStatus({ code: SpanStatusCode.OK });
+    evaluatorSummarySpan.end(run.end_time_ms);
+
+    runSpan.setStatus({ code: SpanStatusCode.OK });
+    runSpan.end(run.end_time_ms);
+    this.clearIssueContexts(run.run_id);
 
     if (!this.datasetReady) {
       this.notes.push(
-        `Pipeline RunSummary fanned out as a single OTel CHAIN span. Phoenix's "Experiments" ` +
-          `view aggregates them, but there is no first-class "logRun" SDK call analogous to ` +
-          `Braintrust's experiment.summarize() or LangSmith's evaluator results.`
+        `Pipeline RunSummary is emitted as one OTel CHAIN span plus per-issue EVALUATOR spans. ` +
+          `Phoenix's experiments UI can aggregate these metrics, but the JS ecosystem still lacks ` +
+          `a first-class "log evaluation row" helper comparable to Braintrust's Eval().`
       );
     }
     // Flush buffered spans so the run is visible in the UI immediately after the eval ends.
@@ -262,7 +339,8 @@ export class ArizeAdapter implements PlatformAdapter {
     const cloudEndpoint = process.env.ARIZE_ENDPOINT || CLOUD_PHOENIX_DEFAULT;
     if (process.env.ARIZE_API_KEY) {
       const headers: Record<string, string> = { api_key: process.env.ARIZE_API_KEY };
-      if (process.env.ARIZE_SPACE_KEY) headers['space_id'] = process.env.ARIZE_SPACE_KEY;
+      const spaceId = process.env.ARIZE_SPACE_KEY || process.env.ARIZE_SPACE_ID;
+      if (spaceId) headers['space_id'] = spaceId;
       out.push({
         label: 'cloud',
         endpoint: stripTrailingSlash(cloudEndpoint),
@@ -331,6 +409,23 @@ export class ArizeAdapter implements PlatformAdapter {
       }
     }
     return attrs;
+  }
+
+  private issueKey(runId: string, issueNumber: number): string {
+    return `${runId}:${issueNumber}`;
+  }
+
+  private getIssueContext(runId: string, issueNumber: number) {
+    const spanContext = this.issueSpanContexts.get(this.issueKey(runId, issueNumber));
+    if (!spanContext) return context.active();
+    return trace.setSpanContext(context.active(), spanContext);
+  }
+
+  private clearIssueContexts(runId: string): void {
+    const prefix = `${runId}:`;
+    for (const key of this.issueSpanContexts.keys()) {
+      if (key.startsWith(prefix)) this.issueSpanContexts.delete(key);
+    }
   }
 
   private async ensureDataset(endpoint: string, name: string): Promise<void> {

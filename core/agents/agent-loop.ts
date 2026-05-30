@@ -13,7 +13,7 @@
  */
 
 import { generateText, type CoreMessage } from 'ai';
-import { getModel, type PhaseEAgent } from '../llm/v2/client';
+import { getModelRoutes, type ModelRoute, type PhaseEAgent } from '../llm/v2/client';
 import { withAgentSpan } from '../observability/spans';
 import { ToolRegistry } from './tools/registry';
 
@@ -42,7 +42,10 @@ export interface AgentLoopResult {
 }
 
 export async function runAgentLoop(args: RunAgentLoopArgs): Promise<AgentLoopResult> {
-  const first = await runAgentLoopOnce(args);
+  const first = await runAgentLoopWithFailover(args);
+  if (first.terminated === 'error' && isProviderFailoverReason(first.reason)) {
+    return first;
+  }
 
   // SAFETY NET — when generateText throws (e.g. Vercel AI SDK's
   // InvalidToolArgumentsError from a missing required field on a strict
@@ -67,7 +70,7 @@ export async function runAgentLoop(args: RunAgentLoopArgs): Promise<AgentLoopRes
       `all fields without an "optional" marker are required. Do NOT drop any required field. ` +
       `If you need to record evidence, every evidence item needs id, kind, source, and summary at minimum.`;
 
-  const retry = await runAgentLoopOnce({ ...args, user: corrective });
+  const retry = await runAgentLoopWithFailover({ ...args, user: corrective });
   return {
     ...retry,
     toolCalls: first.toolCalls + retry.toolCalls,
@@ -114,9 +117,63 @@ function classifyAgentLoopError(raw: string): string {
   return truncate(raw, 800);
 }
 
-async function runAgentLoopOnce(args: RunAgentLoopArgs): Promise<AgentLoopResult> {
+function isProviderFailoverReason(reason: string | undefined): boolean {
+  if (!reason) return false;
+  const lower = reason.toLowerCase();
+  return (
+    lower.includes('[credits-exhausted]') ||
+    lower.includes('[rate-limited]') ||
+    lower.includes('[provider-unavailable]') ||
+    lower.includes('[timeout]')
+  );
+}
+
+function shouldFailover(result: AgentLoopResult, routeIndex: number, routeCount: number): boolean {
+  if (routeIndex >= routeCount - 1) return false;
+  return result.terminated === 'error' && result.toolCalls === 0 && isProviderFailoverReason(result.reason);
+}
+
+async function runAgentLoopWithFailover(args: RunAgentLoopArgs): Promise<AgentLoopResult> {
+  const routes = getModelRoutes(args.agent, args.modelOverride);
+  let aggregateTurns = 0;
+  let aggregateToolCalls = 0;
+  let lastResult: AgentLoopResult | null = null;
+
+  for (let i = 0; i < routes.length; i += 1) {
+    const route = routes[i];
+    const result = await runAgentLoopOnce(args, route);
+    aggregateTurns += result.turns;
+    aggregateToolCalls += result.toolCalls;
+    const merged: AgentLoopResult = {
+      ...result,
+      turns: aggregateTurns,
+      toolCalls: aggregateToolCalls,
+    };
+    lastResult = merged;
+    if (!shouldFailover(result, i, routes.length)) return merged;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[agent-loop] attempt=${args.attemptId} agent=${args.agent} failover_from=${route.routeId}` +
+        ` model=${route.modelId} reason=${JSON.stringify(result.reason ?? 'unknown')}`
+    );
+  }
+
+  return (
+    lastResult ?? {
+      text: '',
+      terminated: 'error',
+      reason: 'No model routes available',
+      turns: 0,
+      toolCalls: 0,
+      toolCallsByTier: { read: 0, note: 0, 'write-test': 0, mutation: 0, sandbox: 0, meta: 0 },
+      transcriptSummary: '(no tool calls)',
+    }
+  );
+}
+
+async function runAgentLoopOnce(args: RunAgentLoopArgs, route: ModelRoute): Promise<AgentLoopResult> {
   const { agent, registry } = args;
-  const model = getModel(agent, args.modelOverride);
+  const model = route.model;
   const tools = registry.toAiSdkTools();
 
   return withAgentSpan(
@@ -126,6 +183,8 @@ async function runAgentLoopOnce(args: RunAgentLoopArgs): Promise<AgentLoopResult
       issue_number: args.issueNumber,
       dossier_snapshot_id: args.dossierSnapshotId,
       'agent.tool_count': Object.keys(tools).length,
+      'llm.model_name': route.modelId,
+      'llm.route': route.routeId,
     },
     async () => {
       const messages: CoreMessage[] = [

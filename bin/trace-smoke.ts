@@ -4,6 +4,7 @@
  * asserts spans flush. Exit code 0 on success, non-zero on failure.
  */
 
+import 'dotenv/config';
 import { initTracing } from '../core/observability/tracing';
 import { runTraceSmoke } from '../core/observability/trace-smoke-test';
 

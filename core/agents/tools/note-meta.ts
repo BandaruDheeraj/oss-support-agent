@@ -53,8 +53,8 @@ const RecordEvidence = z
     suspectSymbols: z.array(SuspectSymbolSchema).default([]),
     preconditions: z.array(PreconditionInputSchema).default([]),
     openQuestions: z.array(z.string()).default([]),
-    summary: z.string().min(1),
-    confidence: z.enum(['low', 'medium', 'high']),
+    summary: z.string().min(1).optional(),
+    confidence: z.enum(['low', 'medium', 'high']).optional(),
     /**
      * Repro recipe — written by the Prober stage. Optional so the Analyst
      * (read-only) can keep calling record_evidence without supplying one;
@@ -93,6 +93,8 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       source: e.source ?? defaultEvidenceSource(e, ctx.issueNumber),
       recordedAt: e.recordedAt ?? now,
     }));
+    const summary = normalizeEvidenceSummary(args.summary, evidence, args.suspectSymbols);
+    const confidence = normalizeEvidenceConfidence(args.confidence, evidence, args.suspectSymbols);
     // Stamp precondition ids when the LLM omits them, drop entries that
     // even the loose normalizer can't make sense of. Preconditions are
     // best-effort metadata; we MUST NOT fail the entire record_evidence
@@ -148,8 +150,8 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       suspectSymbols: args.suspectSymbols,
       preconditions,
       openQuestions: args.openQuestions,
-      summary: args.summary,
-      confidence: args.confidence,
+      summary,
+      confidence,
       ...(reproRecipe ? { reproRecipe } : {}),
       ...(candidateRepro ? { candidateRepro } : {}),
       ...(reproTargets ? { reproTargets } : {}),
@@ -162,6 +164,38 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
     };
   },
 };
+
+function normalizeEvidenceSummary(
+  summary: string | undefined,
+  evidence: Array<{ kind: string; summary: string }>,
+  suspectSymbols: Array<{ symbol: string }>,
+): string {
+  const trimmed = summary?.trim();
+  if (trimmed && trimmed.length > 0) return trimmed;
+  if (evidence.length > 0) {
+    const first = evidence[0];
+    return `Recorded ${evidence.length} evidence item(s); first signal (${first.kind}): ${first.summary}`;
+  }
+  if (suspectSymbols.length > 0) {
+    const names = suspectSymbols
+      .slice(0, 3)
+      .map((s) => s.symbol)
+      .join(', ');
+    const suffix = suspectSymbols.length > 3 ? ', ...' : '';
+    return `Suspect symbols identified: ${names}${suffix}`;
+  }
+  return 'Investigation snapshot recorded without concrete evidence yet.';
+}
+
+function normalizeEvidenceConfidence(
+  confidence: 'low' | 'medium' | 'high' | undefined,
+  evidence: unknown[],
+  suspectSymbols: unknown[],
+): 'low' | 'medium' | 'high' {
+  if (confidence) return confidence;
+  if (evidence.length >= 3 && suspectSymbols.length >= 1) return 'medium';
+  return 'low';
+}
 
 /**
  * Stamp a meaningful `source` when the LLM omits it. We avoid a bare

@@ -55,6 +55,35 @@ describe('record_evidence — server-stamped source defaults', () => {
     expect(snap!.body.evidence[0].recordedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
+  it('fills default summary/confidence when omitted', async () => {
+    const dossier = new DossierStore();
+    await recordEvidence.execute(
+      {
+        evidence: [
+          {
+            id: 'e1',
+            kind: 'issue_excerpt',
+            summary: 'stack trace points to wrapper',
+          } as any,
+        ],
+        suspectSymbols: [
+          {
+            file: 'src/pkg/mod.py',
+            symbol: 'pkg.mod.func',
+            reasoning: 'traceback points to this wrapper',
+          },
+        ],
+        openQuestions: [],
+        preconditions: [],
+      } as any,
+      ctxFor({ dossier })
+    );
+    const snap = dossier.latest();
+    expect(snap).not.toBeNull();
+    expect(snap!.body.summary).toContain('Recorded 1 evidence item');
+    expect(snap!.body.confidence).toBe('low');
+  });
+
   it('uses attrs.file for file_excerpt / symbol_definition / symbol_caller', async () => {
     const dossier = new DossierStore();
     await recordEvidence.execute(

@@ -36,11 +36,23 @@ function btSpanType(kind: StartSpanOpts['kind']): string {
       return 'llm';
     case 'tool':
       return 'tool';
+    case 'evaluator':
+      return 'task';
     case 'phase':
       return 'task';
     default:
       return 'task';
   }
+}
+
+function extractEvaluation(
+  metadata: Record<string, unknown>
+): { key: string; score: number } | null {
+  const rawKey = metadata['evaluation.name'];
+  const rawScore = metadata['evaluation.score'];
+  if (typeof rawKey !== 'string') return null;
+  if (typeof rawScore !== 'number' || !Number.isFinite(rawScore)) return null;
+  return { key: rawKey, score: rawScore };
 }
 
 export class BraintrustTracer implements Tracer {
@@ -110,9 +122,11 @@ export class BraintrustTracer implements Tracer {
       end() {
         try {
           const payload: Record<string, unknown> = { metadata: buffer.metadata };
+          const evaluation = extractEvaluation(buffer.metadata);
           if (buffer.input !== undefined) payload.input = buffer.input;
           if (buffer.output !== undefined) payload.output = buffer.output;
           if (buffer.error) payload.error = buffer.error;
+          if (evaluation) payload.scores = { [evaluation.key]: evaluation.score };
           bt.log(payload);
         } catch (err) {
           // eslint-disable-next-line no-console

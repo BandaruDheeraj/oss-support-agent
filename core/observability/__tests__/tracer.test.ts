@@ -1,7 +1,16 @@
 /**
  * Tracer factory + NoopTracer behavior.
  */
-import { _resetTracer, activeBackend, currentSpan, getTracer, NoopTracer, runWithSpan } from '../tracer';
+import {
+  _resetTracer,
+  activeBackend,
+  assertObservabilityConfigured,
+  currentSpan,
+  getObservabilityConfigErrors,
+  getTracer,
+  NoopTracer,
+  runWithSpan,
+} from '../tracer';
 
 describe('tracer factory', () => {
   const ORIGINAL_ENV = { ...process.env };
@@ -57,6 +66,32 @@ describe('tracer factory', () => {
       span.end();
     }).not.toThrow();
     await expect(tracer.flush()).resolves.toBeUndefined();
+  });
+
+  it('reports missing backend config for OBSERVABILITY_BACKEND=all', () => {
+    process.env.OBSERVABILITY_BACKEND = 'all';
+    expect(getObservabilityConfigErrors()).toEqual(
+      expect.arrayContaining([
+        'LANGSMITH_API_KEY (or LANGCHAIN_API_KEY)',
+        'ARIZE_ENDPOINT (or PHOENIX_OTLP_ENDPOINT)',
+        'BRAINTRUST_API_KEY',
+      ])
+    );
+  });
+
+  it('throws on unknown OBSERVABILITY_BACKEND values', () => {
+    process.env.OBSERVABILITY_BACKEND = 'wandb';
+    expect(() => assertObservabilityConfigured()).toThrow(
+      /Unknown OBSERVABILITY_BACKEND/
+    );
+  });
+
+  it('passes config validation when all required keys are present', () => {
+    process.env.OBSERVABILITY_BACKEND = 'all';
+    process.env.LANGSMITH_API_KEY = 'x';
+    process.env.ARIZE_ENDPOINT = 'https://example.test/v1/traces';
+    process.env.BRAINTRUST_API_KEY = 'y';
+    expect(() => assertObservabilityConfigured()).not.toThrow();
   });
 });
 

@@ -17,6 +17,7 @@ import 'dotenv/config';
 
 import * as fs from 'fs';
 import * as path from 'path';
+import Database from 'better-sqlite3';
 
 import { ArizeAdapter } from './platforms/arize';
 import { LangSmithAdapter, type GoldenExample } from './platforms/langsmith';
@@ -92,6 +93,63 @@ interface ResultsJson {
   };
 }
 
+type EvalMode = 'triage' | 'outcomes';
+
+interface CliOptions {
+  mode: EvalMode;
+  source: string;
+}
+
+interface OutcomeEvalRow {
+  ts: string;
+  issue_number: number;
+  attempt_id: string;
+  mode: string;
+  backend: string;
+  agent: string;
+  repro_passed: boolean | null;
+  fix_passed: boolean | null;
+  verification_gate_passed: boolean | null;
+  verification_stage: string | null;
+  final_disposition: string;
+  error_kind: string | null;
+}
+
+interface OutcomePlatformStats {
+  issues_evaluated: number;
+  repro_pass_rate: number | null;
+  fix_pass_rate: number | null;
+  verification_pass_rate: number | null;
+  verification_skipped: number;
+  issue_resolved_rate: number;
+}
+
+interface OutcomeResultsJson {
+  run_id: string;
+  mode: 'outcomes';
+  timestamp: string;
+  source: string;
+  total_rows: number;
+  backend_coverage: string[];
+  per_platform: Record<string, OutcomePlatformStats>;
+  per_issue: Array<{
+    issue_number: number;
+    by_platform: Record<
+      string,
+      {
+        repro_passed: boolean | null;
+        fix_passed: boolean | null;
+        verification_gate_passed: boolean | null;
+        verification_stage: string | null;
+        issue_resolved: boolean;
+        final_disposition: string;
+        attempt_id: string;
+      }
+    >;
+    discrepancies: string[];
+  }>;
+}
+
 function loadGoldenSet(): GoldenIssue[] {
   const file = path.join(__dirname, 'datasets', 'triage-golden-set.json');
   if (!fs.existsSync(file)) {
@@ -133,10 +191,283 @@ function envFlag(name: string): boolean {
   return process.env[name] !== undefined && process.env[name] !== '';
 }
 
+function parseCliArgs(argv: string[]): CliOptions {
+  let mode: EvalMode = 'outcomes';
+  let source = process.env.OSA_EVAL_PATH || path.join(process.cwd(), '.osa-evals.sqlite');
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === '--mode') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('Missing value for --mode (expected triage or outcomes)');
+      mode = next as EvalMode;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--mode=')) {
+      mode = arg.slice('--mode='.length) as EvalMode;
+      continue;
+    }
+    if (arg === '--source') {
+      const next = argv[i + 1];
+      if (!next) throw new Error('Missing value for --source');
+      source = next;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--source=')) {
+      source = arg.slice('--source='.length);
+      continue;
+    }
+  }
+
+  if (mode !== 'triage' && mode !== 'outcomes') {
+    throw new Error(`Unsupported mode "${mode}". Use --mode triage or --mode outcomes.`);
+  }
+  return { mode, source };
+}
+
+function normalizeBackendName(raw: string): string {
+  const value = (raw || 'unknown').trim().toLowerCase();
+  if (value === 'phoenix') return 'arize';
+  if (value === '') return 'unknown';
+  return value;
+}
+
+function toBooleanOrNull(value: unknown): boolean | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === '' || normalized === 'null') return null;
+    if (normalized === '1' || normalized === 'true') return true;
+    if (normalized === '0' || normalized === 'false') return false;
+  }
+  return null;
+}
+
+function readSqliteOutcomeRows(source: string): OutcomeEvalRow[] {
+  const db = new Database(source, { readonly: true, fileMustExist: true });
+  try {
+    const columns = db
+      .prepare("SELECT name FROM pragma_table_info('evals')")
+      .all() as Array<{ name: string }>;
+    if (columns.length === 0) {
+      throw new Error(`No evals table found in ${source}`);
+    }
+    const names = new Set(columns.map((c) => c.name));
+    const hasBackend = names.has('backend');
+    const hasVerificationGate = names.has('verification_gate_passed');
+    const hasVerificationStage = names.has('verification_stage');
+
+    const rows = db
+      .prepare(
+        `SELECT
+           ts,
+           issue_number,
+           attempt_id,
+           mode,
+           ${hasBackend ? "COALESCE(NULLIF(backend, ''), 'unknown')" : "'unknown'"} AS backend,
+           agent,
+           repro_passed,
+           fix_passed,
+           ${hasVerificationGate ? 'verification_gate_passed' : 'regression_passed'} AS verification_gate_passed,
+           ${hasVerificationStage ? 'verification_stage' : 'NULL'} AS verification_stage,
+           final_disposition,
+           error_kind
+         FROM evals
+         WHERE agent = 'pipeline' AND mode = 'pipeline'
+         ORDER BY ts ASC`
+      )
+      .all() as Array<{
+      ts: string;
+      issue_number: number;
+      attempt_id: string;
+      mode: string;
+      backend: string;
+      agent: string;
+      repro_passed: unknown;
+      fix_passed: unknown;
+      verification_gate_passed: unknown;
+      verification_stage: string | null;
+      final_disposition: string;
+      error_kind: string | null;
+    }>;
+
+    return rows.map((r) => ({
+      ts: r.ts,
+      issue_number: Number(r.issue_number),
+      attempt_id: r.attempt_id,
+      mode: r.mode,
+      backend: normalizeBackendName(r.backend),
+      agent: r.agent,
+      repro_passed: toBooleanOrNull(r.repro_passed),
+      fix_passed: toBooleanOrNull(r.fix_passed),
+      verification_gate_passed: toBooleanOrNull(r.verification_gate_passed),
+      verification_stage: r.verification_stage,
+      final_disposition: r.final_disposition,
+      error_kind: r.error_kind,
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+function readJsonlOutcomeRows(source: string): OutcomeEvalRow[] {
+  const lines = fs
+    .readFileSync(source, 'utf8')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  const rows: OutcomeEvalRow[] = [];
+  for (const line of lines) {
+    const parsed = JSON.parse(line) as Partial<OutcomeEvalRow> & {
+      repro_passed?: unknown;
+      fix_passed?: unknown;
+      verification_gate_passed?: unknown;
+    };
+    if (parsed.agent !== 'pipeline' || parsed.mode !== 'pipeline') continue;
+    rows.push({
+      ts: String(parsed.ts ?? ''),
+      issue_number: Number(parsed.issue_number ?? 0),
+      attempt_id: String(parsed.attempt_id ?? ''),
+      mode: String(parsed.mode ?? ''),
+      backend: normalizeBackendName(String(parsed.backend ?? 'unknown')),
+      agent: String(parsed.agent ?? ''),
+      repro_passed: toBooleanOrNull(parsed.repro_passed),
+      fix_passed: toBooleanOrNull(parsed.fix_passed),
+      verification_gate_passed: toBooleanOrNull(parsed.verification_gate_passed),
+      verification_stage: parsed.verification_stage ?? null,
+      final_disposition: String(parsed.final_disposition ?? ''),
+      error_kind: parsed.error_kind ?? null,
+    });
+  }
+  return rows;
+}
+
+function loadOutcomeRows(source: string): OutcomeEvalRow[] {
+  if (!fs.existsSync(source)) {
+    throw new Error(
+      `Outcome source not found: ${source}. Set OSA_EVAL_PATH or pass --source <path>.`
+    );
+  }
+  if (source.toLowerCase().endsWith('.jsonl')) {
+    return readJsonlOutcomeRows(source);
+  }
+  return readSqliteOutcomeRows(source);
+}
+
+function rate(passed: number, evaluated: number): number | null {
+  if (evaluated === 0) return null;
+  return passed / evaluated;
+}
+
+function computeOutcomeResults(rows: OutcomeEvalRow[], source: string): OutcomeResultsJson {
+  const latestByIssueBackend = new Map<string, OutcomeEvalRow>();
+  for (const row of rows) {
+    const key = `${row.backend}#${row.issue_number}`;
+    latestByIssueBackend.set(key, row);
+  }
+  const latestRows = Array.from(latestByIssueBackend.values()).sort(
+    (a, b) => a.issue_number - b.issue_number
+  );
+
+  const byPlatform = new Map<string, OutcomeEvalRow[]>();
+  for (const row of latestRows) {
+    if (!byPlatform.has(row.backend)) byPlatform.set(row.backend, []);
+    byPlatform.get(row.backend)!.push(row);
+  }
+
+  const perPlatform: Record<string, OutcomePlatformStats> = {};
+  for (const [platform, platformRows] of byPlatform.entries()) {
+    const reproEvaluated = platformRows.filter((r) => r.repro_passed !== null).length;
+    const reproPassed = platformRows.filter((r) => r.repro_passed === true).length;
+    const fixEvaluated = platformRows.filter((r) => r.fix_passed !== null).length;
+    const fixPassed = platformRows.filter((r) => r.fix_passed === true).length;
+    const verificationEvaluated = platformRows.filter(
+      (r) => r.verification_gate_passed !== null
+    ).length;
+    const verificationPassed = platformRows.filter(
+      (r) => r.verification_gate_passed === true
+    ).length;
+    const verificationSkipped = platformRows.filter(
+      (r) => r.verification_stage === 'skipped_non_gha'
+    ).length;
+    const resolved = platformRows.filter((r) => r.final_disposition === 'pr-opened').length;
+
+    perPlatform[platform] = {
+      issues_evaluated: platformRows.length,
+      repro_pass_rate: rate(reproPassed, reproEvaluated),
+      fix_pass_rate: rate(fixPassed, fixEvaluated),
+      verification_pass_rate: rate(verificationPassed, verificationEvaluated),
+      verification_skipped: verificationSkipped,
+      issue_resolved_rate: rate(resolved, platformRows.length) ?? 0,
+    };
+  }
+
+  const perIssueMap = new Map<
+    number,
+    {
+      issue_number: number;
+      by_platform: OutcomeResultsJson['per_issue'][number]['by_platform'];
+    }
+  >();
+  for (const row of latestRows) {
+    if (!perIssueMap.has(row.issue_number)) {
+      perIssueMap.set(row.issue_number, { issue_number: row.issue_number, by_platform: {} });
+    }
+    perIssueMap.get(row.issue_number)!.by_platform[row.backend] = {
+      repro_passed: row.repro_passed,
+      fix_passed: row.fix_passed,
+      verification_gate_passed: row.verification_gate_passed,
+      verification_stage: row.verification_stage,
+      issue_resolved: row.final_disposition === 'pr-opened',
+      final_disposition: row.final_disposition,
+      attempt_id: row.attempt_id,
+    };
+  }
+
+  const compareKeys = ['repro_passed', 'fix_passed', 'verification_gate_passed', 'issue_resolved'] as const;
+  const perIssue = Array.from(perIssueMap.values())
+    .sort((a, b) => a.issue_number - b.issue_number)
+    .map((entry) => {
+      const discrepancies: string[] = [];
+      for (const key of compareKeys) {
+        const values = Object.values(entry.by_platform).map((v) => String(v[key]));
+        if (new Set(values).size > 1) discrepancies.push(key);
+      }
+      return {
+        issue_number: entry.issue_number,
+        by_platform: entry.by_platform,
+        discrepancies,
+      };
+    });
+
+  return {
+    run_id: `outcomes-${Date.now()}`,
+    mode: 'outcomes',
+    timestamp: new Date().toISOString(),
+    source,
+    total_rows: latestRows.length,
+    backend_coverage: Array.from(byPlatform.keys()).sort(),
+    per_platform: perPlatform,
+    per_issue: perIssue,
+  };
+}
+
+function formatPercent(value: number | null): string {
+  if (value === null) return 'n/a';
+  return `${(value * 100).toFixed(1)}%`;
+}
+
 function requiredEnvFor(platform: string): string[] {
   switch (platform) {
-    case 'arize-phoenix':
-      return ['PHOENIX_COLLECTOR_ENDPOINT (local) and/or ARIZE_API_KEY + ARIZE_SPACE_KEY (cloud)'];
+    case 'arize':
+      return [
+        'PHOENIX_COLLECTOR_ENDPOINT (local) and/or ARIZE_API_KEY + (ARIZE_SPACE_KEY or ARIZE_SPACE_ID) (cloud)',
+      ];
     case 'langsmith':
       return ['LANGCHAIN_API_KEY (or LANGSMITH_API_KEY)'];
     case 'braintrust':
@@ -190,7 +521,7 @@ function writeComparisonTemplate(
   const platformRows = Object.entries(results.per_platform)
     .map(
       ([name, stats]) =>
-        `| ${name} | ${stats.traces_sent} | ${stats.errors} | ${stats.avg_trace_latency_ms.toFixed(1)} ms | [MANUAL] | [MANUAL] | [MANUAL] |`
+        `| ${name} | ${stats.traces_sent} | ${stats.errors} | ${stats.avg_trace_latency_ms.toFixed(1)} ms | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |`
     )
     .join('\n');
 
@@ -271,13 +602,45 @@ ${friction}
 - **Documentation quality and completeness:** [MANUAL]
 - **Missing features I wanted but couldn't find:** [MANUAL]
 
-## 5. Summary comparison
+## 5. Systematic evaluator review (keep this updated each run)
 
-| Platform | Traces sent | Errors | Avg trace latency | UI for multi-agent | Eval workflow | Docs |
-|----------|------------:|-------:|------------------:|--------------------|---------------|------|
+### 5.1 Weighted scorecard for this run
+
+Scoring scale: 1 (poor) to 5 (excellent). Keep these weights stable across runs so platform trends remain comparable.
+
+| Criterion | Weight (%) | Arize | LangSmith | Braintrust | Winner | Evidence / notes |
+|-----------|-----------:|------:|----------:|-----------:|--------|------------------|
+| Multi-agent trace readability | 20 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| Evaluator authoring + execution workflow | 20 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| Discrepancy debugging speed | 15 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| Dataset/experiment management | 15 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| API/SDK ergonomics | 15 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| Documentation quality | 15 | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+| **Weighted total (0-5)** | **100** | **[MANUAL]** | **[MANUAL]** | **[MANUAL]** | **[MANUAL]** | **[MANUAL]** |
+
+### 5.2 Run-over-run leaderboard
+
+| Run ID | Arize weighted total | LangSmith weighted total | Braintrust weighted total | Best overall | Biggest change vs previous run | Notes |
+|--------|---------------------:|-------------------------:|--------------------------:|--------------|--------------------------------|------|
+| \`${results.run_id}\` | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+
+### 5.3 Discrepancy register (how evaluators differ)
+
+Record every meaningful mismatch in evaluator behavior, not just outright failures.
+
+| Run ID | Issue / scenario | Expected evaluator behavior | Arize observed | LangSmith observed | Braintrust observed | Discrepancy type | Severity | Follow-up |
+|--------|------------------|-----------------------------|----------------|--------------------|---------------------|------------------|----------|-----------|
+| \`${results.run_id}\` | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] | [MANUAL] |
+
+Discrepancy type taxonomy (recommended): \`scoring\`, \`trace-model\`, \`dataset-eval\`, \`metadata/tokens\`, \`UI/ux\`, \`API/SDK\`, \`latency/reliability\`.
+
+## 6. Summary comparison
+
+| Platform | Traces sent | Errors | Avg trace latency | UI for multi-agent | Eval workflow | Docs | Weighted total | Wins this run | Main discrepancy risk |
+|----------|------------:|-------:|------------------:|--------------------|---------------|------|---------------:|--------------:|-----------------------|
 ${platformRows}
 
-## 6. Recommendation
+## 7. Recommendation
 
 [MANUAL] Recommendation for a team building multi-agent pipelines in 2026.
 `;
@@ -285,7 +648,7 @@ ${platformRows}
   fs.writeFileSync(outPath, md, 'utf8');
 }
 
-async function main(): Promise<void> {
+async function runTriageEval(): Promise<void> {
   console.log('[eval] Booting observability comparison harness');
 
   clearRegisteredPlatforms();
@@ -350,6 +713,7 @@ async function main(): Promise<void> {
   const perIssue: ResultsJson['per_issue'] = [];
   const perIssueRich: PerIssueResult[] = [];
   const triageAccuracyByDifficulty: Record<string, number[]> = { easy: [], medium: [], hard: [] };
+  const triageAccuracies: number[] = [];
   const pmAccuracies: number[] = [];
   const triageLatencies: number[] = [];
   const pmLatencies: number[] = [];
@@ -428,6 +792,7 @@ async function main(): Promise<void> {
       expected_design_needed: g.expected_design_needed,
       actual_design_needed: pmDesignNeeded,
     });
+    triageAccuracies.push(triageScore);
     triageAccuracyByDifficulty[g.difficulty]?.push(triageScore);
     pmAccuracies.push(pmScore);
 
@@ -473,7 +838,7 @@ async function main(): Promise<void> {
     end_time_ms: endTime,
     duration_ms: endTime - startTime,
     aggregate: {
-      triage_accuracy_overall: avg([...pmAccuracies]),
+      triage_accuracy_overall: avg(triageAccuracies),
       pm_accuracy_overall: avg(pmAccuracies),
       triage_accuracy_by_difficulty: {
         easy: avg(triageAccuracyByDifficulty.easy ?? []),
@@ -489,9 +854,9 @@ async function main(): Promise<void> {
 
   const runErrors = await fanOutRun(summary);
   for (const p of getRegisteredPlatforms()) {
-    const errs = runErrors[p.name] ?? [];
-    if (errs.length > 0) {
-      perPlatform[p.name]!.errors += errs.length;
+    const runError = runErrors[p.name];
+    if (runError) {
+      perPlatform[p.name]!.errors += 1;
     }
     // Each issue fans out 2 stage traces (triage + pm) plus 1 run trace.
     // Successful sends = expected total - observed errors.
@@ -545,7 +910,76 @@ async function main(): Promise<void> {
   void envFlag;
 }
 
-main().catch((err) => {
-  console.error('[eval] Fatal:', err);
-  process.exit(1);
-});
+async function runOutcomesEval(options: CliOptions): Promise<void> {
+  console.log(`[eval] Booting outcome comparison mode (source=${options.source})`);
+  const rows = loadOutcomeRows(options.source);
+  if (rows.length === 0) {
+    throw new Error(
+      `No pipeline outcome rows found in ${options.source}. Run the pipeline first with OSA_EVAL_BACKEND=sqlite or jsonl.`
+    );
+  }
+
+  const results = computeOutcomeResults(rows, options.source);
+  if (results.total_rows === 0) {
+    throw new Error(
+      `No latest per-issue pipeline outcomes could be derived from ${options.source}.`
+    );
+  }
+
+  const resultsDir = path.join(__dirname, 'results');
+  if (!fs.existsSync(resultsDir)) fs.mkdirSync(resultsDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const outFile = path.join(resultsDir, `eval-outcomes-${stamp}.json`);
+  fs.writeFileSync(outFile, JSON.stringify(results, null, 2), 'utf8');
+  console.log(`[eval] Wrote ${outFile}`);
+
+  const perPlatformEntries = Object.entries(results.per_platform).sort(([a], [b]) =>
+    a.localeCompare(b)
+  );
+  console.log('');
+  console.log('Platform | Issues | Repro pass | Fix pass | Verify pass | Verify skipped | Resolved');
+  console.log('---------|-------:|-----------:|---------:|------------:|---------------:|---------:');
+  for (const [platform, stats] of perPlatformEntries) {
+    console.log(
+      `${platform} | ${stats.issues_evaluated} | ${formatPercent(stats.repro_pass_rate)} | ${formatPercent(
+        stats.fix_pass_rate
+      )} | ${formatPercent(stats.verification_pass_rate)} | ${stats.verification_skipped} | ${formatPercent(
+        stats.issue_resolved_rate
+      )}`
+    );
+  }
+  console.log('');
+
+  const canonical = ['arize', 'braintrust', 'langsmith'];
+  const missing = canonical.filter((p) => !results.backend_coverage.includes(p));
+  if (missing.length > 0) {
+    console.warn(
+      `[eval] Missing backend coverage for: ${missing.join(
+        ', '
+      )}. Run the same issue set once per backend with OBSERVABILITY_BACKEND=<platform> to compare faithfully.`
+    );
+  }
+
+  const discrepancyCount = results.per_issue.filter((r) => r.discrepancies.length > 0).length;
+  console.log(
+    `[eval] Discrepancies across backend outcomes: ${discrepancyCount}/${results.per_issue.length} issues`
+  );
+}
+
+async function main(): Promise<void> {
+  const options = parseCliArgs(process.argv.slice(2));
+  if (options.mode === 'triage') {
+    await runTriageEval();
+    return;
+  }
+  await runOutcomesEval(options);
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('[eval] Fatal:', err);
+    process.exit(1);
+  });
+}
+
+export { parseCliArgs, toBooleanOrNull, computeOutcomeResults };

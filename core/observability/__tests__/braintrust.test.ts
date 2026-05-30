@@ -111,4 +111,19 @@ describe('BraintrustTracer', () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('log failed'));
     warn.mockRestore();
   });
+
+  it('writes evaluation scores for evaluator spans', () => {
+    const tracer = new BraintrustTracer();
+    const span = tracer.startSpan('evaluator.fix', {
+      kind: 'evaluator',
+      attributes: {
+        'evaluation.name': 'fix_passed',
+        'evaluation.score': 0,
+      },
+    });
+    span.end();
+
+    expect(childLogMock).toHaveBeenCalledTimes(1);
+    expect(childLogMock.mock.calls[0][0].scores).toEqual({ fix_passed: 0 });
+  });
 });

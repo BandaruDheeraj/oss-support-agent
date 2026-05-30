@@ -7,20 +7,19 @@ _Auto-generated from each platform adapter's `getSetupNotes()` after the eval ru
 - No local Phoenix endpoint configured — skipped dataset auto-create. Cloud Arize requires dataset creation via the dashboard or its tabular API; there is no symmetrical local/cloud "create dataset" call.
 - Arize/Phoenix needed FOUR OTel + OpenInference packages to manually instrument: @opentelemetry/sdk-trace-base, @opentelemetry/exporter-trace-otlp-http, @opentelemetry/resources, @arizeai/openinference-semantic-conventions. No single "phoenix-sdk" package wraps these.
 - Cloud Phoenix expected the auth header name "api_key" (snake_case) — different from the typical "Authorization: Bearer …" convention. Discovered via 401 responses, not from a single canonical doc page.
-- Cloud Phoenix additionally requires a "space_id" header — ARIZE_SPACE_KEY in env. Local Phoenix has no concept of a space; setup divergence between cloud and local is not a one-line config change.
-- Pipeline RunSummary fanned out as a single OTel CHAIN span. Phoenix's "Experiments" view aggregates them, but there is no first-class "logRun" SDK call analogous to Braintrust's experiment.summarize() or LangSmith's evaluator results.
+- Cloud Phoenix additionally requires a "space_id" header — ARIZE_SPACE_KEY in env. This adapter accepts ARIZE_SPACE_ID as an alias. Local Phoenix has no concept of a space; setup divergence between cloud and local is not a one-line config change.
+- Pipeline RunSummary is emitted as one OTel CHAIN span plus per-issue EVALUATOR spans. Phoenix's experiments UI can aggregate these metrics, but the JS ecosystem still lacks a first-class "log evaluation row" helper comparable to Braintrust's Eval().
 
 ## langsmith
 
 - LangSmith SDK has no .ping() / .health() — verifying credentials required iterating listProjects(). Discovered after a TypeError when treating it as a Promise.
 - LangSmith's official tracing surface assumes LangChain code: most docs examples wrap a RunnableLambda with traceable(). For non-LangChain code (like ours), the SDK works but every trace requires explicit RunTree construction or explicit Client.createRun + Client.updateRun pairs. Parent/child must be passed via parent_run_id every time.
 - Dataset evaluation (running an evaluator against a dataset) is a separate code path from tracing. There is no "while tracing this run, also score it against dataset X" — you must call client.evaluate() or use the Eval SDK as a post-pass.
-- LangSmith built-in correctness evaluator could not be triggered programmatically against the just-completed run: No-op: LangSmith evaluate() would re-run the pipeline; see SETUP-FRICTION.md.. The supported flow is client.evaluate(target, { data, evaluators }), which re-runs the target — there is no "score the run I already produced" call.
 
 ## braintrust
 
 - Braintrust scorers are evaluated INSIDE Eval() — they take expected/output and return a score. To log a custom score for an arbitrary already-recorded span, the only path is span.log({ scores: { ... } }) on the span you created. There's no separate "addScore" API for an external reviewer to attach scores to existing experiment rows.
-- Braintrust experiment URL: https://www.braintrust.dev/app/OSS-Support-Bot/p/oss-fix-loop/experiments/oss-fix-loop-2026-05-28T22-19-45-319Z
+- Braintrust experiment URL: https://www.braintrust.dev/app/OSS-Support-Bot/p/oss-fix-loop/experiments/oss-fix-loop-2026-05-29T06-05-02-898Z
 
 ## Cross-platform observations
 

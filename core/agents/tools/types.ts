@@ -49,6 +49,19 @@ export interface RegistryOptions {
   maxTurns: number;
   now?: () => Date;
   /**
+   * Optional hard caps by tool name. Once a tool reaches its cap, further calls
+   * return budget_exhausted so the model pivots instead of looping.
+   */
+  perToolCaps?: Partial<Record<string, number>>;
+  /**
+   * Reserve the last N tool calls for terminal/finalization tools. When the
+   * remaining total budget is <= calls, only allowTools may execute.
+   */
+  finalizationReserve?: {
+    calls: number;
+    allowTools: string[];
+  };
+  /**
    * Optional predicate evaluated when the model calls `abandon`. Receives the
    * full transcript so far. Return null to allow the abandon, or a string
    * explaining why the abandon is premature — the registry will throw a

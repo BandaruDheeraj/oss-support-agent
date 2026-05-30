@@ -5,6 +5,7 @@
 export {
   DesignBriefInput,
   DesignBrief,
+  PlannedFileChange,
   ApproachOption,
   FollowUpInput,
   FollowUpResult,

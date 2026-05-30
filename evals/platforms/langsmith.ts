@@ -17,6 +17,7 @@
 import { Client, RunTree } from 'langsmith';
 
 import type {
+  PerIssueResult,
   PlatformAdapter,
   PingResult,
   RunSummary,
@@ -39,6 +40,8 @@ export class LangSmithAdapter implements PlatformAdapter {
   private notes: string[] = [];
   /** runId → RunTree so we can attach stage children to the right pipeline trace. */
   private runTrees = new Map<string, RunTree>();
+  /** runId → (issue number → issue-level RunTree). */
+  private issueRunTrees = new Map<string, Map<number, RunTree>>();
 
   async connect(): Promise<void> {
     // LangSmith SDK reads LANGCHAIN_API_KEY / LANGSMITH_API_KEY from env on
@@ -159,7 +162,34 @@ export class LangSmithAdapter implements PlatformAdapter {
       this.runTrees.set(t.ctx.run_id, parent);
     }
 
-    const child = await parent.createChild({
+    let issueRunMap = this.issueRunTrees.get(t.ctx.run_id);
+    if (!issueRunMap) {
+      issueRunMap = new Map<number, RunTree>();
+      this.issueRunTrees.set(t.ctx.run_id, issueRunMap);
+    }
+    let issueRun = issueRunMap.get(t.ctx.issue_number);
+    if (!issueRun) {
+      issueRun = await parent.createChild({
+        name: `issue.${t.ctx.issue_number}`,
+        run_type: 'chain',
+        start_time: t.start_time_ms,
+        inputs: {
+          issue_number: t.ctx.issue_number,
+          repo: t.ctx.repo_name,
+        },
+        extra: {
+          metadata: {
+            run_id: t.ctx.run_id,
+            repo_name: t.ctx.repo_name,
+            issue_number: t.ctx.issue_number,
+          },
+        },
+      });
+      await issueRun.postRun();
+      issueRunMap.set(t.ctx.issue_number, issueRun);
+    }
+
+    const child = await issueRun.createChild({
       name: t.span_name,
       run_type: t.is_llm ? 'llm' : 'chain',
       start_time: t.start_time_ms,
@@ -193,14 +223,62 @@ export class LangSmithAdapter implements PlatformAdapter {
   async logRun(run: RunSummary): Promise<void> {
     if (!this.client) throw new Error('LangSmith adapter not connected');
 
+    const byIssue = new Map<number, PerIssueResult>();
+    for (const issue of run.per_issue) byIssue.set(issue.issue_number, issue);
+
+    const issueRunMap = this.issueRunTrees.get(run.run_id);
+    if (issueRunMap) {
+      for (const [issueNumber, issueRun] of issueRunMap.entries()) {
+        const issue = byIssue.get(issueNumber);
+        await issueRun.end(
+          issue
+            ? {
+                issue_number: issue.issue_number,
+                triage: issue.triage_result,
+                pm: issue.pm_result,
+                scores: issue.scores,
+              }
+            : { issue_number: issueNumber, missing_result: true },
+          undefined,
+          run.end_time_ms
+        );
+        await issueRun.patchRun();
+
+        if (issue) {
+          await this.writeFeedback(issueRun.id, 'triage_accuracy', issue.scores.triage_accuracy, {
+            repo: run.repo_name,
+            run_id: run.run_id,
+            issue_number: issue.issue_number,
+          });
+          await this.writeFeedback(
+            issueRun.id,
+            'pm_design_score_accuracy',
+            issue.scores.pm_accuracy,
+            {
+              repo: run.repo_name,
+              run_id: run.run_id,
+              issue_number: issue.issue_number,
+            }
+          );
+        }
+      }
+    }
+
     // Close the parent RunTree (if any) with the aggregate output. If none
     // exists, we create a standalone summary run so the UI still sees it.
     const parent = this.runTrees.get(run.run_id);
+    let aggregateRunId: string;
     if (parent) {
-      parent.end({
-        outputs: { aggregate: run.aggregate, total_issues: run.total_issues },
-      });
+      await parent.end(
+        {
+          aggregate: run.aggregate,
+          total_issues: run.total_issues,
+        },
+        undefined,
+        run.end_time_ms
+      );
       await parent.patchRun();
+      aggregateRunId = parent.id;
     } else {
       const summary = new RunTree({
         name: `pipeline.${run.run_id}.summary`,
@@ -210,23 +288,32 @@ export class LangSmithAdapter implements PlatformAdapter {
         client: this.client,
       });
       await summary.postRun();
-      summary.end({ outputs: { aggregate: run.aggregate } });
+      await summary.end({ aggregate: run.aggregate }, undefined, run.end_time_ms);
       await summary.patchRun();
+      aggregateRunId = summary.id;
     }
 
-    // Run the built-in correctness evaluator against the dataset, if examples
-    // have been uploaded. We do not retry — if this fails, the run still
-    // appears as traces; only the dataset eval column is missing.
-    try {
-      await this.runCorrectnessEvaluator(run);
-    } catch (err) {
-      this.notes.push(
-        `LangSmith built-in correctness evaluator could not be triggered programmatically ` +
-          `against the just-completed run: ${err instanceof Error ? err.message : String(err)}. ` +
-          `The supported flow is client.evaluate(target, { data, evaluators }), which re-runs ` +
-          `the target — there is no "score the run I already produced" call.`
-      );
-    }
+    await this.writeFeedback(
+      aggregateRunId,
+      'triage_accuracy_overall',
+      run.aggregate.triage_accuracy_overall,
+      {
+        repo: run.repo_name,
+        run_id: run.run_id,
+      }
+    );
+    await this.writeFeedback(
+      aggregateRunId,
+      'pm_design_score_accuracy_overall',
+      run.aggregate.pm_accuracy_overall,
+      {
+        repo: run.repo_name,
+        run_id: run.run_id,
+      }
+    );
+
+    this.issueRunTrees.delete(run.run_id);
+    this.runTrees.delete(run.run_id);
   }
 
   getSetupNotes(): string[] {
@@ -237,18 +324,21 @@ export class LangSmithAdapter implements PlatformAdapter {
   // Internals
   // -------------------------------------------------------------------------
 
-  private async runCorrectnessEvaluator(_run: RunSummary): Promise<void> {
-    // LangSmith's "built-in correctness" evaluator is part of the evaluation
-    // SDK, not the tracing SDK. To run it against the just-completed pipeline
-    // we would need to (a) materialize each pipeline result as an Example in
-    // the dataset, and (b) call client.evaluate(target, { data, evaluators }).
-    //
-    // We intentionally do NOT call evaluate() here because it would re-run the
-    // pipeline (LLM costs, side effects). Surfacing this as a friction note
-    // instead is the honest answer.
-    throw new Error(
-      'No-op: LangSmith evaluate() would re-run the pipeline; see SETUP-FRICTION.md.'
-    );
+  private async writeFeedback(
+    runId: string,
+    key: string,
+    score: number,
+    sourceInfo: Record<string, unknown>
+  ): Promise<void> {
+    if (!this.client) return;
+    try {
+      await this.client.createFeedback(runId, key, { score, sourceInfo });
+    } catch (err) {
+      this.notes.push(
+        `LangSmith createFeedback(${key}) failed for run ${runId}: ` +
+          `${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 
   async uploadDatasetExamples(examples: GoldenExample[]): Promise<void> {

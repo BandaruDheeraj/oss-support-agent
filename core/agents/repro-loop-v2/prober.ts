@@ -90,13 +90,13 @@ Procedure (follow in order; do not skip):
 2. PROBE imports. For each suspect symbol in the dossier and each import in the issue snippets:
    - python_module_check("X") — fast importability check, no execution.
    - run_python("from X import Y") — confirms the actual import statement works.
-   If an import fails: pip_install with \`-e <candidate-dir>\` from "Candidate editable-install dirs" when the failing module looks like an in-repo package, or grep / find_symbol to locate the correct import path. Repeat until you have a verified import block.
+   If an import fails: pip_install with \`-e <candidate-dir>\` from "Candidate editable-install dirs" when the failing module looks like an in-repo package, or use read_symbol_context / grep_with_context (or grep / find_symbol) to locate the correct import path. Repeat until you have a verified import block.
 
 3. PROBE the exercise. Use run_python to actually call the suspect symbols with hand-constructed inputs. Confirm the call executes (whether or not it raises). If it raises the expected failure signature, you already have a working repro skeleton — copy it into the test.
 
 ESCAPE HATCH (NON-NEGOTIABLE — read this before grepping a 6th time): the moment ANY of these is true, your VERY NEXT tool call MUST be write_test:
    - run_python has errored 2+ times trying to construct the exercise call, OR
-   - you have made 8+ combined grep/find_symbol/find_callers calls and the verified-state ledger shows importable >= 1, OR
+   - you have made 8+ combined grep/grep_with_context/find_symbol/find_callers/read_symbol_context calls and the verified-state ledger shows importable >= 1, OR
    - you have spent a turn doing nothing but read-tier research after a probe phase that already established at least one working import.
 Rationale: pytest stderr from run_repro will pinpoint a wrong call signature in ONE iteration. Continuing to grep cannot. write_test is NOT a one-shot commitment — revise_test corrects course as many times as your sandbox budget allows, and a failing-for-the-wrong-reason test is strictly more information than another grep result. Big-bang authoring is not the failure mode here; analysis-paralysis is.
 
@@ -157,7 +157,7 @@ Preconditions enforcement:
 
 Abandon discipline:
 - abandon is reserved for ENVIRONMENTAL dead-ends — never for "running out of budget" (the registry tracks turns; you have plenty as long as you make focused progress) and never when you already have a positive run_repro observation since your last write.
-- Only call abandon after you have (a) authored at least one test, (b) run_repro at least twice, (c) exhausted grep/find_symbol/read_file for any blocking symbol, AND (d) the abandon gate confirms zero positive observations since your last write. "Symbol not found in repo" alone is NEVER a sufficient reason — third-party symbols (opentelemetry's NonRecordingSpan, pytest's MonkeyPatch, etc.) live in their package, not in this repo, so try importing them directly first.
+- Only call abandon after you have (a) authored at least one test, (b) run_repro at least twice, (c) exhausted read_symbol_context/grep_with_context (or grep/find_symbol/read_file) for any blocking symbol, AND (d) the abandon gate confirms zero positive observations since your last write. "Symbol not found in repo" alone is NEVER a sufficient reason — third-party symbols (opentelemetry's NonRecordingSpan, pytest's MonkeyPatch, etc.) live in their package, not in this repo, so try importing them directly first.
 - The abandon gate will REJECT your abandon call if the verified-state ledger shows ≥1 POSITIVE run_repro observation (exit != 0 + sentinel) since your last test write. If you see that rejection, your next step is record_evidence (after one more run_repro if you only have 1 positive observation), not abandon.
 - Install-fatigue: if pip_install fails 2+ times for the same heavy framework (smolagents, langchain, llama-index, autogen, crewai), treat that as environmental incompatibility. Stop installing — pivot to a direct-call path that imports the suspect symbol straight from its underlying package (e.g. opentelemetry.trace), then run_repro on the revised test before considering abandon.`;
 

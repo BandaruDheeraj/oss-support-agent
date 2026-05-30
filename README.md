@@ -8,11 +8,14 @@ This harness supports a shared LLM client via OpenRouter (OpenAI-compatible `cha
 
 ### Required
 
-- `OPENROUTER_API_KEY`: OpenRouter API key. If unset, LLM-backed agents fall back to deterministic heuristics where available.
+- `OPENROUTER_API_KEY`: primary OpenRouter API key.
+  - Optional additional keys for quota failover: `OPENROUTER_API_KEYS` or `OPENROUTER_API_KEY_FALLBACKS` (comma-separated).
 
 ### Model selection
 
 - `OPENROUTER_MODEL_DEFAULT`: default model when an agent-specific model is not set.
+- `OPENROUTER_MODEL_FALLBACKS`: optional comma-separated model fallback chain applied after the selected model.
+- `OPENROUTER_MODEL_FALLBACKS_<AGENT>`: optional per-agent fallback model chain (e.g. `OPENROUTER_MODEL_FALLBACKS_ANALYST`).
 - Agent-specific overrides:
   - `OPENROUTER_MODEL_TRIAGE`
   - `OPENROUTER_MODEL_PM`
@@ -70,7 +73,8 @@ issue must carry the manifest's `skip_pm_gate_label`.
 | `GITHUB_TOKEN` | Fine-grained PAT. Needs `issues:write` and `metadata:read` on upstream; `contents:write` and `pull-requests:write` on `<DEFAULT_FORK_ORG>/*`. |
 | `WEBHOOK_SECRET` | Shared secret configured on the GitHub webhook. |
 | `DEFAULT_FORK_ORG` | Org/user the agent forks into and pushes to. Must NOT be the upstream owner. |
-| `OPENROUTER_API_KEY` | (recommended) OpenRouter key for real LLM-backed triage + fix. Without this, triage falls back to heuristic and the fix agent will fail (no heuristic fix generator). |
+| `OPENROUTER_API_KEY` | (recommended) Primary OpenRouter key for real LLM-backed triage + fix. |
+| `OPENROUTER_API_KEYS` / `OPENROUTER_API_KEY_FALLBACKS` | Optional comma-separated backup OpenRouter keys used automatically on quota/rate/provider failures. |
 
 ### Optional env vars
 
@@ -164,7 +168,7 @@ See `.env.example` for the full v2 env table.
 
 ## Observability
 
-The harness ships a pluggable observability layer that emits one parent span per pipeline phase and one child span per LLM call. Exactly one backend is selected at process start via the `OBSERVABILITY_BACKEND` environment variable:
+The harness ships a pluggable observability layer that emits one parent span per pipeline phase and one child span per LLM call. Backends are selected at process start via `OBSERVABILITY_BACKEND`:
 
 | Value | Backend | Notes |
 | --- | --- | --- |
@@ -172,12 +176,39 @@ The harness ships a pluggable observability layer that emits one parent span per
 | `langsmith` | LangSmith | Requires `LANGSMITH_API_KEY`. Spans appear in the LangSmith project named by `LANGSMITH_PROJECT` (default `oss-support-agent`). |
 | `arize` | Arize / Phoenix | OTLP/HTTP exporter; set `ARIZE_ENDPOINT` (Arize Cloud) or `PHOENIX_OTLP_ENDPOINT` (self-hosted). Add `ARIZE_API_KEY` + `ARIZE_SPACE_ID` for Arize Cloud. Spans carry OpenInference semantic conventions. |
 | `braintrust` | Braintrust | Requires `BRAINTRUST_API_KEY`. Project name comes from `BRAINTRUST_PROJECT` (default `oss-support-agent`). |
+| `all` | LangSmith + Arize + Braintrust | Fans out the same spans to all three backends in one run; each backend is isolated so one failure does not block the others. |
+
+When `OBSERVABILITY_BACKEND=all`, the live server now validates that all required backend env vars are present at startup and exits with a fatal error if any are missing. This prevents silent runs where tool/evaluator spans are dropped for one platform.
 
 ### What gets traced
 
 - One `pipeline.repro` / `pipeline.fix` parent span around every `runReproPipeline` / `runFixPipeline` call, tagged with `attempt_id`, `issue_number`, `repo`, and `affected_module`.
 - One `llm.<model>` child span per `LLMClient.chat()` call, with `llm.model_name`, `llm.temperature`, prompt + completion token counts, latency, and retry attempt count.
+- One `evaluator.<stage>` span for online pass/fail checks (`repro`, `fix`, `build`, `verification`), including normalized `evaluation.*` attributes and score keys (`evaluation.key.<metric>`), so each run emits evaluator signals in all configured backends.
 - Parent context flows through `AsyncLocalStorage`, so the LLM chokepoint automatically attaches to the enclosing phase span without threading anything through call signatures.
+
+### Outcome-based backend comparison
+
+Use this when you want to know whether the agent actually reproduced and resolved issues per backend (instead of only triage/PM golden-set scoring):
+
+1. Enable recorder output:
+   - `OSA_EVAL_BACKEND=sqlite` (or `jsonl`)
+   - `OSA_EVAL_PATH=.osa-evals.sqlite`
+2. Run the same issue set once per backend:
+   - `OBSERVABILITY_BACKEND=arize`
+   - `OBSERVABILITY_BACKEND=braintrust`
+   - `OBSERVABILITY_BACKEND=langsmith`
+3. Compare outcomes:
+   - `npm run eval:observability`
+
+The outcomes report is written to `evals/results/eval-outcomes-<timestamp>.json` and compares per-backend rates for:
+- `repro_passed`
+- `fix_passed`
+- `verification_gate_passed` (skipped verification is tracked as `skipped_non_gha`, not counted as pass)
+- resolved issues (`final_disposition=pr-opened`)
+
+Legacy triage/PM golden-set comparison is still available via:
+- `npm run eval:observability:triage`
 
 ### Redaction
 

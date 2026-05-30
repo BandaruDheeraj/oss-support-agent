@@ -11,7 +11,8 @@
     "lint": "tsc --noEmit && ts-node scripts/check-core-imports.ts && ts-node scripts/check-config-adapters.ts && ts-node scripts/check-adapter-contract.ts",
     "osa-admin": "ts-node bin/osa-admin.ts",
     "trace-smoke": "ts-node bin/trace-smoke.ts",
-    "eval:observability": "ts-node evals/run-eval.ts"
+    "eval:observability": "ts-node evals/run-eval.ts --mode outcomes",
+    "eval:observability:triage": "ts-node evals/run-eval.ts --mode triage"
   },
   "keywords": [],
   "license": "MIT",

@@ -3,8 +3,8 @@
  * Multi-turn email design conversation until approval keyword is received.
  *
  * - Initial design brief sent within 5 minutes of design_needed=true
- * - Brief contains 6 fields: issue summary, affected module, related open issues,
- *   recent PR context, 2-3 proposed approaches with tradeoffs, open questions
+ * - Brief includes explicit RCA hypothesis + first-pass file/code change plan
+ *   in addition to issue/module context, approaches, and open questions
  * - On each reply, PM agent re-reads full thread history and responds within 60s
  * - Never restates resolved decisions — only surfaces what is still unresolved
  * - Loop exits when reply contains an approval keyword
@@ -14,6 +14,7 @@
 import {
   DesignBriefInput,
   DesignBrief,
+  PlannedFileChange,
   ApproachOption,
   FollowUpInput,
   FollowUpResult,
@@ -58,12 +59,18 @@ export class HeuristicBriefGenerator implements DesignBriefGenerator {
 
     const proposedApproaches = generateApproaches(input);
     const openQuestions = generateOpenQuestions(input);
+    const rootCauseAnalysis = buildRootCauseAnalysis(input);
+    const plannedFileChanges = buildPlannedFileChanges(input);
+    const proposedCodeChanges = buildProposedCodeChanges(input, plannedFileChanges);
 
     return {
       issueSummary: input.issueSummary,
       affectedModule: input.affectedModule,
       relatedOpenIssues,
       recentPRContext,
+      rootCauseAnalysis,
+      plannedFileChanges,
+      proposedCodeChanges,
       proposedApproaches,
       openQuestions,
     };
@@ -152,8 +159,173 @@ function generateOpenQuestions(input: DesignBriefInput): string[] {
   if (questions.length === 0) {
     questions.push('What is the acceptable scope for this change?');
   }
+  questions.push('Does the proposed file touch plan look right, or should we constrain it to specific files?');
 
   return questions;
+}
+
+function buildRootCauseAnalysis(input: DesignBriefInput): string {
+  const issueContext = `${input.issueTitle}\n${input.issueSummary}\n${input.issueBody ?? ''}`.toLowerCase();
+
+  if (/\b(conflict|incompatible|dependency|version|pip install|constraints?)\b/.test(issueContext)) {
+    return `Dependency compatibility issue is the leading hypothesis in ${input.affectedModule}: one or more version constraints likely prevent a valid install/runtime combination. We'll confirm this by reproducing the conflict before finalizing the patch.`;
+  }
+
+  if (/\b(null|none|undefined|nil|reference error|null pointer)\b/.test(issueContext)) {
+    return `Input-shape handling bug is the leading hypothesis in ${input.affectedModule}: a missing guard/default path appears to trigger a null/undefined dereference under the reported scenario.`;
+  }
+
+  if (/\b(timeout|race|concurr|deadlock|intermittent|flaky)\b/.test(issueContext)) {
+    return `Timing/state coordination is the leading hypothesis in ${input.affectedModule}: shared state or ordering assumptions may fail under concurrent or delayed execution.`;
+  }
+
+  return `The likely failure point is within ${input.affectedModule}, based on triage and issue context. We'll validate the exact fault location with a repro test first, then apply the narrowest fix that resolves the reported behavior.`;
+}
+
+function buildPlannedFileChanges(input: DesignBriefInput): PlannedFileChange[] {
+  const candidates = collectCandidatePaths(input).slice(0, 6);
+
+  if (candidates.length === 0) {
+    return [
+      {
+        path: input.affectedModule,
+        plannedChange: 'Implement the primary fix in the affected module and add targeted guard/logic updates for the failing path.',
+      },
+    ];
+  }
+
+  return candidates.map((candidate) => ({
+    path: candidate,
+    plannedChange: inferPlannedChange(candidate, input),
+  }));
+}
+
+function buildProposedCodeChanges(
+  input: DesignBriefInput,
+  plannedFileChanges: PlannedFileChange[]
+): string[] {
+  const primaryCodeFiles = plannedFileChanges
+    .map((f) => f.path)
+    .filter((p) => !looksLikeTestFile(p) && !looksLikeDocsFile(p))
+    .slice(0, 2);
+  const testFiles = plannedFileChanges
+    .map((f) => f.path)
+    .filter((p) => looksLikeTestFile(p))
+    .slice(0, 2);
+
+  const steps: string[] = [];
+  steps.push(
+    `Reproduce the issue from the report and confirm the failing path in ${input.affectedModule}.`
+  );
+
+  if (primaryCodeFiles.length > 0) {
+    steps.push(
+      `Apply the core fix in ${primaryCodeFiles.map((p) => `\`${p}\``).join(', ')}, keeping behavior changes limited to the reported scenario.`
+    );
+  }
+
+  if (plannedFileChanges.some((f) => looksLikeDependencyManifest(f.path))) {
+    steps.push(
+      'Update dependency/version constraints in manifest files to unblock compatible installs while preserving supported ranges.'
+    );
+  }
+
+  if (testFiles.length > 0) {
+    steps.push(
+      `Add or extend regression coverage in ${testFiles.map((p) => `\`${p}\``).join(', ')} to lock the fix.`
+    );
+  } else {
+    steps.push('Add regression coverage for the exact repro path so this failure cannot silently regress.');
+  }
+
+  steps.push('Run the relevant module tests and verification checks before opening the fix PR.');
+  return steps;
+}
+
+function collectCandidatePaths(input: DesignBriefInput): string[] {
+  const seen = new Set<string>();
+
+  const push = (raw: string | null | undefined): void => {
+    const normalized = normalizeRepoPath(raw);
+    if (!normalized) return;
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+  };
+
+  for (const path of input.issueMentionedPaths ?? []) {
+    push(path);
+  }
+
+  for (const pr of input.recentPRs) {
+    for (const changed of pr.files_changed) {
+      if (isPathLikelyInModule(changed, input.affectedModule) || looksLikeDependencyManifest(changed) || looksLikeTestFile(changed)) {
+        push(changed);
+      }
+    }
+  }
+
+  for (const doc of input.designDocs) {
+    push(doc.path);
+  }
+
+  const context = `${input.issueTitle}\n${input.issueSummary}\n${input.issueBody ?? ''}`.toLowerCase();
+  if (/\b(conflict|incompatible|dependency|version|pip install|constraints?)\b/.test(context)) {
+    push(buildModuleCandidatePath(input.affectedModule, 'pyproject.toml'));
+    push(buildModuleCandidatePath(input.affectedModule, 'requirements.txt'));
+    push(buildModuleCandidatePath(input.affectedModule, 'setup.py'));
+  }
+
+  if (seen.size === 0) {
+    push(input.affectedModule);
+  }
+
+  return Array.from(seen);
+}
+
+function normalizeRepoPath(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  const normalized = raw.trim().replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/{2,}/g, '/');
+  if (!normalized || normalized.includes('..')) return null;
+  return normalized;
+}
+
+function buildModuleCandidatePath(modulePath: string, fileName: string): string {
+  const normalizedModule = modulePath.replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, '');
+  return normalizedModule ? `${normalizedModule}/${fileName}` : fileName;
+}
+
+function isPathLikelyInModule(candidate: string, modulePath: string): boolean {
+  const normalizedCandidate = candidate.replace(/\\/g, '/');
+  const normalizedModule = modulePath.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalizedModule.length > 0 && normalizedCandidate.startsWith(`${normalizedModule}/`);
+}
+
+function inferPlannedChange(path: string, input: DesignBriefInput): string {
+  if (looksLikeDependencyManifest(path)) {
+    return 'Adjust dependency/version constraints to resolve the reported compatibility conflict while keeping supported versions explicit.';
+  }
+
+  if (looksLikeTestFile(path)) {
+    return `Add or extend regression tests that reproduce "${input.issueTitle}" and verify the fix path.`;
+  }
+
+  if (looksLikeDocsFile(path)) {
+    return 'Update design/usage docs if behavior or supported constraints change as part of the fix.';
+  }
+
+  return `Implement the targeted code fix in this file and add defensive handling for the failing scenario described in the issue.`;
+}
+
+function looksLikeDependencyManifest(path: string): boolean {
+  return /(pyproject\.toml|requirements(?:\.txt)?|setup\.py|package\.json)$/i.test(path);
+}
+
+function looksLikeTestFile(path: string): boolean {
+  return /(^|\/)(test|tests|__tests__)\b|(\.test\.|_test\.|_spec\.|\.spec\.)/i.test(path);
+}
+
+function looksLikeDocsFile(path: string): boolean {
+  return /(^|\/)docs?\//i.test(path) || /\.md$/i.test(path);
 }
 
 /**
@@ -169,6 +341,29 @@ export function formatDesignBriefEmail(brief: DesignBrief): string {
 
   sections.push(`**Related Open Issues:**\n${brief.relatedOpenIssues}\n`);
   sections.push(`**Recent PR Context:**\n${brief.recentPRContext}\n`);
+  sections.push(`**Suspected Root Cause (Working Hypothesis):**\n${brief.rootCauseAnalysis}\n`);
+
+  sections.push('**Planned File Touches (first pass):**');
+  if (brief.plannedFileChanges.length > 0) {
+    for (const file of brief.plannedFileChanges) {
+      sections.push(`- \`${file.path}\` — ${file.plannedChange}`);
+    }
+  } else {
+    sections.push('- No specific files identified yet; will start from the affected module and narrow quickly.');
+  }
+  sections.push('');
+
+  sections.push('**Proposed Code Change Plan:**');
+  if (brief.proposedCodeChanges.length > 0) {
+    for (let i = 0; i < brief.proposedCodeChanges.length; i++) {
+      sections.push(`${i + 1}. ${brief.proposedCodeChanges[i]}`);
+    }
+  } else {
+    sections.push('1. Build a minimal repro and identify the exact failing path.');
+    sections.push('2. Implement the narrowest fix in the affected module.');
+    sections.push('3. Add regression coverage for the reported scenario.');
+  }
+  sections.push('');
 
   sections.push('**Proposed Approaches:**\n');
   for (let i = 0; i < brief.proposedApproaches.length; i++) {
@@ -498,6 +693,32 @@ export function summarizeAgreedDesign(
     if (summaryMatch) {
       sections.push(`**Issue:** ${summaryMatch[1]}`);
     }
+
+    const rootCause = extractBriefSection(
+      firstAgentMessage.body,
+      '**Suspected Root Cause (Working Hypothesis):**'
+    );
+    if (rootCause) {
+      sections.push(`**Root cause hypothesis:** ${rootCause}`);
+    }
+
+    const fileTouches = extractBriefSection(
+      firstAgentMessage.body,
+      '**Planned File Touches (first pass):**'
+    );
+    if (fileTouches) {
+      sections.push('**Planned file touches:**');
+      sections.push(fileTouches);
+    }
+
+    const codePlan = extractBriefSection(
+      firstAgentMessage.body,
+      '**Proposed Code Change Plan:**'
+    );
+    if (codePlan) {
+      sections.push('**Proposed code changes:**');
+      sections.push(codePlan);
+    }
   }
 
   // Include the number of conversation turns
@@ -505,6 +726,16 @@ export function summarizeAgreedDesign(
   sections.push(`\n**Conversation turns:** ${userMessages.length}`);
 
   return sections.join('\n');
+}
+
+function extractBriefSection(body: string, heading: string): string | null {
+  const start = body.indexOf(heading);
+  if (start < 0) return null;
+
+  const fromStart = body.slice(start + heading.length).trimStart();
+  const nextHeadingIndex = fromStart.indexOf('\n**');
+  const section = (nextHeadingIndex >= 0 ? fromStart.slice(0, nextHeadingIndex) : fromStart).trim();
+  return section.length > 0 ? section : null;
 }
 
 /**
@@ -557,4 +788,3 @@ export function createPMReplyHandler(
     }
   };
 }
-

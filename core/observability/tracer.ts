@@ -13,7 +13,7 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 
-export type SpanKind = 'phase' | 'llm' | 'tool';
+export type SpanKind = 'phase' | 'llm' | 'tool' | 'evaluator';
 
 export interface Span {
   setAttributes(attrs: Record<string, unknown>): void;
@@ -106,6 +106,62 @@ function resolveBackend(raw: string | undefined): BackendName {
     );
   }
   return 'none';
+}
+
+function hasValue(raw: string | undefined): boolean {
+  return Boolean(raw && raw.trim().length > 0);
+}
+
+function missingConfigForBackend(backend: BackendName): string[] {
+  const missing: string[] = [];
+  if (backend === 'langsmith' || backend === 'all') {
+    if (!hasValue(process.env.LANGSMITH_API_KEY) && !hasValue(process.env.LANGCHAIN_API_KEY)) {
+      missing.push('LANGSMITH_API_KEY (or LANGCHAIN_API_KEY)');
+    }
+  }
+  if (backend === 'arize' || backend === 'all') {
+    if (!hasValue(process.env.ARIZE_ENDPOINT) && !hasValue(process.env.PHOENIX_OTLP_ENDPOINT)) {
+      missing.push('ARIZE_ENDPOINT (or PHOENIX_OTLP_ENDPOINT)');
+    }
+  }
+  if (backend === 'braintrust' || backend === 'all') {
+    if (!hasValue(process.env.BRAINTRUST_API_KEY)) {
+      missing.push('BRAINTRUST_API_KEY');
+    }
+  }
+  return missing;
+}
+
+/**
+ * Validate that required runtime env is present for the selected observability backend.
+ * Returns a list of missing environment variables (empty when ready).
+ */
+export function getObservabilityConfigErrors(rawBackend = process.env.OBSERVABILITY_BACKEND): string[] {
+  const normalized = (rawBackend ?? 'none').trim().toLowerCase();
+  if (
+    normalized !== 'langsmith' &&
+    normalized !== 'arize' &&
+    normalized !== 'braintrust' &&
+    normalized !== 'all' &&
+    normalized !== 'none'
+  ) {
+    return [
+      `Unknown OBSERVABILITY_BACKEND="${rawBackend}". Expected one of: langsmith, arize, braintrust, all, none.`,
+    ];
+  }
+  const backend = resolveBackend(rawBackend);
+  if (backend === 'none') return [];
+  return missingConfigForBackend(backend);
+}
+
+/**
+ * Throw when the selected backend is misconfigured, so the caller can fail fast
+ * instead of silently dropping external observability exports.
+ */
+export function assertObservabilityConfigured(rawBackend = process.env.OBSERVABILITY_BACKEND): void {
+  const errors = getObservabilityConfigErrors(rawBackend);
+  if (errors.length === 0) return;
+  throw new Error(`[observability] Missing required runtime config: ${errors.join(', ')}`);
 }
 
 /**

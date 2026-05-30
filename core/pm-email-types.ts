@@ -28,10 +28,12 @@ export interface DesignBriefInput {
   issueLabels: string[];
   /** PM scoring result that triggered design_needed */
   scoringResult: PMScoringResult;
+  /** Candidate repo paths explicitly mentioned in issue title/body */
+  issueMentionedPaths?: string[];
 }
 
 /**
- * The 6 fields required in the design brief per PRD section 5.2.
+ * Structured PM brief content sent to the maintainer.
  */
 export interface DesignBrief {
   /** One-sentence issue summary */
@@ -42,10 +44,26 @@ export interface DesignBrief {
   relatedOpenIssues: string;
   /** Context from recent PRs touching the module */
   recentPRContext: string;
+  /** Working RCA hypothesis based on issue + triage context */
+  rootCauseAnalysis: string;
+  /** Concrete first-pass file touch plan */
+  plannedFileChanges: PlannedFileChange[];
+  /** Code-level implementation steps tied to the file plan */
+  proposedCodeChanges: string[];
   /** 2-3 proposed approach options with tradeoffs */
   proposedApproaches: ApproachOption[];
   /** Open questions that need resolution */
   openQuestions: string[];
+}
+
+/**
+ * Planned change for one file path.
+ */
+export interface PlannedFileChange {
+  /** Repo-relative path planned for modification */
+  path: string;
+  /** Intended change in this file */
+  plannedChange: string;
 }
 
 /**

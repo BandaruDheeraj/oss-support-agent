@@ -33,21 +33,61 @@ function defaultBudgets(overrides: Partial<RegistryBudgets> = {}): RegistryBudge
   };
 }
 
+const ANALYST_PER_TOOL_CAPS: Record<string, number> = {
+  gh_issue: 2,
+  gh_pr: 2,
+  read_issue_repo_context: 2,
+  list_dir: 12,
+  grep: 14,
+  grep_with_context: 10,
+  read_file: 16,
+  read_test: 10,
+  find_symbol: 10,
+  find_callers: 10,
+  read_symbol_context: 8,
+};
+
+const REPRO_PER_TOOL_CAPS: Record<string, number> = {
+  gh_issue: 2,
+  gh_pr: 2,
+  read_issue_repo_context: 2,
+  list_dir: 12,
+  grep: 14,
+  grep_with_context: 10,
+  read_file: 14,
+  read_test: 12,
+  find_symbol: 10,
+  find_callers: 10,
+  read_symbol_context: 8,
+  pip_install: 8,
+  run_python: 14,
+  python_module_check: 16,
+  run_repro: 14,
+};
+
 export function makeAnalystRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
     {
       budgets: defaultBudgets({ total: 40, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }),
       maxTurns: 30,
+      perToolCaps: ANALYST_PER_TOOL_CAPS,
+      finalizationReserve: { calls: 5, allowTools: ['record_evidence', 'abandon'] },
       abandonGate: (transcript) => {
         const readCalls = transcript.filter((t) => t.tier === 'read' && t.ok).length;
         const usedSymbolSearch = transcript.some(
-          (t) => t.ok && (t.tool === 'grep' || t.tool === 'find_symbol' || t.tool === 'find_callers'),
+          (t) =>
+            t.ok &&
+            (t.tool === 'grep' ||
+              t.tool === 'grep_with_context' ||
+              t.tool === 'find_symbol' ||
+              t.tool === 'find_callers' ||
+              t.tool === 'read_symbol_context'),
         );
         if (readCalls < 4) {
-          return `abandon is forbidden before you have made at least 4 successful read-tier tool calls (you have ${readCalls}). Use gh_issue, grep, find_symbol, read_file to gather evidence first. record_evidence with low confidence is preferred over abandon.`;
+          return `abandon is forbidden before you have made at least 4 successful read-tier tool calls (you have ${readCalls}). Use read_issue_repo_context, grep_with_context/read_symbol_context, and read_file to gather evidence first. record_evidence with low confidence is preferred over abandon.`;
         }
         if (!usedSymbolSearch) {
-          return 'abandon is forbidden before you have searched for symbols. Call grep or find_symbol to locate the code referenced in the issue. record_evidence with low confidence is preferred over abandon.';
+          return 'abandon is forbidden before you have searched for symbols. Call read_symbol_context (or grep/find_symbol) to locate the code referenced in the issue. record_evidence with low confidence is preferred over abandon.';
         }
         return null;
       },
@@ -172,6 +212,8 @@ export function makeReproExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolReg
       // as run_repro_errored), so pytest never actually runs.
       budgets: defaultBudgets({ total: 70, perTier: { mutation: 0, sandbox: 30 } }),
       maxTurns: 22,
+      perToolCaps: REPRO_PER_TOOL_CAPS,
+      finalizationReserve: { calls: 5, allowTools: ['done', 'abandon', 'deepen_investigation'] },
       // Probe-first soft gates (Commit B). Forces the Executor to actually
       // exercise its tools before authoring/revising a test, AND to observe
       // a run_repro between rewrites — so it can't default to the legacy
@@ -386,6 +428,16 @@ export function makeReproProberRegistry({ ctx }: RegistryFactoryArgs): ToolRegis
       // run_repro_errored to the verified-state classifier.
       budgets: defaultBudgets({ total: 70, perTier: { mutation: 0, sandbox: 30 } }),
       maxTurns: 22,
+      perToolCaps: {
+        ...REPRO_PER_TOOL_CAPS,
+        write_test: 6,
+        revise_test: 8,
+        record_evidence: 4,
+      },
+      finalizationReserve: {
+        calls: 5,
+        allowTools: ['record_evidence', 'done', 'abandon', 'deepen_investigation'],
+      },
       toolGates: {
         write_test: (transcript) =>
           gateRequirePriorProbe(transcript) ?? gateRequireRunReproSinceLastWrite(transcript),
@@ -498,18 +550,27 @@ export function gateRequireRunReproSinceLastWrite(
  * its best-guess test now.
  *
  * Fires when:
- *   - the tool that just ran was grep/find_symbol/find_callers/read_file/read_test, AND
+ *   - the tool that just ran was grep/grep_with_context/find_symbol/
+ *     find_callers/read_symbol_context/read_file/read_test, AND
  *   - the verified-state ledger shows write_test is unblocked (importable ≥ 1
  *     OR run_python errored ≥ 2 times — pytest stderr will diagnose the call
  *     faster than more grep), AND
  *   - no write_test has succeeded yet, AND
- *   - at least 8 cumulative grep/find_symbol/find_callers calls have happened.
+ *   - at least 8 cumulative symbol/research calls have happened.
  *
  * Hint is added as a `_proberHint` field on the result object so it doesn't
  * change the shape of what the tool returns. Nudge appears at most once per
  * 3 research calls to avoid spamming the model context.
  */
-const RESEARCH_TOOLS = new Set(['grep', 'find_symbol', 'find_callers', 'read_file', 'read_test']);
+const RESEARCH_TOOLS = new Set([
+  'grep',
+  'grep_with_context',
+  'find_symbol',
+  'find_callers',
+  'read_symbol_context',
+  'read_file',
+  'read_test',
+]);
 const NUDGE_HINT =
   'Prober nudge: you have made ≥8 read-tier research calls and the verified-state ledger ' +
   'shows write_test is no longer blocked (importable≥1 or run_python errored ≥2x). Per the ' +
@@ -531,7 +592,15 @@ export function proberWriteTestNudge(args: {
   let runPythonErr = 0;
   for (const e of args.transcript) {
     if (!e.ok) continue;
-    if (e.tool === 'grep' || e.tool === 'find_symbol' || e.tool === 'find_callers') researchCalls++;
+    if (
+      e.tool === 'grep' ||
+      e.tool === 'grep_with_context' ||
+      e.tool === 'find_symbol' ||
+      e.tool === 'find_callers' ||
+      e.tool === 'read_symbol_context'
+    ) {
+      researchCalls++;
+    }
     if (e.tool === 'write_test') writeTestOk++;
   }
   for (const e of args.transcript) {

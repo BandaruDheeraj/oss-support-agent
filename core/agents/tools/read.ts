@@ -43,6 +43,76 @@ function buildAlternation(candidates: string[]): string {
   return candidates.map((candidate) => escapeRegexLiteral(candidate)).join('|');
 }
 
+async function searchSymbolDefinitions(
+  patternCandidates: string[],
+  workspace: ReturnType<typeof asHandles>['workspace'],
+  paths?: string[],
+): Promise<GrepMatch[]> {
+  if (patternCandidates.length === 0) return [];
+  const alternation = buildAlternation(patternCandidates);
+  // Use grep -E compatible syntax (POSIX classes) — no PCRE \b/\s/non-capturing groups.
+  const pattern =
+    `(^|[[:space:]])(class|def|function|const|let|var|fn|interface|type)` +
+    `[[:space:]]+(${alternation})([^[:alnum:]_]|$)`;
+  const defs = await workspace.grep(pattern, paths, { caseInsensitive: false });
+  if (defs.length > 0) return dedupeMatches(defs);
+  const fallbackPattern = `(^|[^[:alnum:]_])(${alternation})([^[:alnum:]_]|$)`;
+  return dedupeMatches(
+    await workspace.grep(fallbackPattern, paths, {
+      caseInsensitive: false,
+    }),
+  );
+}
+
+async function searchSymbolCallers(
+  patternCandidates: string[],
+  workspace: ReturnType<typeof asHandles>['workspace'],
+  paths?: string[],
+): Promise<GrepMatch[]> {
+  if (patternCandidates.length === 0) return [];
+  const alternation = buildAlternation(patternCandidates);
+  const pattern = `(^|[^[:alnum:]_])(${alternation})[[:space:]]*\\(`;
+  const callers = await workspace.grep(pattern, paths, { caseInsensitive: false });
+  if (callers.length > 0) return dedupeMatches(callers);
+  const fallbackPattern = `(^|[^[:alnum:]_])(${alternation})([^[:alnum:]_]|$)`;
+  return dedupeMatches(
+    await workspace.grep(fallbackPattern, paths, {
+      caseInsensitive: false,
+    }),
+  );
+}
+
+function lineContext(content: string | null, line: number, radius: number): string | null {
+  if (!content) return null;
+  const lines = content.split(/\r?\n/);
+  if (line < 1 || line > lines.length) return null;
+  const start = Math.max(1, line - radius);
+  const end = Math.min(lines.length, line + radius);
+  return lines
+    .slice(start - 1, end)
+    .map((text, idx) => `${start + idx}: ${text}`)
+    .join('\n');
+}
+
+async function enrichWithContext(
+  matches: GrepMatch[],
+  workspace: ReturnType<typeof asHandles>['workspace'],
+  contextLines: number,
+): Promise<Array<GrepMatch & { context: string | null }>> {
+  if (matches.length === 0) return [];
+  const uniquePaths = Array.from(new Set(matches.map((m) => m.path)));
+  const contentByPath = new Map<string, string | null>();
+  await Promise.all(
+    uniquePaths.map(async (path) => {
+      contentByPath.set(path, await workspace.readFile(path));
+    }),
+  );
+  return matches.map((match) => ({
+    ...match,
+    context: lineContext(contentByPath.get(match.path) ?? null, match.line, contextLines),
+  }));
+}
+
 /**
  * Convert free-form symbol text (qualified names, call-form snippets) into
  * identifier candidates suitable for grep -E lookup.
@@ -184,19 +254,7 @@ export const findSymbol: ToolDef<z.infer<typeof FindSymbol>, unknown> = {
   async execute({ symbol, paths }, ctx) {
     const candidates = extractSymbolSearchCandidates(symbol);
     if (candidates.length === 0) return { matches: [] };
-    const alternation = buildAlternation(candidates);
-    // Use grep -E compatible syntax (POSIX classes) — no PCRE \b/\s/non-capturing groups.
-    const pattern =
-      `(^|[[:space:]])(class|def|function|const|let|var|fn|interface|type)` +
-      `[[:space:]]+(${alternation})([^[:alnum:]_]|$)`;
-    const defs = await asHandles(ctx.handles).workspace.grep(pattern, paths, { caseInsensitive: false });
-    if (defs.length > 0) return { matches: dedupeMatches(defs) };
-
-    const fallbackPattern = `(^|[^[:alnum:]_])(${alternation})([^[:alnum:]_]|$)`;
-    const fallback = await asHandles(ctx.handles).workspace.grep(fallbackPattern, paths, {
-      caseInsensitive: false,
-    });
-    return { matches: dedupeMatches(fallback) };
+    return { matches: await searchSymbolDefinitions(candidates, asHandles(ctx.handles).workspace, paths) };
   },
 };
 
@@ -209,16 +267,7 @@ export const findCallers: ToolDef<z.infer<typeof FindCallers>, unknown> = {
   async execute({ symbol, paths }, ctx) {
     const candidates = extractSymbolSearchCandidates(symbol);
     if (candidates.length === 0) return { matches: [] };
-    const alternation = buildAlternation(candidates);
-    const pattern = `(^|[^[:alnum:]_])(${alternation})[[:space:]]*\\(`;
-    const callers = await asHandles(ctx.handles).workspace.grep(pattern, paths, { caseInsensitive: false });
-    if (callers.length > 0) return { matches: dedupeMatches(callers) };
-
-    const fallbackPattern = `(^|[^[:alnum:]_])(${alternation})([^[:alnum:]_]|$)`;
-    const fallback = await asHandles(ctx.handles).workspace.grep(fallbackPattern, paths, {
-      caseInsensitive: false,
-    });
-    return { matches: dedupeMatches(fallback) };
+    return { matches: await searchSymbolCallers(candidates, asHandles(ctx.handles).workspace, paths) };
   },
 };
 
@@ -258,6 +307,114 @@ export const ghPr: ToolDef<z.infer<typeof GhPr>, unknown> = {
   parameters: GhPr,
   async execute(_args, ctx) {
     return asHandles(ctx.handles).repo;
+  },
+};
+
+const ReadIssueRepoContext = z.object({ includeBody: z.boolean().default(true) }).strict();
+export const readIssueRepoContext: ToolDef<
+  z.infer<typeof ReadIssueRepoContext>,
+  { issue: { number: number; title: string; labels: string[]; url: string; body?: string }; repo: ReturnType<typeof asHandles>['repo'] }
+> = {
+  name: 'read_issue_repo_context',
+  tier: 'read',
+  description: 'Fetch issue + repository metadata in one call.',
+  parameters: ReadIssueRepoContext,
+  async execute({ includeBody }, ctx) {
+    const handles = asHandles(ctx.handles);
+    return {
+      issue: includeBody
+        ? handles.issue
+        : {
+            number: handles.issue.number,
+            title: handles.issue.title,
+            labels: handles.issue.labels,
+            url: handles.issue.url,
+          },
+      repo: handles.repo,
+    };
+  },
+};
+
+const GrepWithContext = z
+  .object({
+    pattern: z.string().min(1),
+    paths: z.array(z.string()).optional(),
+    caseInsensitive: z.boolean().optional(),
+    maxMatches: z.number().int().min(1).max(200).default(30),
+    contextLines: z.number().int().min(0).max(20).default(2),
+  })
+  .strict();
+export const grepWithContext: ToolDef<z.infer<typeof GrepWithContext>, unknown> = {
+  name: 'grep_with_context',
+  tier: 'read',
+  description: 'Search files and include surrounding line context snippets in one call.',
+  parameters: GrepWithContext,
+  async execute({ pattern, paths, caseInsensitive, maxMatches, contextLines }, ctx) {
+    const workspace = asHandles(ctx.handles).workspace;
+    const rawMatches = dedupeMatches(
+      await workspace.grep(pattern, paths, {
+        caseInsensitive: !!caseInsensitive,
+      }),
+    );
+    const limited = rawMatches.slice(0, maxMatches);
+    return {
+      pattern,
+      truncated: rawMatches.length > maxMatches,
+      matches: await enrichWithContext(limited, workspace, contextLines),
+    };
+  },
+};
+
+const ReadSymbolContext = z
+  .object({
+    symbol: z.string().min(1),
+    paths: z.array(z.string()).optional(),
+    includeCallers: z.boolean().default(true),
+    maxDefinitions: z.number().int().min(1).max(80).default(10),
+    maxCallers: z.number().int().min(0).max(200).default(25),
+    contextLines: z.number().int().min(0).max(20).default(3),
+  })
+  .strict();
+export const readSymbolContext: ToolDef<z.infer<typeof ReadSymbolContext>, unknown> = {
+  name: 'read_symbol_context',
+  tier: 'read',
+  description: 'Resolve symbol definitions + callers with snippets in one call.',
+  parameters: ReadSymbolContext,
+  async execute(
+    { symbol, paths, includeCallers, maxDefinitions, maxCallers, contextLines },
+    ctx,
+  ) {
+    const workspace = asHandles(ctx.handles).workspace;
+    const candidates = extractSymbolSearchCandidates(symbol);
+    if (candidates.length === 0) {
+      return {
+        symbol,
+        candidates: [],
+        definitions: [],
+        callers: [],
+      };
+    }
+    const allDefs = await searchSymbolDefinitions(candidates, workspace, paths);
+    const definitions = await enrichWithContext(allDefs.slice(0, maxDefinitions), workspace, contextLines);
+
+    let callers: Array<GrepMatch & { context: string | null }> = [];
+    let callerTruncated = false;
+    if (includeCallers) {
+      const allCallers = await searchSymbolCallers(candidates, workspace, paths);
+      callerTruncated = allCallers.length > maxCallers;
+      callers = await enrichWithContext(allCallers.slice(0, maxCallers), workspace, contextLines);
+    }
+
+    return {
+      symbol,
+      candidates,
+      definitions,
+      callers,
+      truncated: {
+        definitions: allDefs.length > maxDefinitions,
+        callers: callerTruncated,
+      },
+    };
   },
 };
 
@@ -311,6 +468,9 @@ export const READ_TOOLS = [
   webFetch,
   ghIssue,
   ghPr,
+  readIssueRepoContext,
+  grepWithContext,
+  readSymbolContext,
   readEvidence,
   readInvestigationNotes,
 ] as const;

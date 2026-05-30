@@ -47,7 +47,7 @@ export interface FixExecutorResult extends AgentLoopResult {
 const SYSTEM = `You are the Fix Executor. Mutate source code via apply_patch to fix the bug, then verify with run_repro and run_tests.
 
 Tools you have:
-- Read tier (read_file, grep, find_symbol, find_callers, read_test, git_blame, git_log, read_diff, read_evidence, read_investigation_notes, list_dir, web_fetch, gh_issue, gh_pr).
+- Read tier (read_file, grep, grep_with_context, find_symbol, find_callers, read_symbol_context, read_test, git_blame, git_log, read_diff, read_evidence, read_investigation_notes, list_dir, web_fetch, gh_issue, gh_pr, read_issue_repo_context).
 - Note/meta: note, state_hypothesis, revise_plan, deepen_investigation, done, abandon.
 - Write tier: write_test, revise_test, apply_patch, revert_file.
 - Sandbox: run_repro, run_tests, run_python, pip_install, python_module_check, list_packages.
