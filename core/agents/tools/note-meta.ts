@@ -13,7 +13,21 @@
 import { z } from 'zod';
 import type { ToolDef } from './types';
 import { asHandles } from './handles';
-import { EvidenceInputSchema, PreconditionInputSchema, ReproRecipeInputSchema, ReproTargetsInputSchema, SuspectSymbolSchema, normalizePreconditionInput, normalizeReproRecipeInput, normalizeReproTargetsInput, CandidateReproInputSchema, normalizeCandidateReproInput } from '../analyst/dossier';
+import {
+  EvidenceInputSchema,
+  PreconditionInputSchema,
+  ReproRecipeInputSchema,
+  ReproTargetsInputSchema,
+  ReproOracleSpecInputSchema,
+  SuspectSymbolSchema,
+  normalizePreconditionInput,
+  normalizeReproRecipeInput,
+  normalizeReproTargetsInput,
+  normalizeReproOracleSpecInput,
+  buildReproOracleSpec,
+  CandidateReproInputSchema,
+  normalizeCandidateReproInput,
+} from '../analyst/dossier';
 import { HypothesisSchema } from '../fix-loop/hypotheses';
 import {
   InvestigationFindingInputSchema,
@@ -76,6 +90,12 @@ const RecordEvidence = z
      * stages. Optional; absent on Prober/Investigator dossier writes.
      */
     reproTargets: ReproTargetsInputSchema.optional(),
+    /**
+     * Structured repro oracle assertions consumed by deterministic repro/fix
+     * gates. Optional on input; when omitted we derive defaults from
+     * suspectSymbols + preconditions.
+     */
+    oracleSpec: ReproOracleSpecInputSchema.optional(),
   })
   .passthrough();
 export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = {
@@ -143,12 +163,17 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
     const reproTargets = args.reproTargets
       ? normalizeReproTargetsInput(args.reproTargets) ?? undefined
       : undefined;
+    const oracleSpec =
+      (args.oracleSpec ? normalizeReproOracleSpecInput(args.oracleSpec) : null) ??
+      buildReproOracleSpec(args.suspectSymbols, preconditions) ??
+      undefined;
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
       evidence,
       suspectSymbols: args.suspectSymbols,
       preconditions,
+      ...(oracleSpec ? { oracleSpec } : {}),
       openQuestions: args.openQuestions,
       summary,
       confidence,
@@ -161,6 +186,7 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       recipe_recorded: reproRecipe ? true : false,
       candidate_recorded: candidateRepro ? true : false,
       repro_targets_recorded: reproTargets ? true : false,
+      oracle_spec_recorded: oracleSpec ? true : false,
     };
   },
 };

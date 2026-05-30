@@ -16,7 +16,7 @@
  */
 
 import { runAnalyst } from '../analyst/analyst';
-import { DossierStore, type ReproRecipe } from '../analyst/dossier';
+import { DossierStore, buildReproOracleSpec, type ReproRecipe } from '../analyst/dossier';
 import { runReproProber, type ReproProberResult } from './prober';
 import { runReproBuilder, type ReproBuilderResult, type BuilderRejectStage } from './builder';
 import {
@@ -143,6 +143,13 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   }
 
   const snapshot = dossier.latest()!;
+  const oracleSpec =
+    snapshot.body.oracleSpec ??
+    buildReproOracleSpec(snapshot.body.suspectSymbols, snapshot.body.preconditions) ??
+    {
+      suspect_path_assertions: [],
+      precondition_assertions: [],
+    };
 
   // Editable-install candidates: prefer the Analyst's structured
   // reproTargets.editableInstall when present (and non-empty). Falls back
@@ -224,6 +231,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       evidence: snapshot.body.evidence,
       suspectSymbols: snapshot.body.suspectSymbols,
       preconditions: snapshot.body.preconditions,
+      ...(snapshot.body.oracleSpec ? { oracleSpec: snapshot.body.oracleSpec } : {}),
       openQuestions: snapshot.body.openQuestions,
       summary: snapshot.body.summary,
       confidence: snapshot.body.confidence,
@@ -425,8 +433,26 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   // Stage D: AST preflight on the candidate test (language-aware best-effort)
   const src = await args.workspace.readFile(recipe.candidateTestPath);
   if (src) {
-    const suspectFiles = snapshot.body.suspectSymbols.map((s) => s.file);
-    const suspectSymbols = snapshot.body.suspectSymbols.map((s) => s.symbol);
+    const suspectFiles = Array.from(
+      new Set(
+        [
+          ...snapshot.body.suspectSymbols.map((s) => s.file),
+          ...oracleSpec.suspect_path_assertions
+            .map((a) => a.file)
+            .filter((f): f is string => typeof f === 'string' && f.length > 0),
+        ].filter((f) => typeof f === 'string' && f.length > 0)
+      )
+    );
+    const suspectSymbols = Array.from(
+      new Set(
+        [
+          ...snapshot.body.suspectSymbols.map((s) => s.symbol),
+          ...oracleSpec.suspect_path_assertions
+            .filter((a) => a.kind === 'symbol')
+            .map((a) => a.needle),
+        ].filter((s) => typeof s === 'string' && s.length > 0)
+      )
+    );
     const pre = reproAstPreflight(args.repo.language, src, suspectFiles, suspectSymbols);
     if (!pre.ok) {
       if (pre.code === 'missing_suspect_reference') {

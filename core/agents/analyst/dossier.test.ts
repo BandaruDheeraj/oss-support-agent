@@ -1,4 +1,12 @@
-import { DossierStore, snapshotIdFor, DossierBodySchema, normalizeReproTargetsInput, type DossierBody } from './dossier';
+import {
+  DossierStore,
+  snapshotIdFor,
+  DossierBodySchema,
+  normalizeReproTargetsInput,
+  normalizeReproOracleSpecInput,
+  buildReproOracleSpec,
+  type DossierBody,
+} from './dossier';
 
 function makeBody(overrides: Partial<DossierBody> = {}): DossierBody {
   return DossierBodySchema.parse({
@@ -146,6 +154,35 @@ describe('dossier snapshot id', () => {
       reproTargets: { editableInstall: [], runtimeForbidden: ['smolagents'] },
     });
     expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withTargets));
+  });
+
+  it('omits absent oracleSpec from the canonical hash (backward compat)', () => {
+    const legacy = makeBody();
+    const explicitUndef = { ...makeBody(), oracleSpec: undefined } as DossierBody;
+    expect(snapshotIdFor(explicitUndef)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('omits all-empty oracleSpec from the canonical hash', () => {
+    const legacy = makeBody();
+    const withEmptyOracle = makeBody({
+      oracleSpec: { suspect_path_assertions: [], precondition_assertions: [] },
+    });
+    expect(snapshotIdFor(withEmptyOracle)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('changes when oracleSpec is present with assertions', () => {
+    const without = makeBody();
+    const withOracle = makeBody({
+      oracleSpec: {
+        suspect_path_assertions: [
+          { kind: 'symbol', needle: 'finalize_span', file: 'src/foo.py' },
+        ],
+        precondition_assertions: [
+          { condition: 'no tracer provider', markers: ['NonRecordingSpan('] },
+        ],
+      },
+    });
+    expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withOracle));
   });
 
   it('changes when candidateRepro is present', () => {
@@ -356,6 +393,86 @@ describe('normalizeReproTargetsInput', () => {
     expect(r).toEqual({
       editableInstall: ['python/pkg', 'python/other'],
       runtimeForbidden: [],
+    });
+  });
+
+  describe('normalizeReproOracleSpecInput', () => {
+    it('returns null for nullish / non-object input', () => {
+      expect(normalizeReproOracleSpecInput(null)).toBeNull();
+      expect(normalizeReproOracleSpecInput(undefined)).toBeNull();
+      expect(normalizeReproOracleSpecInput('nope')).toBeNull();
+    });
+
+    it('returns null when both assertion arrays are empty after cleaning', () => {
+      expect(
+        normalizeReproOracleSpecInput({
+          suspect_path_assertions: [null, {}, 1],
+          precondition_assertions: [false, { markers: [] }],
+        })
+      ).toBeNull();
+    });
+
+    it('normalizes mixed string/object entries and de-dupes assertions', () => {
+      const normalized = normalizeReproOracleSpecInput({
+        suspect_path_assertions: [
+          ' finalize_span ',
+          { kind: 'symbol', needle: 'finalize_span', file: 'src/foo.py' },
+          { kind: 'span attribute', match: 'openinference.span.kind=chain' },
+        ],
+        precondition_assertions: [
+          {
+            condition: 'no tracer provider',
+            markers: [' NonRecordingSpan(', 'NonRecordingSpan('],
+          },
+        ],
+      });
+      expect(normalized).toEqual({
+        suspect_path_assertions: [
+          { kind: 'symbol', needle: 'finalize_span' },
+          { kind: 'symbol', needle: 'finalize_span', file: 'src/foo.py' },
+          {
+            kind: 'span_attribute',
+            needle: 'openinference.span.kind=chain',
+          },
+        ],
+        precondition_assertions: [
+          { condition: 'no tracer provider', markers: ['NonRecordingSpan('] },
+        ],
+      });
+    });
+  });
+
+  describe('buildReproOracleSpec', () => {
+    it('derives assertions from suspect symbols and precondition markers', () => {
+      const oracleSpec = buildReproOracleSpec(
+        [
+          { file: 'src/foo.py', symbol: 'finalize_span', reasoning: 'trace points here' },
+          { file: 'src/foo.py', symbol: 'finalize_span', reasoning: 'duplicate' },
+        ],
+        [
+          {
+            id: 'pc-0',
+            condition: 'no tracer provider configured',
+            kind: 'config_absence',
+            evidenceRefs: [],
+            satisfactionModes: [
+              { description: 'direct call', markers: ['NonRecordingSpan(', 'NonRecordingSpan('] },
+            ],
+            threats: [],
+          },
+        ]
+      );
+      expect(oracleSpec).toEqual({
+        suspect_path_assertions: [
+          { kind: 'symbol', needle: 'finalize_span', file: 'src/foo.py' },
+        ],
+        precondition_assertions: [
+          {
+            condition: 'no tracer provider configured',
+            markers: ['NonRecordingSpan('],
+          },
+        ],
+      });
     });
   });
 

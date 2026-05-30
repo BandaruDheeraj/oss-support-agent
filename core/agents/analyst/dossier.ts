@@ -62,6 +62,165 @@ export const SuspectSymbolSchema = z.object({
 export type SuspectSymbol = z.infer<typeof SuspectSymbolSchema>;
 
 /**
+ * Structured oracle spec consumed by downstream deterministic gates.
+ *
+ * - suspect_path_assertions: symbols / stack frames / span attributes that
+ *   MUST appear in failing repro output.
+ * - precondition_assertions: markers that MUST appear in the candidate test
+ *   source to prove the required world-state setup is present.
+ *
+ * Storage contract: optional for back-compat. snapshotIdFor omits absent or
+ * all-empty specs so legacy snapshot ids stay stable.
+ */
+export const ReproOracleSuspectPathKindSchema = z.enum([
+  'symbol',
+  'stack_frame',
+  'span_attribute',
+]);
+export type ReproOracleSuspectPathKind = z.infer<typeof ReproOracleSuspectPathKindSchema>;
+
+export const ReproOracleSuspectPathAssertionSchema = z.object({
+  kind: ReproOracleSuspectPathKindSchema,
+  needle: z.string().min(1).max(512),
+  file: z.string().min(1).max(240).optional(),
+});
+export type ReproOracleSuspectPathAssertion = z.infer<typeof ReproOracleSuspectPathAssertionSchema>;
+
+export const ReproOraclePreconditionAssertionSchema = z.object({
+  condition: z.string().min(1).max(512),
+  markers: z.array(z.string().min(1).max(240)).default([]),
+});
+export type ReproOraclePreconditionAssertion = z.infer<typeof ReproOraclePreconditionAssertionSchema>;
+
+export const ReproOracleSpecSchema = z.object({
+  suspect_path_assertions: z.array(ReproOracleSuspectPathAssertionSchema).default([]),
+  precondition_assertions: z.array(ReproOraclePreconditionAssertionSchema).default([]),
+});
+export type ReproOracleSpec = z.infer<typeof ReproOracleSpecSchema>;
+
+/**
+ * Loose input shape accepted from Analyst/Prober tool calls.
+ */
+export const ReproOracleSpecInputSchema = z
+  .object({
+    suspect_path_assertions: z.array(z.unknown()).optional(),
+    precondition_assertions: z.array(z.unknown()).optional(),
+  })
+  .passthrough();
+export type ReproOracleSpecInput = z.infer<typeof ReproOracleSpecInputSchema>;
+
+function cleanOracleText(raw: unknown, maxLen = 512): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  return trimmed.slice(0, maxLen);
+}
+
+function normalizeOracleSuspectKind(raw: unknown): ReproOracleSuspectPathKind {
+  if (typeof raw !== 'string') return 'symbol';
+  const k = raw.toLowerCase().replace(/[\s-]+/g, '_');
+  return k === 'stack_frame' || k === 'span_attribute' ? k : 'symbol';
+}
+
+function normalizeOraclePreconditionMarkers(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const marker of raw) {
+    const cleaned = cleanOracleText(marker, 240);
+    if (!cleaned || seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    out.push(cleaned);
+  }
+  return out;
+}
+
+/**
+ * Normalize an LLM-emitted oracle spec into strict schema shape. Returns null
+ * when both arrays are empty after cleaning.
+ */
+export function normalizeReproOracleSpecInput(raw: unknown): ReproOracleSpec | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+
+  const suspect_path_assertions: ReproOracleSuspectPathAssertion[] = [];
+  const seenSuspects = new Set<string>();
+  if (Array.isArray(r.suspect_path_assertions)) {
+    for (const entry of r.suspect_path_assertions) {
+      let kind: ReproOracleSuspectPathKind = 'symbol';
+      let needle: string | null = null;
+      let file: string | undefined;
+
+      if (typeof entry === 'string') {
+        needle = cleanOracleText(entry, 512);
+      } else if (entry && typeof entry === 'object') {
+        const e = entry as Record<string, unknown>;
+        kind = normalizeOracleSuspectKind(e.kind ?? e.type);
+        needle =
+          cleanOracleText(
+            e.needle ??
+              e.match ??
+              e.symbol ??
+              e.stack_frame ??
+              e.span_attribute ??
+              e.value,
+            512
+          ) ?? null;
+        file = cleanOracleText(e.file ?? e.path, 240) ?? undefined;
+      }
+      if (!needle) continue;
+      const dedupe = `${kind}|${needle}|${file ?? ''}`;
+      if (seenSuspects.has(dedupe)) continue;
+      seenSuspects.add(dedupe);
+      suspect_path_assertions.push(
+        file ? { kind, needle, file } : { kind, needle }
+      );
+    }
+  }
+
+  const precondition_assertions: ReproOraclePreconditionAssertion[] = [];
+  const seenPreconditions = new Set<string>();
+  if (Array.isArray(r.precondition_assertions)) {
+    for (const entry of r.precondition_assertions) {
+      let condition: string | null = null;
+      let markers: string[] = [];
+
+      if (typeof entry === 'string') {
+        condition = cleanOracleText(entry, 512);
+      } else if (entry && typeof entry === 'object') {
+        const e = entry as Record<string, unknown>;
+        condition = cleanOracleText(e.condition ?? e.description ?? e.id, 512);
+        markers = normalizeOraclePreconditionMarkers(
+          Array.isArray(e.markers)
+            ? e.markers
+            : e.marker != null
+              ? [e.marker]
+              : []
+        );
+        if (!condition && markers.length > 0) {
+          condition = markers[0]!;
+        }
+      }
+
+      if (!condition) continue;
+      const markerSet = Array.from(new Set(markers));
+      const dedupe = `${condition}|${markerSet.join('|')}`;
+      if (seenPreconditions.has(dedupe)) continue;
+      seenPreconditions.add(dedupe);
+      precondition_assertions.push({ condition, markers: markerSet });
+    }
+  }
+
+  if (suspect_path_assertions.length === 0 && precondition_assertions.length === 0) {
+    return null;
+  }
+  return {
+    suspect_path_assertions,
+    precondition_assertions,
+  };
+}
+
+/**
  * ReproTargets — structured hints the Analyst supplies to downstream Repro
  * stages so they don't have to re-derive them via heuristics.
  *
@@ -273,6 +432,58 @@ export function normalizePreconditionInput(
   return { id, condition, kind, appliesTo, evidenceRefs, satisfactionModes, threats };
 }
 export type PreconditionInput = z.infer<typeof PreconditionInputSchema>;
+
+/**
+ * Deterministically derive an oracle spec from legacy dossier signals when
+ * the Analyst omits `oracleSpec`.
+ */
+export function buildReproOracleSpec(
+  suspectSymbols: SuspectSymbol[],
+  preconditions: Precondition[]
+): ReproOracleSpec | null {
+  const suspect_path_assertions: ReproOracleSuspectPathAssertion[] = [];
+  const seenSuspects = new Set<string>();
+  for (const s of suspectSymbols) {
+    const needle = cleanOracleText(s.symbol, 512);
+    const file = cleanOracleText(s.file, 240);
+    if (!needle) continue;
+    const dedupe = `symbol|${needle}|${file ?? ''}`;
+    if (seenSuspects.has(dedupe)) continue;
+    seenSuspects.add(dedupe);
+    suspect_path_assertions.push(
+      file
+        ? { kind: 'symbol', needle, file }
+        : { kind: 'symbol', needle }
+    );
+  }
+
+  const precondition_assertions: ReproOraclePreconditionAssertion[] = [];
+  const seenPreconditions = new Set<string>();
+  for (const p of preconditions) {
+    const condition = cleanOracleText(p.condition, 512);
+    if (!condition) continue;
+    const markers = Array.from(
+      new Set(
+        p.satisfactionModes
+          .flatMap((m) => m.markers)
+          .map((m) => cleanOracleText(m, 240))
+          .filter((m): m is string => m !== null)
+      )
+    );
+    const dedupe = `${condition}|${markers.join('|')}`;
+    if (seenPreconditions.has(dedupe)) continue;
+    seenPreconditions.add(dedupe);
+    precondition_assertions.push({ condition, markers });
+  }
+
+  if (suspect_path_assertions.length === 0 && precondition_assertions.length === 0) {
+    return null;
+  }
+  return {
+    suspect_path_assertions,
+    precondition_assertions,
+  };
+}
 
 /**
  * ReproRecipe — the structured plan + observed proof emitted by the Prober
@@ -487,6 +698,12 @@ export const DossierBodySchema = z.object({
    * dossier snapshots (pre-feature) deserialize successfully.
    */
   preconditions: z.array(PreconditionSchema).default([]),
+  /**
+   * Structured repro oracle spec emitted by the Analyst and consumed by
+   * downstream deterministic gates. Optional for snapshot-id backward compat;
+   * empty specs canonicalize-out in snapshotIdFor.
+   */
+  oracleSpec: ReproOracleSpecSchema.optional(),
   openQuestions: z.array(z.string()),
   summary: z.string(),
   confidence: z.enum(['low', 'medium', 'high']),
@@ -577,6 +794,17 @@ export function snapshotIdFor(body: DossierBody): string {
   ) {
     delete forHash.reproTargets;
   }
+  // Same for oracleSpec (Stage 1 deterministic oracle assertions). Both
+  // absent and all-empty arrays must canonicalize-out for legacy hash
+  // stability.
+  const oracleSpec = (body as { oracleSpec?: ReproOracleSpec }).oracleSpec;
+  if (
+    oracleSpec == null ||
+    ((oracleSpec.suspect_path_assertions ?? []).length === 0 &&
+      (oracleSpec.precondition_assertions ?? []).length === 0)
+  ) {
+    delete forHash.oracleSpec;
+  }
   return createHash('sha1').update(canonicalize(forHash)).digest('hex').slice(0, 16);
 }
 
@@ -629,9 +857,10 @@ export class DossierStore {
    * when omitted, preserving backward-compatible call sites.
    */
   append(
-    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions' | 'reproRecipe' | 'candidateRepro' | 'reproTargets'> & {
+    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions' | 'oracleSpec' | 'reproRecipe' | 'candidateRepro' | 'reproTargets'> & {
       parentSnapshotId?: string | null;
       preconditions?: Precondition[];
+      oracleSpec?: ReproOracleSpec;
       reproRecipe?: ReproRecipe;
       candidateRepro?: CandidateRepro;
       reproTargets?: ReproTargets;

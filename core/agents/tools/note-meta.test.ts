@@ -84,6 +84,86 @@ describe('record_evidence — server-stamped source defaults', () => {
     expect(snap!.body.confidence).toBe('low');
   });
 
+  it('derives oracleSpec when omitted from suspectSymbols + preconditions', async () => {
+    const dossier = new DossierStore();
+    const res = await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectSymbols: [
+          {
+            file: 'src/pkg/mod.py',
+            symbol: 'pkg.mod.finalize',
+            reasoning: 'stack trace points here',
+          },
+        ],
+        openQuestions: [],
+        preconditions: [
+          {
+            id: 'pc-0',
+            condition: 'no tracer provider configured',
+            kind: 'config_absence',
+            evidenceRefs: [],
+            satisfactionModes: [
+              { description: 'direct call', markers: ['NonRecordingSpan('] },
+            ],
+            threats: [],
+          },
+        ],
+        summary: 'analysis summary',
+        confidence: 'high',
+      },
+      ctxFor({ dossier })
+    );
+    expect((res as any).oracle_spec_recorded).toBe(true);
+    expect(dossier.latest()!.body.oracleSpec).toEqual({
+      suspect_path_assertions: [
+        { kind: 'symbol', needle: 'pkg.mod.finalize', file: 'src/pkg/mod.py' },
+      ],
+      precondition_assertions: [
+        {
+          condition: 'no tracer provider configured',
+          markers: ['NonRecordingSpan('],
+        },
+      ],
+    });
+  });
+
+  it('normalizes and persists explicit oracleSpec from tool input', async () => {
+    const dossier = new DossierStore();
+    await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectSymbols: [],
+        openQuestions: [],
+        preconditions: [],
+        summary: 'analysis summary',
+        confidence: 'high',
+        oracleSpec: {
+          suspect_path_assertions: [
+            ' finalize_span ',
+            { kind: 'stack frame', match: 'src/foo.py:42' },
+          ],
+          precondition_assertions: [
+            { condition: 'env var FOO unset', markers: ['FOO not in os.environ'] },
+          ],
+        } as any,
+      },
+      ctxFor({ dossier })
+    );
+    expect(dossier.latest()!.body.oracleSpec).toEqual({
+      suspect_path_assertions: [
+        { kind: 'symbol', needle: 'finalize_span' },
+        { kind: 'stack_frame', needle: 'src/foo.py:42' },
+      ],
+      precondition_assertions: [
+        {
+          condition: 'env var FOO unset',
+          markers: ['FOO not in os.environ'],
+        },
+      ],
+    });
+  });
+
   it('uses attrs.file for file_excerpt / symbol_definition / symbol_caller', async () => {
     const dossier = new DossierStore();
     await recordEvidence.execute(

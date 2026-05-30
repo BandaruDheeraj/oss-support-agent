@@ -38,7 +38,8 @@ Procedure:
 4. Open the relevant files with read_file. Open recent commits with git_log/git_blame if behaviour changed.
 5. Form a list of suspect symbols, open questions, and confidence level.
 6. Identify PRECONDITIONS — see "Preconditions" section below.
-7. Terminate by calling record_evidence with a complete summary. record_evidence is the ONLY way to commit your findings.
+7. Build a structured ORACLE SPEC with suspect_path_assertions + precondition_assertions.
+8. Terminate by calling record_evidence with a complete summary. record_evidence is the ONLY way to commit your findings.
 
 CRITICAL: You MUST end the session with either record_evidence or abandon. Returning a plain-text summary without calling record_evidence wastes the entire investigation — your findings are discarded. Always finalize via tool call.
 
@@ -70,6 +71,17 @@ Each fixture that installs the state a precondition requires to be ABSENT become
 IMPORTANT: This scan is BEST-EFFORT. If you cannot find a tests/ directory, or no conftest.py exists at the expected path, that is FINE — record_evidence with whatever preconditions you have (or none at all) and move on. NEVER call abandon just because the test-infra scan came up empty. "No relevant test files found" is the COMMON case, not an error condition; it just means there are no test-infra threats to enumerate.
 
 Empty preconditions: [] is acceptable for issues with no environmental subtlety. Do NOT fabricate baseline preconditions — that wastes downstream prompt context.
+
+Oracle spec (REQUIRED on record_evidence):
+Provide \`oracleSpec\` with EXACTLY these two fields:
+  - \`suspect_path_assertions\`: array of objects describing what MUST appear in failing output. Use:
+      { kind: "symbol" | "stack_frame" | "span_attribute", needle: "<substring>", file?: "<repo path>" }
+    Use \`needle\` as a concrete substring to match (symbol name, frame text, or span attribute key/value token).
+  - \`precondition_assertions\`: array of objects describing what MUST be present in test source. Use:
+      { condition: "<precondition sentence>", markers: ["<substring>", "..."] }
+    markers should come from your satisfactionModes and be easy to grep in test code.
+
+Downstream stages are deterministic and consume this struct directly. Keep it concise, machine-checkable, and tied to your evidence.
 
 CANDIDATE REPRO (optional, high-leverage):
 When your confidence is medium or high AND the failure mode fits one of two templates, you SHOULD include a \`candidateRepro\` field on record_evidence. A downstream deterministic Builder will use it to author the failing test WITHOUT another LLM round-trip — this dramatically reduces failed repros caused by Prober drift.
