@@ -1,30 +1,20 @@
 /**
- * Repro orchestrator: Analyst → Prober → Deterministic Executor → Critic.
+ * Repro orchestrator: Analyst → Builder/Prober → Deterministic Repro Oracle.
  *
- * The Prober drafts and probe-verifies a ReproRecipe in its own sandbox.
- * The deterministic Executor re-applies the recipe (no LLM calls). The
- * Critic then takes the recipe directly and decides approve/reject/revise.
- *
- * Credential short-circuits live in two places:
- *   - Before the Executor: the recipe's `requiresCredentials` against the
- *     process env. This catches the common "issue requires a paid API key"
- *     case before we burn another sandbox cycle.
- *   - After the Executor (legacy path): scan the Prober's transcript for
- *     credential-error patterns in run_repro stderr that we didn't detect
- *     statically. Surfaced so caller can halt with an awaiting-credentials
- *     email.
+ * No LLM gate can halt this stage after candidate generation. Candidate
+ * validity is decided only by deterministic oracle criteria.
  */
 
 import { runAnalyst } from '../analyst/analyst';
 import { DossierStore, buildReproOracleSpec, type ReproRecipe } from '../analyst/dossier';
 import { runReproProber, type ReproProberResult } from './prober';
 import { runReproBuilder, type ReproBuilderResult, type BuilderRejectStage } from './builder';
+import type { DeterministicExecutorResult } from './executor';
+import type { ReproVerdict } from './critic';
 import {
-  runReproExecutorFromRecipe,
-  reproAstPreflight,
-  type DeterministicExecutorResult,
-} from './executor';
-import { runReproCritic, type ReproVerdict } from './critic';
+  runDeterministicReproOracle,
+  type DeterministicReproOracleResult,
+} from './deterministic-oracle';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
 import { detectCredentialError } from '../../credentials-check';
 import type { IssueCodeSnippet } from './repro-hints';
@@ -104,7 +94,7 @@ export interface ReproV2Outcome {
   builderRejectStage?: BuilderRejectStage;
   executor?: DeterministicExecutorResult;
   criticVerdict?: ReproVerdict;
-  preflightReason?: string;
+  oracle?: DeterministicReproOracleResult;
   /**
    * Populated when status === 'credentials_required'. Either lifted from
    * the recipe's `requiresCredentials` (static check before Executor) or
@@ -365,20 +355,21 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     approach: recipe.approach ?? '',
   };
 
-  // Stage C: Deterministic Executor — re-apply the recipe against a fresh
-  // sandbox state. (We currently share the sandbox handle with the Prober;
-  // pip-install state therefore persists, which is fine because the recipe's
-  // own pipInstalls are idempotent.)
-  const executor = await runReproExecutorFromRecipe({
+  // Stage C: deterministic repro oracle (single authoritative gate).
+  const oracle = await runDeterministicReproOracle({
     attemptId: args.attemptId,
     recipe,
+    oracleSpec,
+    suspectSymbols: snapshot.body.suspectSymbols,
+    repoLanguage: args.repo.language,
     workspace: args.workspace,
     sandbox: args.sandbox,
-    env: args.env,
     editableInstallFallbacks: effectiveEditableInstalls,
+    env: args.env,
   });
+  const executor = oracle.executor;
 
-  if (executor.outcome === 'credentials_missing') {
+  if (oracle.verdict === 'credentials_required' && oracle.credentialsTerminal) {
     return {
       status: 'credentials_required',
       dossier,
@@ -388,18 +379,14 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       ...(builder ? { builder } : {}),
       ...(builderRejectStage ? { builderRejectStage } : {}),
       executor,
-      credentialsTerminal: {
-        inferredEnvVars: executor.missingCredentials,
-        matchedPattern: 'recipe.requiresCredentials',
-        stderrTail: undefined,
-      },
-      message: `Repro halted on missing credentials declared in recipe: ${executor.missingCredentials.join(', ')}`,
+      oracle,
+      credentialsTerminal: oracle.credentialsTerminal,
+      message: `Repro halted on missing credentials (${oracle.credentialsTerminal.matchedPattern ?? 'unknown pattern'}): ${oracle.credentialsTerminal.inferredEnvVars.join(', ')}`,
     };
   }
 
-  if (executor.outcome !== 'reproduced') {
-    // After a non-reproduced run, also check Prober transcript for credential
-    // errors that the recipe didn't statically declare.
+  if (oracle.verdict !== 'valid') {
+    // Keep transcript-based credential detection unchanged.
     const credResult = prober
       ? detectCredentialsFromTranscript(prober.transcript, args.env ?? process.env)
       : null;
@@ -413,6 +400,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
         ...(builder ? { builder } : {}),
         ...(builderRejectStage ? { builderRejectStage } : {}),
         executor,
+        oracle,
         credentialsTerminal: credResult,
         message: `Repro halted on missing credentials (${credResult.matchedPattern ?? 'unknown pattern'}): ${credResult.inferredEnvVars.join(', ')}`,
       };
@@ -426,81 +414,8 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       ...(builder ? { builder } : {}),
       ...(builderRejectStage ? { builderRejectStage } : {}),
       executor,
-      message: `Repro deterministic Executor outcome=${executor.outcome}: ${executor.reason}`,
-    };
-  }
-
-  // Stage D: AST preflight on the candidate test (language-aware best-effort)
-  const src = await args.workspace.readFile(recipe.candidateTestPath);
-  if (src) {
-    const suspectFiles = Array.from(
-      new Set(
-        [
-          ...snapshot.body.suspectSymbols.map((s) => s.file),
-          ...oracleSpec.suspect_path_assertions
-            .map((a) => a.file)
-            .filter((f): f is string => typeof f === 'string' && f.length > 0),
-        ].filter((f) => typeof f === 'string' && f.length > 0)
-      )
-    );
-    const suspectSymbols = Array.from(
-      new Set(
-        [
-          ...snapshot.body.suspectSymbols.map((s) => s.symbol),
-          ...oracleSpec.suspect_path_assertions
-            .filter((a) => a.kind === 'symbol')
-            .map((a) => a.needle),
-        ].filter((s) => typeof s === 'string' && s.length > 0)
-      )
-    );
-    const pre = reproAstPreflight(args.repo.language, src, suspectFiles, suspectSymbols);
-    if (!pre.ok) {
-      if (pre.code === 'missing_suspect_reference') {
-        // eslint-disable-next-line no-console
-        console.log(
-          `[v2-driver] AST preflight warning (non-terminal): ${pre.reason}; proceeding because deterministic replay already reproduced`
-        );
-      } else {
-        return {
-          status: 'preflight_failed',
-          dossier,
-          recipe,
-          plan: planProjection,
-          ...(prober ? { prober } : {}),
-          ...(builder ? { builder } : {}),
-          ...(builderRejectStage ? { builderRejectStage } : {}),
-          executor,
-          preflightReason: pre.reason,
-          message: `AST preflight rejected the candidate test: ${pre.reason}`,
-        };
-      }
-    }
-  }
-
-  // Stage E: Critic
-  const critic = await runReproCritic({
-    attemptId: args.attemptId,
-    recipe,
-    dossier,
-    dossierSnapshot: snapshot,
-    issue: args.issue,
-    repo: args.repo,
-    workspace: args.workspace,
-    sandbox: args.sandbox,
-  });
-
-  if (critic.verdict.verdict !== 'approve') {
-    return {
-      status: 'critic_rejected',
-      dossier,
-      recipe,
-      plan: planProjection,
-      ...(prober ? { prober } : {}),
-      ...(builder ? { builder } : {}),
-      ...(builderRejectStage ? { builderRejectStage } : {}),
-      executor,
-      criticVerdict: critic.verdict,
-      message: `Repro Critic ${critic.verdict.verdict}: ${critic.verdict.reason}`,
+      oracle,
+      message: oracle.message,
     };
   }
 
@@ -513,10 +428,10 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     ...(builder ? { builder } : {}),
     ...(builderRejectStage ? { builderRejectStage } : {}),
     executor,
-    criticVerdict: critic.verdict,
+    oracle,
     message: builderRecipe
-      ? 'Repro reproduced reliably (Builder-authored) and approved by Critic.'
-      : 'Repro reproduced reliably and approved by Critic.',
+      ? 'Repro reproduced reliably (Builder-authored) and passed deterministic oracle.'
+      : 'Repro reproduced reliably and passed deterministic oracle.',
   };
 }
 
