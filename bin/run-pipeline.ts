@@ -648,22 +648,31 @@ export function classifyAlreadyFixedOnMain(outcome: ReproPipelineOutcome): {
   alreadyFixedOnMain: boolean;
   reason?: string;
 } {
-  if (
-    outcome.status === 'executor_failed' &&
-    outcome.v2.executor?.outcome === 'unexpected_pass'
-  ) {
+  if (outcome.status !== 'not_reproduced') return { alreadyFixedOnMain: false };
+
+  const candidateWithUnexpectedPass = outcome.v2.candidates.find(
+    (candidate) =>
+      candidate.executor?.outcome === 'unexpected_pass' ||
+      candidate.oracle?.criteria.baseline_head_fails === false
+  );
+  if (candidateWithUnexpectedPass) {
     return {
       alreadyFixedOnMain: true,
       reason:
-        outcome.v2.executor.reason ||
+        candidateWithUnexpectedPass.executor?.reason ||
+        candidateWithUnexpectedPass.message ||
         'deterministic replay passed unexpectedly (candidate repro no longer fails)',
     };
   }
 
-  if (outcome.status === 'prober_failed' && outcome.v2.builderRejectStage === 'run_repro_pass') {
+  const builderRunPassed = outcome.v2.candidates.find(
+    (candidate) => candidate.source === 'builder' && candidate.builderRejectStage === 'run_repro_pass'
+  );
+  if (builderRunPassed) {
     return {
       alreadyFixedOnMain: true,
       reason:
+        builderRunPassed.message ||
         outcome.message ||
         'candidate repro passed during builder validation and no failing recipe could be established',
     };

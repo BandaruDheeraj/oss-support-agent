@@ -1,7 +1,7 @@
 import { classifyAlreadyFixedOnMain } from '../bin/run-pipeline';
 import type { ReproPipelineOutcome } from '../core/agents/run-v2';
 import { DossierStore } from '../core/agents/analyst/dossier';
-import type { ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
+import type { ReproCandidateEvaluation, ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
 import type { DeterministicExecutorResult } from '../core/agents/repro-loop-v2/executor';
 
 function makeExecutor(
@@ -27,16 +27,14 @@ function makeExecutor(
 function makeOutcome(args: {
   status: ReproPipelineOutcome['status'];
   message?: string;
-  builderRejectStage?: ReproV2Outcome['builderRejectStage'];
-  executor?: DeterministicExecutorResult;
+  candidates?: ReproCandidateEvaluation[];
 }): ReproPipelineOutcome {
   const message = args.message ?? 'repro pipeline message';
   const v2: ReproV2Outcome = {
     status: args.status,
     dossier: new DossierStore(),
     message,
-    builderRejectStage: args.builderRejectStage,
-    executor: args.executor,
+    candidates: args.candidates ?? [],
   };
   return {
     ok: args.status === 'reproduced',
@@ -49,11 +47,17 @@ function makeOutcome(args: {
 describe('classifyAlreadyFixedOnMain', () => {
   test('flags deterministic unexpected_pass as already fixed', () => {
     const outcome = makeOutcome({
-      status: 'executor_failed',
-      executor: makeExecutor(
-        'unexpected_pass',
-        'Unexpected pass: test passed on both runs (exit=0).'
-      ),
+      status: 'not_reproduced',
+      candidates: [
+        {
+          candidateId: 'candidate-0',
+          source: 'builder',
+          sampleIndex: 0,
+          status: 'invalid',
+          message: 'oracle rejected',
+          executor: makeExecutor('unexpected_pass', 'Unexpected pass: test passed on both runs (exit=0).'),
+        },
+      ],
     });
 
     const result = classifyAlreadyFixedOnMain(outcome);
@@ -64,9 +68,17 @@ describe('classifyAlreadyFixedOnMain', () => {
 
   test('flags builder run_repro_pass + prober_failed as already fixed', () => {
     const outcome = makeOutcome({
-      status: 'prober_failed',
-      builderRejectStage: 'run_repro_pass',
-      message: 'Builder candidate passed on every run (2/2).',
+      status: 'not_reproduced',
+      candidates: [
+        {
+          candidateId: 'candidate-0',
+          source: 'builder',
+          sampleIndex: 0,
+          status: 'generation_failed',
+          message: 'Builder candidate passed on every run (2/2).',
+          builderRejectStage: 'run_repro_pass',
+        },
+      ],
     });
 
     const result = classifyAlreadyFixedOnMain(outcome);
@@ -77,9 +89,16 @@ describe('classifyAlreadyFixedOnMain', () => {
 
   test('does not flag unrelated prober failure', () => {
     const outcome = makeOutcome({
-      status: 'prober_failed',
-      builderRejectStage: 'schema_invalid',
-      message: 'Prober could not draft a valid recipe.',
+      status: 'not_reproduced',
+      candidates: [
+        {
+          candidateId: 'candidate-1',
+          source: 'prober',
+          sampleIndex: 1,
+          status: 'generation_failed',
+          message: 'Prober could not draft a valid recipe.',
+        },
+      ],
     });
 
     const result = classifyAlreadyFixedOnMain(outcome);

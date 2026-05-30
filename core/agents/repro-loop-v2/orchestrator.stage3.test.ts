@@ -1,0 +1,322 @@
+import { DossierStore, type ReproRecipe } from '../analyst/dossier';
+import { runReproV2 } from './orchestrator';
+import { runAnalyst } from '../analyst/analyst';
+import { runReproBuilder } from './builder';
+import { runReproProber } from './prober';
+import { runDeterministicReproOracle } from './deterministic-oracle';
+import { rankValidReproCandidates } from './advisory-ranker';
+import type { DeterministicExecutorResult } from './executor';
+import type {
+  DeterministicReproOracleCriteria,
+  DeterministicReproOracleResult,
+} from './deterministic-oracle';
+import type { RunAnalystArgs } from '../analyst/analyst';
+import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
+
+jest.mock('../analyst/analyst', () => ({ runAnalyst: jest.fn() }));
+jest.mock('./builder', () => ({ runReproBuilder: jest.fn() }));
+jest.mock('./prober', () => ({ runReproProber: jest.fn() }));
+jest.mock('./deterministic-oracle', () => ({ runDeterministicReproOracle: jest.fn() }));
+jest.mock('./advisory-ranker', () => ({ rankValidReproCandidates: jest.fn() }));
+
+const runAnalystMock = jest.mocked(runAnalyst);
+const runReproBuilderMock = jest.mocked(runReproBuilder);
+const runReproProberMock = jest.mocked(runReproProber);
+const runDeterministicOracleMock = jest.mocked(runDeterministicReproOracle);
+const rankValidReproCandidatesMock = jest.mocked(rankValidReproCandidates);
+
+const issue: IssueHandle = {
+  number: 42,
+  title: 'Repro issue',
+  body: 'body',
+  labels: [],
+  url: 'https://example.test/issue/42',
+};
+
+const repo: RepoHandle = {
+  fullName: 'org/repo',
+  forkFullName: 'fork/repo',
+  branch: 'main',
+  baselineSha: 'abc123',
+  affectedModule: '.',
+  language: 'python',
+};
+
+const workspace: WorkspaceReader & WorkspaceWriter = {
+  readFile: async () => null,
+  listDir: async () => [],
+  grep: async () => [],
+  readDiff: async () => '',
+  gitLog: async () => [],
+  gitBlame: async () => [],
+  changedFiles: async () => [],
+  writeTest: async () => {},
+  applyPatch: async () => ({ patchId: 'patch-1' }),
+  revertFile: async () => {},
+  testRoots: () => ['tests'],
+  affectedModule: () => '.',
+  reproTestPath: () => undefined,
+};
+
+const sandbox: SandboxHandle = {
+  setReproTestPath: () => {},
+  runRepro: async () => ({ exitCode: 1, stdout: '', stderr: '', durationMs: 1 }),
+  runTests: async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }),
+  runPython: async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }),
+  pipInstall: async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }),
+  pythonModuleCheck: async () => ({ importable: true }),
+  listPackages: async () => [],
+};
+
+function makeRecipe(candidateId: string): ReproRecipe {
+  return {
+    version: 1,
+    candidateTestPath: `tests/repro/${candidateId}.py`,
+    testSource: 'def test_repro():\n    assert False, "boom"\n',
+    sentinelString: 'AssertionError',
+    expectedFailureSignature: 'AssertionError',
+    pipInstalls: [],
+    requiresCredentials: [],
+    verbatimSnippetIncompatible: false,
+    approach: 'direct-call',
+    provenance: {
+      exerciseImports: [],
+      preconditionsSatisfied: [],
+      observedProbe: {
+        sentinelObserved: true,
+        signatureObserved: true,
+        exitCode: 1,
+        durationMs: 25,
+        stderrTail: 'AssertionError',
+        stdoutTail: '',
+      },
+      proberAttempts: 1,
+      recordedAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+    },
+  };
+}
+
+function makeExecutor(outcome: DeterministicExecutorResult['outcome'], reason: string): DeterministicExecutorResult {
+  return {
+    outcome,
+    candidateTestPath: 'tests/repro/test_repro.py',
+    sentinelString: 'AssertionError',
+    expectedFailureSignature: 'AssertionError',
+    ranReproCount: 2,
+    lastReproExitCode: outcome === 'unexpected_pass' ? 0 : 1,
+    runs: [],
+    reproducedReliably: outcome === 'reproduced',
+    signatureMatched: true,
+    missingCredentials: [],
+    installFailures: [],
+    reason,
+  };
+}
+
+function makeProberResult(recipe: ReproRecipe) {
+  return {
+    text: '',
+    terminated: 'done' as const,
+    reason: undefined,
+    turns: 1,
+    toolCalls: 1,
+    toolCallsByTier: { read: 0, note: 0, 'write-test': 0, mutation: 0, sandbox: 0, meta: 0 },
+    transcriptSummary: 'done',
+    recipeSnapshot: null,
+    recipe,
+    verbatimIncompatibleHint: false,
+    transcript: [],
+    ranReproCount: 2,
+    lastReproExitCode: 1,
+    verifiedSummary: 'ok',
+  };
+}
+
+function makeOracleResult(args: {
+  verdict: DeterministicReproOracleResult['verdict'];
+  message: string;
+  criteria?: Partial<DeterministicReproOracleCriteria>;
+  executorOutcome?: DeterministicExecutorResult['outcome'];
+  credentials?: string[];
+}): DeterministicReproOracleResult {
+  const criteria: DeterministicReproOracleCriteria = {
+    baseline_head_fails: true,
+    reliable_failures: true,
+    suspect_path_assertions: true,
+    precondition_assertions: true,
+    ast_preflight: true,
+    ...args.criteria,
+  };
+  const credentials = args.credentials ?? [];
+  return {
+    verdict: args.verdict,
+    criteria,
+    message: args.message,
+    executor: makeExecutor(args.executorOutcome ?? 'reproduced', args.message),
+    suspectPathAssertionResult: {
+      passed: criteria.suspect_path_assertions,
+      missing: [],
+    },
+    preconditionAssertionResult: {
+      passed: criteria.precondition_assertions,
+      missingMarkers: [],
+    },
+    astReason: criteria.ast_preflight ? null : 'AST preflight failed',
+    credentialsTerminal:
+      args.verdict === 'credentials_required'
+        ? {
+            inferredEnvVars: credentials,
+            matchedPattern: 'mock-pattern',
+            stderrTail: 'missing credentials',
+          }
+        : null,
+  };
+}
+
+beforeEach(() => {
+  jest.resetAllMocks();
+  runAnalystMock.mockImplementation(async (args: RunAnalystArgs) => {
+    const snapshot = args.dossier.append({
+      issueNumber: args.issue.number,
+      attemptId: args.attemptId,
+      evidence: [
+        {
+          id: 'e1',
+          kind: 'file_excerpt',
+          source: 'src/module.py',
+          summary: 'suspect summary',
+          recordedAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+        },
+      ],
+      suspectSymbols: [{ file: 'src/module.py', symbol: 'broken_symbol', reasoning: 'Issue stacktrace points here' }],
+      preconditions: [],
+      openQuestions: [],
+      summary: 'seed dossier',
+      confidence: 'medium',
+      oracleSpec: {
+        suspect_path_assertions: [{ kind: 'symbol', needle: 'broken_symbol', file: 'src/module.py' }],
+        precondition_assertions: [],
+      },
+    });
+    return {
+      snapshot,
+      terminated: 'done',
+      toolCalls: 1,
+      transcriptSummary: 'ok',
+    };
+  });
+});
+
+describe('runReproV2 stage3 orchestration', () => {
+  test('defaults to builder + 3 prober samples and returns not_reproduced when none pass oracle', async () => {
+    runReproBuilderMock.mockResolvedValue({
+      ok: false,
+      rejectStage: 'no_candidate',
+      reason: 'No candidate',
+      runs: [],
+    });
+    runReproProberMock.mockImplementation(async ({ forcedCandidateTestPath }) =>
+      makeProberResult(makeRecipe(forcedCandidateTestPath ?? 'fallback'))
+    );
+    runDeterministicOracleMock.mockResolvedValue(
+      makeOracleResult({
+        verdict: 'invalid',
+        criteria: { suspect_path_assertions: false },
+        message: 'suspect assertions failed',
+      })
+    );
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-default',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+    });
+
+    expect(runReproProberMock).toHaveBeenCalledTimes(3);
+    expect(runDeterministicOracleMock).toHaveBeenCalledTimes(3);
+    expect(rankValidReproCandidatesMock).not.toHaveBeenCalled();
+    expect(outcome.status).toBe('not_reproduced');
+    expect(outcome.candidates).toHaveLength(4);
+  });
+
+  test('ranks only valid candidates and selects ranked winner', async () => {
+    runReproBuilderMock.mockResolvedValue({
+      ok: true,
+      recipe: makeRecipe('builder'),
+      reason: 'Builder produced candidate',
+      runs: [],
+    });
+    runReproProberMock.mockImplementation(async ({ forcedCandidateTestPath }) =>
+      makeProberResult(makeRecipe(forcedCandidateTestPath ?? 'fallback'))
+    );
+    runDeterministicOracleMock.mockImplementation(async ({ recipe }) => {
+      const isSample2 = recipe.candidateTestPath.includes('_candidate_2.py');
+      const isBuilder = recipe.candidateTestPath.includes('builder');
+      if (isBuilder || isSample2) {
+        return makeOracleResult({
+          verdict: 'valid',
+          message: 'valid candidate',
+        });
+      }
+      return makeOracleResult({
+        verdict: 'invalid',
+        criteria: { suspect_path_assertions: false },
+        message: 'invalid candidate',
+      });
+    });
+    rankValidReproCandidatesMock.mockResolvedValue({
+      selectedCandidateId: 'candidate-2',
+      reason: 'simpler test body',
+      transcript: 'selected candidate-2',
+    });
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-ranking',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      proberSampleCount: 2,
+    });
+
+    expect(rankValidReproCandidatesMock).toHaveBeenCalledTimes(1);
+    const rankedCandidateIds = rankValidReproCandidatesMock.mock.calls[0]![0].candidates.map(
+      (candidate) => candidate.candidateId
+    );
+    expect(rankedCandidateIds).toEqual(['candidate-0', 'candidate-2']);
+    expect(outcome.status).toBe('reproduced');
+    expect(outcome.selectedCandidateId).toBe('candidate-2');
+  });
+
+  test('returns credentials_required when no valid candidate exists but credentials are required', async () => {
+    runReproBuilderMock.mockResolvedValue({
+      ok: false,
+      rejectStage: 'sandbox_error',
+      reason: 'Required credentials not set: OPENAI_API_KEY',
+      runs: [],
+      missingCredentials: ['OPENAI_API_KEY'],
+    });
+    runReproProberMock.mockResolvedValue(makeProberResult(makeRecipe('candidate-prober')));
+    runDeterministicOracleMock.mockResolvedValue(
+      makeOracleResult({
+        verdict: 'invalid',
+        criteria: { suspect_path_assertions: false },
+        message: 'invalid candidate',
+      })
+    );
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-creds',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      proberSampleCount: 1,
+    });
+
+    expect(outcome.status).toBe('credentials_required');
+    expect(outcome.credentialsTerminal?.inferredEnvVars).toContain('OPENAI_API_KEY');
+  });
+});

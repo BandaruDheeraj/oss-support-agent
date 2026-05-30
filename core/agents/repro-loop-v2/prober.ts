@@ -180,6 +180,13 @@ export interface RunReproProberArgs {
   issueSnippets?: IssueCodeSnippet[];
   /** Issue body prose; used by the heavy-framework heuristic. */
   issueBody?: string;
+  /** Optional sampling temperature override for this prober run. */
+  temperature?: number;
+  /**
+   * Optional forced candidate test path. When provided, the Prober must write
+   * and execute exactly this path.
+   */
+  forcedCandidateTestPath?: string;
 }
 
 export interface ReproProberResult extends AgentLoopResult {
@@ -250,8 +257,11 @@ export async function runReproProber(args: RunReproProberArgs): Promise<ReproPro
   const forcedHintBlock = verbatimIncompatibleHint
     ? `[FORCED] heavy-framework signal: verbatim path is incompatible. Pivot to a direct-call exercise of the underlying primitive. Set reproRecipe.verbatimSnippetIncompatible=true.`
     : null;
+  const forcedPathBlock = args.forcedCandidateTestPath
+    ? `[FORCED] candidate test path: write and execute the repro test at "${args.forcedCandidateTestPath}". Reuse this exact path for write_test/revise_test and reproRecipe.candidateTestPath.`
+    : null;
 
-  const hintsParts = [forcedHintBlock, suspectsBlock, snippetBlock, editableBlock, preconditionsBlock].filter(
+  const hintsParts = [forcedHintBlock, forcedPathBlock, suspectsBlock, snippetBlock, editableBlock, preconditionsBlock].filter(
     (s): s is string => Boolean(s),
   );
   const hintsSection = hintsParts.length > 0 ? `\n\n${hintsParts.join('\n\n')}` : '';
@@ -273,6 +283,7 @@ export async function runReproProber(args: RunReproProberArgs): Promise<ReproPro
       attemptId: args.attemptId,
       issueNumber: args.issue.number,
       dossierSnapshotId: snapshotIdBeforeProber,
+      temperature: args.temperature,
     });
 
   const loop = await runLoop(userPrompt);

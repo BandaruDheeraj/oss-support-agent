@@ -29,6 +29,8 @@ export interface RunAgentLoopArgs {
   dossierSnapshotId?: string;
   /** Override the model id (defaults to env-based selection). */
   modelOverride?: string;
+  /** Optional sampling temperature override for this loop. */
+  temperature?: number;
 }
 
 export interface AgentLoopResult {
@@ -206,6 +208,9 @@ async function runAgentLoopOnce(args: RunAgentLoopArgs, route: ModelRoute): Prom
           toolChoice: 'auto',
           maxSteps: args.registry.maxTurns(),
           maxTokens: Number(process.env.AGENT_LOOP_MAX_TOKENS ?? 16000),
+          ...(typeof args.temperature === 'number'
+            ? { temperature: args.temperature }
+            : {}),
           experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
           onStepFinish: (step) => {
             totalTurns += 1;

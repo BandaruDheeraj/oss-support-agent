@@ -1,14 +1,16 @@
 /**
- * Repro orchestrator: Analyst → Builder/Prober → Deterministic Repro Oracle.
+ * Repro orchestrator: Analyst → Builder + best-of-N Prober sampling →
+ * Deterministic Repro Oracle.
  *
- * No LLM gate can halt this stage after candidate generation. Candidate
- * validity is decided only by deterministic oracle criteria.
+ * One authoritative deterministic gate decides candidate validity. LLMs are
+ * only advisory rankers over already-valid candidates.
  */
 
 import { runAnalyst } from '../analyst/analyst';
-import { DossierStore, buildReproOracleSpec, type ReproRecipe } from '../analyst/dossier';
+import { DossierStore, buildReproOracleSpec, type DossierSnapshot, type ReproRecipe } from '../analyst/dossier';
 import { runReproProber, type ReproProberResult } from './prober';
 import { runReproBuilder, type ReproBuilderResult, type BuilderRejectStage } from './builder';
+import { rankValidReproCandidates, type ReproAdvisoryRankResult } from './advisory-ranker';
 import type { DeterministicExecutorResult } from './executor';
 import type { ReproVerdict } from './critic';
 import {
@@ -19,6 +21,14 @@ import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, Workspace
 import { detectCredentialError } from '../../credentials-check';
 import type { IssueCodeSnippet } from './repro-hints';
 import { deriveEditableInstallsFromSuspectPaths, mergeEditableInstallCandidates } from './repro-hints';
+
+const DEFAULT_PROBER_SAMPLE_COUNT = 3;
+const DEFAULT_PROBER_TEMPERATURE = 0.7;
+const PROBER_SAMPLE_COUNT_ENV = 'OSA_REPRO_PROBER_SAMPLES';
+const PROBER_TEMPERATURE_ENV = 'OSA_REPRO_PROBER_TEMPERATURE';
+
+type CandidateSource = 'builder' | 'prober';
+type CandidateStatus = 'generation_failed' | 'invalid' | 'valid' | 'credentials_required';
 
 export interface RunReproV2Args {
   attemptId: string;
@@ -55,27 +65,45 @@ export interface RunReproV2Args {
    * nearest package manifest, prioritising those over the initial BFS list.
    */
   workspaceDir?: string;
+  /** Number of Prober samples to run in parallel. */
+  proberSampleCount?: number;
+  /** Sampling temperature for Prober best-of-N generation. */
+  proberTemperature?: number;
+}
+
+export interface ReproCandidateEvaluation {
+  candidateId: string;
+  source: CandidateSource;
+  sampleIndex: number;
+  status: CandidateStatus;
+  message: string;
+  recipe?: ReproRecipe;
+  plan?: {
+    candidateTestPath: string;
+    sentinelString: string;
+    expectedFailureSignature: string;
+    approach: string;
+  };
+  prober?: ReproProberResult;
+  builder?: ReproBuilderResult;
+  builderRejectStage?: BuilderRejectStage;
+  executor?: DeterministicExecutorResult;
+  oracle?: DeterministicReproOracleResult;
+  credentialsTerminal?: {
+    inferredEnvVars: string[];
+    matchedPattern: string | null;
+    stderrTail?: string;
+  };
 }
 
 export interface ReproV2Outcome {
-  status:
-    | 'reproduced'
-    | 'critic_rejected'
-    | 'executor_failed'
-    | 'prober_failed'
-    | 'analyst_failed'
-    | 'preflight_failed'
-    | 'credentials_required';
+  status: 'reproduced' | 'credentials_required' | 'not_reproduced';
   dossier: DossierStore;
-  /** The recipe authored by the Prober (when produced). */
+  /** The recipe authored by the selected candidate (when reproduced). */
   recipe?: ReproRecipe;
   /**
    * Back-compat alias: callers (PR builders, run-v2 driver) read
    * `outcome.plan?.candidateTestPath` / `.sentinelString` / `.approach`.
-   * The recipe carries all three, so we project a thin plan-shaped view
-   * to keep those readers working without a sprawling rewrite.
-   *
-   * NOTE: This is a read-only projection. New code should read `recipe`.
    */
   plan?: {
     candidateTestPath: string;
@@ -87,14 +115,16 @@ export interface ReproV2Outcome {
   /** Populated when the Builder ran (success or reject). */
   builder?: ReproBuilderResult;
   /**
-   * Granular Builder stage when the Builder rejected and we fell through to
-   * the Prober (or terminated for credentials). null when the Builder built
-   * the recipe.
+   * Granular Builder stage when the Builder rejected. null when the Builder
+   * built the recipe.
    */
   builderRejectStage?: BuilderRejectStage;
   executor?: DeterministicExecutorResult;
   criticVerdict?: ReproVerdict;
   oracle?: DeterministicReproOracleResult;
+  advisoryRanker?: ReproAdvisoryRankResult;
+  selectedCandidateId?: string;
+  candidates: ReproCandidateEvaluation[];
   /**
    * Populated when status === 'credentials_required'. Either lifted from
    * the recipe's `requiresCredentials` (static check before Executor) or
@@ -109,8 +139,19 @@ export interface ReproV2Outcome {
   message: string;
 }
 
+interface ValidCandidate extends ReproCandidateEvaluation {
+  status: 'valid';
+  recipe: ReproRecipe;
+  executor: DeterministicExecutorResult;
+  oracle: DeterministicReproOracleResult;
+}
+
+type AsyncLock = <T>(task: () => Promise<T>) => Promise<T>;
+
 export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> {
   const dossier = args.dossier ?? new DossierStore();
+  const runtimeEnv = args.env ?? process.env;
+  const candidates: ReproCandidateEvaluation[] = [];
 
   // Stage A: Analyst (skipped if dossier was passed in)
   if (!args.dossier || !dossier.latest()) {
@@ -125,8 +166,9 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     });
     if (!analyst.snapshot) {
       return {
-        status: 'analyst_failed',
+        status: 'not_reproduced',
         dossier,
+        candidates,
         message: `Analyst terminated without producing a dossier (${analyst.terminated}${analyst.reason ? `: ${analyst.reason}` : ''})`,
       };
     }
@@ -180,19 +222,16 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       }`
   );
 
-  // Stage B0: Deterministic Builder.
-  //
-  // If the Analyst supplied a `candidateRepro`, try to author the recipe
-  // without an LLM. Outcomes:
-  //   - success → skip Prober, drop the recipe in the dossier, continue
-  //     straight to Stage C (Executor).
-  //   - credentials missing → short-circuit with credentials_required
-  //     (consistent with the post-Executor credentials_required path).
-  //   - any other reject (or no candidate at all) → fall through to Prober
-  //     with a brief primer so the LLM doesn't re-make the same mistake.
+  const proberSampleCount = resolveProberSampleCount(args.proberSampleCount, runtimeEnv);
+  const proberTemperature = resolveProberTemperature(args.proberTemperature, runtimeEnv);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-orchestrator] attempt=${args.attemptId} prober_samples=${proberSampleCount} prober_temperature=${proberTemperature}`
+  );
+
+  // Stage B0: Deterministic Builder as candidate 0.
   let builder: ReproBuilderResult | undefined;
   let builderRejectStage: BuilderRejectStage | undefined;
-  let builderRecipe: ReproRecipe | undefined;
   try {
     builder = await runReproBuilder({
       attemptId: args.attemptId,
@@ -200,239 +239,407 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       repo: args.repo,
       workspace: args.workspace,
       sandbox: args.sandbox,
-      env: args.env,
+      env: runtimeEnv,
     });
   } catch (err) {
-    // Builder is meant to be defensive; an unexpected throw should not
-    // tank the orchestrator. Log + fall through to Prober.
+    // Builder is defensive; an unexpected throw should not tank the orchestrator.
     // eslint-disable-next-line no-console
     console.log(
       `[v2-orchestrator] attempt=${args.attemptId} builder_threw=${err instanceof Error ? err.message : String(err)}`
     );
   }
-  if (builder?.ok && builder.recipe) {
-    builderRecipe = builder.recipe;
-    // Persist the Builder-authored recipe onto the dossier so the rest of
-    // the pipeline (Executor, Critic) treats it identically to a
-    // Prober-authored recipe.
-    dossier.append({
-      issueNumber: args.issue.number,
-      attemptId: args.attemptId,
-      evidence: snapshot.body.evidence,
-      suspectSymbols: snapshot.body.suspectSymbols,
-      preconditions: snapshot.body.preconditions,
-      ...(snapshot.body.oracleSpec ? { oracleSpec: snapshot.body.oracleSpec } : {}),
-      openQuestions: snapshot.body.openQuestions,
-      summary: snapshot.body.summary,
-      confidence: snapshot.body.confidence,
-      reproRecipe: builderRecipe,
-      ...(snapshot.body.candidateRepro ? { candidateRepro: snapshot.body.candidateRepro } : {}),
-    });
-    // eslint-disable-next-line no-console
-    console.log(`[v2-orchestrator] attempt=${args.attemptId} builder_built_recipe=true skipped_prober=true`);
-  } else if (builder && !builder.ok) {
-    builderRejectStage = builder.rejectStage;
-    if (builder.missingCredentials && builder.missingCredentials.length > 0) {
-      return {
-        status: 'credentials_required',
-        dossier,
-        builder,
-        builderRejectStage,
-        credentialsTerminal: {
-          inferredEnvVars: builder.missingCredentials,
-          matchedPattern: 'builder:requiresCredentials',
-        },
-        message: `Builder halted on missing credentials: ${builder.missingCredentials.join(', ')}`,
-      };
-    }
-    // eslint-disable-next-line no-console
-    console.log(
-      `[v2-orchestrator] attempt=${args.attemptId} builder_rejected stage=${builderRejectStage} falling_through_to_prober=true`
-    );
-  } else {
-    // eslint-disable-next-line no-console
-    console.log(`[v2-orchestrator] attempt=${args.attemptId} builder_no_candidate=true falling_through_to_prober=true`);
-  }
+  const builderCandidate = buildBuilderCandidate({
+    builder,
+    attemptId: args.attemptId,
+    runtimeEnv,
+  });
+  builderRejectStage = builderCandidate.builderRejectStage;
+  candidates.push(builderCandidate);
 
-  // Stage B: Prober — draft and probe-verify a recipe.
-  //
-  // Skipped when the Builder produced a recipe. The Prober's output is
-  // null in that case and downstream stages read `builderRecipe`.
-  let prober: ReproProberResult | undefined;
-  if (!builderRecipe) {
-  try {
-    prober = await runReproProber({
-      attemptId: args.attemptId,
-      dossier,
-      dossierSnapshot: snapshot,
-      issue: args.issue,
-      repo: args.repo,
+  // Stage B1: K Prober samples at temperature in parallel.
+  const lock = createAsyncLock();
+  const proberRuns = Array.from({ length: proberSampleCount }, (_, idx) => {
+    const sampleIndex = idx + 1;
+    return runProberSample({
+      args,
+      snapshot,
+      sampleIndex,
+      temperature: proberTemperature,
+      editableInstallCandidates: effectiveEditableInstalls,
+      runtimeEnv,
+      sandbox: createSerializedSandboxView(args.sandbox, lock),
+    });
+  });
+  const proberCandidates = await Promise.all(proberRuns);
+  candidates.push(...proberCandidates);
+
+  // Stage C: deterministic oracle over every candidate with a recipe.
+  for (const candidate of candidates) {
+    if (!candidate.recipe) continue;
+    const oracle = await runDeterministicReproOracle({
+      attemptId: `${args.attemptId}:${candidate.candidateId}`,
+      recipe: candidate.recipe,
+      oracleSpec,
+      suspectSymbols: snapshot.body.suspectSymbols,
+      repoLanguage: args.repo.language,
       workspace: args.workspace,
       sandbox: args.sandbox,
-      editableInstallCandidates: effectiveEditableInstalls,
-      issueSnippets: args.issueSnippets,
-      issueBody: args.issueBody,
+      editableInstallFallbacks: effectiveEditableInstalls,
+      env: runtimeEnv,
+    });
+    candidate.executor = oracle.executor;
+    candidate.oracle = oracle;
+    candidate.message = oracle.message;
+
+    if (oracle.verdict === 'valid') {
+      candidate.status = 'valid';
+      continue;
+    }
+
+    if (oracle.verdict === 'credentials_required' && oracle.credentialsTerminal) {
+      candidate.status = 'credentials_required';
+      candidate.credentialsTerminal = oracle.credentialsTerminal;
+      candidate.message = `Oracle detected missing credentials: ${oracle.credentialsTerminal.inferredEnvVars.join(', ')}`;
+      continue;
+    }
+
+    candidate.status = 'invalid';
+    if (candidate.prober) {
+      // Keep transcript-based credential detection unchanged.
+      const credResult = detectCredentialsFromTranscript(candidate.prober.transcript, runtimeEnv);
+      if (credResult) {
+        candidate.status = 'credentials_required';
+        candidate.credentialsTerminal = credResult;
+        candidate.message = `Prober transcript indicates missing credentials: ${credResult.inferredEnvVars.join(', ')}`;
+      }
+    }
+  }
+
+  const validCandidates = candidates.filter(isValidCandidate);
+  if (validCandidates.length > 0) {
+    let selected = validCandidates[0];
+    let advisoryRanker: ReproAdvisoryRankResult | undefined;
+    if (validCandidates.length > 1) {
+      const rankResult = await rankValidReproCandidates({
+        attemptId: args.attemptId,
+        issue: args.issue,
+        candidates: validCandidates.map((candidate) => ({
+          candidateId: candidate.candidateId,
+          source: candidate.source,
+          sampleIndex: candidate.sampleIndex,
+          recipe: candidate.recipe,
+          oracle: candidate.oracle,
+        })),
+      });
+      advisoryRanker = rankResult;
+      const ranked = validCandidates.find((candidate) => candidate.candidateId === rankResult.selectedCandidateId);
+      if (ranked) {
+        selected = ranked;
+      }
+    }
+
+    if (selected.source === 'prober') {
+      appendRecipeSnapshot({
+        dossier,
+        baseSnapshot: snapshot,
+        issueNumber: args.issue.number,
+        attemptId: args.attemptId,
+        recipe: selected.recipe,
+      });
+    }
+
+    return {
+      status: 'reproduced',
+      dossier,
+      recipe: selected.recipe,
+      plan: selected.plan,
+      ...(selected.prober ? { prober: selected.prober } : {}),
+      ...(builder ? { builder } : {}),
+      ...(builderRejectStage ? { builderRejectStage } : {}),
+      executor: selected.executor,
+      oracle: selected.oracle,
+      ...(advisoryRanker ? { advisoryRanker } : {}),
+      selectedCandidateId: selected.candidateId,
+      candidates,
+      message:
+        validCandidates.length > 1 && advisoryRanker
+          ? `Repro reproduced reliably. Selected ${selected.candidateId} via advisory ranker: ${advisoryRanker.reason}`
+          : `Repro reproduced reliably with ${selected.candidateId}.`,
+    };
+  }
+
+  const credentialCandidate = candidates.find((candidate) => candidate.status === 'credentials_required');
+  if (credentialCandidate?.credentialsTerminal) {
+    return {
+      status: 'credentials_required',
+      dossier,
+      ...(credentialCandidate.recipe ? { recipe: credentialCandidate.recipe } : {}),
+      ...(credentialCandidate.plan ? { plan: credentialCandidate.plan } : {}),
+      ...(credentialCandidate.prober ? { prober: credentialCandidate.prober } : {}),
+      ...(builder ? { builder } : {}),
+      ...(builderRejectStage ? { builderRejectStage } : {}),
+      ...(credentialCandidate.executor ? { executor: credentialCandidate.executor } : {}),
+      ...(credentialCandidate.oracle ? { oracle: credentialCandidate.oracle } : {}),
+      credentialsTerminal: credentialCandidate.credentialsTerminal,
+      selectedCandidateId: credentialCandidate.candidateId,
+      candidates,
+      message: `Repro halted on missing credentials (${credentialCandidate.credentialsTerminal.matchedPattern ?? 'unknown pattern'}): ${credentialCandidate.credentialsTerminal.inferredEnvVars.join(', ')}`,
+    };
+  }
+
+  return {
+    status: 'not_reproduced',
+    dossier,
+    ...(builder ? { builder } : {}),
+    ...(builderRejectStage ? { builderRejectStage } : {}),
+    candidates,
+    message: `Deterministic repro oracle rejected all ${candidates.length} candidates.`,
+  };
+}
+
+function buildBuilderCandidate(args: {
+  builder: ReproBuilderResult | undefined;
+  attemptId: string;
+  runtimeEnv: NodeJS.ProcessEnv;
+}): ReproCandidateEvaluation {
+  const builder = args.builder;
+  const candidateId = 'candidate-0';
+  if (!builder) {
+    return {
+      candidateId,
+      source: 'builder',
+      sampleIndex: 0,
+      status: 'generation_failed',
+      message: 'Builder did not produce a candidate recipe.',
+    };
+  }
+
+  if (builder.ok && builder.recipe) {
+    return {
+      candidateId,
+      source: 'builder',
+      sampleIndex: 0,
+      status: 'generation_failed',
+      message: 'Builder produced candidate recipe.',
+      recipe: builder.recipe,
+      plan: toPlanProjection(builder.recipe),
+      builder,
+    };
+  }
+
+  const builderRejectStage = builder.rejectStage;
+  if (builder.missingCredentials && builder.missingCredentials.length > 0) {
+    return {
+      candidateId,
+      source: 'builder',
+      sampleIndex: 0,
+      status: 'credentials_required',
+      message: `Builder candidate requires credentials: ${builder.missingCredentials.join(', ')}`,
+      builder,
+      builderRejectStage,
+      credentialsTerminal: {
+        inferredEnvVars: builder.missingCredentials.filter((name) => !args.runtimeEnv[name] || args.runtimeEnv[name]?.length === 0),
+        matchedPattern: 'builder:requiresCredentials',
+      },
+    };
+  }
+
+  return {
+    candidateId,
+    source: 'builder',
+    sampleIndex: 0,
+    status: 'generation_failed',
+    message: `Builder rejected candidate at stage ${builderRejectStage}.`,
+    builder,
+    builderRejectStage,
+  };
+}
+
+async function runProberSample(args: {
+  args: RunReproV2Args;
+  snapshot: DossierSnapshot;
+  sampleIndex: number;
+  temperature: number;
+  editableInstallCandidates: string[];
+  runtimeEnv: NodeJS.ProcessEnv;
+  sandbox: SandboxHandle;
+}): Promise<ReproCandidateEvaluation> {
+  const candidateId = `candidate-${args.sampleIndex}`;
+  const forcedPath = buildProberCandidatePath(args.args.issue.number, args.sampleIndex);
+  const sampleAttemptId = `${args.args.attemptId}:prober:${args.sampleIndex}`;
+  const sampleDossier = cloneDossier(args.snapshot);
+  const sampleSnapshot = sampleDossier.latest()!;
+
+  let prober: ReproProberResult;
+  try {
+    prober = await runReproProber({
+      attemptId: sampleAttemptId,
+      dossier: sampleDossier,
+      dossierSnapshot: sampleSnapshot,
+      issue: args.args.issue,
+      repo: args.args.repo,
+      workspace: args.args.workspace,
+      sandbox: args.sandbox,
+      editableInstallCandidates: args.editableInstallCandidates,
+      issueSnippets: args.args.issueSnippets,
+      issueBody: args.args.issueBody,
+      temperature: args.temperature,
+      forcedCandidateTestPath: forcedPath,
     });
   } catch (err) {
     return {
-      status: 'prober_failed',
-      dossier,
-      ...(builder ? { builder } : {}),
-      ...(builderRejectStage ? { builderRejectStage } : {}),
-      message: err instanceof Error ? err.message : String(err),
+      candidateId,
+      source: 'prober',
+      sampleIndex: args.sampleIndex,
+      status: 'generation_failed',
+      message: `Prober sample failed to run: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
-  }
 
-  // Decide which recipe to run: Builder-authored or Prober-authored.
-  let recipe: ReproRecipe;
-  if (builderRecipe) {
-    recipe = builderRecipe;
-  } else {
-    // Two failure paths for the Prober-authored branch:
-    //   (a) no recipe at all (never called record_evidence), OR
-    //   (b) recipe exists but Prober didn't terminate via `done` — meaning
-    //       the registry's done-gate never approved it. `terminated === 'done'`
-    //       is the *only* signal that proves the recipe self-verified (≥2 failing
-    //       run_repro since last write + sentinel match). Any other termination
-    //       (abandon / max_turns / error / finished) means the recipe is
-    //       unverified and almost guaranteed to fail in the deterministic
-    //       Executor — surface a structured failure with the verified-state
-    //       ledger so the operator sees what was actually established.
-    const proberAuthoritative = prober?.terminated === 'done' && !!prober.recipe;
-    if (!prober || !proberAuthoritative) {
-      // Credential detection takes precedence — a missing-creds failure is
-      // actionable and shouldn't be masked by a generic "prober didn't finish"
-      // message. Check transcript patterns first.
-      const credResult = prober
-        ? detectCredentialsFromTranscript(prober.transcript, args.env ?? process.env)
-        : null;
-      if (credResult) {
-        return {
-          status: 'credentials_required',
-          dossier,
-          prober,
-          ...(builder ? { builder } : {}),
-          ...(builderRejectStage ? { builderRejectStage } : {}),
-          credentialsTerminal: credResult,
-          message: `Repro halted on missing credentials (${credResult.matchedPattern ?? 'unknown pattern'}): ${credResult.inferredEnvVars.join(', ')}`,
-        };
-      }
-      // Build a precise failure message that distinguishes "no recipe" from
-      // "recipe exists but Prober didn't approve it via done". The latter
-      // includes the verified-state ledger so the operator sees why.
-      let message: string;
-      if (!prober) {
-        message = `Builder rejected (${builderRejectStage}) and Prober was skipped`;
-      } else if (!prober.recipe) {
-        message = `Repro Prober terminated without producing a recipe (${prober.terminated}${prober.reason ? `: ${prober.reason}` : ''})`;
-      } else {
-        // recipe exists but terminated !== 'done' — most common: abandon.
-        message =
-          `Repro Prober produced a recipe but did not self-verify it ` +
-          `(terminated=${prober.terminated}${prober.reason ? `, reason="${prober.reason}"` : ''}). ` +
-          `verifiedState=[${prober.verifiedSummary}]. ` +
-          `The done-gate requires ≥2 failing run_repro since last write with the recipe's sentinel observed — ` +
-          `running an unverified recipe through the deterministic Executor would predictably fail.`;
-      }
+  const proberAuthoritative = prober.terminated === 'done' && !!prober.recipe;
+  if (!proberAuthoritative) {
+    const credResult = detectCredentialsFromTranscript(prober.transcript, args.runtimeEnv);
+    if (credResult) {
       return {
-        status: 'prober_failed',
-        dossier,
-        ...(prober ? { prober } : {}),
-        ...(builder ? { builder } : {}),
-        ...(builderRejectStage ? { builderRejectStage } : {}),
-        message,
+        candidateId,
+        source: 'prober',
+        sampleIndex: args.sampleIndex,
+        status: 'credentials_required',
+        message: `Prober sample requires credentials: ${credResult.inferredEnvVars.join(', ')}`,
+        prober,
+        credentialsTerminal: credResult,
       };
     }
-    // Past the gate: prober exists, terminated='done', recipe is non-null.
-    recipe = prober.recipe as ReproRecipe;
+    if (!prober.recipe) {
+      return {
+        candidateId,
+        source: 'prober',
+        sampleIndex: args.sampleIndex,
+        status: 'generation_failed',
+        message: `Prober sample terminated without recipe (${prober.terminated}${prober.reason ? `: ${prober.reason}` : ''})`,
+        prober,
+      };
+    }
+    return {
+      candidateId,
+      source: 'prober',
+      sampleIndex: args.sampleIndex,
+      status: 'generation_failed',
+      message:
+        `Prober sample produced a recipe but did not self-verify it ` +
+        `(terminated=${prober.terminated}${prober.reason ? `, reason="${prober.reason}"` : ''}). ` +
+        `verifiedState=[${prober.verifiedSummary}].`,
+      recipe: prober.recipe,
+      plan: toPlanProjection(prober.recipe),
+      prober,
+    };
   }
 
-  const planProjection = {
+  const recipe = prober.recipe as ReproRecipe;
+  return {
+    candidateId,
+    source: 'prober',
+    sampleIndex: args.sampleIndex,
+    status: 'generation_failed',
+    message: 'Prober sample produced candidate recipe.',
+    recipe,
+    plan: toPlanProjection(recipe),
+    prober,
+  };
+}
+
+function toPlanProjection(recipe: ReproRecipe): ReproV2Outcome['plan'] {
+  return {
     candidateTestPath: recipe.candidateTestPath,
     sentinelString: recipe.sentinelString,
     expectedFailureSignature: recipe.expectedFailureSignature ?? '',
     approach: recipe.approach ?? '',
   };
+}
 
-  // Stage C: deterministic repro oracle (single authoritative gate).
-  const oracle = await runDeterministicReproOracle({
+function isValidCandidate(candidate: ReproCandidateEvaluation): candidate is ValidCandidate {
+  return (
+    candidate.status === 'valid' &&
+    !!candidate.recipe &&
+    !!candidate.oracle &&
+    !!candidate.executor
+  );
+}
+
+function buildProberCandidatePath(issueNumber: number, sampleIndex: number): string {
+  return `tests/repro/test_issue_${issueNumber}_candidate_${sampleIndex}.py`;
+}
+
+function cloneDossier(snapshot: DossierSnapshot): DossierStore {
+  const cloned = new DossierStore();
+  cloned.append({ ...snapshot.body });
+  return cloned;
+}
+
+function appendRecipeSnapshot(args: {
+  dossier: DossierStore;
+  baseSnapshot: DossierSnapshot;
+  issueNumber: number;
+  attemptId: string;
+  recipe: ReproRecipe;
+}): void {
+  args.dossier.append({
+    ...args.baseSnapshot.body,
+    issueNumber: args.issueNumber,
     attemptId: args.attemptId,
-    recipe,
-    oracleSpec,
-    suspectSymbols: snapshot.body.suspectSymbols,
-    repoLanguage: args.repo.language,
-    workspace: args.workspace,
-    sandbox: args.sandbox,
-    editableInstallFallbacks: effectiveEditableInstalls,
-    env: args.env,
+    reproRecipe: args.recipe,
   });
-  const executor = oracle.executor;
+}
 
-  if (oracle.verdict === 'credentials_required' && oracle.credentialsTerminal) {
-    return {
-      status: 'credentials_required',
-      dossier,
-      recipe,
-      plan: planProjection,
-      ...(prober ? { prober } : {}),
-      ...(builder ? { builder } : {}),
-      ...(builderRejectStage ? { builderRejectStage } : {}),
-      executor,
-      oracle,
-      credentialsTerminal: oracle.credentialsTerminal,
-      message: `Repro halted on missing credentials (${oracle.credentialsTerminal.matchedPattern ?? 'unknown pattern'}): ${oracle.credentialsTerminal.inferredEnvVars.join(', ')}`,
-    };
-  }
-
-  if (oracle.verdict !== 'valid') {
-    // Keep transcript-based credential detection unchanged.
-    const credResult = prober
-      ? detectCredentialsFromTranscript(prober.transcript, args.env ?? process.env)
-      : null;
-    if (credResult) {
-      return {
-        status: 'credentials_required',
-        dossier,
-        recipe,
-        plan: planProjection,
-        ...(prober ? { prober } : {}),
-        ...(builder ? { builder } : {}),
-        ...(builderRejectStage ? { builderRejectStage } : {}),
-        executor,
-        oracle,
-        credentialsTerminal: credResult,
-        message: `Repro halted on missing credentials (${credResult.matchedPattern ?? 'unknown pattern'}): ${credResult.inferredEnvVars.join(', ')}`,
-      };
-    }
-    return {
-      status: 'executor_failed',
-      dossier,
-      recipe,
-      plan: planProjection,
-      ...(prober ? { prober } : {}),
-      ...(builder ? { builder } : {}),
-      ...(builderRejectStage ? { builderRejectStage } : {}),
-      executor,
-      oracle,
-      message: oracle.message,
-    };
-  }
-
-  return {
-    status: 'reproduced',
-    dossier,
-    recipe,
-    plan: planProjection,
-    ...(prober ? { prober } : {}),
-    ...(builder ? { builder } : {}),
-    ...(builderRejectStage ? { builderRejectStage } : {}),
-    executor,
-    oracle,
-    message: builderRecipe
-      ? 'Repro reproduced reliably (Builder-authored) and passed deterministic oracle.'
-      : 'Repro reproduced reliably and passed deterministic oracle.',
+function createAsyncLock(): AsyncLock {
+  let queue = Promise.resolve();
+  return async function withLock<T>(task: () => Promise<T>): Promise<T> {
+    const run = queue.then(task, task);
+    queue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
   };
+}
+
+function createSerializedSandboxView(base: SandboxHandle, lock: AsyncLock): SandboxHandle {
+  let reproTestPath: string | undefined;
+  return {
+    runPython: (snippet, env) => lock(() => base.runPython(snippet, env)),
+    pipInstall: (spec) => lock(() => base.pipInstall(spec)),
+    runRepro: () =>
+      lock(async () => {
+        if (reproTestPath) {
+          base.setReproTestPath(reproTestPath);
+        }
+        return base.runRepro();
+      }),
+    runTests: (command) => lock(() => base.runTests(command)),
+    pythonModuleCheck: (name) => lock(() => base.pythonModuleCheck(name)),
+    listPackages: () => lock(() => base.listPackages()),
+    setReproTestPath: (path) => {
+      reproTestPath = path;
+    },
+  };
+}
+
+function resolveProberSampleCount(explicit: number | undefined, env: NodeJS.ProcessEnv): number {
+  const raw = explicit ?? parseNumberEnv(env[PROBER_SAMPLE_COUNT_ENV]);
+  if (raw === undefined || !Number.isFinite(raw)) return DEFAULT_PROBER_SAMPLE_COUNT;
+  return Math.max(0, Math.floor(raw));
+}
+
+function resolveProberTemperature(explicit: number | undefined, env: NodeJS.ProcessEnv): number {
+  const raw = explicit ?? parseNumberEnv(env[PROBER_TEMPERATURE_ENV]);
+  if (raw === undefined || !Number.isFinite(raw)) return DEFAULT_PROBER_TEMPERATURE;
+  return Math.min(2, Math.max(0, raw));
+}
+
+function parseNumberEnv(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 /**
