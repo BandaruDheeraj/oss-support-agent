@@ -17,7 +17,7 @@ import {
   SandboxRunError,
   SandboxTimeoutError,
 } from './sandbox-types';
-import type { RepoAdapter, SandboxCommandResult } from './adapter.interface';
+import type { RepoAdapter, SandboxCommandResult, ServiceConfig } from './adapter.interface';
 
 /**
  * Validates sandbox configuration.
@@ -94,108 +94,121 @@ export function buildWorkflowInputs(config: SandboxConfig): Record<string, strin
 /**
  * Creates a SandboxConfig from adapter fields and fork context.
  */
-export function createSandboxConfig(
-  repoFullName: string,
-  forkFullName: string,
-  branchName: string,
-  adapter: RepoAdapter,
-  timeoutMinutes?: number,
-  workflowRepoFullName?: string
-): Promise<SandboxConfig>;
-export function createSandboxConfig(
-  repoFullName: string,
-  forkFullName: string,
-  branchName: string,
-  testCommand: string,
-  sandboxServices: string[],
-  timeoutMinutes?: number,
-  workflowRepoFullName?: string
-): SandboxConfig;
-
-// Back-compat overload: treat the provided repo as both upstream + fork.
-export function createSandboxConfig(
-  forkFullName: string,
-  branchName: string,
-  adapter: RepoAdapter,
-  timeoutMinutes?: number,
-  workflowRepoFullName?: string
-): Promise<SandboxConfig>;
-export function createSandboxConfig(
-  forkFullName: string,
-  branchName: string,
-  testCommand: string,
-  sandboxServices: string[],
-  timeoutMinutes?: number,
-  workflowRepoFullName?: string
-): SandboxConfig;
-
-export function createSandboxConfig(...args: any[]): SandboxConfig | Promise<SandboxConfig> {
-  const inferredWorkflowRepo =
-    args[args.length - 1] ??
-    process.env.HARNESS_REPO_FULL_NAME ??
-    process.env.GITHUB_REPOSITORY;
-
-  const makeBase = (repoFullName: string, forkFullName: string, branchName: string) => ({
-    repoFullName,
-    forkFullName,
-    branchName,
-    workflowRepoFullName: inferredWorkflowRepo ?? repoFullName,
-  });
-
-  // New signature: repoFullName, forkFullName, branchName, <adapterOrCommand>, ...
-  if (args.length >= 4 && typeof args[2] === 'string' && typeof args[1] === 'string' && typeof args[0] === 'string' && typeof args[3] !== 'undefined' && (typeof args[3] === 'string' || typeof args[3] === 'object')) {
-    const [repoFullName, forkFullName, branchName, adapterOrCommand, maybeServices, maybeTimeout] = args;
-
-    if (typeof adapterOrCommand === 'string') {
-      return {
-        ...makeBase(repoFullName, forkFullName, branchName),
-        testCommands: [adapterOrCommand],
-        testCommand: adapterOrCommand,
-        sandboxServices: Array.isArray(maybeServices) ? [...maybeServices] : [],
-        timeoutMinutes: typeof maybeTimeout === 'number' ? maybeTimeout : DEFAULT_TIMEOUT_MINUTES,
-      };
+type CreateSandboxConfigOptions =
+  | {
+      repoFullName: string;
+      forkFullName: string;
+      branchName: string;
+      adapter: RepoAdapter;
+      timeoutMinutes?: number;
+      workflowRepoFullName?: string;
     }
+  | {
+      repoFullName: string;
+      forkFullName: string;
+      branchName: string;
+      testCommand: string;
+      sandboxServices: Array<ServiceConfig | string>;
+      timeoutMinutes?: number;
+      workflowRepoFullName?: string;
+    };
 
-    const adapter = adapterOrCommand as RepoAdapter;
-    const timeoutMinutes = typeof maybeServices === 'number' ? maybeServices : DEFAULT_TIMEOUT_MINUTES;
-
-    return Promise.all([adapter.getTestCommands(), adapter.getSandboxServices()]).then(
-      ([testCommands, sandboxServices]) => ({
-        ...makeBase(repoFullName, forkFullName, branchName),
-        testCommands: [...testCommands],
-        testCommand: testCommands[0],
-        sandboxServices: sandboxServices.map((s) => ({ ...s, ports: [...s.ports] })),
-        timeoutMinutes,
-      })
+function requireRepoFullName(value: unknown, field: string): string {
+  if (typeof value !== 'string' || !value.includes('/')) {
+    throw new Error(
+      `createSandboxConfig: ${field} must be "owner/repo", got: ${JSON.stringify(value)}`
     );
   }
+  return value;
+}
 
-  // Legacy signature: forkFullName, branchName, <adapterOrCommand>, ...
-  const [forkFullName, branchName, adapterOrCommand, maybeServices, maybeTimeout] = args;
-  const repoFullName = forkFullName;
+function cloneSandboxServices(
+  services: Array<ServiceConfig | string>
+): Array<ServiceConfig | string> {
+  return services.map((service) =>
+    typeof service === 'string'
+      ? service
+      : {
+          ...service,
+          ports: [...service.ports],
+          ...(service.env ? { env: { ...service.env } } : {}),
+        }
+  );
+}
 
-  if (typeof adapterOrCommand === 'string') {
-    return {
-      ...makeBase(repoFullName, forkFullName, branchName),
-      testCommands: [adapterOrCommand],
-      testCommand: adapterOrCommand,
-      sandboxServices: Array.isArray(maybeServices) ? [...maybeServices] : [],
-      timeoutMinutes: typeof maybeTimeout === 'number' ? maybeTimeout : DEFAULT_TIMEOUT_MINUTES,
-    };
+function resolveWorkflowRepoFullName(
+  workflowRepoFullName: unknown,
+  repoFullName: string
+): string {
+  const inferred =
+    workflowRepoFullName ??
+    process.env.HARNESS_REPO_FULL_NAME ??
+    process.env.GITHUB_REPOSITORY ??
+    repoFullName;
+  return requireRepoFullName(inferred, 'workflowRepoFullName');
+}
+
+export function createSandboxConfig(
+  options: {
+    repoFullName: string;
+    forkFullName: string;
+    branchName: string;
+    adapter: RepoAdapter;
+    timeoutMinutes?: number;
+    workflowRepoFullName?: string;
   }
+): Promise<SandboxConfig>;
+export function createSandboxConfig(
+  options: {
+    repoFullName: string;
+    forkFullName: string;
+    branchName: string;
+    testCommand: string;
+    sandboxServices: Array<ServiceConfig | string>;
+    timeoutMinutes?: number;
+    workflowRepoFullName?: string;
+  }
+): SandboxConfig;
+export function createSandboxConfig(
+  options: CreateSandboxConfigOptions
+): SandboxConfig | Promise<SandboxConfig> {
+  const repoFullName = requireRepoFullName(options.repoFullName, 'repoFullName');
+  const forkFullName = requireRepoFullName(options.forkFullName, 'forkFullName');
+  const workflowRepoFullName = resolveWorkflowRepoFullName(
+    options.workflowRepoFullName,
+    repoFullName
+  );
+  const timeoutMinutes = options.timeoutMinutes ?? DEFAULT_TIMEOUT_MINUTES;
+  const base = {
+    repoFullName,
+    forkFullName,
+    branchName: options.branchName,
+    workflowRepoFullName,
+    timeoutMinutes,
+  };
 
-  const adapter = adapterOrCommand as RepoAdapter;
-  const timeoutMinutes = typeof maybeServices === 'number' ? maybeServices : DEFAULT_TIMEOUT_MINUTES;
-
-  return Promise.all([adapter.getTestCommands(), adapter.getSandboxServices()]).then(
-    ([testCommands, sandboxServices]) => ({
-      ...makeBase(repoFullName, forkFullName, branchName),
+  if ('adapter' in options) {
+    return Promise.all([
+      options.adapter.getTestCommands(),
+      options.adapter.getSandboxServices(),
+    ]).then(([testCommands, sandboxServices]) => ({
+      ...base,
       testCommands: [...testCommands],
       testCommand: testCommands[0],
-      sandboxServices: sandboxServices.map((s) => ({ ...s, ports: [...s.ports] })),
-      timeoutMinutes,
-    })
-  );
+      sandboxServices: sandboxServices.map((service) => ({
+        ...service,
+        ports: [...service.ports],
+        ...(service.env ? { env: { ...service.env } } : {}),
+      })),
+    }));
+  }
+
+  return {
+    ...base,
+    testCommands: [options.testCommand],
+    testCommand: options.testCommand,
+    sandboxServices: cloneSandboxServices(options.sandboxServices),
+  };
 }
 
 /**
@@ -474,4 +487,3 @@ function parseSandboxOutputArtifact(raw: string): SandboxCommandResult[] | undef
 
   return results;
 }
-

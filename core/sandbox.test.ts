@@ -165,15 +165,15 @@ describe('buildWorkflowInputs', () => {
 // ============================================================
 describe('createSandboxConfig', () => {
   it('creates config with all fields', () => {
-    const config = createSandboxConfig(
-      'org/repo',
-      'org/repo',
-      'branch-1',
-      'npm test',
-      ['postgres'],
-      10,
-      'harness-org/harness-repo'
-    );
+    const config = createSandboxConfig({
+      repoFullName: 'org/repo',
+      forkFullName: 'org/repo',
+      branchName: 'branch-1',
+      testCommand: 'npm test',
+      sandboxServices: ['postgres'],
+      timeoutMinutes: 10,
+      workflowRepoFullName: 'harness-org/harness-repo',
+    });
     expect(config.repoFullName).toBe('org/repo');
     expect(config.forkFullName).toBe('org/repo');
     expect(config.branchName).toBe('branch-1');
@@ -184,15 +184,42 @@ describe('createSandboxConfig', () => {
   });
 
   it('uses DEFAULT_TIMEOUT_MINUTES when not specified', () => {
-    const config = createSandboxConfig('org/repo', 'org/repo', 'branch', 'test', []);
+    const config = createSandboxConfig({
+      repoFullName: 'org/repo',
+      forkFullName: 'org/repo',
+      branchName: 'branch',
+      testCommand: 'test',
+      sandboxServices: [],
+    });
     expect(config.timeoutMinutes).toBe(DEFAULT_TIMEOUT_MINUTES);
   });
 
   it('copies sandboxServices array (no shared reference)', () => {
     const services = ['redis'];
-    const config = createSandboxConfig('org/repo', 'org/repo', 'branch', 'test', services);
+    const config = createSandboxConfig({
+      repoFullName: 'org/repo',
+      forkFullName: 'org/repo',
+      branchName: 'branch',
+      testCommand: 'test',
+      sandboxServices: services,
+    });
     services.push('postgres');
     expect(config.sandboxServices).toEqual(['redis']);
+  });
+
+  it('throws clear error when workflowRepoFullName is invalid', () => {
+    expect(() =>
+      createSandboxConfig({
+        repoFullName: 'org/repo',
+        forkFullName: 'org/repo',
+        branchName: 'branch',
+        testCommand: 'test',
+        sandboxServices: [],
+        workflowRepoFullName: 15 as unknown as string,
+      })
+    ).toThrow(
+      'createSandboxConfig: workflowRepoFullName must be "owner/repo", got: 15'
+    );
   });
 });
 
@@ -521,7 +548,14 @@ describe('adapter-backed sandbox config', () => {
 
   it('createSandboxConfig calls adapter.getTestCommands and getSandboxServices', async () => {
     const repoAdapter = adapter();
-    const config = await createSandboxConfig('org/repo', 'org/repo', 'branch', repoAdapter, 9, 'harness-org/harness-repo');
+    const config = await createSandboxConfig({
+      repoFullName: 'org/repo',
+      forkFullName: 'org/repo',
+      branchName: 'branch',
+      adapter: repoAdapter,
+      timeoutMinutes: 9,
+      workflowRepoFullName: 'harness-org/harness-repo',
+    });
     expect(repoAdapter.getTestCommands).toHaveBeenCalledWith();
     expect(repoAdapter.getSandboxServices).toHaveBeenCalledWith();
     expect(config.testCommands).toEqual(['npm test', 'npm run lint']);
@@ -530,13 +564,27 @@ describe('adapter-backed sandbox config', () => {
   });
 
   it('buildWorkflowInputs serializes all adapter commands', async () => {
-    const config = await createSandboxConfig('org/repo', 'org/repo', 'branch', adapter(), 9, 'harness-org/harness-repo');
+    const config = await createSandboxConfig({
+      repoFullName: 'org/repo',
+      forkFullName: 'org/repo',
+      branchName: 'branch',
+      adapter: adapter(),
+      timeoutMinutes: 9,
+      workflowRepoFullName: 'harness-org/harness-repo',
+    });
     const inputs = buildWorkflowInputs(config);
     expect(JSON.parse(Buffer.from(inputs.test_commands_b64, 'base64').toString('utf8'))).toEqual(['npm test', 'npm run lint']);
   });
 
   it('buildWorkflowInputs uses adapter service names for network policy', async () => {
-    const config = await createSandboxConfig('org/repo', 'org/repo', 'branch', adapter(), 9, 'harness-org/harness-repo');
+    const config = await createSandboxConfig({
+      repoFullName: 'org/repo',
+      forkFullName: 'org/repo',
+      branchName: 'branch',
+      adapter: adapter(),
+      timeoutMinutes: 9,
+      workflowRepoFullName: 'harness-org/harness-repo',
+    });
     const inputs = buildWorkflowInputs(config);
     const decoded = JSON.parse(Buffer.from(inputs.services_b64, 'base64').toString('utf8'));
     expect(decoded).toEqual([{ name: 'redis', image: 'redis:7', ports: [] }]);

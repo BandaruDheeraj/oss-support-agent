@@ -1783,11 +1783,13 @@ export async function runPipeline(args: {
       v2SandboxDriver === 'gha'
         ? await (async () => {
             const cfg = await createSandboxConfig(
-              repoFullName,
-              fork.forkFullName,
-              fork.branchName,
-              adapter,
-              manifest.sandbox_timeout_mins ?? 15
+              {
+                repoFullName,
+                forkFullName: fork.forkFullName,
+                branchName: fork.branchName,
+                adapter,
+                timeoutMinutes: manifest.sandbox_timeout_mins,
+              }
             );
             return {
               actionsClient: new GitHubActionsClient(deps.token),
