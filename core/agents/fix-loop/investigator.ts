@@ -19,6 +19,7 @@ export interface RunFixInvestigatorArgs {
   repo: RepoHandle;
   workspace: WorkspaceReader & WorkspaceWriter;
   sandbox: SandboxHandle;
+  retryFeedback?: string;
 }
 
 export interface FixInvestigatorResult {
@@ -59,7 +60,9 @@ export async function runFixInvestigator(args: RunFixInvestigatorArgs): Promise<
 
   const userPrompt = `Dossier snapshot ${args.snapshot.snapshotId} (issue #${args.issue.number}):\n${args.snapshot.body.summary}\n\nConfidence: ${args.snapshot.body.confidence}\nSuspect symbols:\n${args.snapshot.body.suspectSymbols
     .map((s) => `- ${s.file} :: ${s.symbol} (${s.reasoning})`)
-    .join('\n')}\nOpen questions:\n${args.snapshot.body.openQuestions.map((q) => `- ${q}`).join('\n')}\n\nDeepen the investigation. State structured hypotheses for each file you believe the fix will touch. Terminate with write_investigation_notes.`;
+    .join('\n')}\nOpen questions:\n${args.snapshot.body.openQuestions.map((q) => `- ${q}`).join('\n')}${
+    args.retryFeedback ? `\n\nPrevious iteration feedback (must be addressed):\n${args.retryFeedback}` : ''
+  }\n\nDeepen the investigation. State structured hypotheses for each file you believe the fix will touch. Terminate with write_investigation_notes.`;
 
   const result = await runAgentLoop({
     agent: 'FIX_INVESTIGATOR',

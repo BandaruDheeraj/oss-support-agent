@@ -21,6 +21,7 @@ export interface RunFixPlannerArgs {
   repo: RepoHandle;
   workspace: WorkspaceReader & WorkspaceWriter;
   sandbox: SandboxHandle;
+  retryFeedback?: string;
 }
 
 export interface FixPlannerResult {
@@ -72,7 +73,9 @@ export async function runFixPlanner(args: RunFixPlannerArgs): Promise<FixPlanner
 
   const userPrompt = `Dossier ${args.snapshot.snapshotId} root-cause hypothesis: ${args.investigationNotes.body.rootCauseHypothesis}\nSuggested approach: ${args.investigationNotes.body.suggestedApproach}\nRisks: ${args.investigationNotes.body.risks.join('; ')}\nFindings:\n${args.investigationNotes.body.findings
     .map((f) => `- ${f.file ?? '?'}::${f.symbol ?? '?'} — ${f.observation}`)
-    .join('\n')}\n\nCommit a Plan via commit_plan.`;
+    .join('\n')}${
+    args.retryFeedback ? `\n\nPrevious iteration feedback (must be addressed):\n${args.retryFeedback}` : ''
+  }\n\nCommit a Plan via commit_plan.`;
 
   const result = await runAgentLoop({
     agent: 'FIX_PLANNER',

@@ -19,7 +19,14 @@ import type { Plan } from '../tools/handles';
 import type { DossierStore, DossierSnapshot } from '../analyst/dossier';
 import type { InvestigationNotesStore } from './investigation-notes';
 import type { HypothesisTracker } from './hypotheses';
-import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
+import type {
+  IssueHandle,
+  RepoHandle,
+  SandboxHandle,
+  SandboxRun,
+  WorkspaceReader,
+  WorkspaceWriter,
+} from '../tools/handles';
 
 export interface RunFixExecutorArgs {
   attemptId: string;
@@ -32,6 +39,7 @@ export interface RunFixExecutorArgs {
   repo: RepoHandle;
   workspace: WorkspaceReader & WorkspaceWriter;
   sandbox: SandboxHandle;
+  retryFeedback?: string;
 }
 
 export interface FixExecutorResult extends AgentLoopResult {
@@ -39,6 +47,8 @@ export interface FixExecutorResult extends AgentLoopResult {
     lastMutationTurn: number | null;
     reproGreenAfterMutation: boolean;
     testsGreenAfterMutation: boolean;
+    lastReproRun: SandboxRun | null;
+    lastTestsRun: SandboxRun | null;
   };
   changedFiles: string[];
   unconsumedHypothesisFiles: string[];
@@ -60,6 +70,18 @@ Hard rules (the registry will reject violations):
 5. Every changed file must have a consumed hypothesis. The Critic will reject otherwise.
 
 If you cannot satisfy these rules, call abandon with a clear reason. Do NOT fabricate hypotheses.`;
+
+function asSandboxRun(value: unknown): SandboxRun | null {
+  if (!value || typeof value !== 'object') return null;
+  const run = value as Partial<SandboxRun>;
+  if (typeof run.exitCode !== 'number') return null;
+  return {
+    exitCode: run.exitCode,
+    stdout: typeof run.stdout === 'string' ? run.stdout : '',
+    stderr: typeof run.stderr === 'string' ? run.stderr : '',
+    durationMs: typeof run.durationMs === 'number' ? run.durationMs : 0,
+  };
+}
 
 export async function runFixExecutor(args: RunFixExecutorArgs): Promise<FixExecutorResult> {
   const planState = new InMemoryPlanState();
@@ -89,7 +111,9 @@ export async function runFixExecutor(args: RunFixExecutorArgs): Promise<FixExecu
       (s) =>
         `- [${s.stepId}] (${s.risk}) ${s.goal}\n   hypothesis: ${s.hypothesisSummary}\n   files: ${s.files.join(', ')}\n   successCheck: ${s.successCheck}`
     )
-    .join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}\nAffected module: ${args.repo.affectedModule}\n\nImplement the plan step-by-step. Remember the hard rules.`;
+    .join('\n')}\n\nIssue #${args.issue.number}: ${args.issue.title}\nAffected module: ${args.repo.affectedModule}${
+    args.retryFeedback ? `\n\nPrevious iteration feedback (must be addressed):\n${args.retryFeedback}` : ''
+  }\n\nImplement the plan step-by-step. Remember the hard rules.`;
 
   const loop = await runAgentLoop({
     agent: 'FIX_EXECUTOR',
@@ -123,11 +147,25 @@ export async function runFixExecutor(args: RunFixExecutorArgs): Promise<FixExecu
   }
   let reproGreen = false;
   let testsGreen = false;
+  let lastReproRun: SandboxRun | null = null;
+  let lastTestsRun: SandboxRun | null = null;
   if (lastMutationTurn !== null) {
     for (const e of transcript) {
       if (e.turn <= lastMutationTurn) continue;
-      if (e.tool === 'run_repro' && e.ok && (e.result as any)?.exitCode === 0) reproGreen = true;
-      if (e.tool === 'run_tests' && e.ok && (e.result as any)?.exitCode === 0) testsGreen = true;
+      if (e.tool === 'run_repro' && e.ok) {
+        const run = asSandboxRun(e.result);
+        if (run) {
+          lastReproRun = run;
+          if (run.exitCode === 0) reproGreen = true;
+        }
+      }
+      if (e.tool === 'run_tests' && e.ok) {
+        const run = asSandboxRun(e.result);
+        if (run) {
+          lastTestsRun = run;
+          if (run.exitCode === 0) testsGreen = true;
+        }
+      }
     }
   }
 
@@ -149,6 +187,8 @@ export async function runFixExecutor(args: RunFixExecutorArgs): Promise<FixExecu
       lastMutationTurn,
       reproGreenAfterMutation: reproGreen,
       testsGreenAfterMutation: testsGreen,
+      lastReproRun,
+      lastTestsRun,
     },
     changedFiles: changed,
     unconsumedHypothesisFiles: hypothesisAudit.missing,
