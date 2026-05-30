@@ -1,7 +1,8 @@
 /**
  * v2 adapter index. Sandbox factory selects backend via OSA_SANDBOX_DRIVER:
  *   - "local"      → local subprocess driver (default; fast, dev/CI)
- *   - "gh-actions" → GitHub Actions workflow_dispatch (production)
+ *   - "gha"        → GitHub Actions workflow_dispatch (manifest-aligned alias)
+ *   - "gh-actions" → GitHub Actions workflow_dispatch (legacy env spelling)
  */
 
 export { createWorkspaceFsAdapter } from './workspace-fs';
@@ -19,11 +20,12 @@ import type { LocalSandboxAdapterOptions } from './sandbox-local';
 import { createLocalSandboxAdapter } from './sandbox-local';
 import { createGhActionsSandboxAdapter } from './sandbox-gh-actions';
 
-export type SandboxDriver = 'local' | 'gh-actions';
+export type SandboxDriver = 'local' | 'gha' | 'gh-actions';
+type ResolvedSandboxDriver = 'local' | 'gh-actions';
 
-export function selectSandboxDriver(envVar?: string): SandboxDriver {
+export function selectSandboxDriver(envVar?: string): ResolvedSandboxDriver {
   const v = (envVar ?? process.env.OSA_SANDBOX_DRIVER ?? 'local').toLowerCase();
-  return v === 'gh-actions' ? 'gh-actions' : 'local';
+  return v === 'gha' || v === 'gh-actions' ? 'gh-actions' : 'local';
 }
 
 export function createSandboxAdapter(args: {
@@ -32,7 +34,7 @@ export function createSandboxAdapter(args: {
   localOptions?: LocalSandboxAdapterOptions;
   ghActionsOptions?: GhActionsSandboxAdapterOptions;
 }): SandboxHandle {
-  const driver = args.driver ?? selectSandboxDriver();
+  const driver = selectSandboxDriver(args.driver);
   if (driver === 'gh-actions') {
     if (!args.ghActionsOptions) {
       throw new Error('createSandboxAdapter: gh-actions driver selected but ghActionsOptions missing');

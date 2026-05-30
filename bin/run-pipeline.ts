@@ -71,6 +71,7 @@ import { LocalWorkspace } from './clients/local-workspace';
 import { LocalForkCommitter, LocalRepoFileReader } from './clients/local-fork-deps';
 import { runLocalSandbox } from './clients/local-sandbox';
 import type { LiveDeps } from './clients/live-deps';
+import { createSandboxConfig } from '../core/sandbox';
 import {
   InMemorySweepStateStore,
   listOpenIssues,
@@ -1777,6 +1778,38 @@ export async function runPipeline(args: {
     };
 
     // ---- Repro stage (v2) -----------------------------------------------
+    const v2SandboxDriver = manifest.sandbox_runner ?? 'local';
+    const v2GhActionsSandboxOptions =
+      v2SandboxDriver === 'gha'
+        ? await (async () => {
+            const cfg = await createSandboxConfig(
+              repoFullName,
+              fork.forkFullName,
+              fork.branchName,
+              adapter,
+              manifest.sandbox_timeout_mins ?? 15
+            );
+            return {
+              actionsClient: new GitHubActionsClient(deps.token),
+              baseConfig: {
+                repoFullName: cfg.repoFullName,
+                forkFullName: cfg.forkFullName,
+                branchName: cfg.branchName,
+                workflowRepoFullName: cfg.workflowRepoFullName,
+                ...(cfg.forkCloneUrl ? { forkCloneUrl: cfg.forkCloneUrl } : {}),
+                sandboxServices: cfg.sandboxServices,
+                timeoutMinutes: cfg.timeoutMinutes,
+              },
+              testCommand: cfg.testCommands?.[0] ?? cfg.testCommand,
+              log,
+            };
+          })()
+        : undefined;
+
+    log(
+      `[v2-driver] sandbox_runner=${v2SandboxDriver} adapter=${v2SandboxDriver === 'gha' ? 'gh-actions' : 'local'}`
+    );
+
     const reproAttemptId = runId + "-repro";
     const reproOutcome = await runReproPipeline({
       attemptId: reproAttemptId,
@@ -1787,6 +1820,8 @@ export async function runPipeline(args: {
       baselineSha,
       affectedModule: routing.result.affectedModule,
       language: 'python',
+      sandboxDriver: v2SandboxDriver,
+      ghActionsSandboxOptions: v2GhActionsSandboxOptions,
       log,
     });
 
@@ -1859,6 +1894,8 @@ export async function runPipeline(args: {
       language: 'python',
       dossier: reproOutcome.v2.dossier,
       reproTestPath: reproPath,
+      sandboxDriver: v2SandboxDriver,
+      ghActionsSandboxOptions: v2GhActionsSandboxOptions,
       log,
     });
 
