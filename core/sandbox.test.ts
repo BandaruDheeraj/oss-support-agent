@@ -264,7 +264,7 @@ describe('runSandbox', () => {
     expect(client.triggerWorkflowDispatch).toHaveBeenCalledWith(
       'harness-org/harness-repo',
       SANDBOX_WORKFLOW_FILE,
-      'agent/scope-42-56',
+      'main',
       expect.objectContaining({ branch_name: 'agent/scope-42-56' })
     );
   });
@@ -276,7 +276,7 @@ describe('runSandbox', () => {
     expect(client.getWorkflowRun).toHaveBeenCalledWith(
       'harness-org/harness-repo',
       SANDBOX_WORKFLOW_FILE,
-      'agent/scope-42-56',
+      'main',
       expect.any(String)
     );
   });
@@ -530,8 +530,22 @@ describe('runSandbox', () => {
     await runSandbox(config, client, 0);
 
     const callArgs = (client.triggerWorkflowDispatch as jest.Mock).mock.calls[0];
-    expect(callArgs[2]).toBe('agent/scope-100-200'); // branch parameter
-    expect(callArgs[3].branch_name).toBe('agent/scope-100-200'); // also in inputs
+    expect(callArgs[2]).toBe('main'); // workflow branch
+    expect(callArgs[3].branch_name).toBe('agent/scope-100-200'); // checkout target branch in inputs
+  });
+
+  it('dispatches on the fork branch when workflow repo equals fork repo', async () => {
+    const client = mockClient();
+    const config = validConfig({
+      forkFullName: 'harness-org/harness-repo',
+      workflowRepoFullName: 'harness-org/harness-repo',
+      branchName: 'agent/scope-200-300',
+    });
+    await runSandbox(config, client, 0);
+
+    const callArgs = (client.triggerWorkflowDispatch as jest.Mock).mock.calls[0];
+    expect(callArgs[2]).toBe('agent/scope-200-300');
+    expect(callArgs[3].branch_name).toBe('agent/scope-200-300');
   });
 });
 

@@ -299,6 +299,10 @@ export async function runSandbox(
 
   const startedAt = new Date().toISOString();
   const interval = pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const workflowDispatchBranch =
+    refreshedConfig.workflowRepoFullName === refreshedConfig.forkFullName
+      ? refreshedConfig.branchName
+      : process.env.HARNESS_WORKFLOW_REF ?? 'main';
 
   // 2. Trigger workflow_dispatch
   const inputs = buildWorkflowInputs(refreshedConfig);
@@ -306,7 +310,7 @@ export async function runSandbox(
     await client.triggerWorkflowDispatch(
       refreshedConfig.workflowRepoFullName,
       SANDBOX_WORKFLOW_FILE,
-      refreshedConfig.branchName,
+      workflowDispatchBranch,
       inputs
     );
   } catch (err: unknown) {
@@ -333,7 +337,7 @@ export async function runSandbox(
     workflowRun = await client.getWorkflowRun(
       refreshedConfig.workflowRepoFullName,
       SANDBOX_WORKFLOW_FILE,
-      refreshedConfig.branchName,
+      workflowDispatchBranch,
       startedAt
     );
     if (workflowRun) break;
