@@ -1,0 +1,4 @@
+llama-index-core
+llama-index-embeddings-huggingface
+llama-index-readers-file
+sentence-transformers

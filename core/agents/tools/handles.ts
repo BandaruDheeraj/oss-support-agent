@@ -5,6 +5,7 @@
  */
 
 import type { DossierStore } from '../analyst/dossier';
+import type { SemanticSuspectSeed } from '../analyst/semantic-search';
 import type { InvestigationNotesStore } from '../fix-loop/investigation-notes';
 import type { HypothesisTracker } from '../fix-loop/hypotheses';
 
@@ -128,6 +129,7 @@ export interface ToolHandles {
   issue: IssueHandle;
   repo: RepoHandle;
   dossier?: DossierStore;       // Analyst writes; everyone else reads
+  semanticSuspectSeed?: SemanticSuspectSeed | null;
   notes?: InvestigationNotesStore; // Fix Investigator writes; downstream reads
   hypotheses?: HypothesisTracker;
   plan?: PlanState;

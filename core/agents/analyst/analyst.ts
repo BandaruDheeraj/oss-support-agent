@@ -7,6 +7,7 @@ import { DossierStore, type DossierSnapshot } from './dossier';
 import { runAgentLoop } from '../agent-loop';
 import { makeAnalystRegistry } from '../tools';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
+import type { SemanticSuspectSeed } from './semantic-search';
 
 export interface RunAnalystArgs {
   issue: IssueHandle;
@@ -17,6 +18,8 @@ export interface RunAnalystArgs {
   dossier: DossierStore;
   /** Optional carryforward from a prior attempt. */
   carryforwardSummary?: string;
+  /** Optional semantic retrieval seed computed pre-Analyst. */
+  semanticSuspectSeed?: SemanticSuspectSeed | null;
 }
 
 export interface AnalystResult {
@@ -34,9 +37,10 @@ You are read-only. You can call: read_file, grep, grep_with_context, list_dir, r
 Procedure:
 1. Call read_issue_repo_context (or gh_issue + gh_pr) to anchor yourself.
 2. Read the issue body carefully. Note any version info, stack traces, repro snippets.
+2b. If a semantic suspect seed is provided in the user prompt, treat it as your PRIMARY suspect-file/suspect-symbol starting point and verify/refine it with direct file reads.
 3. Locate the affected symbols in the repo using read_symbol_context (or grep/find_symbol/find_callers).
 4. Open the relevant files with read_file. Open recent commits with git_log/git_blame if behaviour changed.
-5. Form a list of suspect symbols, open questions, and confidence level.
+5. Form a list of suspect files + suspect symbols, open questions, and confidence level.
 6. Identify PRECONDITIONS — see "Preconditions" section below.
 7. Build a structured ORACLE SPEC with suspect_path_assertions + precondition_assertions.
 8. Terminate by calling record_evidence with a complete summary. record_evidence is the ONLY way to commit your findings.
@@ -72,6 +76,9 @@ IMPORTANT: This scan is BEST-EFFORT. If you cannot find a tests/ directory, or n
 
 Empty preconditions: [] is acceptable for issues with no environmental subtlety. Do NOT fabricate baseline preconditions — that wastes downstream prompt context.
 
+Suspect files (REQUIRED when known):
+When you can identify likely source files, include a \`suspectFiles\` array on \`record_evidence\` with repo-relative paths. Keep this aligned with \`suspectSymbols[*].file\`.
+
 Oracle spec (REQUIRED on record_evidence):
 Provide \`oracleSpec\` with EXACTLY these two fields:
   - \`suspect_path_assertions\`: array of objects describing what MUST appear in failing output. Use:
@@ -84,7 +91,7 @@ Provide \`oracleSpec\` with EXACTLY these two fields:
 Downstream stages are deterministic and consume this struct directly. Keep it concise, machine-checkable, and tied to your evidence.
 
 CANDIDATE REPRO (optional, high-leverage):
-When your confidence is medium or high AND the failure mode fits one of two templates, you SHOULD include a \`candidateRepro\` field on record_evidence. A downstream deterministic Builder will use it to author the failing test WITHOUT another LLM round-trip — this dramatically reduces failed repros caused by Prober drift.
+When you identified at least one suspect symbol, can write a single deterministic exercise call that references a suspect symbol, and the failure mode fits one of the two templates below, you MUST include a \`candidateRepro\` field on record_evidence (even if confidence is only low/medium). A downstream deterministic Builder will use it to author the failing test WITHOUT another LLM round-trip — this dramatically reduces failed repros caused by Prober drift.
 
 Two supported failureMode templates:
 1. \`unexpected_exception\` — the exercise call raises an exception when it shouldn't (or a different exception type than expected). Set \`expectedExceptionType\` to the FQN or short name of the exception type that the BUGGY code raises (e.g. "AttributeError"). The Builder will assert that calling \`exerciseCall\` raises an exception of that type; if no exception is raised, the test passes (meaning the bug is fixed) — DO NOT emit candidateRepro when you've established the bug is already fixed.
@@ -105,12 +112,11 @@ EXACT field names (the Builder schema is strict):
 DO NOT emit a \`testSource\` or \`sentinelString\` field — the Builder renders the test source itself from the template + your fields.
 
 DO NOT include candidateRepro when:
-- Confidence is low
 - The bug has already been fixed in the current checkout (the test would pass, not fail)
 - The bug is intermittent, race-conditional, or requires real network/credentials
 - You can't pin down a single exercise call
 
-When in doubt, omit candidateRepro — the Prober will handle it.
+Do NOT omit candidateRepro solely because of uncertainty. If evidence is sufficient for a plausible deterministic single-call candidate, emit a minimal best-effort candidateRepro and let downstream deterministic stages validate/reject it.
 
 REPRO TARGETS (optional, low-cost):
 Independent of candidateRepro, you SHOULD include a \`reproTargets\` field on record_evidence when you've identified the structural setup the repro needs:
@@ -134,6 +140,7 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
         issue: args.issue,
         repo: args.repo,
         dossier: args.dossier,
+        semanticSuspectSeed: args.semanticSuspectSeed ?? null,
       },
     },
   });
@@ -142,7 +149,23 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
     ? `\n\nPrior-attempt carry-forward (treat as new evidence inputs, not as the original issue):\n${args.carryforwardSummary}`
     : '';
 
-  const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\n${args.issue.body}\n\nRepo: ${args.repo.fullName} (affected module: ${args.repo.affectedModule}, language: ${args.repo.language})${carry}\n\nInvestigate and produce an EvidenceDossier via record_evidence.`;
+  const semanticSeed = args.semanticSuspectSeed
+    ? `\n\nSemantic retrieval seed (PRIMARY suspect triage input):\n` +
+      `${JSON.stringify(
+        {
+          model: args.semanticSuspectSeed.model,
+          cacheHit: args.semanticSuspectSeed.cacheHit,
+          indexedFileCount: args.semanticSuspectSeed.indexedFileCount,
+          suspectFiles: args.semanticSuspectSeed.suspectFiles,
+          suspectSymbols: args.semanticSuspectSeed.suspectSymbols,
+        },
+        null,
+        2
+      )}\n` +
+      `You MUST treat these suspectFiles/suspectSymbols as the primary starting point and carry them into record_evidence unless direct file reads disprove them.`
+    : '';
+
+  const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\n${args.issue.body}\n\nRepo: ${args.repo.fullName} (affected module: ${args.repo.affectedModule}, language: ${args.repo.language})${carry}${semanticSeed}\n\nInvestigate and produce an EvidenceDossier via record_evidence.`;
 
   // Pin Analyst to a strong tool-calling model unless explicitly overridden.
   // We bypass OPENROUTER_MODEL_DEFAULT here because some defaults (e.g.

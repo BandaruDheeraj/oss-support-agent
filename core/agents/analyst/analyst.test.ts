@@ -91,6 +91,57 @@ describe('runAnalyst parse-recovery', () => {
     mockedRunAgentLoop.mockReset();
   });
 
+  it('includes strong candidateRepro emission guidance in the system prompt', async () => {
+    mockedRunAgentLoop.mockResolvedValue(makeLoopResult());
+
+    await runAnalyst({
+      issue: makeIssue(),
+      repo: makeRepo(),
+      workspace: makeWorkspace(),
+      sandbox: makeSandbox(),
+      attemptId: 'attempt-system-prompt',
+      dossier: new DossierStore(),
+    });
+
+    const systemPrompt = mockedRunAgentLoop.mock.calls[0][0].system;
+    expect(systemPrompt).toContain('you MUST include a `candidateRepro` field on record_evidence');
+    expect(systemPrompt).toContain('Do NOT omit candidateRepro solely because of uncertainty');
+  });
+
+  it('injects semantic suspect seed into the analyst user prompt', async () => {
+    mockedRunAgentLoop.mockResolvedValue(makeLoopResult());
+
+    await runAnalyst({
+      issue: makeIssue(),
+      repo: makeRepo(),
+      workspace: makeWorkspace(),
+      sandbox: makeSandbox(),
+      attemptId: 'attempt-semantic-seed',
+      dossier: new DossierStore(),
+      semanticSuspectSeed: {
+        model: 'BAAI/bge-small-en-v1.5',
+        query: 'issue query',
+        cacheHit: true,
+        cacheKey: 'abc',
+        indexedFileCount: 12,
+        instrumentationDirs: ['python/instrumentation'],
+        suspectFiles: ['python/instrumentation/foo.py'],
+        suspectSymbols: [
+          {
+            file: 'python/instrumentation/foo.py',
+            symbol: 'Instrumentor',
+            reasoning: 'semantic hit',
+          },
+        ],
+      },
+    });
+
+    const userPrompt = mockedRunAgentLoop.mock.calls[0][0].user;
+    expect(userPrompt).toContain('Semantic retrieval seed (PRIMARY suspect triage input)');
+    expect(userPrompt).toContain('"suspectFiles": [');
+    expect(userPrompt).toContain('"suspectSymbols": [');
+  });
+
   it('retries once after record_evidence JSON parse failure', async () => {
     const dossier = new DossierStore();
     let calls = 0;

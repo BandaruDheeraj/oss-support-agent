@@ -24,6 +24,7 @@ import type { GhActionsSandboxAdapterOptions } from './adapters/sandbox-gh-actio
 import { runReproV2, type ReproV2Outcome } from './repro-loop-v2/orchestrator';
 import { runFixV2, type FixV2Outcome } from './fix-loop/orchestrator';
 import { DossierStore } from './analyst/dossier';
+import { buildSemanticSuspectSeed } from './analyst/semantic-search';
 import {
   discoverEditableInstallCandidates,
   extractIssueCodeSnippets,
@@ -157,6 +158,27 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     log(`[v2-driver] surfaced ${issueSnippets.length} issue code snippet(s) to Planner/Executor`);
   }
 
+  let semanticSuspectSeed = null;
+  if (language === 'python') {
+    try {
+      semanticSuspectSeed = await buildSemanticSuspectSeed({
+        workspaceDir: input.workspace.dir,
+        issueTitle: input.payload.issue.title,
+        issueBody: input.payload.issue.body ?? '',
+        affectedModule: input.affectedModule,
+        log,
+      });
+      if (semanticSuspectSeed) {
+        log(
+          `[v2-driver] semantic suspects ready: files=${semanticSuspectSeed.suspectFiles.length} symbols=${semanticSuspectSeed.suspectSymbols.length} indexed=${semanticSuspectSeed.indexedFileCount} cacheHit=${semanticSuspectSeed.cacheHit}`
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`[v2-driver] semantic suspect indexing failed (continuing without seed): ${message}`);
+    }
+  }
+
   const v2 = await runReproV2({
     attemptId: input.attemptId,
     issue: issueHandle,
@@ -168,6 +190,7 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     issueSnippets,
     issueBody: input.payload.issue.body ?? undefined,
     workspaceDir: input.workspace.dir,
+    ...(semanticSuspectSeed ? { semanticSuspectSeed } : {}),
   });
 
   log(

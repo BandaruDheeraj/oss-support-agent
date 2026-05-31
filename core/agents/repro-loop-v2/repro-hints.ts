@@ -40,6 +40,9 @@ const IGNORED_DIRS = new Set([
   '.next',
   '.cache',
   '.agent-venv',
+  '.semantic-venv',
+  '.semantic-hf-cache',
+  '.semantic-index-cache',
   '.idea',
   '.vscode',
 ]);

@@ -21,14 +21,61 @@ import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, Workspace
 import { detectCredentialError } from '../../credentials-check';
 import type { IssueCodeSnippet } from './repro-hints';
 import { deriveEditableInstallsFromSuspectPaths, mergeEditableInstallCandidates } from './repro-hints';
+import type { SemanticSuspectSeed } from '../analyst/semantic-search';
 
 const DEFAULT_PROBER_SAMPLE_COUNT = 3;
 const DEFAULT_PROBER_TEMPERATURE = 0.7;
 const PROBER_SAMPLE_COUNT_ENV = 'OSA_REPRO_PROBER_SAMPLES';
 const PROBER_TEMPERATURE_ENV = 'OSA_REPRO_PROBER_TEMPERATURE';
+const OPENINFERENCE_REPO_SUFFIX = '/openinference';
+
+type ProberSandboxPreflightStep =
+  | {
+      kind: 'pip_install';
+      label: string;
+      spec: string;
+    }
+  | {
+      kind: 'run_python';
+      label: string;
+      snippet: string;
+    };
+
+const OPENINFERENCE_PROBER_PREFLIGHT_STEPS: readonly ProberSandboxPreflightStep[] = [
+  {
+    kind: 'pip_install',
+    label: 'pip install -e python/openinference-semantic-conventions',
+    spec: '-e python/openinference-semantic-conventions',
+  },
+  {
+    kind: 'pip_install',
+    label: 'pip install -e python/openinference-instrumentation',
+    spec: '-e python/openinference-instrumentation',
+  },
+  {
+    kind: 'pip_install',
+    label: 'pip install -e python/instrumentation/openinference-instrumentation-smolagents',
+    spec: '-e python/instrumentation/openinference-instrumentation-smolagents',
+  },
+  {
+    kind: 'pip_install',
+    label: 'pip install smolagents',
+    spec: 'smolagents',
+  },
+  {
+    kind: 'run_python',
+    label: 'python -c "from openinference.instrumentation.smolagents import SmolagentsInstrumentor"',
+    snippet: 'from openinference.instrumentation.smolagents import SmolagentsInstrumentor',
+  },
+] as const;
 
 type CandidateSource = 'builder' | 'prober';
-type CandidateStatus = 'generation_failed' | 'invalid' | 'valid' | 'credentials_required';
+type CandidateStatus =
+  | 'generation_failed'
+  | 'setup_failed'
+  | 'invalid'
+  | 'valid'
+  | 'credentials_required';
 
 export interface RunReproV2Args {
   attemptId: string;
@@ -65,6 +112,12 @@ export interface RunReproV2Args {
    * nearest package manifest, prioritising those over the initial BFS list.
    */
   workspaceDir?: string;
+  /**
+   * Semantic retrieval seed computed once per pipeline run after clone and
+   * before Analyst execution. Analyst uses this as the primary suspect-file
+   * and suspect-symbol starting point.
+   */
+  semanticSuspectSeed?: SemanticSuspectSeed | null;
   /** Number of Prober samples to run in parallel. */
   proberSampleCount?: number;
   /** Sampling temperature for Prober best-of-N generation. */
@@ -163,6 +216,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       attemptId: args.attemptId,
       dossier,
       carryforwardSummary: args.carryforwardSummary,
+      semanticSuspectSeed: args.semanticSuspectSeed ?? null,
     });
     if (!analyst.snapshot) {
       return {
@@ -255,6 +309,26 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   });
   builderRejectStage = builderCandidate.builderRejectStage;
   candidates.push(builderCandidate);
+
+  const requiresOpenInferencePreflight =
+    proberSampleCount > 0 && shouldRunOpenInferencePreflight(args.repo.fullName);
+  if (requiresOpenInferencePreflight) {
+    const preflight = await runOpenInferenceProberPreflight({
+      sandbox: args.sandbox,
+      attemptId: args.attemptId,
+    });
+    if (!preflight.ok) {
+      candidates.push(...buildBlockedProberCandidates(proberSampleCount, preflight.message));
+      return {
+        status: 'not_reproduced',
+        dossier,
+        ...(builder ? { builder } : {}),
+        ...(builderRejectStage ? { builderRejectStage } : {}),
+        candidates,
+        message: preflight.message,
+      };
+    }
+  }
 
   // Stage B1: K Prober samples at temperature in parallel.
   const lock = createAsyncLock();
@@ -393,8 +467,55 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     ...(builder ? { builder } : {}),
     ...(builderRejectStage ? { builderRejectStage } : {}),
     candidates,
-    message: `Deterministic repro oracle rejected all ${candidates.length} candidates.`,
+    message: buildNoReproMessage(candidates),
   };
+}
+
+function shouldRunOpenInferencePreflight(repoFullName: string): boolean {
+  return repoFullName.toLowerCase().endsWith(OPENINFERENCE_REPO_SUFFIX);
+}
+
+function buildBlockedProberCandidates(sampleCount: number, message: string): ReproCandidateEvaluation[] {
+  return Array.from({ length: sampleCount }, (_, idx) => {
+    const sampleIndex = idx + 1;
+    return {
+      candidateId: `candidate-${sampleIndex}`,
+      source: 'prober',
+      sampleIndex,
+      status: 'setup_failed',
+      message,
+    };
+  });
+}
+
+async function runOpenInferenceProberPreflight(args: {
+  sandbox: SandboxHandle;
+  attemptId: string;
+}): Promise<{ ok: true } | { ok: false; message: string }> {
+  for (const step of OPENINFERENCE_PROBER_PREFLIGHT_STEPS) {
+    try {
+      const run =
+        step.kind === 'pip_install'
+          ? await args.sandbox.pipInstall(step.spec)
+          : await args.sandbox.runPython(step.snippet);
+      if (run.exitCode !== 0) {
+        const tail = collapseWhitespace(run.stderr || run.stdout).slice(-600);
+        const message =
+          `sandbox_setup_failed: ${step.label} failed (exitCode=${run.exitCode}).` +
+          (tail ? ` Output tail: ${tail}` : '');
+        // eslint-disable-next-line no-console
+        console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
+        return { ok: false, message };
+      }
+    } catch (err) {
+      const detail = collapseWhitespace(err instanceof Error ? err.message : String(err));
+      const message = `sandbox_setup_failed: ${step.label} threw: ${detail}`;
+      // eslint-disable-next-line no-console
+      console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
+      return { ok: false, message };
+    }
+  }
+  return { ok: true };
 }
 
 function buildBuilderCandidate(args: {
@@ -487,12 +608,13 @@ async function runProberSample(args: {
       forcedCandidateTestPath: forcedPath,
     });
   } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
     return {
       candidateId,
       source: 'prober',
       sampleIndex: args.sampleIndex,
-      status: 'generation_failed',
-      message: `Prober sample failed to run: ${err instanceof Error ? err.message : String(err)}`,
+      status: isSandboxSetupFailure(detail) ? 'setup_failed' : 'generation_failed',
+      message: `Prober sample failed to run: ${detail}`,
     };
   }
 
@@ -640,6 +762,32 @@ function parseNumberEnv(value: string | undefined): number | undefined {
   if (!value) return undefined;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function isSandboxSetupFailure(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('sandbox_setup_failed') ||
+    normalized.includes('no ref found for') ||
+    normalized.includes('missing fork repro ref') ||
+    normalized.includes('missing workflow dispatch ref') ||
+    normalized.includes('pre_dispatch_ref')
+  );
+}
+
+function buildNoReproMessage(candidates: ReproCandidateEvaluation[]): string {
+  const setupFailures = candidates.filter((candidate) => candidate.status === 'setup_failed').length;
+  if (setupFailures > 0) {
+    return (
+      `No candidate passed deterministic repro oracle after evaluating ${candidates.length} candidates; ` +
+      `${setupFailures} candidate(s) failed sandbox setup before oracle validation.`
+    );
+  }
+  return `Deterministic repro oracle rejected all ${candidates.length} candidates.`;
 }
 
 /**

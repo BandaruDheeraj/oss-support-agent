@@ -84,6 +84,50 @@ describe('record_evidence — server-stamped source defaults', () => {
     expect(snap!.body.confidence).toBe('low');
   });
 
+  it('uses semantic seed as primary suspectFiles/suspectSymbols when analyst omits them', async () => {
+    const dossier = new DossierStore();
+    await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectSymbols: [],
+        openQuestions: [],
+        preconditions: [],
+        summary: 'seeded',
+        confidence: 'medium',
+      },
+      ctxFor({
+        dossier,
+        semanticSuspectSeed: {
+          model: 'BAAI/bge-small-en-v1.5',
+          query: 'issue query',
+          cacheHit: true,
+          cacheKey: 'abc',
+          indexedFileCount: 10,
+          instrumentationDirs: ['python/instrumentation'],
+          suspectFiles: ['python/instrumentation/pkg/mod.py'],
+          suspectSymbols: [
+            {
+              file: 'python/instrumentation/pkg/mod.py',
+              symbol: 'Instrumentor',
+              reasoning: 'semantic hit',
+            },
+          ],
+        },
+      })
+    );
+
+    const snap = dossier.latest();
+    expect(snap).not.toBeNull();
+    expect(snap!.body.suspectFiles).toEqual(['python/instrumentation/pkg/mod.py']);
+    expect(snap!.body.suspectSymbols).toEqual([
+      {
+        file: 'python/instrumentation/pkg/mod.py',
+        symbol: 'Instrumentor',
+        reasoning: 'semantic hit',
+      },
+    ]);
+  });
+
   it('derives oracleSpec when omitted from suspectSymbols + preconditions', async () => {
     const dossier = new DossierStore();
     const res = await recordEvidence.execute(

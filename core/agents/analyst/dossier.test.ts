@@ -87,6 +87,24 @@ describe('dossier snapshot id', () => {
     expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withPc));
   });
 
+  it('omits absent suspectFiles from the canonical hash (backward compat)', () => {
+    const legacy = makeBody();
+    const explicitUndef = { ...makeBody(), suspectFiles: undefined } as unknown as DossierBody;
+    expect(snapshotIdFor(explicitUndef)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('omits empty suspectFiles from the canonical hash', () => {
+    const legacy = makeBody();
+    const withEmpty = makeBody({ suspectFiles: [] });
+    expect(snapshotIdFor(withEmpty)).toBe(snapshotIdFor(legacy));
+  });
+
+  it('changes when suspectFiles is populated', () => {
+    const without = makeBody();
+    const withFiles = makeBody({ suspectFiles: ['src/foo.py'] });
+    expect(snapshotIdFor(without)).not.toBe(snapshotIdFor(withFiles));
+  });
+
   it('omits absent reproRecipe from the canonical hash (backward compat)', () => {
     // Body literally lacking the reproRecipe key (pre-Prober pipeline)
     const legacy = makeBody();

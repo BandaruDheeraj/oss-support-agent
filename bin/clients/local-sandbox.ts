@@ -60,7 +60,7 @@ async function checkServices(services: ServiceConfig[], log: (m: string) => void
  * environment" unless we install into a venv. Creating a per-workspace venv
  * also keeps installs isolated from other workspaces / the agent host itself.
  *
- * Idempotent: if `<workspaceDir>/.agent-venv/bin/pip` already exists, we
+ * Idempotent: if `<workspaceDir>/<venvDirName>/bin/pip` already exists, we
  * reuse it. Otherwise we try `python3 -m venv` then fall back to `python -m
  * venv`. On failure we return null and let the caller decide what to do
  * (typically: continue without the venv and let pip fail naturally so the
@@ -69,9 +69,10 @@ async function checkServices(services: ServiceConfig[], log: (m: string) => void
 export async function ensurePythonVenv(
   workspaceDir: string,
   log: (m: string) => void,
-  perCommandTimeoutMs: number
+  perCommandTimeoutMs: number,
+  venvDirName = '.agent-venv'
 ): Promise<{ binDir: string } | null> {
-  const venvDir = path.join(workspaceDir, '.agent-venv');
+  const venvDir = path.join(workspaceDir, venvDirName);
   // venv layout differs between Unix (`bin`) and Windows (`Scripts`).
   const binDirName = process.platform === 'win32' ? 'Scripts' : 'bin';
   const binDir = path.join(venvDir, binDirName);

@@ -60,6 +60,8 @@ export const SuspectSymbolSchema = z.object({
 });
 
 export type SuspectSymbol = z.infer<typeof SuspectSymbolSchema>;
+export const SuspectFileSchema = z.string();
+export type SuspectFile = z.infer<typeof SuspectFileSchema>;
 
 /**
  * Structured oracle spec consumed by downstream deterministic gates.
@@ -692,6 +694,11 @@ export const DossierBodySchema = z.object({
   attemptId: z.string(),
   parentSnapshotId: z.string().nullable(),
   evidence: z.array(EvidenceSchema),
+  /**
+   * Primary suspect file shortlist surfaced by semantic retrieval and/or
+   * Analyst refinement.
+   */
+  suspectFiles: z.array(SuspectFileSchema).optional(),
   suspectSymbols: z.array(SuspectSymbolSchema),
   /**
    * Preconditions identified by the Analyst. Defaults to [] so legacy
@@ -781,6 +788,12 @@ export function snapshotIdFor(body: DossierBody): string {
   if (candidate == null) {
     delete forHash.candidateRepro;
   }
+  // Same for suspectFiles (added with semantic retrieval). Both absent and
+  // empty arrays canonicalize out for backward compatibility.
+  const suspectFiles = (body as { suspectFiles?: string[] }).suspectFiles;
+  if (!Array.isArray(suspectFiles) || suspectFiles.length === 0) {
+    delete forHash.suspectFiles;
+  }
   // Same for reproTargets (analyst-authored hints, added in Phase 8). Both
   // absent and "present but both arrays empty" MUST canonicalize-out
   // identically, otherwise a body that defaults the field through the
@@ -857,8 +870,18 @@ export class DossierStore {
    * when omitted, preserving backward-compatible call sites.
    */
   append(
-    input: Omit<DossierBody, 'parentSnapshotId' | 'preconditions' | 'oracleSpec' | 'reproRecipe' | 'candidateRepro' | 'reproTargets'> & {
+    input: Omit<
+      DossierBody,
+      | 'parentSnapshotId'
+      | 'suspectFiles'
+      | 'preconditions'
+      | 'oracleSpec'
+      | 'reproRecipe'
+      | 'candidateRepro'
+      | 'reproTargets'
+    > & {
       parentSnapshotId?: string | null;
+      suspectFiles?: SuspectFile[];
       preconditions?: Precondition[];
       oracleSpec?: ReproOracleSpec;
       reproRecipe?: ReproRecipe;

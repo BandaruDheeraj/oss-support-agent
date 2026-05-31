@@ -19,6 +19,7 @@ import {
   ReproRecipeInputSchema,
   ReproTargetsInputSchema,
   ReproOracleSpecInputSchema,
+  type SuspectSymbol,
   SuspectSymbolSchema,
   normalizePreconditionInput,
   normalizeReproRecipeInput,
@@ -64,6 +65,7 @@ export const stateHypothesis: ToolDef<z.infer<typeof StateHypothesisArgs>, unkno
 const RecordEvidence = z
   .object({
     evidence: z.array(EvidenceInputSchema).default([]),
+    suspectFiles: z.array(z.string()).optional(),
     suspectSymbols: z.array(SuspectSymbolSchema).default([]),
     preconditions: z.array(PreconditionInputSchema).default([]),
     openQuestions: z.array(z.string()).default([]),
@@ -102,10 +104,11 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
   name: 'record_evidence',
   tier: 'note',
   description:
-    'Analyst- and Prober-only: append a new EvidenceDossier snapshot summarising everything you have read so far. Call this to terminate the loop. Prober additionally supplies `reproRecipe` carrying the executable test + observed probe results.',
+    'Analyst- and Prober-only: append a new EvidenceDossier snapshot summarising everything you have read so far. Include suspectFiles/suspectSymbols when known. Call this to terminate the loop. Prober additionally supplies `reproRecipe` carrying the executable test + observed probe results.',
   parameters: RecordEvidence,
   async execute(args, ctx) {
-    const dossier = asHandles(ctx.handles).dossier;
+    const handles = asHandles(ctx.handles);
+    const dossier = handles.dossier;
     if (!dossier) return { error: 'dossier writer not available — caller is not the Analyst' };
     const now = new Date().toISOString();
     const evidence = args.evidence.map((e) => ({
@@ -113,8 +116,18 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       source: e.source ?? defaultEvidenceSource(e, ctx.issueNumber),
       recordedAt: e.recordedAt ?? now,
     }));
-    const summary = normalizeEvidenceSummary(args.summary, evidence, args.suspectSymbols);
-    const confidence = normalizeEvidenceConfidence(args.confidence, evidence, args.suspectSymbols);
+    const seededSuspectFiles = normalizeSuspectFiles(handles.semanticSuspectSeed?.suspectFiles ?? []);
+    const seededSuspectSymbols = handles.semanticSuspectSeed?.suspectSymbols ?? [];
+    const suspectFiles = mergeSuspectFiles(seededSuspectFiles, args.suspectFiles ?? []);
+    const suspectSymbols = mergeSuspectSymbols(seededSuspectSymbols, args.suspectSymbols);
+    if (suspectFiles.length === 0 && suspectSymbols.length > 0) {
+      for (const file of suspectSymbols.map((s) => normalizeSuspectFilePath(s.file))) {
+        if (!file || suspectFiles.includes(file)) continue;
+        suspectFiles.push(file);
+      }
+    }
+    const summary = normalizeEvidenceSummary(args.summary, evidence, suspectSymbols);
+    const confidence = normalizeEvidenceConfidence(args.confidence, evidence, suspectSymbols);
     // Stamp precondition ids when the LLM omits them, drop entries that
     // even the loose normalizer can't make sense of. Preconditions are
     // best-effort metadata; we MUST NOT fail the entire record_evidence
@@ -165,13 +178,14 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       : undefined;
     const oracleSpec =
       (args.oracleSpec ? normalizeReproOracleSpecInput(args.oracleSpec) : null) ??
-      buildReproOracleSpec(args.suspectSymbols, preconditions) ??
+      buildReproOracleSpec(suspectSymbols, preconditions) ??
       undefined;
     const snap = dossier.append({
       issueNumber: ctx.issueNumber,
       attemptId: ctx.attemptId,
       evidence,
-      suspectSymbols: args.suspectSymbols,
+      suspectFiles,
+      suspectSymbols,
       preconditions,
       ...(oracleSpec ? { oracleSpec } : {}),
       openQuestions: args.openQuestions,
@@ -187,6 +201,8 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       candidate_recorded: candidateRepro ? true : false,
       repro_targets_recorded: reproTargets ? true : false,
       oracle_spec_recorded: oracleSpec ? true : false,
+      suspect_files_count: suspectFiles.length,
+      suspect_symbols_count: suspectSymbols.length,
     };
   },
 };
@@ -221,6 +237,50 @@ function normalizeEvidenceConfidence(
   if (confidence) return confidence;
   if (evidence.length >= 3 && suspectSymbols.length >= 1) return 'medium';
   return 'low';
+}
+
+function normalizeSuspectFilePath(file: string): string {
+  return file.replace(/\\+/g, '/').replace(/^[/]+/, '').replace(/^\.\//, '').trim();
+}
+
+function normalizeSuspectFiles(files: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const file of files) {
+    const normalized = normalizeSuspectFilePath(file);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function mergeSuspectFiles(primary: string[], secondary: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const file of [...primary, ...secondary]) {
+    const normalized = normalizeSuspectFilePath(file);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function mergeSuspectSymbols(primary: SuspectSymbol[], secondary: SuspectSymbol[]): SuspectSymbol[] {
+  const out: SuspectSymbol[] = [];
+  const seen = new Set<string>();
+  for (const symbol of [...primary, ...secondary]) {
+    const file = normalizeSuspectFilePath(symbol.file);
+    const name = symbol.symbol?.trim();
+    const reasoning = symbol.reasoning?.trim() || 'suspect symbol';
+    if (!file || !name) continue;
+    const key = `${file}::${name}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ file, symbol: name, reasoning });
+  }
+  return out;
 }
 
 /**
