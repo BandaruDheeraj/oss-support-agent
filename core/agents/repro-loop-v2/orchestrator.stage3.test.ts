@@ -241,6 +241,135 @@ describe('runReproV2 stage3 orchestration', () => {
     expect(outcome.candidates).toHaveLength(4);
   });
 
+  test('halts with sandbox_setup_failed before prober sampling when OpenInference preflight fails', async () => {
+    runReproBuilderMock.mockResolvedValue({
+      ok: false,
+      rejectStage: 'no_candidate',
+      reason: 'No candidate',
+      runs: [],
+    });
+
+    const pipInstall = jest.fn(async (spec: string) => ({
+      exitCode: spec === '-e python/openinference-semantic-conventions' ? 1 : 0,
+      stdout: '',
+      stderr: spec === '-e python/openinference-semantic-conventions' ? 'editable install failed' : '',
+      durationMs: 1,
+    }));
+    const runPython = jest.fn(async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }));
+
+    const failingPreflightSandbox: SandboxHandle = {
+      ...sandbox,
+      pipInstall,
+      runPython,
+    };
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-preflight-fail',
+      issue,
+      repo: { ...repo, fullName: 'BandaruDheeraj/openinference' },
+      workspace,
+      sandbox: failingPreflightSandbox,
+      proberSampleCount: 2,
+    });
+
+    expect(outcome.status).toBe('not_reproduced');
+    expect(outcome.message).toContain('sandbox_setup_failed');
+    expect(runReproProberMock).not.toHaveBeenCalled();
+    expect(runDeterministicOracleMock).not.toHaveBeenCalled();
+    expect(pipInstall).toHaveBeenCalledTimes(1);
+    expect(runPython).not.toHaveBeenCalled();
+    expect(outcome.candidates).toHaveLength(3);
+    expect(outcome.candidates.filter((candidate) => candidate.source === 'prober')).toHaveLength(2);
+    expect(
+      outcome.candidates
+        .filter((candidate) => candidate.source === 'prober')
+        .every((candidate) => candidate.status === 'setup_failed')
+    ).toBe(true);
+    expect(
+      outcome.candidates
+        .filter((candidate) => candidate.source === 'prober')
+        .every((candidate) => candidate.message.includes('sandbox_setup_failed'))
+    ).toBe(true);
+  });
+
+  test('classifies prober dispatch ref errors as setup_failed candidates', async () => {
+    runReproBuilderMock.mockResolvedValue({
+      ok: false,
+      rejectStage: 'no_candidate',
+      reason: 'No candidate',
+      runs: [],
+    });
+    runReproProberMock.mockRejectedValue(new Error('No ref found for: agent/scope-52'));
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-missing-ref',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      proberSampleCount: 2,
+    });
+
+    expect(outcome.status).toBe('not_reproduced');
+    expect(outcome.message).toContain('failed sandbox setup before oracle validation');
+    const proberCandidates = outcome.candidates.filter((candidate) => candidate.source === 'prober');
+    expect(proberCandidates).toHaveLength(2);
+    expect(proberCandidates.every((candidate) => candidate.status === 'setup_failed')).toBe(true);
+    expect(runDeterministicOracleMock).not.toHaveBeenCalled();
+  });
+
+  test('classifies non-authoritative wait_for_run termination as setup_failed', async () => {
+    runReproBuilderMock.mockResolvedValue({
+      ok: false,
+      rejectStage: 'no_candidate',
+      reason: 'No candidate',
+      runs: [],
+    });
+    runReproProberMock.mockResolvedValue({
+      text: '',
+      terminated: 'abandon',
+      reason:
+        'sandbox_setup_failed: wait_for_run: Workflow run did not appear within 180000ms after dispatch',
+      turns: 1,
+      toolCalls: 1,
+      toolCallsByTier: { read: 0, note: 0, 'write-test': 0, mutation: 0, sandbox: 1, meta: 0 },
+      transcriptSummary: 'abandon',
+      recipeSnapshot: null,
+      recipe: null,
+      verbatimIncompatibleHint: false,
+      transcript: [
+        {
+          tool: 'run_repro',
+          ok: false,
+          result: {
+            exitCode: 2,
+            stdout: '',
+            stderr: 'Workflow run did not appear within 180000ms after dispatch',
+          },
+        },
+      ],
+      ranReproCount: 0,
+      lastReproExitCode: null,
+      verifiedSummary: 'run_repro_positive_since_write=0',
+    });
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-wait-for-run',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      proberSampleCount: 1,
+    });
+
+    expect(outcome.status).toBe('not_reproduced');
+    expect(outcome.message.startsWith('sandbox_setup_failed:')).toBe(true);
+    const proberCandidate = outcome.candidates.find((candidate) => candidate.source === 'prober');
+    expect(proberCandidate?.status).toBe('setup_failed');
+    expect(proberCandidate?.message).toContain('wait_for_run');
+    expect(runDeterministicOracleMock).not.toHaveBeenCalled();
+  });
+
   test('ranks only valid candidates and selects ranked winner', async () => {
     runReproBuilderMock.mockResolvedValue({
       ok: true,

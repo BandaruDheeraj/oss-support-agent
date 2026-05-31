@@ -38,6 +38,7 @@ function validConfig(overrides: Partial<SandboxConfig> = {}): SandboxConfig {
 // --- Helper: create a mock ActionsClient ---
 function mockClient(overrides: Partial<ActionsClient> = {}): ActionsClient {
   return {
+    branchRefExists: jest.fn().mockResolvedValue(true),
     triggerWorkflowDispatch: jest.fn().mockResolvedValue(undefined),
     getWorkflowRun: jest.fn().mockResolvedValue({
       id: 12345,
@@ -256,6 +257,22 @@ describe('buildSandboxArtifact', () => {
 // runSandbox - integration tests
 // ============================================================
 describe('runSandbox', () => {
+  const originalWaitForRunMaxMs = process.env.OSA_SANDBOX_WAIT_FOR_RUN_MAX_MS;
+  const originalWaitForRunRedispatches = process.env.OSA_SANDBOX_WAIT_FOR_RUN_REDISPATCHES;
+
+  afterEach(() => {
+    if (originalWaitForRunMaxMs === undefined) {
+      delete process.env.OSA_SANDBOX_WAIT_FOR_RUN_MAX_MS;
+    } else {
+      process.env.OSA_SANDBOX_WAIT_FOR_RUN_MAX_MS = originalWaitForRunMaxMs;
+    }
+    if (originalWaitForRunRedispatches === undefined) {
+      delete process.env.OSA_SANDBOX_WAIT_FOR_RUN_REDISPATCHES;
+    } else {
+      process.env.OSA_SANDBOX_WAIT_FOR_RUN_REDISPATCHES = originalWaitForRunRedispatches;
+    }
+  });
+
   it('triggers workflow_dispatch with correct parameters', async () => {
     const client = mockClient();
     const config = validConfig({ testCommand: 'make test' });
@@ -269,6 +286,32 @@ describe('runSandbox', () => {
     );
   });
 
+  it('verifies workflow and fork refs exist before dispatch', async () => {
+    const branchRefExists = jest.fn().mockResolvedValue(true);
+    const client = mockClient({ branchRefExists });
+    await runSandbox(validConfig(), client, 0);
+
+    expect(branchRefExists).toHaveBeenCalledWith('harness-org/harness-repo', 'main');
+    expect(branchRefExists).toHaveBeenCalledWith('my-org/my-repo', 'agent/scope-42-56');
+    expect(client.triggerWorkflowDispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails fast with sandbox_setup_failed when fork branch ref is missing', async () => {
+    const branchRefExists = jest
+      .fn()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValue(false);
+    const client = mockClient({ branchRefExists });
+    const runPromise = runSandbox(validConfig(), client, 0);
+
+    await expect(runPromise).rejects.toThrow(/sandbox_setup_failed: missing fork repro ref/);
+    await expect(runPromise).rejects.toThrow(SandboxRunError);
+    await expect(runPromise).rejects.toMatchObject({
+      phase: 'pre_dispatch_ref',
+    });
+    expect(client.triggerWorkflowDispatch).not.toHaveBeenCalled();
+  });
+
   it('polls for workflow run after dispatch', async () => {
     const client = mockClient();
     await runSandbox(validConfig(), client, 0);
@@ -279,6 +322,34 @@ describe('runSandbox', () => {
       'main',
       expect.any(String)
     );
+  });
+
+  it('re-dispatches once when run appearance polling misses the first dispatch', async () => {
+    process.env.OSA_SANDBOX_WAIT_FOR_RUN_MAX_MS = '5';
+    process.env.OSA_SANDBOX_WAIT_FOR_RUN_REDISPATCHES = '1';
+    const triggerWorkflowDispatch = jest.fn().mockResolvedValue(undefined);
+    const getWorkflowRun = jest.fn().mockImplementation(async () => {
+      const dispatchCount = triggerWorkflowDispatch.mock.calls.length;
+      if (dispatchCount >= 2) {
+        return {
+          id: 12345,
+          status: 'in_progress',
+          conclusion: null,
+          html_url: 'https://github.com/my-org/my-repo/actions/runs/12345',
+          created_at: new Date().toISOString(),
+        } as WorkflowRun;
+      }
+      return null;
+    });
+    const client = mockClient({
+      triggerWorkflowDispatch,
+      getWorkflowRun,
+    });
+
+    await runSandbox(validConfig(), client, 1);
+
+    expect(triggerWorkflowDispatch).toHaveBeenCalledTimes(2);
+    expect(getWorkflowRun).toHaveBeenCalled();
   });
 
   it('waits for workflow run completion with correct timeout', async () => {

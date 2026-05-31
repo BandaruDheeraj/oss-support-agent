@@ -19,6 +19,13 @@ import {
 } from './sandbox-types';
 import type { RepoAdapter, SandboxCommandResult, ServiceConfig } from './adapter.interface';
 
+const WAIT_FOR_RUN_MAX_MS_ENV = 'OSA_SANDBOX_WAIT_FOR_RUN_MAX_MS';
+const WAIT_FOR_RUN_REDISPATCHES_ENV = 'OSA_SANDBOX_WAIT_FOR_RUN_REDISPATCHES';
+const DEFAULT_WAIT_FOR_RUN_MAX_MS = 180_000;
+const DEFAULT_WAIT_FOR_RUN_REDISPATCHES = 1;
+const MAX_WAIT_FOR_RUN_REDISPATCHES = 3;
+const ZERO_INTERVAL_WAIT_FOR_RUN_MAX_MS = 50;
+
 /**
  * Validates sandbox configuration.
  */
@@ -304,49 +311,55 @@ export async function runSandbox(
       ? refreshedConfig.branchName
       : process.env.HARNESS_WORKFLOW_REF ?? 'main';
 
-  // 2. Trigger workflow_dispatch
+  // 2-3. Trigger workflow_dispatch and wait for the run to appear.
   const inputs = buildWorkflowInputs(refreshedConfig);
-  try {
-    await client.triggerWorkflowDispatch(
-      refreshedConfig.workflowRepoFullName,
-      SANDBOX_WORKFLOW_FILE,
-      workflowDispatchBranch,
-      inputs
-    );
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    throw new SandboxRunError(
-      `Failed to trigger workflow dispatch: ${message}`,
-      'trigger',
-      refreshedConfig.forkFullName
-    );
-  }
-
-  // 3. Wait for workflow run to appear (poll with backoff)
-  let workflowRun: WorkflowRun | null = null;
   const runPollInterval = Math.min(interval, 5_000);
-  // Bound the wait for run-appearance by a small multiple of the poll interval.
-  // This keeps unit tests (which pass interval=0/1) fast while preserving a reasonable
-  // default when interval is large.
-  const maxWaitForRunMs = runPollInterval === 0
-    ? 50
-    : Math.min(60_000, runPollInterval * 12);
-  const runPollStart = Date.now();
+  const maxWaitForRunMs = resolveWaitForRunMaxMs(runPollInterval);
+  const maxRedispatches = resolveWaitForRunRedispatches(runPollInterval);
+  const totalDispatchAttempts = maxRedispatches + 1;
+  let workflowRun: WorkflowRun | null = null;
 
-  while (Date.now() - runPollStart < maxWaitForRunMs) {
-    workflowRun = await client.getWorkflowRun(
-      refreshedConfig.workflowRepoFullName,
-      SANDBOX_WORKFLOW_FILE,
+  for (let dispatchAttempt = 1; dispatchAttempt <= totalDispatchAttempts; dispatchAttempt += 1) {
+    await verifyDispatchRefs({
+      client,
+      workflowRepoFullName: refreshedConfig.workflowRepoFullName,
       workflowDispatchBranch,
-      startedAt
-    );
+      forkFullName: refreshedConfig.forkFullName,
+      forkBranchName: refreshedConfig.branchName,
+      retryDelayMs: interval === 0 ? 0 : 2_000,
+    });
+
+    const dispatchStartedAt = new Date().toISOString();
+    try {
+      await client.triggerWorkflowDispatch(
+        refreshedConfig.workflowRepoFullName,
+        SANDBOX_WORKFLOW_FILE,
+        workflowDispatchBranch,
+        inputs
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new SandboxRunError(
+        `Failed to trigger workflow dispatch: ${message}`,
+        'trigger',
+        refreshedConfig.forkFullName
+      );
+    }
+
+    workflowRun = await waitForWorkflowRunAppearance({
+      client,
+      workflowRepoFullName: refreshedConfig.workflowRepoFullName,
+      workflowDispatchBranch,
+      createdAfter: dispatchStartedAt,
+      pollIntervalMs: runPollInterval,
+      maxWaitForRunMs,
+    });
     if (workflowRun) break;
-    await sleep(runPollInterval);
   }
 
   if (!workflowRun) {
     throw new SandboxRunError(
-      `Workflow run did not appear within ${maxWaitForRunMs}ms after dispatch`,
+      `sandbox_setup_failed: wait_for_run: Workflow run did not appear within ${maxWaitForRunMs}ms after dispatch (${totalDispatchAttempts} dispatch attempt${totalDispatchAttempts === 1 ? '' : 's'})`,
       'wait_for_run',
       refreshedConfig.forkFullName
     );
@@ -441,9 +454,129 @@ export async function runSandbox(
   return artifact;
 }
 
-/**
- * Sleep utility for polling.
- */
+type DispatchRefCheck = {
+  repoFullName: string;
+  branch: string;
+  label: 'workflow dispatch ref' | 'fork repro ref';
+};
+
+async function verifyDispatchRefs(args: {
+  client: ActionsClient;
+  workflowRepoFullName: string;
+  workflowDispatchBranch: string;
+  forkFullName: string;
+  forkBranchName: string;
+  retryDelayMs: number;
+}): Promise<void> {
+  if (!args.client.branchRefExists) {
+    return;
+  }
+
+  const checks: DispatchRefCheck[] = [
+    {
+      repoFullName: args.workflowRepoFullName,
+      branch: args.workflowDispatchBranch,
+      label: 'workflow dispatch ref',
+    },
+    {
+      repoFullName: args.forkFullName,
+      branch: args.forkBranchName,
+      label: 'fork repro ref',
+    },
+  ];
+
+  const uniqueChecks = checks.filter(
+    (check, index, all) =>
+      all.findIndex(
+        (candidate) =>
+          candidate.repoFullName === check.repoFullName && candidate.branch === check.branch
+      ) === index
+  );
+
+  for (const check of uniqueChecks) {
+    await verifyDispatchRef(check, args.client, args.retryDelayMs);
+  }
+}
+
+async function verifyDispatchRef(
+  check: DispatchRefCheck,
+  client: ActionsClient,
+  retryDelayMs: number
+): Promise<void> {
+  if (!client.branchRefExists) return;
+
+  const maxAttempts = 3;
+  let exists = false;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      exists = await client.branchRefExists(check.repoFullName, check.branch);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new SandboxRunError(
+        `sandbox_setup_failed: unable to verify ${check.label} "${check.branch}" in ${check.repoFullName}: ${message}`,
+        'pre_dispatch_ref',
+        check.repoFullName
+      );
+    }
+    if (exists) {
+      return;
+    }
+    if (attempt < maxAttempts && retryDelayMs > 0) {
+      await sleep(retryDelayMs);
+    }
+  }
+
+  throw new SandboxRunError(
+    `sandbox_setup_failed: missing ${check.label} "${check.branch}" in ${check.repoFullName} before dispatch`,
+    'pre_dispatch_ref',
+    check.repoFullName
+  );
+}
+
+async function waitForWorkflowRunAppearance(args: {
+  client: ActionsClient;
+  workflowRepoFullName: string;
+  workflowDispatchBranch: string;
+  createdAfter: string;
+  pollIntervalMs: number;
+  maxWaitForRunMs: number;
+}): Promise<WorkflowRun | null> {
+  const runPollStart = Date.now();
+  while (Date.now() - runPollStart < args.maxWaitForRunMs) {
+    const workflowRun = await args.client.getWorkflowRun(
+      args.workflowRepoFullName,
+      SANDBOX_WORKFLOW_FILE,
+      args.workflowDispatchBranch,
+      args.createdAfter
+    );
+    if (workflowRun) return workflowRun;
+    await sleep(args.pollIntervalMs);
+  }
+  return null;
+}
+
+function parseNonNegativeIntegerEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return undefined;
+  return Math.floor(parsed);
+}
+
+function resolveWaitForRunMaxMs(runPollInterval: number): number {
+  if (runPollInterval === 0) return ZERO_INTERVAL_WAIT_FOR_RUN_MAX_MS;
+  const envOverride = parseNonNegativeIntegerEnv(WAIT_FOR_RUN_MAX_MS_ENV);
+  const configured = envOverride && envOverride > 0 ? envOverride : DEFAULT_WAIT_FOR_RUN_MAX_MS;
+  return Math.max(runPollInterval, configured);
+}
+
+function resolveWaitForRunRedispatches(runPollInterval: number): number {
+  if (runPollInterval === 0) return 0;
+  const envOverride = parseNonNegativeIntegerEnv(WAIT_FOR_RUN_REDISPATCHES_ENV);
+  const configured = envOverride ?? DEFAULT_WAIT_FOR_RUN_REDISPATCHES;
+  return Math.min(MAX_WAIT_FOR_RUN_REDISPATCHES, Math.max(0, configured));
+}
+
 function legacyAdapterFromConfig(config: SandboxConfig): RepoAdapter {
   return {
     async classifyModule() { return '.'; },
@@ -458,6 +591,9 @@ function legacyAdapterFromConfig(config: SandboxConfig): RepoAdapter {
   };
 }
 
+/**
+ * Sleep utility for polling.
+ */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

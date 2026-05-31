@@ -136,6 +136,83 @@ export type PipelineResult =
     }
   | { status: 'pr-opened'; prUrl: string; prNumber: number };
 
+const DEFAULT_REPRO_STAGE_TIMEOUT_MS = 20 * 60 * 1000;
+const REPRO_STAGE_TIMEOUT_MS_ENV = 'OSA_REPRO_STAGE_TIMEOUT_MS';
+
+export class ReproStageTimeoutError extends Error {
+  readonly timeoutMs: number;
+  readonly attemptId: string;
+
+  constructor(attemptId: string, timeoutMs: number) {
+    super(`repro_stage_timeout: runReproPipeline exceeded ${timeoutMs}ms for attempt ${attemptId}`);
+    this.name = 'ReproStageTimeoutError';
+    this.timeoutMs = timeoutMs;
+    this.attemptId = attemptId;
+  }
+}
+
+export function resolveReproStageTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[REPRO_STAGE_TIMEOUT_MS_ENV];
+  if (!raw) return DEFAULT_REPRO_STAGE_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_REPRO_STAGE_TIMEOUT_MS;
+  return Math.floor(parsed);
+}
+
+export async function runReproPipelineWithTimeout(args: {
+  attemptId: string;
+  timeoutMs: number;
+  run: () => Promise<ReproPipelineOutcome>;
+  log: (msg: string) => void;
+}): Promise<ReproPipelineOutcome> {
+  let timedOut = false;
+  let timeoutHandle: NodeJS.Timeout | null = null;
+
+  const reproPromise = args.run();
+  const guardedReproPromise = reproPromise.catch((err) => {
+    if (!timedOut) throw err;
+    const detail = err instanceof Error ? err.message : String(err);
+    args.log(`[v2-repro-timeout] repro pipeline rejected after timeout: ${detail}`);
+    return new Promise<ReproPipelineOutcome>(() => {});
+  });
+
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      reject(new ReproStageTimeoutError(args.attemptId, args.timeoutMs));
+    }, args.timeoutMs);
+  });
+
+  try {
+    return await Promise.race([guardedReproPromise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (timedOut) {
+      args.log(`[v2-repro-timeout] timed out after ${args.timeoutMs}ms (attempt=${args.attemptId})`);
+    }
+  }
+}
+
+function buildTerminalLogDetail(result: PipelineResult): string {
+  switch (result.status) {
+    case 'pr-opened':
+      return `pr=${result.prUrl}`;
+    case 'awaiting-credentials':
+      return `reason=${result.reason} missingEnvVars=${result.missingEnvVars.join(',')}`;
+    case 'sandbox-failed':
+      return `reason=${result.reason}${result.logsPath ? ` logsPath=${result.logsPath}` : ''}`;
+    case 'skipped':
+    case 'commented':
+    case 'fix-failed':
+    case 'max-retries-exceeded':
+    case 'repro-not-runnable':
+    case 'already-fixed-on-main':
+      return `reason=${result.reason}`;
+    default:
+      return '';
+  }
+}
+
 function buildTriageInput(payload: IssueEvent, manifest: Manifest, repoTree: string[]): TriageInput {
   const labels = (payload.issue.labels ?? []).map((l) => l.name);
   return {
@@ -1224,6 +1301,9 @@ export async function runPipeline(args: {
 
   const finish = (result: PipelineResult): PipelineResult => {
     finalDisposition = result.status;
+    const terminalTag = result.status === 'pr-opened' ? '[v2-done] DONE' : '[v2-halt] HALT';
+    const detail = buildTerminalLogDetail(result);
+    log(`${terminalTag} status=${result.status}${detail ? ` ${detail}` : ''}`);
     return result;
   };
 
@@ -1813,19 +1893,38 @@ export async function runPipeline(args: {
     );
 
     const reproAttemptId = runId + "-repro";
-    const reproOutcome = await runReproPipeline({
-      attemptId: reproAttemptId,
-      payload,
-      workspace,
-      forkFullName: fork.forkFullName,
-      branch: fork.branchName,
-      baselineSha,
-      affectedModule: routing.result.affectedModule,
-      language: 'python',
-      sandboxDriver: v2SandboxDriver,
-      ghActionsSandboxOptions: v2GhActionsSandboxOptions,
-      log,
-    });
+    const reproStageTimeoutMs = resolveReproStageTimeoutMs(process.env);
+    let reproOutcome: ReproPipelineOutcome;
+    try {
+      reproOutcome = await runReproPipelineWithTimeout({
+        attemptId: reproAttemptId,
+        timeoutMs: reproStageTimeoutMs,
+        log,
+        run: () =>
+          runReproPipeline({
+            attemptId: reproAttemptId,
+            payload,
+            workspace,
+            forkFullName: fork.forkFullName,
+            branch: fork.branchName,
+            baselineSha,
+            affectedModule: routing.result.affectedModule,
+            language: 'python',
+            sandboxDriver: v2SandboxDriver,
+            ghActionsSandboxOptions: v2GhActionsSandboxOptions,
+            log,
+          }),
+      });
+    } catch (err) {
+      if (err instanceof ReproStageTimeoutError) {
+        return finish(
+          await haltForReproNotRunnable({
+            reason: err.message,
+          })
+        );
+      }
+      throw err;
+    }
 
     // Capture for typed halt/success emails (before any halt return path).
     reproDossier = reproOutcome.v2.dossier.latest() ?? null;

@@ -1,4 +1,9 @@
-import { classifyAlreadyFixedOnMain } from '../bin/run-pipeline';
+import {
+  classifyAlreadyFixedOnMain,
+  ReproStageTimeoutError,
+  resolveReproStageTimeoutMs,
+  runReproPipelineWithTimeout,
+} from '../bin/run-pipeline';
 import type { ReproPipelineOutcome } from '../core/agents/run-v2';
 import { DossierStore } from '../core/agents/analyst/dossier';
 import type { ReproCandidateEvaluation, ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
@@ -116,5 +121,49 @@ describe('classifyAlreadyFixedOnMain', () => {
     const result = classifyAlreadyFixedOnMain(outcome);
 
     expect(result.alreadyFixedOnMain).toBe(false);
+  });
+});
+
+describe('runReproPipelineWithTimeout', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  test('returns repro outcome when run finishes before timeout', async () => {
+    const expected = makeOutcome({ status: 'not_reproduced', message: 'no repro' });
+    const result = await runReproPipelineWithTimeout({
+      attemptId: 'attempt-fast',
+      timeoutMs: 5_000,
+      run: async () => expected,
+      log: () => {},
+    });
+    expect(result).toBe(expected);
+  });
+
+  test('throws ReproStageTimeoutError when repro stage exceeds timeout', async () => {
+    jest.useFakeTimers();
+    const pending = runReproPipelineWithTimeout({
+      attemptId: 'attempt-timeout',
+      timeoutMs: 10,
+      run: async () => await new Promise<ReproPipelineOutcome>(() => {}),
+      log: () => {},
+    });
+
+    const rejection = expect(pending).rejects.toThrow('repro_stage_timeout');
+    await jest.advanceTimersByTimeAsync(10);
+    await rejection;
+    await expect(pending).rejects.toBeInstanceOf(ReproStageTimeoutError);
+  });
+});
+
+describe('resolveReproStageTimeoutMs', () => {
+  test('returns default timeout when env value is missing or invalid', () => {
+    expect(resolveReproStageTimeoutMs({})).toBe(20 * 60 * 1000);
+    expect(resolveReproStageTimeoutMs({ OSA_REPRO_STAGE_TIMEOUT_MS: 'invalid' })).toBe(20 * 60 * 1000);
+    expect(resolveReproStageTimeoutMs({ OSA_REPRO_STAGE_TIMEOUT_MS: '0' })).toBe(20 * 60 * 1000);
+  });
+
+  test('returns configured timeout from env', () => {
+    expect(resolveReproStageTimeoutMs({ OSA_REPRO_STAGE_TIMEOUT_MS: '45000' })).toBe(45_000);
   });
 });

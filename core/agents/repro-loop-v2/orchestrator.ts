@@ -633,6 +633,17 @@ async function runProberSample(args: {
       };
     }
     if (!prober.recipe) {
+      const setupFailureDetail = inferProberSetupFailureDetail(prober);
+      if (setupFailureDetail) {
+        return {
+          candidateId,
+          source: 'prober',
+          sampleIndex: args.sampleIndex,
+          status: 'setup_failed',
+          message: `Prober sample failed sandbox setup before recipe generation: ${setupFailureDetail}`,
+          prober,
+        };
+      }
       return {
         candidateId,
         source: 'prober',
@@ -768,10 +779,35 @@ function collapseWhitespace(value: string): string {
   return value.replace(/\s+/g, ' ').trim();
 }
 
+function inferProberSetupFailureDetail(prober: ReproProberResult): string | null {
+  const candidates: string[] = [];
+  if (prober.reason) candidates.push(prober.reason);
+  for (const entry of prober.transcript) {
+    if (entry.result && typeof entry.result === 'object') {
+      const result = entry.result as Record<string, unknown>;
+      const message = result.message;
+      if (typeof message === 'string') candidates.push(message);
+      const stderr = result.stderr;
+      if (typeof stderr === 'string') candidates.push(stderr);
+      const error = result.error;
+      if (typeof error === 'string') candidates.push(error);
+    } else if (typeof entry.result === 'string') {
+      candidates.push(entry.result);
+    }
+  }
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (isSandboxSetupFailure(candidate)) return collapseWhitespace(candidate).slice(0, 320);
+  }
+  return null;
+}
+
 function isSandboxSetupFailure(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
     normalized.includes('sandbox_setup_failed') ||
+    normalized.includes('wait_for_run') ||
+    normalized.includes('workflow run did not appear within') ||
     normalized.includes('no ref found for') ||
     normalized.includes('missing fork repro ref') ||
     normalized.includes('missing workflow dispatch ref') ||
@@ -781,6 +817,21 @@ function isSandboxSetupFailure(message: string): boolean {
 
 function buildNoReproMessage(candidates: ReproCandidateEvaluation[]): string {
   const setupFailures = candidates.filter((candidate) => candidate.status === 'setup_failed').length;
+  const proberCandidates = candidates.filter((candidate) => candidate.source === 'prober');
+  const builderCandidates = candidates.filter((candidate) => candidate.source === 'builder');
+  const allProberSetupFailed =
+    proberCandidates.length > 0 && proberCandidates.every((candidate) => candidate.status === 'setup_failed');
+  const builderUnavailable =
+    builderCandidates.length === 0 ||
+    builderCandidates.every(
+      (candidate) => candidate.status === 'generation_failed' && candidate.builderRejectStage === 'no_candidate'
+    );
+  if (allProberSetupFailed && builderUnavailable) {
+    return (
+      `sandbox_setup_failed: no candidate passed deterministic repro oracle after evaluating ${candidates.length} candidates; ` +
+      `${setupFailures} candidate(s) failed sandbox setup before oracle validation.`
+    );
+  }
   if (setupFailures > 0) {
     return (
       `No candidate passed deterministic repro oracle after evaluating ${candidates.length} candidates; ` +
