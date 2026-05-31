@@ -61,6 +61,20 @@ export class GitHubActionsClient implements ActionsClient {
     }
   }
 
+  async branchRefExists(repoFullName: string, branch: string): Promise<boolean> {
+    const url = `${GITHUB_API}/repos/${repoFullName}/git/ref/heads/${encodeURIComponent(branch)}`;
+    const res = await ghFetch(this.token, url);
+    if (res.status === 404) {
+      return false;
+    }
+    if (!res.ok) {
+      throw new Error(
+        `GitHub branchRefExists failed (${res.status}) for ${repoFullName} ${branch}: ${await res.text()}`
+      );
+    }
+    return true;
+  }
+
   async getWorkflowRun(
     forkFullName: string,
     workflowId: string,

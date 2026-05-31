@@ -84,6 +84,12 @@ export interface ActionsClient {
     inputs: Record<string, string>
   ): Promise<void>;
 
+  /**
+   * Best-effort branch existence check used for pre-dispatch setup validation.
+   * Optional so lightweight test doubles do not need to implement it.
+   */
+  branchRefExists?(repoFullName: string, branch: string): Promise<boolean>;
+
   /** Get the most recent workflow run for a branch after a given time */
   getWorkflowRun(
     forkFullName: string,
