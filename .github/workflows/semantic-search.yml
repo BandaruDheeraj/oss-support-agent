@@ -1,0 +1,113 @@
+name: semantic-search
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_full_name:
+        description: Target repository full name (owner/repo)
+        required: true
+        type: string
+      fork_clone_url:
+        description: HTTPS clone URL of the target fork
+        required: true
+        type: string
+      branch_name:
+        description: Branch in the target fork to analyze
+        required: true
+        type: string
+      issue_title:
+        description: Issue title used for semantic query
+        required: true
+        type: string
+      issue_body:
+        description: Issue body used for semantic query
+        required: false
+        type: string
+      affected_module:
+        description: Optional module hint (repo-relative path)
+        required: false
+        default: .
+        type: string
+      top_k:
+        description: Number of top semantic files to return
+        required: false
+        default: "5"
+        type: string
+
+jobs:
+  semantic-search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out workflow repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install semantic dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Clone target repository branch
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.branch_name }}" "${{ inputs.fork_clone_url }}" target
+          echo "[semantic-search] cloned ${{ inputs.repo_full_name }}@${{ inputs.branch_name }}"
+
+      - name: Build semantic suspect seed
+        env:
+          ISSUE_TITLE: ${{ inputs.issue_title }}
+          ISSUE_BODY: ${{ inputs.issue_body }}
+          AFFECTED_MODULE: ${{ inputs.affected_module }}
+          TOP_K: ${{ inputs.top_k }}
+          HF_HOME: ${{ runner.temp }}/hf-cache
+          TRANSFORMERS_CACHE: ${{ runner.temp }}/hf-cache
+          SENTENCE_TRANSFORMERS_HOME: ${{ runner.temp }}/hf-cache
+          TOKENIZERS_PARALLELISM: "false"
+          PYTHONUNBUFFERED: "1"
+          SEMANTIC_INDEX_CACHE_DIR: ${{ runner.temp }}/semantic-index-cache
+          SEMANTIC_INDEX_MODEL: BAAI/bge-small-en-v1.5
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = {
+              "workspaceDir": str((Path.cwd() / "target").resolve()),
+              "query": f"{os.environ.get('ISSUE_TITLE', '')}\n\n{os.environ.get('ISSUE_BODY', '')}".strip(),
+              "topK": int(os.environ.get("TOP_K", "5") or "5"),
+              "affectedModule": (os.environ.get("AFFECTED_MODULE", ".") or ".").strip() or ".",
+          }
+          if not payload["query"]:
+              raise SystemExit("semantic query is empty")
+          Path("semantic-input.json").write_text(json.dumps(payload), encoding="utf-8")
+          PY
+
+          python scripts/semantic_suspects.py < semantic-input.json > target/semantic-output.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          data = json.loads(Path("target/semantic-output.json").read_text(encoding="utf-8"))
+          if not isinstance(data.get("results"), list):
+              raise SystemExit("semantic output missing results list")
+          print(
+              f"[semantic-search] indexed={data.get('indexedFileCount', 0)} "
+              f"results={len(data['results'])}"
+          )
+          PY
+
+      - name: Upload semantic output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-output
+          path: target/semantic-output.json
+          if-no-files-found: error
+

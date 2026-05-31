@@ -1,0 +1,104 @@
+import type { ActionsClient, WorkflowRun } from '../../sandbox-types';
+import { buildSemanticSuspectSeed } from './semantic-search';
+
+function mockWorkflowRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
+  return {
+    id: 101,
+    status: 'completed',
+    conclusion: 'success',
+    html_url: 'https://github.com/BandaruDheeraj/oss-support-agent/actions/runs/101',
+    created_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+function createActionsClient(overrides: Partial<ActionsClient> = {}): ActionsClient {
+  return {
+    triggerWorkflowDispatch: jest.fn().mockResolvedValue(undefined),
+    getWorkflowRun: jest.fn().mockResolvedValue(mockWorkflowRun()),
+    waitForWorkflowRun: jest
+      .fn()
+      .mockResolvedValue({ completed: true, conclusion: 'success', timedOut: false }),
+    getWorkflowRunLogs: jest.fn().mockResolvedValue({ stdout: '', stderr: '', exitCode: 0 }),
+    uploadArtifact: jest.fn().mockResolvedValue('https://github.com/example/actions/runs/101'),
+    downloadWorkflowRunArtifact: jest.fn().mockResolvedValue(
+      JSON.stringify({
+        model: 'BAAI/bge-small-en-v1.5',
+        cacheHit: false,
+        cacheKey: 'seed',
+        indexedFileCount: 23,
+        instrumentationDirs: ['python/openinference-instrumentation'],
+        results: [
+          {
+            file: 'python/openinference-instrumentation/openinference/instrumentation/demo.py',
+            score: 0.91,
+            primaryClass: 'DemoClass',
+            primaryFunction: 'demo_function',
+          },
+        ],
+      })
+    ),
+    ...overrides,
+  };
+}
+
+describe('buildSemanticSuspectSeed', () => {
+  it('dispatches semantic workflow and maps suspect files/symbols from artifact output', async () => {
+    const actionsClient = createActionsClient({
+      branchRefExists: jest.fn().mockResolvedValue(true),
+    });
+    const result = await buildSemanticSuspectSeed({
+      workspaceDir: '/tmp/workspace',
+      issueTitle: 'Agent crashes when tracing tool calls',
+      issueBody: 'Regression appears in instrumentation path.',
+      affectedModule: 'python/openinference-instrumentation',
+      ghaConfig: {
+        actionsClient,
+        repoFullName: 'BandaruDheeraj/openinference',
+        forkFullName: 'BandaruDheeraj/openinference',
+        forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
+        branchName: 'agent/scope-52',
+        workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
+        workflowDispatchRef: 'main',
+        timeoutMinutes: 15,
+      },
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        suspectFiles: ['python/openinference-instrumentation/openinference/instrumentation/demo.py'],
+      })
+    );
+    expect(result?.suspectSymbols).toEqual([
+      expect.objectContaining({ symbol: 'DemoClass' }),
+      expect.objectContaining({ symbol: 'demo_function' }),
+    ]);
+
+    expect(actionsClient.triggerWorkflowDispatch).toHaveBeenCalledWith(
+      'BandaruDheeraj/oss-support-agent',
+      'semantic-search.yml',
+      'main',
+      expect.objectContaining({
+        repo_full_name: 'BandaruDheeraj/openinference',
+        branch_name: 'agent/scope-52',
+        issue_title: 'Agent crashes when tracing tool calls',
+        issue_body: 'Regression appears in instrumentation path.',
+      })
+    );
+    expect(actionsClient.downloadWorkflowRunArtifact).toHaveBeenCalledWith(
+      'BandaruDheeraj/oss-support-agent',
+      101,
+      'semantic-output'
+    );
+  });
+
+  it('returns null when gha config is unavailable', async () => {
+    const result = await buildSemanticSuspectSeed({
+      workspaceDir: '/tmp/workspace',
+      issueTitle: 'No-op',
+      issueBody: '',
+    });
+    expect(result).toBeNull();
+  });
+});
+

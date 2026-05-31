@@ -9,6 +9,8 @@
  * path remains the default and does not touch this client.
  */
 
+import JSZip from 'jszip';
+
 import type {
   ActionsClient,
   WorkflowRun,
@@ -201,7 +203,22 @@ export class GitHubActionsClient implements ActionsClient {
       throw new Error(`GitHub downloadArtifact failed (${dlRes.status}): ${await dlRes.text()}`);
     }
     const buf = Buffer.from(await dlRes.arrayBuffer());
-    return buf.toString('base64');
+    let zip: JSZip;
+    try {
+      zip = await JSZip.loadAsync(buf);
+    } catch (err) {
+      throw new Error(
+        `GitHub downloadArtifact failed to read zip for "${artifactName}": ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    const files = Object.values(zip.files).filter((file) => !file.dir);
+    if (files.length === 0) {
+      throw new Error(`GitHub artifact "${artifactName}" in run ${runId} had no files`);
+    }
+    const preferredNames = [`${artifactName}.json`, `${artifactName}.txt`, 'semantic-output.json', 'sandbox-output.json'];
+    const targetFile =
+      files.find((file) => preferredNames.some((name) => file.name.endsWith(name))) ?? files[0];
+    return targetFile.async('string');
   }
 
   /**

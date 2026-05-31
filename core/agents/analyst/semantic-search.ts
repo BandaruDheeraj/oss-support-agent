@@ -1,33 +1,15 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
-import { ensurePythonVenv } from '../../../bin/clients/local-sandbox';
-import { execCommand } from '../../../bin/clients/local-workspace';
+import type { ActionsClient, WorkflowRun } from '../../sandbox-types';
 import type { SuspectSymbol } from './dossier';
 
 const SEMANTIC_MODEL_NAME = 'BAAI/bge-small-en-v1.5';
-const SEMANTIC_VENV_DIR = '.semantic-venv';
 const SEMANTIC_TOP_K = 5;
-const SEMANTIC_TIMEOUT_MS = 20 * 60 * 1_000;
-const PYTHON_IMPORT_PROBE_TIMEOUT_MS = 2 * 60 * 1_000;
-const PIP_INSTALL_TIMEOUT_MS = 20 * 60 * 1_000;
-
-const REQUIRED_SEMANTIC_PACKAGES = [
-  'llama-index-core',
-  'llama-index-embeddings-huggingface',
-  'llama-index-readers-file',
-  'sentence-transformers',
-] as const;
-
-const SCRIPT_RELATIVE_PATH = path.join('scripts', 'semantic_suspects.py');
-const REQUIREMENTS_FILE = 'requirements.txt';
-
-interface SemanticScriptPayload {
-  workspaceDir: string;
-  query: string;
-  topK: number;
-  affectedModule: string;
-}
+const SEMANTIC_WORKFLOW_FILE = 'semantic-search.yml';
+const SEMANTIC_RUN_APPEAR_TIMEOUT_MS = 180_000;
+const SEMANTIC_RUN_APPEAR_POLL_MS = 5_000;
+const SEMANTIC_REF_CHECK_ATTEMPTS = 3;
+const SEMANTIC_REF_CHECK_DELAY_MS = 2_000;
+const SEMANTIC_ISSUE_TITLE_MAX_CHARS = 4_000;
+const SEMANTIC_ISSUE_BODY_MAX_CHARS = 60_000;
 
 interface SemanticScriptResultItem {
   file: string;
@@ -61,7 +43,19 @@ export interface BuildSemanticSuspectSeedArgs {
   issueTitle: string;
   issueBody?: string;
   affectedModule?: string;
+  ghaConfig?: SemanticSearchGhaConfig;
   log?: (message: string) => void;
+}
+
+export interface SemanticSearchGhaConfig {
+  actionsClient: ActionsClient;
+  repoFullName: string;
+  forkFullName: string;
+  forkCloneUrl: string;
+  branchName: string;
+  workflowRepoFullName: string;
+  workflowDispatchRef: string;
+  timeoutMinutes: number;
 }
 
 export async function buildSemanticSuspectSeed(
@@ -70,56 +64,19 @@ export async function buildSemanticSuspectSeed(
   const log = args.log ?? (() => {});
   const query = `${args.issueTitle}\n\n${args.issueBody ?? ''}`.trim();
   if (!query) return null;
-
-  const venv = await ensurePythonVenv(args.workspaceDir, log, SEMANTIC_TIMEOUT_MS, SEMANTIC_VENV_DIR);
-  if (!venv) {
-    log('[semantic-search] unable to initialize Python venv; skipping semantic seed');
+  if (!args.ghaConfig) {
+    log('[semantic-search] skipping semantic seed: gha workflow config unavailable');
     return null;
   }
-  const pythonPath = path.join(venv.binDir, process.platform === 'win32' ? 'python.exe' : 'python');
-  const pipPath = path.join(venv.binDir, process.platform === 'win32' ? 'pip.exe' : 'pip');
 
-  await ensureSemanticDependencies({
-    workspaceDir: args.workspaceDir,
-    pythonPath,
-    pipPath,
+  const workflowOutput = await runSemanticWorkflow({
+    issueTitle: args.issueTitle,
+    issueBody: args.issueBody ?? '',
+    affectedModule: args.affectedModule?.trim() || '.',
+    ghaConfig: args.ghaConfig,
     log,
   });
-
-  const scriptPath = resolveRepoFile(SCRIPT_RELATIVE_PATH);
-  if (!scriptPath) {
-    throw new Error(`semantic search script not found at ${SCRIPT_RELATIVE_PATH}`);
-  }
-
-  const payload: SemanticScriptPayload = {
-    workspaceDir: args.workspaceDir,
-    query,
-    topK: SEMANTIC_TOP_K,
-    affectedModule: args.affectedModule?.trim() || '.',
-  };
-  const cacheRoot = path.join(args.workspaceDir, '.semantic-index-cache');
-  const hfCache = path.join(args.workspaceDir, '.semantic-hf-cache');
-  const run = await execCommand(`"${pythonPath}" "${scriptPath}"`, [], args.workspaceDir, {
-    shell: true,
-    timeoutMs: SEMANTIC_TIMEOUT_MS,
-    stdin: `${JSON.stringify(payload)}\n`,
-    env: {
-      ...process.env,
-      HF_HOME: hfCache,
-      TRANSFORMERS_CACHE: hfCache,
-      SENTENCE_TRANSFORMERS_HOME: hfCache,
-      TOKENIZERS_PARALLELISM: 'false',
-      PYTHONUNBUFFERED: '1',
-      SEMANTIC_INDEX_CACHE_DIR: cacheRoot,
-      SEMANTIC_INDEX_MODEL: SEMANTIC_MODEL_NAME,
-    },
-  });
-  if (run.exitCode !== 0) {
-    throw new Error(
-      `semantic search script failed (exit=${run.exitCode}): ${(run.stderr || run.stdout).slice(0, 800)}`
-    );
-  }
-  const parsed = parseSemanticScriptResult(run.stdout);
+  const parsed = parseSemanticScriptResult(workflowOutput);
   const suspectFiles = parsed.results.map((r) => normalizeRepoPath(r.file)).filter((p) => p.length > 0);
   const suspectSymbols = dedupeSuspectSymbols(parsed.results.flatMap(resultToSuspectSymbols));
 
@@ -142,52 +99,170 @@ export async function buildSemanticSuspectSeed(
   };
 }
 
-interface EnsureSemanticDependenciesArgs {
-  workspaceDir: string;
-  pythonPath: string;
-  pipPath: string;
+interface RunSemanticWorkflowArgs {
+  issueTitle: string;
+  issueBody: string;
+  affectedModule: string;
+  ghaConfig: SemanticSearchGhaConfig;
   log: (message: string) => void;
 }
 
-async function ensureSemanticDependencies(args: EnsureSemanticDependenciesArgs): Promise<void> {
-  const probe = await execCommand(
-    `"${args.pythonPath}" -c "import llama_index.core; import llama_index.embeddings.huggingface; import sentence_transformers"`,
-    [],
-    args.workspaceDir,
-    { shell: true, timeoutMs: PYTHON_IMPORT_PROBE_TIMEOUT_MS }
-  );
-  if (probe.exitCode === 0) return;
-
-  args.log('[semantic-search] installing llama-index + sentence-transformers dependencies');
-  const requirementsPath = resolveRepoFile(REQUIREMENTS_FILE);
-  const installCommand = requirementsPath
-    ? `"${args.pipPath}" install --disable-pip-version-check --quiet -r "${requirementsPath}"`
-    : `"${args.pipPath}" install --disable-pip-version-check --quiet ${REQUIRED_SEMANTIC_PACKAGES.join(' ')}`;
-  const install = await execCommand(installCommand, [], args.workspaceDir, {
-    shell: true,
-    timeoutMs: PIP_INSTALL_TIMEOUT_MS,
-    env: {
-      ...process.env,
-      PIP_DISABLE_PIP_VERSION_CHECK: '1',
-    },
+async function runSemanticWorkflow(args: RunSemanticWorkflowArgs): Promise<string> {
+  const { ghaConfig } = args;
+  await verifySemanticDispatchRefs({
+    actionsClient: ghaConfig.actionsClient,
+    workflowRepoFullName: ghaConfig.workflowRepoFullName,
+    workflowDispatchRef: ghaConfig.workflowDispatchRef,
+    forkFullName: ghaConfig.forkFullName,
+    forkBranchName: ghaConfig.branchName,
   });
-  if (install.exitCode !== 0) {
-    throw new Error(
-      `failed to install semantic dependencies (exit=${install.exitCode}): ${(install.stderr || install.stdout).slice(0, 800)}`
+
+  const issueTitle = limitWorkflowInput(args.issueTitle, SEMANTIC_ISSUE_TITLE_MAX_CHARS);
+  const issueBody = limitWorkflowInput(args.issueBody, SEMANTIC_ISSUE_BODY_MAX_CHARS);
+  if (issueTitle.truncated || issueBody.truncated) {
+    args.log(
+      `[semantic-search] workflow inputs truncated (title=${issueTitle.value.length}, body=${issueBody.value.length})`
     );
+  }
+
+  const dispatchCreatedAt = new Date().toISOString();
+  await ghaConfig.actionsClient.triggerWorkflowDispatch(
+    ghaConfig.workflowRepoFullName,
+    SEMANTIC_WORKFLOW_FILE,
+    ghaConfig.workflowDispatchRef,
+    {
+      repo_full_name: ghaConfig.repoFullName,
+      fork_clone_url: ghaConfig.forkCloneUrl,
+      branch_name: ghaConfig.branchName,
+      issue_title: issueTitle.value,
+      issue_body: issueBody.value,
+      affected_module: args.affectedModule,
+      top_k: String(SEMANTIC_TOP_K),
+    }
+  );
+
+  const workflowRun = await waitForSemanticRunAppearance({
+    actionsClient: ghaConfig.actionsClient,
+    workflowRepoFullName: ghaConfig.workflowRepoFullName,
+    workflowDispatchRef: ghaConfig.workflowDispatchRef,
+    createdAfter: dispatchCreatedAt,
+  });
+  if (!workflowRun) {
+    throw new Error(
+      `semantic workflow run did not appear within ${SEMANTIC_RUN_APPEAR_TIMEOUT_MS}ms after dispatch`
+    );
+  }
+
+  const runStatus = await ghaConfig.actionsClient.waitForWorkflowRun(
+    ghaConfig.workflowRepoFullName,
+    workflowRun.id,
+    ghaConfig.timeoutMinutes * 60 * 1_000
+  );
+  if (runStatus.timedOut) {
+    throw new Error(
+      `semantic workflow timed out after ${ghaConfig.timeoutMinutes} minute(s): ${workflowRun.html_url}`
+    );
+  }
+  if (runStatus.conclusion !== 'success') {
+    throw new Error(
+      `semantic workflow failed with conclusion=${runStatus.conclusion ?? 'unknown'}: ${workflowRun.html_url}`
+    );
+  }
+
+  const rawArtifact = await ghaConfig.actionsClient.downloadWorkflowRunArtifact?.(
+    ghaConfig.workflowRepoFullName,
+    workflowRun.id,
+    'semantic-output'
+  );
+  if (!rawArtifact) {
+    throw new Error(`semantic workflow produced no semantic-output artifact: ${workflowRun.html_url}`);
+  }
+  return rawArtifact;
+}
+
+async function waitForSemanticRunAppearance(args: {
+  actionsClient: ActionsClient;
+  workflowRepoFullName: string;
+  workflowDispatchRef: string;
+  createdAfter: string;
+}): Promise<WorkflowRun | null> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < SEMANTIC_RUN_APPEAR_TIMEOUT_MS) {
+    const run = await args.actionsClient.getWorkflowRun(
+      args.workflowRepoFullName,
+      SEMANTIC_WORKFLOW_FILE,
+      args.workflowDispatchRef,
+      args.createdAfter
+    );
+    if (run) return run;
+    await sleep(SEMANTIC_RUN_APPEAR_POLL_MS);
+  }
+  return null;
+}
+
+async function verifySemanticDispatchRefs(args: {
+  actionsClient: ActionsClient;
+  workflowRepoFullName: string;
+  workflowDispatchRef: string;
+  forkFullName: string;
+  forkBranchName: string;
+}): Promise<void> {
+  if (!args.actionsClient.branchRefExists) return;
+
+  const checks = [
+    {
+      repoFullName: args.workflowRepoFullName,
+      branch: args.workflowDispatchRef,
+      label: 'workflow dispatch ref',
+    },
+    {
+      repoFullName: args.forkFullName,
+      branch: args.forkBranchName,
+      label: 'fork semantic ref',
+    },
+  ] as const;
+
+  const uniqueChecks = checks.filter(
+    (check, index, all) =>
+      all.findIndex(
+        (candidate) =>
+          candidate.repoFullName === check.repoFullName && candidate.branch === check.branch
+      ) === index
+  );
+
+  for (const check of uniqueChecks) {
+    let exists = false;
+    for (let attempt = 1; attempt <= SEMANTIC_REF_CHECK_ATTEMPTS; attempt += 1) {
+      exists = await args.actionsClient.branchRefExists(check.repoFullName, check.branch);
+      if (exists) break;
+      if (attempt < SEMANTIC_REF_CHECK_ATTEMPTS) {
+        await sleep(SEMANTIC_REF_CHECK_DELAY_MS);
+      }
+    }
+    if (!exists) {
+      throw new Error(
+        `semantic workflow pre-dispatch missing ${check.label} "${check.branch}" in ${check.repoFullName}`
+      );
+    }
   }
 }
 
-function resolveRepoFile(relativePath: string): string | null {
-  let cursor = __dirname;
-  for (let i = 0; i < 12; i += 1) {
-    const candidate = path.join(cursor, relativePath);
-    if (fs.existsSync(candidate)) return candidate;
-    const parent = path.dirname(cursor);
-    if (parent === cursor) break;
-    cursor = parent;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function limitWorkflowInput(
+  value: string,
+  maxChars: number
+): {
+  value: string;
+  truncated: boolean;
+} {
+  const normalized = value.replace(/\r\n/g, '\n');
+  if (normalized.length <= maxChars) {
+    return { value: normalized, truncated: false };
   }
-  return null;
+  return { value: normalized.slice(0, maxChars), truncated: true };
 }
 
 function parseSemanticScriptResult(stdout: string): SemanticScriptResult {

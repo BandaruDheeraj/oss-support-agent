@@ -51,6 +51,21 @@ async function withPipelineSpan<T>(
   }
 }
 
+function isGhaSandboxDriver(driver: SandboxDriver | undefined): boolean {
+  return driver === 'gha' || driver === 'gh-actions';
+}
+
+function resolveWorkflowDispatchRef(args: {
+  workflowRepoFullName: string;
+  forkFullName: string;
+  branchName: string;
+}): string {
+  if (args.workflowRepoFullName === args.forkFullName) {
+    return args.branchName;
+  }
+  return process.env.HARNESS_WORKFLOW_REF?.trim() || 'main';
+}
+
 /* -------------------------------------------------------------------------- */
 /* Common driver inputs                                                       */
 /* -------------------------------------------------------------------------- */
@@ -159,13 +174,37 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
   }
 
   let semanticSuspectSeed = null;
-  if (language === 'python') {
+  const useGhaSemanticSearch =
+    language === 'python' && isGhaSandboxDriver(input.sandboxDriver) && !!input.ghActionsSandboxOptions;
+  if (useGhaSemanticSearch) {
+    const ghaOptions = input.ghActionsSandboxOptions;
+    if (!ghaOptions) {
+      throw new Error('runReproPipeline: gha semantic search requested without ghActionsSandboxOptions');
+    }
     try {
+      const baseConfig = ghaOptions.baseConfig;
       semanticSuspectSeed = await buildSemanticSuspectSeed({
         workspaceDir: input.workspace.dir,
         issueTitle: input.payload.issue.title,
         issueBody: input.payload.issue.body ?? '',
         affectedModule: input.affectedModule,
+        ghaConfig: {
+          actionsClient: ghaOptions.actionsClient,
+          repoFullName: baseConfig.repoFullName,
+          forkFullName: baseConfig.forkFullName,
+          forkCloneUrl:
+            baseConfig.forkCloneUrl && baseConfig.forkCloneUrl.trim()
+              ? baseConfig.forkCloneUrl
+              : `https://github.com/${baseConfig.forkFullName}.git`,
+          branchName: baseConfig.branchName,
+          workflowRepoFullName: baseConfig.workflowRepoFullName,
+          workflowDispatchRef: resolveWorkflowDispatchRef({
+            workflowRepoFullName: baseConfig.workflowRepoFullName,
+            forkFullName: baseConfig.forkFullName,
+            branchName: baseConfig.branchName,
+          }),
+          timeoutMinutes: baseConfig.timeoutMinutes,
+        },
         log,
       });
       if (semanticSuspectSeed) {
@@ -177,6 +216,8 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
       const message = err instanceof Error ? err.message : String(err);
       log(`[v2-driver] semantic suspect indexing failed (continuing without seed): ${message}`);
     }
+  } else if (language === 'python') {
+    log('[v2-driver] semantic suspect indexing skipped (requires gha sandbox mode)');
   }
 
   const v2 = await runReproV2({
