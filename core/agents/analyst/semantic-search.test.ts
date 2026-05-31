@@ -100,5 +100,91 @@ describe('buildSemanticSuspectSeed', () => {
     });
     expect(result).toBeNull();
   });
-});
 
+  it('parses pretty JSON wrapped by noisy workflow output', async () => {
+    const actionsClient = createActionsClient({
+      branchRefExists: jest.fn().mockResolvedValue(true),
+      downloadWorkflowRunArtifact: jest.fn().mockResolvedValue(
+        [
+          '[semantic-search] script_exit=1 raw_bytes=321 stderr_bytes=45',
+          '{',
+          '  "model": "BAAI/bge-small-en-v1.5",',
+          '  "cacheHit": false,',
+          '  "cacheKey": "seed",',
+          '  "indexedFileCount": 7,',
+          '  "instrumentationDirs": ["python/openinference-instrumentation"],',
+          '  "results": [',
+          '    {',
+          '      "file": "python/openinference-instrumentation/openinference/instrumentation/demo.py",',
+          '      "score": 0.82,',
+          '      "primaryClass": "DemoClass",',
+          '      "primaryFunction": "demo_function"',
+          '    }',
+          '  ]',
+          '}',
+          '[semantic-search] done',
+        ].join('\n')
+      ),
+    });
+
+    const result = await buildSemanticSuspectSeed({
+      workspaceDir: '/tmp/workspace',
+      issueTitle: 'Wrapped JSON payload',
+      issueBody: 'Body',
+      ghaConfig: {
+        actionsClient,
+        repoFullName: 'BandaruDheeraj/openinference',
+        forkFullName: 'BandaruDheeraj/openinference',
+        forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
+        branchName: 'agent/scope-53',
+        workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
+        workflowDispatchRef: 'main',
+        timeoutMinutes: 15,
+      },
+    });
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        suspectFiles: ['python/openinference-instrumentation/openinference/instrumentation/demo.py'],
+      })
+    );
+  });
+
+  it('returns null when semantic workflow artifact has no suspect results', async () => {
+    const actionsClient = createActionsClient({
+      branchRefExists: jest.fn().mockResolvedValue(true),
+      downloadWorkflowRunArtifact: jest.fn().mockResolvedValue(
+        JSON.stringify({
+          model: 'BAAI/bge-small-en-v1.5',
+          cacheHit: false,
+          cacheKey: 'workflow-fallback',
+          indexedFileCount: 0,
+          instrumentationDirs: [],
+          results: [],
+          diagnostics: {
+            reason: 'non_json_output',
+            scriptExitCode: 1,
+          },
+        })
+      ),
+    });
+
+    const result = await buildSemanticSuspectSeed({
+      workspaceDir: '/tmp/workspace',
+      issueTitle: 'No semantic output',
+      issueBody: 'Body',
+      ghaConfig: {
+        actionsClient,
+        repoFullName: 'BandaruDheeraj/openinference',
+        forkFullName: 'BandaruDheeraj/openinference',
+        forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
+        branchName: 'agent/scope-54',
+        workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
+        workflowDispatchRef: 'main',
+        timeoutMinutes: 15,
+      },
+    });
+
+    expect(result).toBeNull();
+  });
+});

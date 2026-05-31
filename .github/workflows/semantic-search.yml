@@ -38,6 +38,10 @@ jobs:
   semantic-search:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      SEMANTIC_INDEX_MODEL: BAAI/bge-small-en-v1.5
+      HF_CACHE_DIR: ${{ github.workspace }}/.semantic-hf-cache
+      SEMANTIC_CACHE_DIR: ${{ github.workspace }}/.semantic-index-cache
     steps:
       - name: Check out workflow repository
         uses: actions/checkout@v4
@@ -52,6 +56,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --disable-pip-version-check -r requirements.txt
 
+      - name: Restore HuggingFace cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.HF_CACHE_DIR }}
+          key: semantic-hf-${{ runner.os }}-${{ replace(env.SEMANTIC_INDEX_MODEL, '/', '-') }}
+
+      - name: Restore semantic index cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SEMANTIC_CACHE_DIR }}
+          key: semantic-index-${{ runner.os }}-${{ replace(inputs.repo_full_name, '/', '-') }}-${{ replace(inputs.branch_name, '/', '-') }}-${{ replace(env.SEMANTIC_INDEX_MODEL, '/', '-') }}
+          restore-keys: |
+            semantic-index-${{ runner.os }}-${{ replace(inputs.repo_full_name, '/', '-') }}-${{ replace(inputs.branch_name, '/', '-') }}-
+            semantic-index-${{ runner.os }}-${{ replace(inputs.repo_full_name, '/', '-') }}-
+
       - name: Clone target repository branch
         run: |
           set -euo pipefail
@@ -64,15 +83,18 @@ jobs:
           ISSUE_BODY: ${{ inputs.issue_body }}
           AFFECTED_MODULE: ${{ inputs.affected_module }}
           TOP_K: ${{ inputs.top_k }}
-          HF_HOME: ${{ runner.temp }}/hf-cache
-          TRANSFORMERS_CACHE: ${{ runner.temp }}/hf-cache
-          SENTENCE_TRANSFORMERS_HOME: ${{ runner.temp }}/hf-cache
+          HF_HOME: ${{ env.HF_CACHE_DIR }}
+          TRANSFORMERS_CACHE: ${{ env.HF_CACHE_DIR }}
+          SENTENCE_TRANSFORMERS_HOME: ${{ env.HF_CACHE_DIR }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           TOKENIZERS_PARALLELISM: "false"
           PYTHONUNBUFFERED: "1"
-          SEMANTIC_INDEX_CACHE_DIR: ${{ runner.temp }}/semantic-index-cache
-          SEMANTIC_INDEX_MODEL: BAAI/bge-small-en-v1.5
+          SEMANTIC_INDEX_CACHE_DIR: ${{ env.SEMANTIC_CACHE_DIR }}
+          SEMANTIC_INDEX_MODEL: ${{ env.SEMANTIC_INDEX_MODEL }}
         run: |
           set -euo pipefail
+          mkdir -p "$HF_HOME" "$SEMANTIC_INDEX_CACHE_DIR"
+
           python - <<'PY'
           import json
           import os
@@ -89,25 +111,97 @@ jobs:
           Path("semantic-input.json").write_text(json.dumps(payload), encoding="utf-8")
           PY
 
-          python scripts/semantic_suspects.py < semantic-input.json > target/semantic-output.json
+          set +e
+          python scripts/semantic_suspects.py < semantic-input.json > target/semantic-output.raw.txt 2> target/semantic-output.stderr.log
+          semantic_exit="$?"
+          set -e
+          export SEMANTIC_SCRIPT_EXIT_CODE="$semantic_exit"
 
           python - <<'PY'
           import json
+          import os
           from pathlib import Path
 
-          data = json.loads(Path("target/semantic-output.json").read_text(encoding="utf-8"))
+          def parse_payload(raw: str):
+              trimmed = raw.strip()
+              if not trimmed:
+                  return None
+              try:
+                  return json.loads(trimmed)
+              except json.JSONDecodeError:
+                  pass
+              for line in reversed([line.strip() for line in trimmed.splitlines()]):
+                  if line.startswith("{") and line.endswith("}"):
+                      try:
+                          return json.loads(line)
+                      except json.JSONDecodeError:
+                          continue
+              first = trimmed.find("{")
+              last = trimmed.rfind("}")
+              if first != -1 and last > first:
+                  candidate = trimmed[first : last + 1]
+                  try:
+                      return json.loads(candidate)
+                  except json.JSONDecodeError:
+                      return None
+              return None
+
+          output_path = Path("target/semantic-output.json")
+          raw_path = Path("target/semantic-output.raw.txt")
+          stderr_path = Path("target/semantic-output.stderr.log")
+          raw = raw_path.read_text(encoding="utf-8", errors="replace") if raw_path.exists() else ""
+          stderr = stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""
+          script_exit = int(os.environ.get("SEMANTIC_SCRIPT_EXIT_CODE", "0") or "0")
+
+          parsed = parse_payload(raw)
+          data = parsed if isinstance(parsed, dict) else None
+          if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+              reason = "non_json_output" if raw.strip() else "empty_output"
+              data = {
+                  "model": os.environ.get("SEMANTIC_INDEX_MODEL", "BAAI/bge-small-en-v1.5"),
+                  "cacheHit": False,
+                  "cacheKey": "workflow-fallback",
+                  "indexedFileCount": 0,
+                  "instrumentationDirs": [],
+                  "results": [],
+                  "diagnostics": {
+                      "reason": reason,
+                      "scriptExitCode": script_exit,
+                      "rawBytes": len(raw.encode("utf-8")),
+                      "stderrBytes": len(stderr.encode("utf-8")),
+                      "rawHead": raw[:1500],
+                      "stderrHead": stderr[:1500],
+                  },
+              }
+              print(f"[semantic-search] fallback output generated reason={reason} script_exit={script_exit}")
+
+          output_path.write_text(json.dumps(data), encoding="utf-8")
           if not isinstance(data.get("results"), list):
               raise SystemExit("semantic output missing results list")
           print(
               f"[semantic-search] indexed={data.get('indexedFileCount', 0)} "
               f"results={len(data['results'])}"
           )
+          print(
+              f"[semantic-search] script_exit={script_exit} "
+              f"raw_bytes={len(raw.encode('utf-8'))} stderr_bytes={len(stderr.encode('utf-8'))}"
+          )
           PY
 
       - name: Upload semantic output artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: semantic-output
           path: target/semantic-output.json
           if-no-files-found: error
 
+      - name: Upload semantic diagnostics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-diagnostics
+          path: |
+            target/semantic-output.raw.txt
+            target/semantic-output.stderr.log
+          if-no-files-found: warn

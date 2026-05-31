@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import json
 import os
@@ -166,7 +167,10 @@ def _load_or_build_index(
 
 def _extract_primary_symbols(file_path: Path) -> tuple[str | None, str | None]:
   source = file_path.read_text(encoding="utf-8", errors="ignore")
-  tree = ast.parse(source, filename=str(file_path))
+  try:
+    tree = ast.parse(source, filename=str(file_path))
+  except SyntaxError:
+    return None, None
   primary_class: str | None = None
   primary_func: str | None = None
   for node in tree.body:
@@ -207,6 +211,12 @@ def _normalize_result_path(workspace_dir: Path, file_value: str) -> str:
     return _normalize_rel_path(file_value)
 
 
+def _emit_json(payload: dict[str, Any]) -> None:
+  sys.stdout.write(json.dumps(payload))
+  sys.stdout.write("\n")
+  sys.stdout.flush()
+
+
 def main() -> int:
   payload = _read_payload()
   workspace_dir = Path(str(payload.get("workspaceDir", ""))).resolve()
@@ -226,31 +236,34 @@ def main() -> int:
   instrumentation_dirs = _collect_instrumentation_dirs(workspace_dir, affected_module)
   py_files = _list_python_files(instrumentation_dirs, workspace_dir)
   if not py_files:
-    print(
-      json.dumps(
-        {
-          "model": model_name,
-          "cacheHit": False,
-          "cacheKey": "no-files",
-          "indexedFileCount": 0,
-          "instrumentationDirs": [
-            _normalize_rel_path(str(d.relative_to(workspace_dir))) for d in instrumentation_dirs
-          ],
-          "results": [],
-        }
-      )
+    _emit_json(
+      {
+        "model": model_name,
+        "cacheHit": False,
+        "cacheKey": "no-files",
+        "indexedFileCount": 0,
+        "instrumentationDirs": [
+          _normalize_rel_path(str(d.relative_to(workspace_dir))) for d in instrumentation_dirs
+        ],
+        "results": [],
+      }
     )
     return 0
 
-  Settings.embed_model = HuggingFaceEmbedding(model_name=model_name)
-  Settings.llm = None
+  # Guard stdout contract: third-party libraries may print progress lines.
+  # Redirecting to stderr keeps stdout as JSON-only for workflow parsers.
+  with contextlib.redirect_stdout(sys.stderr):
+    Settings.embed_model = HuggingFaceEmbedding(model_name=model_name)
+    Settings.llm = None
 
-  cache_root = Path(os.getenv("SEMANTIC_INDEX_CACHE_DIR", str(workspace_dir / ".semantic-index-cache"))).resolve()
-  cache_root.mkdir(parents=True, exist_ok=True)
-  index, cache_hit, cache_key = _load_or_build_index(workspace_dir, py_files, model_name, cache_root)
+    cache_root = Path(
+      os.getenv("SEMANTIC_INDEX_CACHE_DIR", str(workspace_dir / ".semantic-index-cache"))
+    ).resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    index, cache_hit, cache_key = _load_or_build_index(workspace_dir, py_files, model_name, cache_root)
 
-  retriever = index.as_retriever(similarity_top_k=top_k)
-  nodes = retriever.retrieve(query)
+    retriever = index.as_retriever(similarity_top_k=top_k)
+    nodes = retriever.retrieve(query)
   seen_files: set[str] = set()
   results: list[dict[str, Any]] = []
   for node in nodes:
@@ -277,19 +290,17 @@ def main() -> int:
     if len(results) >= top_k:
       break
 
-  print(
-    json.dumps(
-      {
-        "model": model_name,
-        "cacheHit": cache_hit,
-        "cacheKey": cache_key,
-        "indexedFileCount": len(py_files),
-        "instrumentationDirs": [
-          _normalize_rel_path(str(d.relative_to(workspace_dir))) for d in instrumentation_dirs
-        ],
-        "results": results,
-      }
-    )
+  _emit_json(
+    {
+      "model": model_name,
+      "cacheHit": cache_hit,
+      "cacheKey": cache_key,
+      "indexedFileCount": len(py_files),
+      "instrumentationDirs": [
+        _normalize_rel_path(str(d.relative_to(workspace_dir))) for d in instrumentation_dirs
+      ],
+      "results": results,
+    }
   )
   return 0
 

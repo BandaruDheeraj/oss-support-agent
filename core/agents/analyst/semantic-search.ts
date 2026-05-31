@@ -269,20 +269,7 @@ function parseSemanticScriptResult(stdout: string): SemanticScriptResult {
   const trimmed = stdout.trim();
   if (!trimmed) throw new Error('semantic search script returned empty output');
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    const jsonLine = trimmed
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .reverse()
-      .find((line) => line.startsWith('{') && line.endsWith('}'));
-    if (!jsonLine) {
-      throw new Error(`semantic search script returned non-JSON output: ${trimmed.slice(0, 300)}`);
-    }
-    parsed = JSON.parse(jsonLine);
-  }
+  const parsed = parseJsonLikeOutput(trimmed);
 
   if (!parsed || typeof parsed !== 'object') {
     throw new Error('semantic search script returned invalid JSON payload');
@@ -301,6 +288,39 @@ function parseSemanticScriptResult(stdout: string): SemanticScriptResult {
       : [],
     results: p.results.map(parseResultItem).filter((v): v is SemanticScriptResultItem => v !== null),
   };
+}
+
+function parseJsonLikeOutput(trimmed: string): unknown {
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Continue to tolerant extraction fallback.
+  }
+
+  const jsonLine = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .reverse()
+    .find((line) => line.startsWith('{') && line.endsWith('}'));
+  if (jsonLine) {
+    try {
+      return JSON.parse(jsonLine);
+    } catch {
+      // Continue to broader brace extraction fallback.
+    }
+  }
+
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+    } catch {
+      // Fall through to explicit non-JSON error below.
+    }
+  }
+
+  throw new Error(`semantic search script returned non-JSON output: ${trimmed.slice(0, 300)}`);
 }
 
 function parseResultItem(raw: unknown): SemanticScriptResultItem | null {
@@ -355,4 +375,3 @@ function dedupeSuspectSymbols(symbols: SuspectSymbol[]): SuspectSymbol[] {
 function normalizeRepoPath(p: string): string {
   return p.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').trim();
 }
-
