@@ -19,7 +19,7 @@ const createGhActionsSandboxAdapterMock =
 describe('sandbox adapter driver resolution', () => {
   const localHandle = { kind: 'local' } as unknown as SandboxHandle;
   const ghaHandle = { kind: 'gha' } as unknown as SandboxHandle;
-  const workspace = { cwd: '/tmp/workspace' } as any;
+  const workspace = { cwd: '/tmp/workspace', push: jest.fn().mockResolvedValue(undefined) } as any;
   const ghActionsOptions = {
     actionsClient: {} as any,
     baseConfig: {
@@ -38,6 +38,8 @@ describe('sandbox adapter driver resolution', () => {
     createGhActionsSandboxAdapterMock.mockReset();
     createLocalSandboxAdapterMock.mockReturnValue(localHandle);
     createGhActionsSandboxAdapterMock.mockReturnValue(ghaHandle);
+    workspace.push.mockReset();
+    workspace.push.mockResolvedValue(undefined);
     if (priorDriver === undefined) {
       delete process.env.OSA_SANDBOX_DRIVER;
     } else {
@@ -64,14 +66,22 @@ describe('sandbox adapter driver resolution', () => {
     expect(selectSandboxDriver()).toBe('gh-actions');
   });
 
-  it('creates the GitHub Actions adapter when driver is gha', () => {
+  it('creates the GitHub Actions adapter when driver is gha', async () => {
     const adapter = createSandboxAdapter({
       driver: 'gha',
       workspace,
       ghActionsOptions,
     });
 
-    expect(createGhActionsSandboxAdapterMock).toHaveBeenCalledWith(ghActionsOptions);
+    expect(createGhActionsSandboxAdapterMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...ghActionsOptions,
+        beforeDispatch: expect.any(Function),
+      })
+    );
+    const ghArgs = createGhActionsSandboxAdapterMock.mock.calls[0][0];
+    await ghArgs.beforeDispatch?.();
+    expect(workspace.push).toHaveBeenCalledTimes(1);
     expect(createLocalSandboxAdapterMock).not.toHaveBeenCalled();
     expect(adapter).toBe(ghaHandle);
   });

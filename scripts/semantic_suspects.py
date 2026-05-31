@@ -102,12 +102,17 @@ def _list_python_files(instrumentation_dirs: list[Path], workspace_dir: Path) ->
     rel_dir = _normalize_rel_path(str(directory.relative_to(workspace_dir)))
     if _is_hidden_or_ignored(directory.name):
       continue
-    reader = SimpleDirectoryReader(
-      input_dir=str(directory),
-      recursive=True,
-      required_exts=[".py"],
-      filename_as_id=True,
-    )
+    try:
+      reader = SimpleDirectoryReader(
+        input_dir=str(directory),
+        recursive=True,
+        required_exts=[".py"],
+        filename_as_id=True,
+      )
+    except ValueError as exc:
+      if "No files found" in str(exc):
+        continue
+      raise
     for file_path in reader.input_files:
       path_obj = Path(file_path).resolve()
       if not path_obj.is_file():
@@ -217,8 +222,6 @@ def main() -> int:
   affected_module = str(payload.get("affectedModule", ".")).strip() or "."
 
   model_name = os.getenv("SEMANTIC_INDEX_MODEL", "BAAI/bge-small-en-v1.5")
-  Settings.embed_model = HuggingFaceEmbedding(model_name=model_name)
-  Settings.llm = None
 
   instrumentation_dirs = _collect_instrumentation_dirs(workspace_dir, affected_module)
   py_files = _list_python_files(instrumentation_dirs, workspace_dir)
@@ -238,6 +241,9 @@ def main() -> int:
       )
     )
     return 0
+
+  Settings.embed_model = HuggingFaceEmbedding(model_name=model_name)
+  Settings.llm = None
 
   cache_root = Path(os.getenv("SEMANTIC_INDEX_CACHE_DIR", str(workspace_dir / ".semantic-index-cache"))).resolve()
   cache_root.mkdir(parents=True, exist_ok=True)
@@ -294,4 +300,3 @@ if __name__ == "__main__":
   except Exception as exc:
     print(str(exc), file=sys.stderr)
     raise
-

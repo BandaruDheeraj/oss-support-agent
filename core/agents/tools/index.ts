@@ -302,7 +302,7 @@ export function reproProberDoneGate(transcript: TranscriptEntry[]): string | nul
   if (recipeEntryIdx < 0 || !recipeArgs?.reproRecipe) {
     return (
       `done is blocked: you have not yet emitted a ReproRecipe via record_evidence. ` +
-      `Once your candidate test has produced two consecutive failing run_repro calls ` +
+      `Once your candidate test has produced at least two failing run_repro calls ` +
       `with the sentinel in stderr/stdout, call record_evidence with the full reproRecipe ` +
       `payload (candidateTestPath, testSource, sentinelString, expectedFailureSignature, ` +
       `pipInstalls, requiresCredentials, verbatimSnippetIncompatible, and a provenance ` +
@@ -340,11 +340,33 @@ export function reproProberDoneGate(transcript: TranscriptEntry[]): string | nul
   }
   if (failingWithSentinel < 2) {
     return (
-      `done is blocked: the reproRecipe requires two consecutive failing run_repro calls ` +
+      `done is blocked: the reproRecipe requires at least two failing run_repro calls ` +
       `with sentinel "${sentinelString}" in combined stdout+stderr after the write of ` +
       `"${candidateTestPath}". Observed only ${failingWithSentinel} such call(s). Run run_repro ` +
       `until you see two failing observations with the sentinel, then re-emit record_evidence ` +
-      `with provenance.observedProbe populated from the latest run.`
+      `with provenance.observedProbe populated from the latest run. run_repro errors and failing ` +
+      `runs without the sentinel are treated as setup failures and do not count.`
+    );
+  }
+  return null;
+}
+
+export function reproProberRecordEvidenceGate(transcript: TranscriptEntry[]): string | null {
+  const state = deriveVerifiedState(transcript);
+  if (!state.derivedSentinel) {
+    return (
+      `record_evidence is blocked: no sentinel was derivable from your latest successful write_test/revise_test. ` +
+      `Rewrite the test so it fails with a literal sentinel string (for example: assert False, "REPRO_SENTINEL"), ` +
+      `then run run_repro until the sentinel appears in at least two failing outputs. run_repro errors do not count.\n\n` +
+      `${renderVerifiedState(state)}`
+    );
+  }
+  if (state.runReproPositiveSinceWrite < 2) {
+    return (
+      `record_evidence is blocked: you need at least 2 qualifying run_repro observations after the latest test write ` +
+      `(exit!=0 AND sentinel "${state.derivedSentinel}" in output). Observed ${state.runReproPositiveSinceWrite}. ` +
+      `run_repro errors and failing runs without the sentinel are treated as setup failures and do not count.\n\n` +
+      `${renderVerifiedState(state)}`
     );
   }
   return null;
@@ -443,6 +465,7 @@ export function makeReproProberRegistry({ ctx }: RegistryFactoryArgs): ToolRegis
           gateRequirePriorProbe(transcript) ?? gateRequireRunReproSinceLastWrite(transcript),
         revise_test: (transcript) =>
           gateRequirePriorProbe(transcript) ?? gateRequireRunReproSinceLastWrite(transcript),
+        record_evidence: reproProberRecordEvidenceGate,
         done: reproProberDoneGate,
       },
       abandonGate: reproProberAbandonGate,

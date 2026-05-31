@@ -141,7 +141,7 @@ Hard rules:
 - Do NOT call write_test before step 4. Big-bang authoring burns budget on incorrect imports before any sandbox feedback. Probe first. The registry will block write_test until at least one import probe has succeeded — the error message will show you the verified-state ledger.
 - revise_test is allowed only after at least one run_repro call has produced output you can react to.
 - Embed the sentinelString in your test's failure message so the Executor and Critic can verify reproducibility across runs.
-- Before calling record_evidence you MUST have two consecutive run_repro results with non-zero exit AND the sentinel in stderr/stdout.
+- Before calling record_evidence you MUST have at least two run_repro results with non-zero exit AND the sentinel in stderr/stdout.
 - Do NOT call done in the same model turn as record_evidence — wait for the result on the next turn so you can confirm recipe_recorded=true before terminating.
 - You may not modify source files (apply_patch is not registered for you).
 - Each turn make ONE stateful tool call (sandbox/write-test/meta). Reads may be batched.

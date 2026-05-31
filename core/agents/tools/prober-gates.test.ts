@@ -8,7 +8,7 @@
  *      escape the workspace test roots, mirroring write_test's scoping.
  */
 
-import { reproProberDoneGate, reproProberAbandonGate } from './index';
+import { reproProberDoneGate, reproProberAbandonGate, reproProberRecordEvidenceGate } from './index';
 import { recordEvidence } from './note-meta';
 import { DossierStore } from '../analyst/dossier';
 import type { TranscriptEntry, ToolContext } from './types';
@@ -137,6 +137,52 @@ describe('reproProberDoneGate', () => {
       entry({ tool: 'record_evidence', args: VALID_RECIPE_ARGS, result: { snapshot_id: 'snap-1', recipe_recorded: true } }),
     ];
     expect(reproProberDoneGate(transcript)).toContain('Observed only 0 such call');
+  });
+});
+
+describe('reproProberRecordEvidenceGate', () => {
+  it('blocks record_evidence when fewer than two qualifying failing run_repro observations exist', () => {
+    const reason = reproProberRecordEvidenceGate([
+      entry({
+        tool: 'write_test',
+        tier: 'write-test',
+        args: { path: 'tests/test_repro.py', content: 'def test_x():\n    assert False, "REPRO_SENTINEL"\n' },
+      }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'REPRO_SENTINEL' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'ModuleNotFoundError' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', ok: false, result: undefined }),
+    ]);
+    expect(reason).not.toBeNull();
+    expect(reason).toContain('Observed 1');
+    expect(reason).toContain('do not count');
+  });
+
+  it('blocks record_evidence when no sentinel can be derived from the latest test write', () => {
+    const reason = reproProberRecordEvidenceGate([
+      entry({
+        tool: 'write_test',
+        tier: 'write-test',
+        args: { path: 'tests/test_repro.py', content: 'def test_x():\n    raise RuntimeError("boom")\n' },
+      }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'boom' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'boom' } }),
+    ]);
+    expect(reason).not.toBeNull();
+    expect(reason).toContain('no sentinel was derivable');
+  });
+
+  it('allows record_evidence after two qualifying failing run_repro observations', () => {
+    const reason = reproProberRecordEvidenceGate([
+      entry({
+        tool: 'write_test',
+        tier: 'write-test',
+        args: { path: 'tests/test_repro.py', content: 'def test_x():\n    assert False, "REPRO_SENTINEL"\n' },
+      }),
+      entry({ tool: 'run_repro', tier: 'sandbox', ok: false, result: undefined }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: '', stderr: 'REPRO_SENTINEL' } }),
+      entry({ tool: 'run_repro', tier: 'sandbox', result: { exitCode: 1, stdout: 'REPRO_SENTINEL', stderr: '' } }),
+    ]);
+    expect(reason).toBeNull();
   });
 });
 
