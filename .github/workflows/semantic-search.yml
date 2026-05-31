@@ -60,16 +60,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.HF_CACHE_DIR }}
-          key: semantic-hf-${{ runner.os }}-${{ replace(env.SEMANTIC_INDEX_MODEL, '/', '-') }}
+          key: semantic-hf-${{ runner.os }}-${{ env.SEMANTIC_INDEX_MODEL }}
 
       - name: Restore semantic index cache
         uses: actions/cache@v4
         with:
           path: ${{ env.SEMANTIC_CACHE_DIR }}
-          key: semantic-index-${{ runner.os }}-${{ replace(inputs.repo_full_name, '/', '-') }}-${{ replace(inputs.branch_name, '/', '-') }}-${{ replace(env.SEMANTIC_INDEX_MODEL, '/', '-') }}
+          key: semantic-index-${{ runner.os }}-${{ env.SEMANTIC_INDEX_MODEL }}-${{ github.run_id }}
           restore-keys: |
-            semantic-index-${{ runner.os }}-${{ replace(inputs.repo_full_name, '/', '-') }}-${{ replace(inputs.branch_name, '/', '-') }}-
-            semantic-index-${{ runner.os }}-${{ replace(inputs.repo_full_name, '/', '-') }}-
+            semantic-index-${{ runner.os }}-${{ env.SEMANTIC_INDEX_MODEL }}-
 
       - name: Clone target repository branch
         run: |
