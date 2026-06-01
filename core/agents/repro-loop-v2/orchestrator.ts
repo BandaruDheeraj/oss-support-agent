@@ -150,7 +150,7 @@ export interface ReproCandidateEvaluation {
 }
 
 export interface ReproV2Outcome {
-  status: 'reproduced' | 'credentials_required' | 'not_reproduced';
+  status: 'reproduced' | 'credentials_required' | 'not_reproduced' | 'api_unavailable';
   dossier: DossierStore;
   /** The recipe authored by the selected candidate (when reproduced). */
   recipe?: ReproRecipe;
@@ -189,6 +189,12 @@ export interface ReproV2Outcome {
     matchedPattern: string | null;
     stderrTail?: string;
   };
+  apiUnavailable?: {
+    stage: 'analyst_preflight';
+    reason: string;
+    routeId: string | null;
+    modelId: string | null;
+  };
   message: string;
 }
 
@@ -219,6 +225,23 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       semanticSuspectSeed: args.semanticSuspectSeed ?? null,
     });
     if (!analyst.snapshot) {
+      if (analyst.terminated === 'api_unavailable') {
+        return {
+          status: 'api_unavailable',
+          dossier,
+          candidates,
+          apiUnavailable:
+            analyst.apiUnavailable ?? {
+              stage: 'analyst_preflight',
+              reason: analyst.reason ?? 'analyst api preflight failed',
+              routeId: null,
+              modelId: null,
+            },
+          message:
+            `Analyst API preflight failed` +
+            `${analyst.reason ? ` (${analyst.reason})` : ''}`,
+        };
+      }
       return {
         status: 'not_reproduced',
         dossier,

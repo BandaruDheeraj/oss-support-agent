@@ -1,4 +1,5 @@
 import {
+  buildApiUnavailableRunDiagnostics,
   buildNotReproducedRunDiagnostics,
   classifyAlreadyFixedOnMain,
   ReproStageTimeoutError,
@@ -256,6 +257,38 @@ describe('buildNotReproducedRunDiagnostics', () => {
 
   test('returns null for non-not_reproduced outcomes', () => {
     const diagnostics = buildNotReproducedRunDiagnostics(makeOutcome({ status: 'reproduced' }));
+    expect(diagnostics).toBeNull();
+  });
+});
+
+describe('buildApiUnavailableRunDiagnostics', () => {
+  test('emits structured diagnostics for api_unavailable outcomes', () => {
+    const outcome = makeOutcome({
+      status: 'api_unavailable',
+      message: 'Analyst API preflight failed ([credits-exhausted] 402 Payment Required)',
+    });
+    outcome.v2.apiUnavailable = {
+      stage: 'analyst_preflight',
+      reason: '[credits-exhausted] 402 Payment Required',
+      routeId: 'openrouter:k1:m1',
+      modelId: 'anthropic/claude-sonnet-4.5',
+    };
+
+    const diagnostics = buildApiUnavailableRunDiagnostics(outcome);
+
+    expect(diagnostics).toEqual({
+      reason: 'Analyst API preflight failed ([credits-exhausted] 402 Payment Required)',
+      api_preflight: {
+        stage: 'analyst_preflight',
+        route_id: 'openrouter:k1:m1',
+        model_id: 'anthropic/claude-sonnet-4.5',
+        failure_reason: '[credits-exhausted] 402 Payment Required',
+      },
+    });
+  });
+
+  test('returns null for non-api_unavailable outcomes', () => {
+    const diagnostics = buildApiUnavailableRunDiagnostics(makeOutcome({ status: 'not_reproduced' }));
     expect(diagnostics).toBeNull();
   });
 });

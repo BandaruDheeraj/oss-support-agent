@@ -1,6 +1,8 @@
 import { runAnalyst } from './analyst';
 import { DossierStore } from './dossier';
 import { runAgentLoop, type AgentLoopResult } from '../agent-loop';
+import { generateText } from 'ai';
+import { getModelRoutes, type ModelRoute } from '../../llm/v2/client';
 import type {
   IssueHandle,
   RepoHandle,
@@ -9,8 +11,19 @@ import type {
   WorkspaceWriter,
 } from '../tools/handles';
 
-jest.mock('../agent-loop', () => ({
-  runAgentLoop: jest.fn(),
+jest.mock('../agent-loop', () => {
+  const actual = jest.requireActual('../agent-loop');
+  return {
+    ...actual,
+    runAgentLoop: jest.fn(),
+  };
+});
+jest.mock('ai', () => ({
+  generateText: jest.fn(),
+}));
+jest.mock('../../llm/v2/client', () => ({
+  getModelRoutes: jest.fn(),
+  MissingOpenRouterApiKeyError: class MissingOpenRouterApiKeyError extends Error {},
 }));
 
 function makeLoopResult(overrides: Partial<AgentLoopResult> = {}): AgentLoopResult {
@@ -86,9 +99,22 @@ function makeRepo(): RepoHandle {
 
 describe('runAnalyst parse-recovery', () => {
   const mockedRunAgentLoop = runAgentLoop as jest.MockedFunction<typeof runAgentLoop>;
+  const mockedGenerateText = generateText as jest.MockedFunction<typeof generateText>;
+  const mockedGetModelRoutes = getModelRoutes as jest.MockedFunction<typeof getModelRoutes>;
 
   beforeEach(() => {
     mockedRunAgentLoop.mockReset();
+    mockedGenerateText.mockReset();
+    mockedGetModelRoutes.mockReset();
+    mockedGetModelRoutes.mockReturnValue([
+      {
+        provider: 'openrouter',
+        routeId: 'openrouter:k1:m1',
+        modelId: 'anthropic/claude-sonnet-4.5',
+        model: {} as ModelRoute['model'],
+      },
+    ]);
+    mockedGenerateText.mockResolvedValue({ text: 'ok' } as Awaited<ReturnType<typeof generateText>>);
   });
 
   it('includes strong candidateRepro emission guidance in the system prompt', async () => {
@@ -148,6 +174,30 @@ describe('runAnalyst parse-recovery', () => {
     expect(userPrompt).toContain('"suspectSymbols": [');
     expect(userPrompt).toContain('"semanticConfidence": {');
     expect(userPrompt).toContain('explicitly state that uncertainty');
+  });
+
+  it('returns api_unavailable when analyst API preflight fails', async () => {
+    mockedGenerateText.mockRejectedValue(new Error('402 Payment Required: insufficient credit balance'));
+
+    const result = await runAnalyst({
+      issue: makeIssue(),
+      repo: makeRepo(),
+      workspace: makeWorkspace(),
+      sandbox: makeSandbox(),
+      attemptId: 'attempt-preflight-fail',
+      dossier: new DossierStore(),
+    });
+
+    expect(mockedRunAgentLoop).not.toHaveBeenCalled();
+    expect(result.terminated).toBe('api_unavailable');
+    expect(result.reason).toContain('[credits-exhausted]');
+    expect(result.apiUnavailable).toEqual({
+      stage: 'analyst_preflight',
+      reason: expect.stringContaining('[credits-exhausted]'),
+      routeId: 'openrouter:k1:m1',
+      modelId: 'anthropic/claude-sonnet-4.5',
+    });
+    expect(result.toolCalls).toBe(0);
   });
 
   it('retries once after record_evidence JSON parse failure', async () => {

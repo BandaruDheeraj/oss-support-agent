@@ -208,6 +208,42 @@ beforeEach(() => {
 });
 
 describe('runReproV2 stage3 orchestration', () => {
+  test('returns api_unavailable when analyst preflight fails before dossier creation', async () => {
+    runAnalystMock.mockResolvedValueOnce({
+      snapshot: null,
+      terminated: 'api_unavailable',
+      reason: '[credits-exhausted] 402 Payment Required',
+      apiUnavailable: {
+        stage: 'analyst_preflight',
+        reason: '[credits-exhausted] 402 Payment Required',
+        routeId: 'openrouter:k1:m1',
+        modelId: 'anthropic/claude-sonnet-4.5',
+      },
+      toolCalls: 0,
+      transcriptSummary: '(analyst api preflight failed)',
+    });
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-api-unavailable',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+    });
+
+    expect(outcome.status).toBe('api_unavailable');
+    expect(outcome.message).toContain('Analyst API preflight failed');
+    expect(outcome.apiUnavailable).toEqual({
+      stage: 'analyst_preflight',
+      reason: '[credits-exhausted] 402 Payment Required',
+      routeId: 'openrouter:k1:m1',
+      modelId: 'anthropic/claude-sonnet-4.5',
+    });
+    expect(runReproBuilderMock).not.toHaveBeenCalled();
+    expect(runReproProberMock).not.toHaveBeenCalled();
+    expect(runDeterministicOracleMock).not.toHaveBeenCalled();
+  });
+
   test('defaults to builder + 3 prober samples and returns not_reproduced when none pass oracle', async () => {
     runReproBuilderMock.mockResolvedValue({
       ok: false,

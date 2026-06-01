@@ -3,11 +3,13 @@
  * call to produce a new EvidenceDossier snapshot.
  */
 
+import { generateText } from 'ai';
 import { DossierStore, type DossierSnapshot } from './dossier';
-import { runAgentLoop } from '../agent-loop';
+import { classifyAgentLoopError, runAgentLoop } from '../agent-loop';
 import { makeAnalystRegistry } from '../tools';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
 import type { SemanticSuspectSeed } from './semantic-search';
+import { getModelRoutes, MissingOpenRouterApiKeyError, type ModelRoute } from '../../llm/v2/client';
 
 export interface RunAnalystArgs {
   issue: IssueHandle;
@@ -24,11 +26,21 @@ export interface RunAnalystArgs {
 
 export interface AnalystResult {
   snapshot: DossierSnapshot | null;
-  terminated: 'done' | 'abandon' | 'max_turns' | 'finished' | 'error';
+  terminated: 'done' | 'abandon' | 'max_turns' | 'finished' | 'error' | 'api_unavailable';
   reason?: string;
+  apiUnavailable?: AnalystApiUnavailable;
   toolCalls: number;
   transcriptSummary: string;
 }
+
+export interface AnalystApiUnavailable {
+  stage: 'analyst_preflight';
+  reason: string;
+  routeId: string | null;
+  modelId: string | null;
+}
+
+const DEFAULT_ANALYST_PREFLIGHT_TIMEOUT_MS = 8_000;
 
 const SYSTEM_PROMPT = `You are the Analyst agent for an OSS bug-fixing pipeline. Your job is to investigate an upstream issue, read the relevant code, and produce a structured EvidenceDossier — but you DO NOT propose fixes and you DO NOT write code.
 
@@ -131,6 +143,86 @@ reproTargets is independent of confidence — even a low-confidence dossier bene
 
 FINAL REMINDER: regardless of how much you investigated or how confident you are, you MUST end this session by calling record_evidence (with whatever you have). Use abandon ONLY when the issue itself is contradictory or empty — NEVER as a way out of an incomplete investigation. Plain-text summaries without a terminal tool call are discarded.`;
 
+function resolveAnalystPreflightTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.OSA_ANALYST_PREFLIGHT_TIMEOUT_MS;
+  if (!raw) return DEFAULT_ANALYST_PREFLIGHT_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_ANALYST_PREFLIGHT_TIMEOUT_MS;
+  return Math.floor(parsed);
+}
+
+function classifyAnalystProbeError(err: unknown, timeoutMs: number): string {
+  if (err instanceof Error) {
+    const lower = err.message.toLowerCase();
+    if (err.name === 'AbortError' || lower.includes('aborted')) {
+      return `[timeout] Analyst API preflight timed out after ${timeoutMs}ms`;
+    }
+    return classifyAgentLoopError(err.message);
+  }
+  return classifyAgentLoopError(String(err));
+}
+
+async function probeAnalystApiAvailability(
+  modelOverride: string
+): Promise<{ ok: true } | { ok: false; unavailable: AnalystApiUnavailable }> {
+  let routes: ModelRoute[];
+  try {
+    routes = getModelRoutes('ANALYST', modelOverride);
+  } catch (err) {
+    const reason =
+      err instanceof MissingOpenRouterApiKeyError
+        ? `[no-api-keys] ${err.message}`
+        : classifyAnalystProbeError(err, resolveAnalystPreflightTimeoutMs());
+    return {
+      ok: false,
+      unavailable: {
+        stage: 'analyst_preflight',
+        reason,
+        routeId: null,
+        modelId: modelOverride,
+      },
+    };
+  }
+
+  const timeoutMs = resolveAnalystPreflightTimeoutMs();
+  let lastFailure: AnalystApiUnavailable | null = null;
+  for (const route of routes) {
+    const abortController = new AbortController();
+    const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
+    try {
+      await generateText({
+        model: route.model,
+        system: 'Analyst API preflight probe. Reply with "ok".',
+        messages: [{ role: 'user', content: 'ok' }],
+        maxTokens: 4,
+        temperature: 0,
+        abortSignal: abortController.signal,
+      });
+      return { ok: true };
+    } catch (err) {
+      lastFailure = {
+        stage: 'analyst_preflight',
+        reason: classifyAnalystProbeError(err, timeoutMs),
+        routeId: route.routeId,
+        modelId: route.modelId,
+      };
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  }
+
+  return {
+    ok: false,
+    unavailable:
+      lastFailure ?? {
+        stage: 'analyst_preflight',
+        reason: '[provider-unavailable] Analyst API preflight failed with no route-level error detail',
+        routeId: null,
+        modelId: modelOverride,
+      },
+  };
+}
+
 export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
   const registry = makeAnalystRegistry({
     ctx: {
@@ -178,6 +270,27 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
   // a plain-text summary, which is then discarded — leading to repeated
   // `terminated=finished` failures with no dossier.
   const analystModel = process.env.OPENROUTER_MODEL_ANALYST || 'anthropic/claude-sonnet-4.5';
+
+  const preflight = await probeAnalystApiAvailability(analystModel);
+  if (!preflight.ok) {
+    const unavailable = preflight.unavailable;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[v2-analyst] attempt=${args.attemptId} phase=preflight terminated=api_unavailable` +
+        ` stage=${unavailable.stage}` +
+        (unavailable.routeId ? ` route=${unavailable.routeId}` : '') +
+        (unavailable.modelId ? ` model=${unavailable.modelId}` : '') +
+        ` reason=${JSON.stringify(unavailable.reason).slice(0, 320)}`
+    );
+    return {
+      snapshot: args.dossier.latest(),
+      terminated: 'api_unavailable',
+      reason: unavailable.reason,
+      apiUnavailable: unavailable,
+      toolCalls: 0,
+      transcriptSummary: '(analyst api preflight failed)',
+    };
+  }
 
   const result = await runAgentLoop({
     agent: 'ANALYST',

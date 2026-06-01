@@ -91,7 +91,7 @@ function truncate(s: string, n: number): string {
  * GitHub (and the maintainer email) actionable instead of a generic
  * stack-trace dump.
  */
-function classifyAgentLoopError(raw: string): string {
+export function classifyAgentLoopError(raw: string): string {
   const lower = raw.toLowerCase();
   const tag = (kind: string) => `[${kind}] ${truncate(raw, 800)}`;
   if (
@@ -119,7 +119,7 @@ function classifyAgentLoopError(raw: string): string {
   return truncate(raw, 800);
 }
 
-function isProviderFailoverReason(reason: string | undefined): boolean {
+export function isProviderFailoverReason(reason: string | undefined): boolean {
   if (!reason) return false;
   const lower = reason.toLowerCase();
   return (

@@ -131,6 +131,10 @@ export type PipelineResult =
       reason: string;
     }
   | {
+      status: 'api-unavailable';
+      reason: string;
+    }
+  | {
       status: 'already-fixed-on-main';
       reason: string;
     }
@@ -206,6 +210,7 @@ function buildTerminalLogDetail(result: PipelineResult): string {
     case 'fix-failed':
     case 'max-retries-exceeded':
     case 'repro-not-runnable':
+    case 'api-unavailable':
     case 'already-fixed-on-main':
       return `reason=${result.reason}`;
     default:
@@ -808,6 +813,16 @@ export interface NotReproducedRunDiagnostics {
   } | null;
 }
 
+export interface ApiUnavailableRunDiagnostics {
+  reason: string;
+  api_preflight: {
+    stage: 'analyst_preflight' | 'unknown';
+    route_id: string | null;
+    model_id: string | null;
+    failure_reason: string;
+  };
+}
+
 const LLM_QUOTA_FAILURE_PATTERN =
   /\[credits-exhausted\]|\[rate-limited\]|insufficient credit|quota exceeded|payment required|\b(?:402|429)\b/i;
 
@@ -928,6 +943,22 @@ export function buildNotReproducedRunDiagnostics(
       by_candidate: outcome.v2.candidates.map(summarizeOracleCandidate),
     },
     llm_quota_failure: detectLlmQuotaFailure(outcome.v2),
+  };
+}
+
+export function buildApiUnavailableRunDiagnostics(
+  outcome: ReproPipelineOutcome
+): ApiUnavailableRunDiagnostics | null {
+  if (outcome.status !== 'api_unavailable') return null;
+  const unavailable = outcome.v2.apiUnavailable;
+  return {
+    reason: outcome.message,
+    api_preflight: {
+      stage: unavailable?.stage ?? 'unknown',
+      route_id: unavailable?.routeId ?? null,
+      model_id: unavailable?.modelId ?? null,
+      failure_reason: unavailable?.reason ?? outcome.message,
+    },
   };
 }
 
@@ -1470,7 +1501,7 @@ export async function runPipeline(args: {
   let verificationStage: 'pass' | 'fail' | 'skipped_non_gha' | 'not_reached' = 'not_reached';
   let finalDisposition: string = 'runtime-error';
   let errorKind: string | null = null;
-  let runDiagnostics: NotReproducedRunDiagnostics | null = null;
+  let runDiagnostics: NotReproducedRunDiagnostics | ApiUnavailableRunDiagnostics | null = null;
 
   const finish = (result: PipelineResult): PipelineResult => {
     finalDisposition = result.status;
@@ -1989,6 +2020,43 @@ export async function runPipeline(args: {
       });
     };
 
+    const haltForApiUnavailable = async (args: { reason: string }): Promise<PipelineResult> => {
+      const issueUrl = "https://github.com/" + repoFullName + "/issues/" + issueNumber;
+      const appendBody = [
+        "The Analyst API preflight failed before dossier generation, so this run halted early.",
+        '',
+        "Reason: " + args.reason,
+        '',
+        "Interpretation: this is an LLM provider/runtime availability problem (not a repro verdict).",
+        "Action: restore API access/credits and re-trigger the issue.",
+        '',
+        "Issue: " + issueUrl,
+        '',
+        "Run: " + runId,
+      ].join('\n');
+      return haltAndEmail({
+        kind: 'repro_unreachable',
+        context: buildHaltContext({
+          attemptId: runId,
+          recipient: manifest.pm_email,
+          issueNumber,
+          issueUrl,
+          failureSnippet: args.reason,
+          dossier: reproDossier,
+        }),
+        appendBody,
+        commentBody:
+          "⚠️ **Analyst API unavailable.** " +
+          args.reason +
+          "\n\nThe run halted before dossier/repro execution. Restore API access and re-trigger.",
+        result: {
+          status: 'api-unavailable',
+          reason: args.reason,
+        },
+        logTag: "api-unavailable: " + args.reason,
+      });
+    };
+
     const haltForAlreadyFixedOnMain = async (args: {
       reason: string;
     }): Promise<PipelineResult> => {
@@ -2116,6 +2184,15 @@ export async function runPipeline(args: {
           creds,
           term?.matchedPattern ?? 'credentials terminal'
         )
+      );
+    }
+
+    if (reproOutcome.status === 'api_unavailable') {
+      runDiagnostics = buildApiUnavailableRunDiagnostics(reproOutcome);
+      return finish(
+        await haltForApiUnavailable({
+          reason: reproOutcome.message,
+        })
       );
     }
 
