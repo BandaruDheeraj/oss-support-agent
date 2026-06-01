@@ -147,11 +147,16 @@ export function deriveVerifiedState(
     if (e.tool === 'python_module_check') {
       const name = typeof args?.name === 'string' ? args.name : '<unknown>';
       if (e.ok && r?.importable === true) {
-        if (!seenImportable.has(name)) {
-          importable.push(name);
-          seenImportable.add(name);
+        const resolvedModule =
+          typeof r?.module === 'string' && r.module.trim().length > 0
+            ? r.module
+            : name;
+        if (!seenImportable.has(resolvedModule)) {
+          importable.push(resolvedModule);
+          seenImportable.add(resolvedModule);
         }
         notImportableMap.delete(name);
+        notImportableMap.delete(resolvedModule);
       } else if (e.ok && r?.importable === false) {
         const reason = typeof r?.error === 'string' ? r.error : 'python_module_check returned importable=false';
         notImportableMap.set(name, reason);

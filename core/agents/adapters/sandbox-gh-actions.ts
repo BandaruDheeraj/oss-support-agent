@@ -7,6 +7,7 @@ import type { ActionsClient, SandboxConfig } from '../../sandbox-types';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
 import { resolveSkippablePipInstall } from './pip-spec';
 import { buildPipInstallCommand } from './sandbox-local';
+import { buildPythonModuleCheckSnippet } from './python-module-check';
 
 export interface GhActionsSandboxAdapterOptions {
   actionsClient: ActionsClient;
@@ -199,9 +200,7 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
       return installRun;
     },
     async pythonModuleCheck(name) {
-      const r = await handle.runPython(
-        `import importlib,json\ntry:\n  m=importlib.import_module(${JSON.stringify(name)})\n  print(json.dumps({"importable":True,"version":getattr(m,"__version__",None)}))\nexcept Exception as e:\n  print(json.dumps({"importable":False,"error":str(e)}))`
-      );
+      const r = await handle.runPython(buildPythonModuleCheckSnippet(name));
       try {
         return JSON.parse(r.stdout.trim().split('\n').pop() ?? '{}');
       } catch {

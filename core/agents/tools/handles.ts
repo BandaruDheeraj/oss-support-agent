@@ -73,7 +73,13 @@ export interface SandboxHandle {
   /** Install a pip package by name+version (or requirement string). */
   pipInstall(spec: string): Promise<SandboxRun>;
   /** Check whether a python module is importable. */
-  pythonModuleCheck(name: string): Promise<{ importable: boolean; version?: string; error?: string }>;
+  pythonModuleCheck(name: string): Promise<{
+    importable: boolean;
+    module?: string;
+    version?: string;
+    error?: string;
+    tried?: string[];
+  }>;
   /** List currently installed packages. */
   listPackages(): Promise<{ name: string; version: string }[]>;
 }

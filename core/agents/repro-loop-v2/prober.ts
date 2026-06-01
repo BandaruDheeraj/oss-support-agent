@@ -88,7 +88,7 @@ Procedure (follow in order; do not skip):
 1. PICK a candidate test path under one of the configured test roots. Pick a filename that conveys the bug (e.g. tests/test_repro_<short-desc>.py). Remember this path; you will write to it and record it on the recipe.
 
 2. PROBE imports. For each suspect symbol in the dossier and each import in the issue snippets:
-   - python_module_check("X") — fast importability check, no execution.
+   - python_module_check("X") — fast importability check, no execution. X MUST be a Python import name (e.g. "openinference.instrumentation.openai"), not a pip/distribution name (e.g. "openinference-instrumentation-openai").
    - run_python("from X import Y") — confirms the actual import statement works.
    If an import fails: pip_install with \`-e <candidate-dir>\` from "Candidate editable-install dirs" when the failing module looks like an in-repo package, or use read_symbol_context / grep_with_context (or grep / find_symbol) to locate the correct import path. Repeat until you have a verified import block.
 

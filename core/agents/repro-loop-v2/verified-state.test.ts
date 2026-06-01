@@ -65,6 +65,19 @@ describe('deriveVerifiedState', () => {
     ]);
   });
 
+  it('prefers resolved module names from python_module_check results', () => {
+    const s = deriveVerifiedState([
+      entry({ tool: 'python_module_check', tier: sandbox, ok: true,
+        args: { name: 'openinference-instrumentation-openai' },
+        result: { importable: false, error: 'No module named openinference-instrumentation-openai' } }),
+      entry({ tool: 'python_module_check', tier: sandbox, ok: true,
+        args: { name: 'openinference-instrumentation-openai' },
+        result: { importable: true, module: 'openinference.instrumentation.openai', version: '0.1.0' } }),
+    ]);
+    expect(s.importable).toContain('openinference.instrumentation.openai');
+    expect(s.notImportable.map((n) => n.module)).not.toContain('openinference-instrumentation-openai');
+  });
+
   it('infers importable modules from successful run_python "from X import Y" snippets', () => {
     const s = deriveVerifiedState([
       entry({ tool: 'run_python', tier: sandbox, ok: true,

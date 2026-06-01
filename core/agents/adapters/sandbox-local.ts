@@ -14,6 +14,7 @@ import { execCommand, LocalWorkspace } from '../../../bin/clients/local-workspac
 import { ensurePythonVenv } from '../../../bin/clients/local-sandbox';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
 import { resolveSkippablePipInstall } from './pip-spec';
+import { buildPythonModuleCheckSnippet } from './python-module-check';
 
 /**
  * Build a `pip install <args>` command from a free-form spec.
@@ -155,7 +156,7 @@ export function createLocalSandboxAdapter(
       return runShell(buildPipInstallCommand(spec));
     },
     async pythonModuleCheck(name: string) {
-      const snippet = `import importlib, json\ntry:\n  m = importlib.import_module(${JSON.stringify(name)})\n  v = getattr(m, "__version__", None)\n  print(json.dumps({"importable": True, "version": v}))\nexcept Exception as e:\n  print(json.dumps({"importable": False, "error": str(e)}))\n`;
+      const snippet = buildPythonModuleCheckSnippet(name);
       const r = await handle.runPython(snippet);
       try {
         return JSON.parse(r.stdout.trim().split('\n').pop() ?? '{}');
