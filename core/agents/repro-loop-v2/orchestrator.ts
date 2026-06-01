@@ -360,6 +360,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       sandbox: args.sandbox,
       editableInstallFallbacks: effectiveEditableInstalls,
       env: runtimeEnv,
+      semanticConfidence: snapshot.body.semanticConfidence,
     });
     candidate.executor = oracle.executor;
     candidate.oracle = oracle;

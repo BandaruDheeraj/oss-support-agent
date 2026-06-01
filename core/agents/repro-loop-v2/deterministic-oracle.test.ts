@@ -165,6 +165,35 @@ describe('runDeterministicReproOracle', () => {
     ]);
   });
 
+  it('soft-checks suspect_path_assertions when semantic confidence is low', async () => {
+    const workspace = new FakeWorkspace();
+    const sandbox = new FakeSandbox([
+      { exitCode: 1, stdout: '', stderr: 'AssertionError: telemetry shape mismatch' },
+      { exitCode: 1, stdout: '', stderr: 'AssertionError: telemetry shape mismatch' },
+    ]);
+
+    const result = await runDeterministicReproOracle({
+      attemptId: 'attempt-1',
+      recipe: baseRecipe,
+      oracleSpec: baseOracleSpec,
+      suspectSymbols: baseSuspects,
+      repoLanguage: 'python',
+      workspace,
+      sandbox,
+      env: {},
+      semanticConfidence: {
+        top_score: 0.41,
+        low_confidence: true,
+        diagnostics: 'semantic top_score=0.410 below threshold 0.600; suspects are low-confidence',
+      },
+    });
+
+    expect(result.verdict).toBe('valid');
+    expect(result.criteria.suspect_path_assertions).toBe(true);
+    expect(result.suspectPathAssertionResult.passed).toBe(false);
+    expect(result.message).toContain('soft-check');
+  });
+
   it('rejects candidate when precondition markers are missing in test source', async () => {
     const workspace = new FakeWorkspace();
     const sandbox = new FakeSandbox([

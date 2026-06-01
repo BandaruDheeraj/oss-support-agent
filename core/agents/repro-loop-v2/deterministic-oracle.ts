@@ -10,6 +10,7 @@ import type {
   ReproOracleSpec,
   ReproOracleSuspectPathAssertion,
   ReproRecipe,
+  SemanticConfidence,
   SuspectSymbol,
 } from '../analyst/dossier';
 import type { RepoHandle, SandboxHandle, WorkspaceWriter } from '../tools/handles';
@@ -24,6 +25,7 @@ export interface DeterministicReproOracleArgs {
   sandbox: SandboxHandle;
   editableInstallFallbacks?: string[];
   env?: NodeJS.ProcessEnv;
+  semanticConfidence?: SemanticConfidence;
 }
 
 export interface OracleSuspectAssertionResult {
@@ -178,6 +180,7 @@ export async function runDeterministicReproOracle(
 
   const baseline_head_fails = (executor.runs[0]?.exitCode ?? 0) !== 0;
   const reliable_failures = executor.runs.filter((r) => r.exitCode !== 0).length >= 2;
+  const relaxSuspectPathAssertion = args.semanticConfidence?.low_confidence === true;
   const failingOutput = executor.runs
     .filter((r) => r.exitCode !== 0)
     .map((r) => `${r.stderrTail}\n${r.stdoutTail}`)
@@ -189,16 +192,20 @@ export async function runDeterministicReproOracle(
   const criteria: DeterministicReproOracleCriteria = {
     baseline_head_fails,
     reliable_failures,
-    suspect_path_assertions: suspectPathAssertionResult.passed,
+    suspect_path_assertions: relaxSuspectPathAssertion ? true : suspectPathAssertionResult.passed,
     precondition_assertions: preconditionAssertionResult.passed,
     ast_preflight: ast.ok,
   };
 
   if (allCriteriaPass(criteria)) {
+    const acceptedWithSoftCheck =
+      relaxSuspectPathAssertion && !suspectPathAssertionResult.passed && args.oracleSpec.suspect_path_assertions.length > 0;
     return {
       verdict: 'valid',
       criteria,
-      message: 'Deterministic repro oracle accepted candidate: all criteria satisfied.',
+      message: acceptedWithSoftCheck
+        ? 'Deterministic repro oracle accepted candidate: suspect_path_assertions treated as soft-check due to low semantic confidence.'
+        : 'Deterministic repro oracle accepted candidate: all criteria satisfied.',
       executor,
       suspectPathAssertionResult,
       preconditionAssertionResult,
