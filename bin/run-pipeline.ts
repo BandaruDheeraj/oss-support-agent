@@ -71,7 +71,12 @@ import { LocalWorkspace } from './clients/local-workspace';
 import { LocalForkCommitter, LocalRepoFileReader } from './clients/local-fork-deps';
 import { runLocalSandbox } from './clients/local-sandbox';
 import type { LiveDeps } from './clients/live-deps';
-import { SandboxSession, type GitClient } from '../core/sandbox-session';
+import {
+  SandboxSession,
+  type GitClient,
+  type SandboxPhaseFailure,
+  type SandboxResult as SandboxSessionResult,
+} from '../core/sandbox-session';
 import {
   InMemorySweepStateStore,
   listOpenIssues,
@@ -215,6 +220,34 @@ function buildTerminalLogDetail(result: PipelineResult): string {
       return `reason=${result.reason}`;
     default:
       return '';
+  }
+}
+
+function buildDefaultRunDiagnostics(result: PipelineResult): PipelineDefaultRunDiagnostics {
+  switch (result.status) {
+    case 'awaiting-credentials':
+      return {
+        status: result.status,
+        reason: result.reason,
+        missing_env_vars: [...result.missingEnvVars],
+      };
+    case 'sandbox-failed':
+      return {
+        status: result.status,
+        reason: result.reason,
+        logs_path: result.logsPath,
+      };
+    case 'pr-opened':
+      return {
+        status: result.status,
+        pr_url: result.prUrl,
+        pr_number: result.prNumber,
+      };
+    default:
+      return {
+        status: result.status,
+        reason: 'reason' in result ? result.reason : undefined,
+      };
   }
 }
 
@@ -839,6 +872,67 @@ export interface ApiUnavailableRunDiagnostics {
   };
 }
 
+export interface SandboxFailedRunDiagnostics {
+  reason: string;
+  sandbox_workflow: {
+    configured_repo: string | null;
+    configured_ref: string | null;
+    target_repo: string;
+    configured_repo_is_target_repo: boolean;
+  };
+  runnable_candidates: {
+    count: number;
+    candidate_ids: string[];
+  };
+  oracle: {
+    by_candidate: Array<{
+      candidate_id: string;
+      source: ReproCandidateEvaluation['source'];
+      status: ReproCandidateEvaluation['status'];
+      oracle_verdict: 'valid' | 'invalid' | 'credentials_required' | 'sandbox_failed' | null;
+      failed_criteria: string[];
+      criteria: Record<string, boolean> | null;
+      message: string;
+    }>;
+  };
+  candidates: Array<{
+    candidate_id: string;
+    source: ReproCandidateEvaluation['source'];
+    status: ReproCandidateEvaluation['status'];
+    repro_status: SandboxSessionResult['reproStatus'] | null;
+    branch_ref_confirmed_before_dispatch: boolean | null;
+    workflow_dispatch_target: {
+      sandbox_workflow_repo: string | null;
+      target_repo: string | null;
+      dispatched_to_target_repo: boolean | null;
+    };
+    import_verification: {
+      passed: boolean | null;
+      failed_step: number | null;
+      stdout: string | null;
+      stderr: string | null;
+    };
+    install_manifest: SandboxSessionResult['installManifest'];
+    phase_failures: SandboxPhaseFailure[];
+    message: string;
+  }>;
+}
+
+interface PipelineDefaultRunDiagnostics {
+  status: PipelineResult['status'];
+  reason?: string;
+  missing_env_vars?: string[];
+  logs_path?: string;
+  pr_url?: string;
+  pr_number?: number;
+}
+
+type PipelineRunDiagnostics =
+  | NotReproducedRunDiagnostics
+  | ApiUnavailableRunDiagnostics
+  | SandboxFailedRunDiagnostics
+  | PipelineDefaultRunDiagnostics;
+
 const LLM_QUOTA_FAILURE_PATTERN =
   /\[credits-exhausted\]|\[rate-limited\]|insufficient credit|quota exceeded|payment required|key limit exceeded|\b(?:402|429)\b/i;
 
@@ -978,6 +1072,121 @@ export function buildApiUnavailableRunDiagnostics(
       model_id: unavailable?.modelId ?? null,
       failure_reason: unavailable?.reason ?? outcome.message,
     },
+  };
+}
+
+export function buildSandboxFailedRunDiagnostics(args: {
+  outcome: ReproPipelineOutcome;
+  targetRepo: string;
+  sandboxWorkflowRepo: string | null;
+  sandboxWorkflowRef: string | null;
+}): SandboxFailedRunDiagnostics | null {
+  if (args.outcome.status !== 'sandbox_failed') return null;
+
+  const candidateDiagnostics = args.outcome.v2.candidates.map((candidate) => {
+    const sandboxResult = candidate.oracle?.sandboxResult ?? null;
+    const phaseFailures = sandboxResult?.phaseFailures ?? [];
+    const setupFailure = phaseFailures.find((failure) => failure.phase === 'setup');
+    const importVerificationFailure =
+      setupFailure?.reason === 'import_verification_failed' ? setupFailure : null;
+
+    const branchRefConfirmed =
+      phaseFailures.some((failure) => failure.phase === 'branch')
+        ? false
+        : sandboxResult
+          ? true
+          : null;
+
+    const diagnosticsWithRepoHints = phaseFailures
+      .map((failure) => failure.diagnostics ?? {})
+      .find(
+        (diagnostics) =>
+          typeof diagnostics.sandboxWorkflowRepo === 'string' ||
+          typeof diagnostics.targetRepo === 'string'
+      );
+
+    const sandboxWorkflowRepo =
+      (diagnosticsWithRepoHints?.sandboxWorkflowRepo as string | undefined) ??
+      args.sandboxWorkflowRepo;
+    const targetRepo =
+      (diagnosticsWithRepoHints?.targetRepo as string | undefined) ?? args.targetRepo;
+
+    const oracleFailedCriteria =
+      candidate.oracle == null
+        ? ['oracle_not_executed']
+        : [
+            ...(candidate.oracle.verdict === 'sandbox_failed' ? ['sandbox_failed'] : []),
+            ...Object.entries(candidate.oracle.criteria)
+              .filter(([, passed]) => !passed)
+              .map(([criterion]) => criterion),
+          ];
+
+    return {
+      candidate_id: candidate.candidateId,
+      source: candidate.source,
+      status: candidate.status,
+      repro_status: sandboxResult?.reproStatus ?? null,
+      branch_ref_confirmed_before_dispatch: branchRefConfirmed,
+      workflow_dispatch_target: {
+        sandbox_workflow_repo: sandboxWorkflowRepo ?? null,
+        target_repo: targetRepo ?? null,
+        dispatched_to_target_repo:
+          sandboxWorkflowRepo && targetRepo ? sandboxWorkflowRepo === targetRepo : null,
+      },
+      import_verification: {
+        passed: importVerificationFailure ? false : setupFailure ? false : sandboxResult ? true : null,
+        failed_step: setupFailure?.failedStep ?? null,
+        stdout: setupFailure?.stdout ?? null,
+        stderr: setupFailure?.stderr ?? null,
+      },
+      install_manifest: sandboxResult?.installManifest ?? [],
+      phase_failures: phaseFailures,
+      message: candidate.message,
+      oracle_verdict: candidate.oracle?.verdict ?? null,
+      oracle_failed_criteria: oracleFailedCriteria,
+      oracle_criteria: candidate.oracle ? { ...candidate.oracle.criteria } : null,
+    };
+  });
+
+  const runnableCandidates = candidateDiagnostics.filter(
+    (candidate) => candidate.repro_status === 'failing' || candidate.repro_status === 'passing'
+  );
+
+  return {
+    reason: args.outcome.message,
+    sandbox_workflow: {
+      configured_repo: args.sandboxWorkflowRepo,
+      configured_ref: args.sandboxWorkflowRef,
+      target_repo: args.targetRepo,
+      configured_repo_is_target_repo: args.sandboxWorkflowRepo === args.targetRepo,
+    },
+    runnable_candidates: {
+      count: runnableCandidates.length,
+      candidate_ids: runnableCandidates.map((candidate) => candidate.candidate_id),
+    },
+    oracle: {
+      by_candidate: candidateDiagnostics.map((candidate) => ({
+        candidate_id: candidate.candidate_id,
+        source: candidate.source,
+        status: candidate.status,
+        oracle_verdict: candidate.oracle_verdict,
+        failed_criteria: candidate.oracle_failed_criteria,
+        criteria: candidate.oracle_criteria,
+        message: candidate.message,
+      })),
+    },
+    candidates: candidateDiagnostics.map((candidate) => ({
+      candidate_id: candidate.candidate_id,
+      source: candidate.source,
+      status: candidate.status,
+      repro_status: candidate.repro_status,
+      branch_ref_confirmed_before_dispatch: candidate.branch_ref_confirmed_before_dispatch,
+      workflow_dispatch_target: candidate.workflow_dispatch_target,
+      import_verification: candidate.import_verification,
+      install_manifest: candidate.install_manifest,
+      phase_failures: candidate.phase_failures,
+      message: candidate.message,
+    })),
   };
 }
 
@@ -1594,9 +1803,12 @@ export async function runPipeline(args: {
   let verificationStage: 'pass' | 'fail' | 'skipped_non_gha' | 'not_reached' = 'not_reached';
   let finalDisposition: string = 'runtime-error';
   let errorKind: string | null = null;
-  let runDiagnostics: NotReproducedRunDiagnostics | ApiUnavailableRunDiagnostics | null = null;
+  let runDiagnostics: PipelineRunDiagnostics | null = null;
 
   const finish = (result: PipelineResult): PipelineResult => {
+    if (result.status !== 'pr-opened' && runDiagnostics == null) {
+      runDiagnostics = buildDefaultRunDiagnostics(result);
+    }
     finalDisposition = result.status;
     const terminalTag = result.status === 'pr-opened' ? '[v2-done] DONE' : '[v2-halt] HALT';
     const detail = buildTerminalLogDetail(result);
@@ -2373,6 +2585,12 @@ export async function runPipeline(args: {
     }
 
     if (reproOutcome.status === 'sandbox_failed') {
+      runDiagnostics = buildSandboxFailedRunDiagnostics({
+        outcome: reproOutcome,
+        targetRepo: fork.forkFullName,
+        sandboxWorkflowRepo: manifest.sandbox_workflow_repo || null,
+        sandboxWorkflowRef: manifest.sandbox_workflow_ref || 'main',
+      });
       return finish(
         await haltForSandboxFailed({
           reason: reproOutcome.message,

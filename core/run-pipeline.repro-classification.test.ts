@@ -1,6 +1,7 @@
 import {
   buildApiUnavailableRunDiagnostics,
   buildNotReproducedRunDiagnostics,
+  buildSandboxFailedRunDiagnostics,
   classifyAlreadyFixedOnMain,
   classifyNotReproducedAsApiUnavailable,
   ReproStageTimeoutError,
@@ -290,6 +291,93 @@ describe('buildApiUnavailableRunDiagnostics', () => {
 
   test('returns null for non-api_unavailable outcomes', () => {
     const diagnostics = buildApiUnavailableRunDiagnostics(makeOutcome({ status: 'not_reproduced' }));
+    expect(diagnostics).toBeNull();
+  });
+});
+
+describe('buildSandboxFailedRunDiagnostics', () => {
+  test('emits structured diagnostics for sandbox_failed outcomes', () => {
+    const outcome = makeOutcome({
+      status: 'sandbox_failed',
+      message: 'Sandbox execution failed before runnable repro evidence',
+      candidates: [
+        {
+          candidateId: 'candidate-0',
+          source: 'builder',
+          sampleIndex: 0,
+          status: 'sandbox_failed',
+          message: 'Sandbox execution failed before runnable repro evidence: setup/import_verification_failed',
+          oracle: {
+            verdict: 'sandbox_failed',
+            criteria: {
+              baseline_head_fails: false,
+              reliable_failures: false,
+              suspect_path_assertions: false,
+              precondition_assertions: true,
+              ast_preflight: true,
+            },
+            message: 'sandbox failed',
+            executor: {} as any,
+            suspectPathAssertionResult: { passed: false, missing: [] },
+            preconditionAssertionResult: { passed: true, missingMarkers: [] },
+            astReason: null,
+            sandboxResult: {
+              ok: false,
+              reproStatus: 'not_executed',
+              failureOutput: '',
+              sentinelMatched: false,
+              suspectPathHit: false,
+              installManifest: [{ name: 'openinference-instrumentation-smolagents', version: '0.1.0' }],
+              phaseFailures: [
+                {
+                  ok: false,
+                  phase: 'setup',
+                  reason: 'import_verification_failed',
+                  failedStep: 5,
+                  stdout: '',
+                  stderr: 'ImportError: cannot import name SmolagentsInstrumentor',
+                  diagnostics: {
+                    sandboxWorkflowRepo: 'BandaruDheeraj/oss-support-agent',
+                    targetRepo: 'BandaruDheeraj/openinference',
+                  },
+                },
+              ],
+              rawLogs: 'setup logs',
+            },
+            credentialsTerminal: null,
+          },
+        } as any,
+      ],
+    });
+
+    const diagnostics = buildSandboxFailedRunDiagnostics({
+      outcome,
+      targetRepo: 'BandaruDheeraj/openinference',
+      sandboxWorkflowRepo: 'BandaruDheeraj/oss-support-agent',
+      sandboxWorkflowRef: 'main',
+    });
+
+    expect(diagnostics).not.toBeNull();
+    expect(diagnostics?.sandbox_workflow).toEqual({
+      configured_repo: 'BandaruDheeraj/oss-support-agent',
+      configured_ref: 'main',
+      target_repo: 'BandaruDheeraj/openinference',
+      configured_repo_is_target_repo: false,
+    });
+    expect(diagnostics?.runnable_candidates.count).toBe(0);
+    expect(diagnostics?.candidates[0]?.phase_failures[0]?.reason).toBe('import_verification_failed');
+    expect(diagnostics?.candidates[0]?.import_verification.passed).toBe(false);
+    expect(diagnostics?.oracle.by_candidate[0]?.failed_criteria).toContain('sandbox_failed');
+  });
+
+  test('returns null for non-sandbox_failed outcomes', () => {
+    const diagnostics = buildSandboxFailedRunDiagnostics({
+      outcome: makeOutcome({ status: 'not_reproduced' }),
+      targetRepo: 'BandaruDheeraj/openinference',
+      sandboxWorkflowRepo: 'BandaruDheeraj/oss-support-agent',
+      sandboxWorkflowRef: 'main',
+    });
+
     expect(diagnostics).toBeNull();
   });
 });
