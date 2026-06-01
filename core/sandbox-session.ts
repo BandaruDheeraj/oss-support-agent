@@ -1,3 +1,5 @@
+// Verified clean: triggerWorkflowDispatch, createSandboxConfig, verifyDispatchRefs
+// have no call sites outside SandboxSession as of 4cf4ecd.
 import type { Manifest } from './manifest/types';
 import {
   SANDBOX_WORKFLOW_FILE,
