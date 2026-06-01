@@ -19,7 +19,7 @@ export {
 export {
   SandboxSession,
   SandboxConfigError,
-  type SandboxResult,
+  type SandboxResult as SandboxSessionResult,
   type SandboxPhaseResult,
   type SandboxPhaseFailure,
   type InstallSpec,
