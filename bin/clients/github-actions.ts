@@ -19,6 +19,8 @@ import type {
 } from '../../core/sandbox-types';
 
 const GITHUB_API = 'https://api.github.com';
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS_ENV = 'OSA_GH_API_TIMEOUT_MS';
 
 function authHeaders(token: string): Record<string, string> {
   return {
@@ -33,16 +35,79 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function ghFetch(token: string, url: string, init: RequestInit = {}): Promise<Response> {
+function resolveRequestTimeoutMs(override?: number): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+    return Math.floor(override);
+  }
+  const raw = process.env[REQUEST_TIMEOUT_MS_ENV];
+  if (raw) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed);
+    }
+  }
+  return DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
+function isAbortError(err: unknown): err is Error {
+  return err instanceof Error && err.name === 'AbortError';
+}
+
+async function ghFetch(
+  token: string,
+  url: string,
+  timeoutMs: number,
+  init: RequestInit = {}
+): Promise<Response> {
   const headers = {
     ...authHeaders(token),
     ...((init.headers as Record<string, string> | undefined) ?? {}),
   };
-  return fetch(url, { ...init, headers });
+  const controller = new AbortController();
+  const upstreamSignal = init.signal;
+  const onAbort = () => controller.abort();
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) {
+      controller.abort();
+    } else {
+      upstreamSignal.addEventListener('abort', onAbort, { once: true });
+    }
+  }
+  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, { ...init, headers, signal: controller.signal });
+  } catch (err: unknown) {
+    if (isAbortError(err)) {
+      const method = (init.method ?? 'GET').toUpperCase();
+      throw new Error(`GitHub request timed out after ${timeoutMs}ms (${method} ${url})`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutHandle);
+    if (upstreamSignal) {
+      upstreamSignal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
+export interface GitHubActionsClientOptions {
+  requestTimeoutMs?: number;
 }
 
 export class GitHubActionsClient implements ActionsClient {
-  constructor(private readonly token: string) {}
+  private readonly requestTimeoutMs: number;
+
+  constructor(
+    private readonly token: string,
+    options: GitHubActionsClientOptions = {}
+  ) {
+    this.requestTimeoutMs = resolveRequestTimeoutMs(options.requestTimeoutMs);
+  }
+
+  private request(url: string, init: RequestInit = {}): Promise<Response> {
+    return ghFetch(this.token, url, this.requestTimeoutMs, init);
+  }
 
   async triggerWorkflowDispatch(
     forkFullName: string,
@@ -51,7 +116,7 @@ export class GitHubActionsClient implements ActionsClient {
     inputs: Record<string, string>
   ): Promise<void> {
     const url = `${GITHUB_API}/repos/${forkFullName}/actions/workflows/${encodeURIComponent(workflowId)}/dispatches`;
-    const res = await ghFetch(this.token, url, {
+    const res = await this.request(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ref: branch, inputs }),
@@ -65,7 +130,7 @@ export class GitHubActionsClient implements ActionsClient {
 
   async branchRefExists(repoFullName: string, branch: string): Promise<boolean> {
     const url = `${GITHUB_API}/repos/${repoFullName}/git/ref/heads/${encodeURIComponent(branch)}`;
-    const res = await ghFetch(this.token, url);
+    const res = await this.request(url);
     if (res.status === 404) {
       return false;
     }
@@ -89,7 +154,7 @@ export class GitHubActionsClient implements ActionsClient {
       per_page: '10',
     });
     const url = `${GITHUB_API}/repos/${forkFullName}/actions/workflows/${encodeURIComponent(workflowId)}/runs?${params}`;
-    const res = await ghFetch(this.token, url);
+    const res = await this.request(url);
     if (!res.ok) {
       throw new Error(`GitHub listWorkflowRuns failed (${res.status}): ${await res.text()}`);
     }
@@ -122,7 +187,7 @@ export class GitHubActionsClient implements ActionsClient {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       const url = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}`;
-      const res = await ghFetch(this.token, url);
+      const res = await this.request(url);
       if (!res.ok) {
         throw new Error(`GitHub getWorkflowRun failed (${res.status}): ${await res.text()}`);
       }
@@ -141,7 +206,7 @@ export class GitHubActionsClient implements ActionsClient {
 
   async cancelWorkflowRun(forkFullName: string, runId: number): Promise<void> {
     const url = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/cancel`;
-    const res = await ghFetch(this.token, url, { method: 'POST' });
+    const res = await this.request(url, { method: 'POST' });
     if (!res.ok && res.status !== 409) {
       throw new Error(`GitHub cancelWorkflowRun failed (${res.status}): ${await res.text()}`);
     }
@@ -154,7 +219,7 @@ export class GitHubActionsClient implements ActionsClient {
    */
   async getWorkflowRunLogs(forkFullName: string, runId: number): Promise<WorkflowRunLogs> {
     const runUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}`;
-    const runRes = await ghFetch(this.token, runUrl);
+    const runRes = await this.request(runUrl);
     if (!runRes.ok) {
       throw new Error(`GitHub getWorkflowRun failed (${runRes.status}): ${await runRes.text()}`);
     }
@@ -162,7 +227,7 @@ export class GitHubActionsClient implements ActionsClient {
     const exitCode = runData.conclusion === 'success' ? 0 : 1;
 
     const logsUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/logs`;
-    const logsRes = await ghFetch(this.token, logsUrl, { redirect: 'follow' });
+    const logsRes = await this.request(logsUrl, { redirect: 'follow' });
     if (!logsRes.ok) {
       // Logs API can 404 briefly after completion; return partial info.
       return {
@@ -189,7 +254,7 @@ export class GitHubActionsClient implements ActionsClient {
     artifactName: string
   ): Promise<string | null> {
     const listUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/artifacts`;
-    const listRes = await ghFetch(this.token, listUrl);
+    const listRes = await this.request(listUrl);
     if (!listRes.ok) {
       throw new Error(`GitHub listArtifacts failed (${listRes.status}): ${await listRes.text()}`);
     }
@@ -198,7 +263,7 @@ export class GitHubActionsClient implements ActionsClient {
     const match = artifacts.find((a) => a.name === artifactName);
     if (!match) return null;
     const dlUrl = `${GITHUB_API}/repos/${forkFullName}/actions/artifacts/${match.id}/zip`;
-    const dlRes = await ghFetch(this.token, dlUrl, { redirect: 'follow' });
+    const dlRes = await this.request(dlUrl, { redirect: 'follow' });
     if (!dlRes.ok) {
       throw new Error(`GitHub downloadArtifact failed (${dlRes.status}): ${await dlRes.text()}`);
     }

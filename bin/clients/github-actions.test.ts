@@ -44,5 +44,30 @@ describe('GitHubActionsClient.downloadWorkflowRunArtifact', () => {
     expect(content).toContain('"model":"BAAI/bge-small-en-v1.5"');
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
-});
 
+  it('times out stalled requests', async () => {
+    const fetchMock = jest.fn().mockImplementation((_url: unknown, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) return;
+        const rejectAbort = () => {
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          reject(err);
+        };
+        if (signal.aborted) {
+          rejectAbort();
+          return;
+        }
+        signal.addEventListener('abort', rejectAbort, { once: true });
+      });
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const client = new GitHubActionsClient('token', { requestTimeoutMs: 10 });
+    await expect(client.branchRefExists('BandaruDheeraj/oss-support-agent', 'main')).rejects.toThrow(
+      'GitHub request timed out after 10ms'
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
