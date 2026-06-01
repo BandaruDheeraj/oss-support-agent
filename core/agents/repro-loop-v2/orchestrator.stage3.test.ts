@@ -285,18 +285,18 @@ describe('runReproV2 stage3 orchestration', () => {
       runs: [],
     });
 
-    const pipInstall = jest.fn(async (spec: string) => ({
-      exitCode: spec === '-e python/openinference-semantic-conventions' ? 1 : 0,
+    const setupDependencies = jest.fn(async () => ({
+      ok: false as const,
+      phase: 'setup' as const,
+      reason: 'dependency_setup_failed',
+      failedStep: 1,
       stdout: '',
-      stderr: spec === '-e python/openinference-semantic-conventions' ? 'editable install failed' : '',
-      durationMs: 1,
+      stderr: 'editable install failed',
     }));
-    const runPython = jest.fn(async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }));
 
     const failingPreflightSandbox: SandboxHandle = {
       ...sandbox,
-      pipInstall,
-      runPython,
+      setupDependencies,
     };
 
     const outcome = await runReproV2({
@@ -312,8 +312,7 @@ describe('runReproV2 stage3 orchestration', () => {
     expect(outcome.message).toContain('sandbox_setup_failed');
     expect(runReproProberMock).not.toHaveBeenCalled();
     expect(runDeterministicOracleMock).not.toHaveBeenCalled();
-    expect(pipInstall).toHaveBeenCalledTimes(1);
-    expect(runPython).not.toHaveBeenCalled();
+    expect(setupDependencies).toHaveBeenCalledTimes(1);
     expect(outcome.candidates).toHaveLength(3);
     expect(outcome.candidates.filter((candidate) => candidate.source === 'prober')).toHaveLength(2);
     expect(

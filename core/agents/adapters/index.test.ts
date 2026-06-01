@@ -86,6 +86,27 @@ describe('sandbox adapter driver resolution', () => {
     expect(adapter).toBe(ghaHandle);
   });
 
+  it('does not inject beforeDispatch when sandboxSession is provided', () => {
+    const sandboxSession = { verifyAndPushBranch: jest.fn() } as any;
+    createSandboxAdapter({
+      driver: 'gha',
+      workspace,
+      ghActionsOptions: {
+        ...ghActionsOptions,
+        sandboxSession,
+      },
+    });
+
+    expect(createGhActionsSandboxAdapterMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...ghActionsOptions,
+        sandboxSession,
+      })
+    );
+    const ghArgs = createGhActionsSandboxAdapterMock.mock.calls[0][0];
+    expect(ghArgs.beforeDispatch).toBeUndefined();
+  });
+
   it('creates the local adapter for local driver', () => {
     const adapter = createSandboxAdapter({
       driver: 'local',

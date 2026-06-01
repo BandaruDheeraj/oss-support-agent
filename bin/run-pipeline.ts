@@ -71,7 +71,7 @@ import { LocalWorkspace } from './clients/local-workspace';
 import { LocalForkCommitter, LocalRepoFileReader } from './clients/local-fork-deps';
 import { runLocalSandbox } from './clients/local-sandbox';
 import type { LiveDeps } from './clients/live-deps';
-import { createSandboxConfig } from '../core/sandbox';
+import { SandboxSession, type GitClient } from '../core/sandbox-session';
 import {
   InMemorySweepStateStore,
   listOpenIssues,
@@ -2119,27 +2119,66 @@ export async function runPipeline(args: {
     const v2GhActionsSandboxOptions =
       v2SandboxDriver === 'gha'
         ? await (async () => {
-            const cfg = await createSandboxConfig(
-              {
+            const [testCommands, sandboxServices] = await Promise.all([
+              adapter.getTestCommands(),
+              adapter.getSandboxServices(),
+            ]);
+            const actionsClient = new GitHubActionsClient(deps.token);
+            const sandboxWorkflowRepo =
+              manifest.sandbox_workflow_repo?.trim() ||
+              process.env.HARNESS_REPO_FULL_NAME?.trim() ||
+              process.env.GITHUB_REPOSITORY?.trim();
+            if (!sandboxWorkflowRepo) {
+              throw new Error(
+                'sandbox_workflow_repo is required for gha sandbox dispatch and could not be inferred from HARNESS_REPO_FULL_NAME/GITHUB_REPOSITORY.'
+              );
+            }
+            const sandboxWorkflowRef =
+              manifest.sandbox_workflow_ref?.trim() ||
+              process.env.HARNESS_WORKFLOW_REF?.trim() ||
+              'main';
+
+            const gitClient: GitClient = {
+              getDefaultBranch: (repoName) => ghClient.getDefaultBranch(repoName),
+              getBranchSha: (repoName, branchName) => ghClient.getBranchSha(repoName, branchName),
+              createBranch: (repoName, branchName, sha) =>
+                ghClient.createBranch(repoName, branchName, sha),
+              pushPendingChanges: async (repoName, branchName) => {
+                if (repoName !== fork.forkFullName || branchName !== fork.branchName) {
+                  throw new Error(
+                    `SandboxSession pushPendingChanges target mismatch: expected ${fork.forkFullName}@${fork.branchName}, got ${repoName}@${branchName}`
+                  );
+                }
+                await workspace.push();
+              },
+              getFileContents: (repoName, filePath, ref) =>
+                ghClient.getFileContents(repoName, filePath, ref),
+            };
+            const sandboxSession = new SandboxSession({
+              manifest,
+              targetRepo: fork.forkFullName,
+              sandboxWorkflowRepo,
+              sandboxWorkflowRef,
+              branch: fork.branchName,
+              issueNumber,
+              timeoutMins: manifest.sandbox_timeout_mins,
+              actionsClient,
+              gitClient,
+            });
+
+            return {
+              actionsClient,
+              baseConfig: {
                 repoFullName,
                 forkFullName: fork.forkFullName,
                 branchName: fork.branchName,
-                adapter,
+                workflowRepoFullName: sandboxWorkflowRepo,
+                forkCloneUrl: `https://github.com/${fork.forkFullName}.git`,
+                sandboxServices,
                 timeoutMinutes: manifest.sandbox_timeout_mins,
-              }
-            );
-            return {
-              actionsClient: new GitHubActionsClient(deps.token),
-              baseConfig: {
-                repoFullName: cfg.repoFullName,
-                forkFullName: cfg.forkFullName,
-                branchName: cfg.branchName,
-                workflowRepoFullName: cfg.workflowRepoFullName,
-                ...(cfg.forkCloneUrl ? { forkCloneUrl: cfg.forkCloneUrl } : {}),
-                sandboxServices: cfg.sandboxServices,
-                timeoutMinutes: cfg.timeoutMinutes,
               },
-              testCommand: cfg.testCommands?.[0] ?? cfg.testCommand,
+              testCommand: testCommands[0],
+              sandboxSession,
               log,
             };
           })()

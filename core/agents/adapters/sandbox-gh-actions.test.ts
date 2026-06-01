@@ -52,6 +52,28 @@ function makeOptions(
   };
 }
 
+function makeSandboxSessionMock(overrides: Record<string, unknown> = {}): any {
+  return {
+    verifyAndPushBranch: jest
+      .fn()
+      .mockResolvedValue({ ok: true, phase: 'branch', sha: 'abc123' }),
+    verifyWorkflowReachability: jest.fn().mockResolvedValue({ ok: true, phase: 'workflow' }),
+    setupDependencies: jest
+      .fn()
+      .mockResolvedValue({ ok: true, phase: 'setup', installManifest: [] }),
+    dispatch: jest.fn().mockResolvedValue({
+      ok: true,
+      runId: 42,
+      conclusion: 'success',
+      stepOutcomes: [],
+      rawLogs: 'dispatch-logs',
+      exitCode: 0,
+    }),
+    recordReplayInstallCommand: jest.fn(),
+    ...overrides,
+  };
+}
+
 describe('createGhActionsSandboxAdapter pre-dispatch checks', () => {
   beforeEach(() => {
     runSandboxMock.mockReset();
@@ -150,5 +172,66 @@ describe('createGhActionsSandboxAdapter pre-dispatch checks', () => {
     expect(runSandboxMock.mock.calls[1][0]).toMatchObject({
       testCommands: ['pytest -xvs tests/repro/test_issue_52.py'],
     });
+  });
+
+  it('uses sandboxSession dispatch path and skips beforeDispatch', async () => {
+    const beforeDispatch = jest.fn().mockResolvedValue(undefined);
+    const session = makeSandboxSessionMock();
+    const handle = createGhActionsSandboxAdapter(
+      makeOptions({
+        beforeDispatch,
+        sandboxSession: session,
+      })
+    );
+    handle.setReproTestPath('tests/repro/test_issue_52.py');
+
+    const run = await handle.runRepro();
+
+    expect(run.exitCode).toBe(0);
+    expect(session.verifyAndPushBranch).toHaveBeenCalledTimes(1);
+    expect(session.verifyWorkflowReachability).toHaveBeenCalledTimes(1);
+    expect(session.dispatch).toHaveBeenCalledWith({
+      commands: ['pytest -xvs tests/repro/test_issue_52.py'],
+    });
+    expect(beforeDispatch).not.toHaveBeenCalled();
+    expect(runSandboxMock).not.toHaveBeenCalled();
+  });
+
+  it('reuses verified session readiness across multiple dispatches', async () => {
+    const session = makeSandboxSessionMock();
+    const handle = createGhActionsSandboxAdapter(
+      makeOptions({
+        sandboxSession: session,
+      })
+    );
+    handle.setReproTestPath('tests/repro/test_issue_52.py');
+
+    await handle.runRepro();
+    await handle.runRepro();
+
+    expect(session.verifyAndPushBranch).toHaveBeenCalledTimes(1);
+    expect(session.verifyWorkflowReachability).toHaveBeenCalledTimes(1);
+    expect(session.dispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('records replay installs on successful session pip install', async () => {
+    const session = makeSandboxSessionMock();
+    const handle = createGhActionsSandboxAdapter(
+      makeOptions({
+        sandboxSession: session,
+      })
+    );
+
+    const editableSpec = '-e python/openinference-instrumentation';
+    const result = await handle.pipInstall(editableSpec);
+
+    expect(result.exitCode).toBe(0);
+    expect(session.dispatch).toHaveBeenCalledWith({
+      commands: [buildPipInstallCommand(editableSpec)],
+    });
+    expect(session.recordReplayInstallCommand).toHaveBeenCalledWith(
+      buildPipInstallCommand(editableSpec)
+    );
+    expect(runSandboxMock).not.toHaveBeenCalled();
   });
 });

@@ -8,6 +8,7 @@ import type { DossierStore } from '../analyst/dossier';
 import type { SemanticSuspectSeed } from '../analyst/semantic-search';
 import type { InvestigationNotesStore } from '../fix-loop/investigation-notes';
 import type { HypothesisTracker } from '../fix-loop/hypotheses';
+import type { InstallSpec, SandboxPhaseResult } from '../../sandbox-session';
 
 export interface WorkspaceReader {
   /** Read a repo file at the agent's working ref. Returns null if not found. */
@@ -82,6 +83,8 @@ export interface SandboxHandle {
   }>;
   /** List currently installed packages. */
   listPackages(): Promise<{ name: string; version: string }[]>;
+  /** Session-owned dependency setup for deterministic repro runs. */
+  setupDependencies?(spec: InstallSpec): Promise<SandboxPhaseResult>;
 }
 
 export interface SandboxRun {

@@ -63,6 +63,16 @@ export const manifestSchema = {
         'Sandbox runner. "local" runs subprocess on the harness host (default). "gha" dispatches to GitHub Actions; required for macOS/iOS targets and for regression-guard/usability cross-branch runs.',
       default: 'local',
     },
+    sandbox_workflow_repo: {
+      type: 'string',
+      pattern: '^[\\w.-]+/[\\w.-]+$',
+      description: 'Repo hosting shared sandbox workflows (owner/repo).',
+    },
+    sandbox_workflow_ref: {
+      type: 'string',
+      description: 'Ref in sandbox_workflow_repo used for workflow_dispatch.',
+      default: 'main',
+    },
   },
   additionalProperties: false,
 } as const;

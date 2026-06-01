@@ -39,7 +39,7 @@ export function createSandboxAdapter(args: {
     if (!args.ghActionsOptions) {
       throw new Error('createSandboxAdapter: gh-actions driver selected but ghActionsOptions missing');
     }
-    const ghOptions = args.ghActionsOptions.beforeDispatch
+    const ghOptions = args.ghActionsOptions.sandboxSession || args.ghActionsOptions.beforeDispatch
       ? args.ghActionsOptions
       : { ...args.ghActionsOptions, beforeDispatch: () => args.workspace.push() };
     return createGhActionsSandboxAdapter(ghOptions);

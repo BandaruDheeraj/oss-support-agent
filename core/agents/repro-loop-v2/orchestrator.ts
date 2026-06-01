@@ -22,6 +22,7 @@ import { detectCredentialError } from '../../credentials-check';
 import type { IssueCodeSnippet } from './repro-hints';
 import { deriveEditableInstallsFromSuspectPaths, mergeEditableInstallCandidates } from './repro-hints';
 import type { SemanticSuspectSeed } from '../analyst/semantic-search';
+import type { InstallSpec } from '../../sandbox-session';
 
 const DEFAULT_PROBER_SAMPLE_COUNT = 3;
 const DEFAULT_PROBER_TEMPERATURE = 0.7;
@@ -29,45 +30,16 @@ const PROBER_SAMPLE_COUNT_ENV = 'OSA_REPRO_PROBER_SAMPLES';
 const PROBER_TEMPERATURE_ENV = 'OSA_REPRO_PROBER_TEMPERATURE';
 const OPENINFERENCE_REPO_SUFFIX = '/openinference';
 
-type ProberSandboxPreflightStep =
-  | {
-      kind: 'pip_install';
-      label: string;
-      spec: string;
-    }
-  | {
-      kind: 'run_python';
-      label: string;
-      snippet: string;
-    };
-
-const OPENINFERENCE_PROBER_PREFLIGHT_STEPS: readonly ProberSandboxPreflightStep[] = [
-  {
-    kind: 'pip_install',
-    label: 'pip install -e python/openinference-semantic-conventions',
-    spec: '-e python/openinference-semantic-conventions',
+const OPENINFERENCE_PROBER_INSTALL_SPEC: InstallSpec = {
+  semanticConventionsPath: 'python/openinference-semantic-conventions',
+  instrumentationCorePath: 'python/openinference-instrumentation',
+  instrumentationPackagePath: 'python/instrumentation/openinference-instrumentation-smolagents',
+  thirdPartyDeps: ['smolagents'],
+  importVerification: {
+    modulePath: 'openinference.instrumentation.smolagents',
+    className: 'SmolagentsInstrumentor',
   },
-  {
-    kind: 'pip_install',
-    label: 'pip install -e python/openinference-instrumentation',
-    spec: '-e python/openinference-instrumentation',
-  },
-  {
-    kind: 'pip_install',
-    label: 'pip install -e python/instrumentation/openinference-instrumentation-smolagents',
-    spec: '-e python/instrumentation/openinference-instrumentation-smolagents',
-  },
-  {
-    kind: 'pip_install',
-    label: 'pip install smolagents',
-    spec: 'smolagents',
-  },
-  {
-    kind: 'run_python',
-    label: 'python -c "from openinference.instrumentation.smolagents import SmolagentsInstrumentor"',
-    snippet: 'from openinference.instrumentation.smolagents import SmolagentsInstrumentor',
-  },
-] as const;
+};
 
 type CandidateSource = 'builder' | 'prober';
 type CandidateStatus =
@@ -516,28 +488,33 @@ async function runOpenInferenceProberPreflight(args: {
   sandbox: SandboxHandle;
   attemptId: string;
 }): Promise<{ ok: true } | { ok: false; message: string }> {
-  for (const step of OPENINFERENCE_PROBER_PREFLIGHT_STEPS) {
-    try {
-      const run =
-        step.kind === 'pip_install'
-          ? await args.sandbox.pipInstall(step.spec)
-          : await args.sandbox.runPython(step.snippet);
-      if (run.exitCode !== 0) {
-        const tail = collapseWhitespace(run.stderr || run.stdout).slice(-600);
-        const message =
-          `sandbox_setup_failed: ${step.label} failed (exitCode=${run.exitCode}).` +
-          (tail ? ` Output tail: ${tail}` : '');
-        // eslint-disable-next-line no-console
-        console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
-        return { ok: false, message };
-      }
-    } catch (err) {
-      const detail = collapseWhitespace(err instanceof Error ? err.message : String(err));
-      const message = `sandbox_setup_failed: ${step.label} threw: ${detail}`;
+  if (!args.sandbox.setupDependencies) {
+    const message =
+      'sandbox_setup_failed: sandbox adapter does not implement setupDependencies required for openinference preflight.';
+    // eslint-disable-next-line no-console
+    console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
+    return { ok: false, message };
+  }
+
+  try {
+    const setup = await args.sandbox.setupDependencies(OPENINFERENCE_PROBER_INSTALL_SPEC);
+    if (!setup.ok) {
+      const tail = collapseWhitespace(setup.stderr || setup.stdout || '').slice(-600);
+      const message =
+        `sandbox_setup_failed: openinference setup phase=${setup.phase} reason=${setup.reason}` +
+        (setup.failedStep ? ` failedStep=${setup.failedStep}` : '') +
+        (tail ? ` output_tail=${tail}` : '') +
+        (setup.diagnostics ? ` diagnostics=${JSON.stringify(setup.diagnostics)}` : '');
       // eslint-disable-next-line no-console
       console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
       return { ok: false, message };
     }
+  } catch (err) {
+    const detail = collapseWhitespace(err instanceof Error ? err.message : String(err));
+    const message = `sandbox_setup_failed: openinference setup threw: ${detail}`;
+    // eslint-disable-next-line no-console
+    console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
+    return { ok: false, message };
   }
   return { ok: true };
 }

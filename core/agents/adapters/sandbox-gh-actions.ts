@@ -5,6 +5,7 @@
 import { runSandbox } from '../../sandbox';
 import type { ActionsClient, SandboxConfig } from '../../sandbox-types';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
+import type { InstallSpec, SandboxPhaseFailure, SandboxPhaseResult, SandboxSession } from '../../sandbox-session';
 import { resolveSkippablePipInstall } from './pip-spec';
 import { buildPipInstallCommand } from './sandbox-local';
 import { buildPythonModuleCheckSnippet } from './python-module-check';
@@ -18,6 +19,7 @@ export interface GhActionsSandboxAdapterOptions {
   beforeDispatch?: () => Promise<void>;
   preDispatchRefCheckAttempts?: number;
   preDispatchRefCheckDelayMs?: number;
+  sandboxSession?: SandboxSession;
   log?: (msg: string) => void;
 }
 
@@ -31,6 +33,20 @@ function asRun(stdout: string, stderr: string, exitCode: number, durationMs: num
 
 function normalizePipSpec(spec: string): string {
   return spec.trim();
+}
+
+function formatPhaseFailure(phase: SandboxPhaseFailure): string {
+  const details = [
+    `phase=${phase.phase}`,
+    `reason=${phase.reason}`,
+    phase.failedStep ? `failedStep=${phase.failedStep}` : null,
+    phase.stdout ? `stdout=${phase.stdout.slice(-300)}` : null,
+    phase.stderr ? `stderr=${phase.stderr.slice(-300)}` : null,
+    phase.diagnostics ? `diagnostics=${JSON.stringify(phase.diagnostics)}` : null,
+  ]
+    .filter((part) => !!part)
+    .join(' ');
+  return `sandbox_setup_failed: ${details}`;
 }
 
 function buildInstallCommands(specs: readonly string[]): string[] {
@@ -100,6 +116,22 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
   let preDispatchPushConfirmed = false;
 
   const ensureReadyForDispatch = async (): Promise<void> => {
+    if (opts.sandboxSession) {
+      if (preDispatchPushConfirmed) {
+        return;
+      }
+      const branch = await opts.sandboxSession.verifyAndPushBranch();
+      if (!branch.ok) {
+        throw new Error(formatPhaseFailure(branch));
+      }
+      const workflow = await opts.sandboxSession.verifyWorkflowReachability();
+      if (!workflow.ok) {
+        throw new Error(formatPhaseFailure(workflow));
+      }
+      preDispatchPushConfirmed = true;
+      return;
+    }
+
     if (!preDispatchPushConfirmed && opts.beforeDispatch) {
       try {
         await opts.beforeDispatch();
@@ -135,6 +167,17 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
     await ensureReadyForDispatch();
     log(`[sandbox-gh] dispatching: ${commands.join(' && ')}`);
     const start = Date.now();
+    if (opts.sandboxSession) {
+      const dispatch = await opts.sandboxSession.dispatch({ commands: [...commands] });
+      const dur = Date.now() - start;
+      if (!dispatch.ok) {
+        throw new Error(
+          `sandbox_dispatch_failed: ${dispatch.reason} ${JSON.stringify(dispatch.diagnostics)}`
+        );
+      }
+      const exitCode = dispatch.exitCode ?? 1;
+      return asRun(dispatch.rawLogs, exitCode === 0 ? '' : dispatch.rawLogs, exitCode, dur);
+    }
     const result = await runSandbox(
       { ...opts.baseConfig, testCommands: [...commands] },
       opts.actionsClient
@@ -149,6 +192,9 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
   };
 
   const runOne = async (cmd: string): Promise<SandboxRun> => {
+    if (opts.sandboxSession) {
+      return runCommands([cmd]);
+    }
     const commands = [...buildInstallCommands(stickyPipInstalls), cmd];
     return runCommands(commands);
   };
@@ -186,6 +232,14 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
         log(msg);
         return asRun(`${msg}\n`, '', 0, 0);
       }
+      if (opts.sandboxSession) {
+        const installCommand = buildPipInstallCommand(normalizedSpec);
+        const installRun = await runCommands([installCommand]);
+        if (installRun.exitCode === 0) {
+          opts.sandboxSession.recordReplayInstallCommand(installCommand);
+        }
+        return installRun;
+      }
       if (stickyPipInstalls.includes(normalizedSpec)) {
         const msg = `[sandbox-gh] pip_install already tracked for replay: "${normalizedSpec}"`;
         log(msg);
@@ -214,6 +268,66 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
       } catch {
         return [];
       }
+    },
+    async setupDependencies(spec: InstallSpec): Promise<SandboxPhaseResult> {
+      if (opts.sandboxSession) {
+        await ensureReadyForDispatch();
+        return opts.sandboxSession.setupDependencies(spec);
+      }
+
+      const steps = [
+        {
+          step: 1,
+          run: () => handle.pipInstall(`-e ${spec.semanticConventionsPath}`),
+        },
+        {
+          step: 2,
+          run: () => handle.pipInstall(`-e ${spec.instrumentationCorePath}`),
+        },
+        {
+          step: 3,
+          run: () => handle.pipInstall(`-e ${spec.instrumentationPackagePath}`),
+        },
+        {
+          step: 4,
+          run: () => handle.pipInstall(spec.thirdPartyDeps.join(' ')),
+        },
+        {
+          step: 5,
+          run: () =>
+            handle.runPython(
+              `from ${spec.importVerification.modulePath} import ${spec.importVerification.className}\nprint("import_ok")`
+            ),
+        },
+      ];
+
+      for (const step of steps) {
+        const run = await step.run();
+        if (step.step === 5) {
+          const output = `${run.stdout}\n${run.stderr}`;
+          if (run.exitCode !== 0 || !output.includes('import_ok')) {
+            return {
+              ok: false,
+              phase: 'setup',
+              reason: 'import_verification_failed',
+              failedStep: 5,
+              stdout: run.stdout,
+              stderr: run.stderr,
+            };
+          }
+        } else if (run.exitCode !== 0) {
+          return {
+            ok: false,
+            phase: 'setup',
+            reason: 'dependency_setup_failed',
+            failedStep: step.step,
+            stdout: run.stdout,
+            stderr: run.stderr,
+          };
+        }
+      }
+
+      return { ok: true, phase: 'setup', installManifest: [] };
     },
   };
 

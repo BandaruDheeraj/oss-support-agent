@@ -162,6 +162,34 @@ export class GitHubRestClient implements GitHubClient {
     return json.default_branch;
   }
 
+  async getFileContents(
+    fullName: string,
+    filePath: string,
+    ref: string
+  ): Promise<{ ok: boolean; status: number; content?: string; error?: string }> {
+    const url = `${GITHUB_API}/repos/${fullName}/contents/${filePath}?ref=${encodeURIComponent(ref)}`;
+    const res = await ghFetch(this.token, url);
+    if (res.status === 404) {
+      return { ok: false, status: 404 };
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        error: await res.text(),
+      };
+    }
+    const json: any = await res.json();
+    if (typeof json.content === 'string') {
+      return {
+        ok: true,
+        status: 200,
+        content: Buffer.from(json.content, 'base64').toString('utf-8'),
+      };
+    }
+    return { ok: true, status: 200 };
+  }
+
   async getBranchSha(fullName: string, branch: string): Promise<string | null> {
     const url = `${GITHUB_API}/repos/${fullName}/git/ref/heads/${encodeURIComponent(branch)}`;
     const res = await ghFetch(this.token, url);
@@ -263,4 +291,3 @@ export class GitHubRestClient implements GitHubClient {
     }
   }
 }
-

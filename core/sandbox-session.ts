@@ -135,6 +135,7 @@ export class SandboxSession {
 
   private readonly phaseResults: Partial<Record<SandboxPhase, SandboxPhaseResult>> = {};
   private installManifestState: PackageVersion[] = [];
+  private replayInstallCommands: string[] = [];
   private lastDispatch:
     | {
         ok: boolean;
@@ -360,6 +361,14 @@ export class SandboxSession {
     });
   }
 
+  recordReplayInstallCommand(command: string): void {
+    const normalized = command.trim();
+    if (!normalized) return;
+    if (!this.replayInstallCommands.includes(normalized)) {
+      this.replayInstallCommands.push(normalized);
+    }
+  }
+
   async dispatch(recipe: Recipe): Promise<SandboxDispatchResult> {
     this.assertPhaseSucceeded('branch', 'verifyAndPushBranch');
     this.assertPhaseSucceeded('workflow', 'verifyWorkflowReachability');
@@ -512,6 +521,12 @@ export class SandboxSession {
       if (!seen.has(command)) {
         seen.add(command);
         commands.push(command);
+      }
+    }
+    for (const replay of this.replayInstallCommands) {
+      if (!seen.has(replay)) {
+        seen.add(replay);
+        commands.push(replay);
       }
     }
     return commands;
@@ -774,4 +789,3 @@ function isOwnerRepo(value: unknown): value is string {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
