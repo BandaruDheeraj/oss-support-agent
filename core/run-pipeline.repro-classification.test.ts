@@ -1,4 +1,5 @@
 import {
+  buildNotReproducedRunDiagnostics,
   classifyAlreadyFixedOnMain,
   ReproStageTimeoutError,
   resolveReproStageTimeoutMs,
@@ -33,11 +34,12 @@ function makeOutcome(args: {
   status: ReproPipelineOutcome['status'];
   message?: string;
   candidates?: ReproCandidateEvaluation[];
+  dossier?: DossierStore;
 }): ReproPipelineOutcome {
   const message = args.message ?? 'repro pipeline message';
   const v2: ReproV2Outcome = {
     status: args.status,
-    dossier: new DossierStore(),
+    dossier: args.dossier ?? new DossierStore(),
     message,
     candidates: args.candidates ?? [],
   };
@@ -121,6 +123,140 @@ describe('classifyAlreadyFixedOnMain', () => {
     const result = classifyAlreadyFixedOnMain(outcome);
 
     expect(result.alreadyFixedOnMain).toBe(false);
+  });
+});
+
+describe('buildNotReproducedRunDiagnostics', () => {
+  test('emits structured diagnostics for not_reproduced outcomes', () => {
+    const dossier = new DossierStore();
+    dossier.append({
+      issueNumber: 48,
+      attemptId: 'attempt-diag',
+      evidence: [],
+      suspectFiles: ['python/instrumentation/foo.py'],
+      suspectSymbols: [
+        {
+          file: 'python/instrumentation/foo.py',
+          symbol: 'Instrumentor',
+          reasoning: 'semantic hit',
+        },
+      ],
+      semanticConfidence: {
+        top_score: 0.41,
+        low_confidence: true,
+        diagnostics: 'semantic top_score=0.410 below threshold 0.600; suspects are low-confidence',
+      },
+      openQuestions: [],
+      summary: 'low confidence',
+      confidence: 'low',
+    });
+
+    const outcome = makeOutcome({
+      status: 'not_reproduced',
+      message:
+        'Analyst terminated without producing a dossier (error: [credits-exhausted] 402 Payment Required: insufficient credit balance)',
+      candidates: [
+        {
+          candidateId: 'candidate-0',
+          source: 'builder',
+          sampleIndex: 0,
+          status: 'invalid',
+          message: 'Deterministic repro oracle rejected candidate.',
+          executor: {
+            outcome: 'fails_reliably',
+            candidateTestPath: 'tests/test_repro.py',
+            sentinelString: 'REPRO_SENTINEL',
+            expectedFailureSignature: null,
+            ranReproCount: 2,
+            lastReproExitCode: 1,
+            runs: [
+              { runId: 1, exitCode: 1, stderrTail: 'AssertionError', stdoutTail: '', durationMs: 10 },
+              { runId: 2, exitCode: 1, stderrTail: 'AssertionError', stdoutTail: '', durationMs: 12 },
+            ],
+            reproducedReliably: true,
+            signatureMatched: true,
+            missingCredentials: [],
+            installFailures: [],
+            reason: 'failing',
+          },
+          oracle: {
+            verdict: 'invalid',
+            criteria: {
+              baseline_head_fails: true,
+              reliable_failures: true,
+              suspect_path_assertions: false,
+              precondition_assertions: true,
+              ast_preflight: true,
+            },
+            message: 'missing suspect_path_assertions',
+            executor: {} as any,
+            suspectPathAssertionResult: {
+              passed: false,
+              missing: [{ kind: 'symbol', needle: 'Instrumentor', file: 'python/instrumentation/foo.py' }],
+            },
+            preconditionAssertionResult: { passed: true, missingMarkers: [] },
+            astReason: null,
+            credentialsTerminal: null,
+          },
+        } as any,
+        {
+          candidateId: 'candidate-1',
+          source: 'prober',
+          sampleIndex: 1,
+          status: 'generation_failed',
+          message: 'Prober sample terminated without recipe ([rate-limited] 429)',
+          prober: {
+            terminated: 'error',
+            reason: '[rate-limited] 429',
+            turns: 4,
+            toolCalls: 6,
+            toolCallsByTier: {
+              read: 2,
+              note: 0,
+              'write-test': 1,
+              mutation: 0,
+              sandbox: 3,
+              meta: 0,
+            },
+            transcriptSummary: 'run_repro(0)',
+            text: '',
+            recipeSnapshot: null,
+            recipe: null,
+            verbatimIncompatibleHint: false,
+            transcript: [],
+            ranReproCount: 0,
+            lastReproExitCode: null,
+            verifiedSummary: 'run_repro_ok=0',
+          },
+        } as any,
+      ],
+      dossier,
+    });
+
+    const diagnostics = buildNotReproducedRunDiagnostics(outcome);
+
+    expect(diagnostics).not.toBeNull();
+    expect(diagnostics?.semantic_confidence).toEqual({
+      top_score: 0.41,
+      low_confidence: true,
+      diagnostics: 'semantic top_score=0.410 below threshold 0.600; suspects are low-confidence',
+      files_returned: ['python/instrumentation/foo.py'],
+    });
+    expect(diagnostics?.analyst).toEqual({
+      has_suspect_symbols: true,
+      suspect_symbol_count: 1,
+    });
+    expect(diagnostics?.oracle.by_candidate[0]?.failed_criteria).toEqual(['suspect_path_assertions']);
+    expect(diagnostics?.run_repro.any_executed).toBe(true);
+    expect(diagnostics?.run_repro.total_calls).toBe(2);
+    expect(diagnostics?.run_repro.errored_before_execution[0]?.candidate_id).toBe('candidate-1');
+    expect(diagnostics?.llm_quota_failure?.stage).toBe('analyst');
+    expect(diagnostics?.llm_quota_failure?.reason).toContain('credits-exhausted');
+  });
+
+  test('returns null for non-not_reproduced outcomes', () => {
+    const diagnostics = buildNotReproducedRunDiagnostics(makeOutcome({ status: 'reproduced' }));
+    expect(diagnostics).toBeNull();
   });
 });
 

@@ -36,6 +36,7 @@ export interface EvalRow {
   notes_id: string | null;
   trace_id: string | null;
   error_kind: string | null;
+  run_diagnostics?: unknown | null;
 }
 
 export interface EvalRecorder {
@@ -90,7 +91,8 @@ class SqliteRecorder implements EvalRecorder {
         dossier_snapshot_id TEXT,
         notes_id TEXT,
         trace_id TEXT,
-        error_kind TEXT
+        error_kind TEXT,
+        run_diagnostics TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_evals_attempt ON evals(issue_number, attempt_id);
       CREATE INDEX IF NOT EXISTS idx_evals_mode ON evals(mode);
@@ -98,9 +100,10 @@ class SqliteRecorder implements EvalRecorder {
     this.ensureColumn('backend', 'TEXT');
     this.ensureColumn('verification_gate_passed', 'INTEGER');
     this.ensureColumn('verification_stage', 'TEXT');
+    this.ensureColumn('run_diagnostics', 'TEXT');
     this.stmt = this.db.prepare(
-      `INSERT INTO evals (ts, issue_number, attempt_id, mode, backend, agent, repro_passed, fix_passed, verification_gate_passed, verification_stage, regression_passed, tool_call_counts, total_cost_usd, final_disposition, dossier_snapshot_id, notes_id, trace_id, error_kind)
-       VALUES (@ts, @issue_number, @attempt_id, @mode, @backend, @agent, @repro_passed, @fix_passed, @verification_gate_passed, @verification_stage, @regression_passed, @tool_call_counts, @total_cost_usd, @final_disposition, @dossier_snapshot_id, @notes_id, @trace_id, @error_kind)`
+      `INSERT INTO evals (ts, issue_number, attempt_id, mode, backend, agent, repro_passed, fix_passed, verification_gate_passed, verification_stage, regression_passed, tool_call_counts, total_cost_usd, final_disposition, dossier_snapshot_id, notes_id, trace_id, error_kind, run_diagnostics)
+       VALUES (@ts, @issue_number, @attempt_id, @mode, @backend, @agent, @repro_passed, @fix_passed, @verification_gate_passed, @verification_stage, @regression_passed, @tool_call_counts, @total_cost_usd, @final_disposition, @dossier_snapshot_id, @notes_id, @trace_id, @error_kind, @run_diagnostics)`
     );
   }
 
@@ -125,6 +128,8 @@ class SqliteRecorder implements EvalRecorder {
       notes_id: row.notes_id,
       trace_id: row.trace_id,
       error_kind: row.error_kind,
+      run_diagnostics:
+        row.run_diagnostics == null ? null : JSON.stringify(row.run_diagnostics),
     });
   }
 

@@ -39,7 +39,7 @@ import {
   type ReproPipelineOutcome,
 } from '../core/agents/run-v2';
 import { dispatchTypedHaltEmail, buildHaltContext, buildSuccessContext } from '../core/agents/email/dispatch';
-import type { ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
+import type { ReproCandidateEvaluation, ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
 import type { FixV2Outcome } from '../core/agents/fix-loop/orchestrator';
 
 import { scoreDesign } from '../core/agents/pm';
@@ -759,6 +759,178 @@ export function classifyAlreadyFixedOnMain(outcome: ReproPipelineOutcome): {
   return { alreadyFixedOnMain: false };
 }
 
+export interface NotReproducedRunDiagnostics {
+  reason: string;
+  semantic_confidence: {
+    top_score: number | null;
+    low_confidence: boolean;
+    diagnostics: string;
+    files_returned: string[];
+  };
+  analyst: {
+    has_suspect_symbols: boolean;
+    suspect_symbol_count: number;
+  };
+  run_repro: {
+    any_executed: boolean;
+    total_calls: number;
+    by_candidate: Array<{
+      candidate_id: string;
+      source: ReproCandidateEvaluation['source'];
+      status: ReproCandidateEvaluation['status'];
+      calls: number;
+    }>;
+    errored_before_execution: Array<{
+      candidate_id: string;
+      status: ReproCandidateEvaluation['status'];
+      message: string;
+    }>;
+  };
+  oracle: {
+    by_candidate: Array<{
+      candidate_id: string;
+      source: ReproCandidateEvaluation['source'];
+      status: ReproCandidateEvaluation['status'];
+      oracle_executed: boolean;
+      verdict: 'valid' | 'invalid' | 'credentials_required' | null;
+      failed_criteria: string[];
+      criteria: Record<string, boolean> | null;
+      suspect_path_evidence_present: boolean | null;
+      missing_suspect_needles: string[];
+      missing_precondition_markers: string[];
+      message: string;
+    }>;
+  };
+  llm_quota_failure: {
+    stage: 'analyst' | 'prober' | 'builder' | 'orchestrator';
+    candidate_id?: string;
+    reason: string;
+  } | null;
+}
+
+const LLM_QUOTA_FAILURE_PATTERN =
+  /\[credits-exhausted\]|\[rate-limited\]|insufficient credit|quota exceeded|payment required|\b(?:402|429)\b/i;
+
+function isLlmQuotaFailure(reason: string | null | undefined): boolean {
+  if (!reason) return false;
+  return LLM_QUOTA_FAILURE_PATTERN.test(reason);
+}
+
+function summarizeOracleCandidate(
+  candidate: ReproCandidateEvaluation
+): NotReproducedRunDiagnostics['oracle']['by_candidate'][number] {
+  const oracle = candidate.oracle;
+  if (!oracle) {
+    return {
+      candidate_id: candidate.candidateId,
+      source: candidate.source,
+      status: candidate.status,
+      oracle_executed: false,
+      verdict: null,
+      failed_criteria: ['oracle_not_executed'],
+      criteria: null,
+      suspect_path_evidence_present: null,
+      missing_suspect_needles: [],
+      missing_precondition_markers: [],
+      message: candidate.message,
+    };
+  }
+  const failedCriteria = Object.entries(oracle.criteria)
+    .filter(([, passed]) => !passed)
+    .map(([criterion]) => criterion);
+  return {
+    candidate_id: candidate.candidateId,
+    source: candidate.source,
+    status: candidate.status,
+    oracle_executed: true,
+    verdict: oracle.verdict,
+    failed_criteria: failedCriteria,
+    criteria: { ...oracle.criteria },
+    suspect_path_evidence_present: oracle.suspectPathAssertionResult.passed,
+    missing_suspect_needles: oracle.suspectPathAssertionResult.missing.map((m) => m.needle),
+    missing_precondition_markers: oracle.preconditionAssertionResult.missingMarkers,
+    message: oracle.message,
+  };
+}
+
+function detectLlmQuotaFailure(v2: ReproV2Outcome): NotReproducedRunDiagnostics['llm_quota_failure'] {
+  if (isLlmQuotaFailure(v2.message)) {
+    return {
+      stage: v2.message.toLowerCase().includes('analyst terminated') ? 'analyst' : 'orchestrator',
+      reason: v2.message,
+    };
+  }
+  for (const candidate of v2.candidates) {
+    const candidateReason = candidate.prober?.reason ?? candidate.message;
+    if (!isLlmQuotaFailure(candidateReason)) continue;
+    return {
+      stage: candidate.source === 'prober' ? 'prober' : candidate.source === 'builder' ? 'builder' : 'orchestrator',
+      candidate_id: candidate.candidateId,
+      reason: candidateReason,
+    };
+  }
+  return null;
+}
+
+export function buildNotReproducedRunDiagnostics(
+  outcome: ReproPipelineOutcome
+): NotReproducedRunDiagnostics | null {
+  if (outcome.status !== 'not_reproduced') return null;
+  const latest = outcome.v2.dossier.latest();
+  const semanticConfidence = latest?.body.semanticConfidence;
+  const suspectFiles = latest?.body.suspectFiles ?? [];
+  const suspectSymbols = latest?.body.suspectSymbols ?? [];
+
+  const runReproByCandidate = outcome.v2.candidates.map((candidate) => {
+    const deterministicCalls = candidate.executor?.runs.length ?? 0;
+    const proberCalls = candidate.prober?.ranReproCount ?? 0;
+    return {
+      candidate_id: candidate.candidateId,
+      source: candidate.source,
+      status: candidate.status,
+      calls: deterministicCalls + proberCalls,
+      message: candidate.message,
+    };
+  });
+  const totalRunReproCalls = runReproByCandidate.reduce((sum, candidate) => sum + candidate.calls, 0);
+  const erroredBeforeExecution = runReproByCandidate
+    .filter((candidate) => candidate.calls === 0)
+    .map((candidate) => ({
+      candidate_id: candidate.candidate_id,
+      status: candidate.status,
+      message: candidate.message,
+    }));
+
+  return {
+    reason: outcome.message,
+    semantic_confidence: {
+      top_score: semanticConfidence?.top_score ?? null,
+      low_confidence: semanticConfidence?.low_confidence ?? false,
+      diagnostics: semanticConfidence?.diagnostics ?? 'semantic confidence unavailable',
+      files_returned: suspectFiles,
+    },
+    analyst: {
+      has_suspect_symbols: suspectSymbols.length > 0,
+      suspect_symbol_count: suspectSymbols.length,
+    },
+    run_repro: {
+      any_executed: totalRunReproCalls > 0,
+      total_calls: totalRunReproCalls,
+      by_candidate: runReproByCandidate.map(({ candidate_id, source, status, calls }) => ({
+        candidate_id,
+        source,
+        status,
+        calls,
+      })),
+      errored_before_execution: erroredBeforeExecution,
+    },
+    oracle: {
+      by_candidate: outcome.v2.candidates.map(summarizeOracleCandidate),
+    },
+    llm_quota_failure: detectLlmQuotaFailure(outcome.v2),
+  };
+}
+
 interface VerificationResult {
   /** Aggregate gate outcome. ok=false means feed retryContext back to the fix agent. */
   outcome: { ok: boolean; retryContext: string };
@@ -1298,6 +1470,7 @@ export async function runPipeline(args: {
   let verificationStage: 'pass' | 'fail' | 'skipped_non_gha' | 'not_reached' = 'not_reached';
   let finalDisposition: string = 'runtime-error';
   let errorKind: string | null = null;
+  let runDiagnostics: NotReproducedRunDiagnostics | null = null;
 
   const finish = (result: PipelineResult): PipelineResult => {
     finalDisposition = result.status;
@@ -1956,6 +2129,9 @@ export async function runPipeline(args: {
     }
 
     if (!reproOutcome.ok || !reproOutcome.candidateTestPath || !reproOutcome.candidateTestContent) {
+      if (reproOutcome.status === 'not_reproduced') {
+        runDiagnostics = buildNotReproducedRunDiagnostics(reproOutcome);
+      }
       return finish(
         await haltForReproNotRunnable({
           reason: reproOutcome.message,
@@ -2234,6 +2410,7 @@ export async function runPipeline(args: {
         notes_id: null,
         trace_id: runId,
         error_kind: errorKind,
+        run_diagnostics: runDiagnostics,
       });
     } catch (recordErr) {
       log(
