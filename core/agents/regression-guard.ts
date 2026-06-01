@@ -17,10 +17,8 @@ import {
 } from './regression-guard-types';
 import {
   ActionsClient,
-  WorkflowRun,
-  WorkflowRunLogs,
-  DEFAULT_POLL_INTERVAL_MS,
 } from '../sandbox-types';
+import type { SandboxPhaseFailure, SandboxSession } from '../sandbox-session';
 
 /**
  * Validates regression guard configuration.
@@ -117,99 +115,49 @@ export function buildRegressionWorkflowInputs(
 async function runBranchTest(
   config: RegressionConfig,
   branch: string,
-  client: ActionsClient,
-  pollIntervalMs: number
+  sandboxSession: SandboxSession
 ): Promise<BranchTestResult> {
-  const startedAt = new Date().toISOString();
+  const startedAtMs = Date.now();
   const inputs = buildRegressionWorkflowInputs(config, branch);
 
-  // Trigger workflow_dispatch against the branch under test. The workflow file
-  // is installed on this branch by the pipeline before this runs, so head_branch
-  // on the resulting run matches `branch` and we can find it via the runs API.
-  try {
-    await client.triggerWorkflowDispatch(
-      config.forkFullName,
-      REGRESSION_WORKFLOW_FILE,
-      branch,
-      inputs
-    );
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
+  const dispatch = await sandboxSession.dispatchWorkflow({
+    workflowId: REGRESSION_WORKFLOW_FILE,
+    timeoutMins: config.timeoutMinutes,
+    inputs,
+  });
+
+  if (!dispatch.ok) {
+    if (isTimeoutDispatchFailure(dispatch.diagnostics)) {
+      const durationSeconds = Math.round((Date.now() - startedAtMs) / 1000);
+      return {
+        branch,
+        completed: false,
+        exitCode: null,
+        stdout: '',
+        stderr: 'Run timed out',
+        durationSeconds,
+        timedOut: true,
+        workflowRunUrl: '',
+      };
+    }
     throw new RegressionGuardError(
-      `Failed to trigger workflow dispatch for branch "${branch}": ${message}`,
+      `Failed to trigger workflow dispatch for branch "${branch}": reason=${dispatch.reason} diagnostics=${JSON.stringify(dispatch.diagnostics)}`,
       'trigger',
       branch
     );
   }
 
-  // Wait for workflow run to appear
-  let workflowRun: WorkflowRun | null = null;
-  const runPollInterval = Math.min(pollIntervalMs, 5_000);
-  // Bound the wait for run-appearance by a small multiple of the poll interval.
-  const maxWaitForRunMs = runPollInterval === 0
-    ? 1
-    : Math.min(60_000, runPollInterval * 12);
-  const runPollStart = Date.now();
-
-  while (Date.now() - runPollStart < maxWaitForRunMs) {
-    workflowRun = await client.getWorkflowRun(
-      config.forkFullName,
-      REGRESSION_WORKFLOW_FILE,
-      branch,
-      startedAt
-    );
-    if (workflowRun) break;
-    await sleep(runPollInterval);
-  }
-
-  if (!workflowRun) {
-    throw new RegressionGuardError(
-      `Workflow run for branch "${branch}" did not appear within ${maxWaitForRunMs}ms`,
-      'wait_for_run',
-      branch
-    );
-  }
-
-  // Wait for completion
-  const timeoutMs = config.timeoutMinutes * 60 * 1000;
-  const runStatus = await client.waitForWorkflowRun(
-    config.forkFullName,
-    workflowRun.id,
-    timeoutMs,
-    pollIntervalMs
-  );
-
-  // Retrieve logs
-  let logs: WorkflowRunLogs;
-  if (runStatus.timedOut) {
-    logs = { stdout: '', stderr: 'Run timed out', exitCode: null };
-  } else {
-    try {
-      logs = await client.getWorkflowRunLogs(config.forkFullName, workflowRun.id);
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new RegressionGuardError(
-        `Failed to retrieve logs for branch "${branch}": ${message}`,
-        'logs',
-        branch
-      );
-    }
-  }
-
-  const completedAt = new Date().toISOString();
-  const durationSeconds = Math.round(
-    (new Date(completedAt).getTime() - new Date(startedAt).getTime()) / 1000
-  );
+  const durationSeconds = Math.round((Date.now() - startedAtMs) / 1000);
 
   return {
     branch,
-    completed: runStatus.completed && !runStatus.timedOut,
-    exitCode: logs.exitCode,
-    stdout: logs.stdout,
-    stderr: logs.stderr,
+    completed: true,
+    exitCode: dispatch.exitCode,
+    stdout: dispatch.stdout,
+    stderr: dispatch.stderr,
     durationSeconds,
-    timedOut: runStatus.timedOut,
-    workflowRunUrl: workflowRun.html_url,
+    timedOut: false,
+    workflowRunUrl: dispatch.runUrl,
   };
 }
 
@@ -331,17 +279,36 @@ export function generateRegressionSummary(result: RegressionResult): string {
 export async function runRegressionGuard(
   config: RegressionConfig,
   client: ActionsClient,
-  pollIntervalMs?: number
+  pollIntervalMs?: number,
+  sandboxSession?: SandboxSession
 ): Promise<RegressionResult> {
+  void client;
+  void pollIntervalMs;
+
   // 1. Validate
   validateRegressionConfig(config);
 
-  const interval = pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  if (!sandboxSession) {
+    throw new RegressionGuardError(
+      'SandboxSession is required for regression guard dispatch',
+      'trigger',
+      config.forkBranchName
+    );
+  }
+
+  const workflowResult = await sandboxSession.verifyWorkflowReachability(REGRESSION_WORKFLOW_FILE);
+  if (!workflowResult.ok) {
+    throw new RegressionGuardError(
+      `Regression workflow reachability failed: ${formatSessionFailure(workflowResult)}`,
+      'workflow',
+      config.forkBranchName
+    );
+  }
 
   // 2. Run tests on both branches in parallel
   const [forkResult, upstreamResult] = await Promise.all([
-    runBranchTest(config, config.forkBranchName, client, interval),
-    runBranchTest(config, config.upstreamDefaultBranch, client, interval),
+    runBranchTest(config, config.forkBranchName, sandboxSession),
+    runBranchTest(config, config.upstreamDefaultBranch, sandboxSession),
   ]);
 
   // 3. Diff observable outputs
@@ -366,9 +333,12 @@ export async function runRegressionGuard(
   };
 }
 
-/**
- * Sleep utility for polling.
- */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function formatSessionFailure(failure: SandboxPhaseFailure): string {
+  const diagnostics = failure.diagnostics ? ` diagnostics=${JSON.stringify(failure.diagnostics)}` : '';
+  return `phase=${failure.phase} reason=${failure.reason}${diagnostics}`;
+}
+
+function isTimeoutDispatchFailure(diagnostics: Record<string, unknown>): boolean {
+  const errorText = diagnostics.error;
+  return typeof errorText === 'string' && errorText.includes('workflow timed out');
 }

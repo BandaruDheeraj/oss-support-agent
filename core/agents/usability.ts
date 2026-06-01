@@ -19,6 +19,7 @@ import {
   DEFAULT_USABILITY_TIMEOUT_MINUTES,
 } from './usability-types';
 import { ActionsClient, SandboxRunError } from '../sandbox-types';
+import type { SandboxPhaseFailure, SandboxSession } from '../sandbox-session';
 
 /**
  * Validates usability agent configuration.
@@ -185,8 +186,11 @@ export function createUsabilityConfig(input: UsabilityAgentInput): UsabilityConf
 export async function runUsabilityAgent(
   input: UsabilityAgentInput,
   exerciser: UsabilityExerciser,
-  actionsClient: ActionsClient
+  _actionsClient: ActionsClient,
+  sandboxSession?: SandboxSession
 ): Promise<UsabilityAgentResult> {
+  void _actionsClient;
+
   // 1. Validate input
   validateUsabilityConfig(input);
 
@@ -196,68 +200,50 @@ export async function runUsabilityAgent(
   const workflowInputs = buildUsabilityWorkflowInputs(input);
 
   let workflowRunUrl = '';
-  try {
-    // Dispatch against the agent branch directly. The pipeline ensures the
-    // workflow file is committed to this branch before we get here, so the
-    // resulting run's head_branch matches and getWorkflowRun can find it.
-    await actionsClient.triggerWorkflowDispatch(
-      input.forkFullName,
-      USABILITY_WORKFLOW_FILE,
-      input.branchName,
-      workflowInputs
-    );
-
-    // Poll for the run — workflow_dispatch returns immediately but the run may
-    // not be indexed in the runs API for a second or two. Retry briefly.
-    const createdAfter = new Date(startTime - 5000).toISOString();
-    let run: { id: number; html_url: string; status: string; conclusion: string | null; created_at: string } | null = null;
-    const runPollIntervalMs = 2_000;
-    const maxWaitForRunMs = 30_000;
-    const runPollStart = Date.now();
-    while (Date.now() - runPollStart < maxWaitForRunMs) {
-      run = await actionsClient.getWorkflowRun(
-        input.forkFullName,
-        USABILITY_WORKFLOW_FILE,
-        input.branchName,
-        createdAfter
-      );
-      if (run) break;
-      await new Promise((resolve) => setTimeout(resolve, runPollIntervalMs));
-    }
-
-    if (run) {
-      workflowRunUrl = run.html_url;
-
-      // Wait for the run to complete
-      const timeoutMs = (input.timeoutMinutes || DEFAULT_USABILITY_TIMEOUT_MINUTES) * 60 * 1000;
-      const status = await actionsClient.waitForWorkflowRun(
-        input.forkFullName,
-        run.id,
-        timeoutMs
-      );
-
-      if (status.timedOut) {
-        const durationSeconds = (Date.now() - startTime) / 1000;
-        return {
-          completed: false,
-          dxScore: 0,
-          checks: [],
-          summary: 'Usability run timed out',
-          durationSeconds,
-          timedOut: true,
-          workflowRunUrl,
-          blockers: ['Usability run timed out — could not complete DX assessment'],
-          suggestions: [],
-        };
-      }
-    }
-  } catch (error: any) {
+  if (!sandboxSession) {
     throw new UsabilityAgentError(
-      `Failed to trigger usability workflow: ${error.message}`,
+      'SandboxSession is required for usability dispatch',
       'dispatch',
       input.forkFullName
     );
   }
+
+  const workflowResult = await sandboxSession.verifyWorkflowReachability(USABILITY_WORKFLOW_FILE);
+  if (!workflowResult.ok) {
+    throw new UsabilityAgentError(
+      `Usability workflow reachability failed: ${formatSessionFailure(workflowResult)}`,
+      'dispatch',
+      input.forkFullName
+    );
+  }
+
+  const dispatch = await sandboxSession.dispatchWorkflow({
+    workflowId: USABILITY_WORKFLOW_FILE,
+    timeoutMins: input.timeoutMinutes || DEFAULT_USABILITY_TIMEOUT_MINUTES,
+    inputs: workflowInputs,
+  });
+  if (!dispatch.ok) {
+    if (isTimeoutDispatchFailure(dispatch.diagnostics)) {
+      const durationSeconds = (Date.now() - startTime) / 1000;
+      return {
+        completed: false,
+        dxScore: 0,
+        checks: [],
+        summary: 'Usability run timed out',
+        durationSeconds,
+        timedOut: true,
+        workflowRunUrl: '',
+        blockers: ['Usability run timed out — could not complete DX assessment'],
+        suggestions: [],
+      };
+    }
+    throw new UsabilityAgentError(
+      `Failed to trigger usability workflow: reason=${dispatch.reason} diagnostics=${JSON.stringify(dispatch.diagnostics)}`,
+      'dispatch',
+      input.forkFullName
+    );
+  }
+  workflowRunUrl = dispatch.runUrl;
 
   // 3. Exercise the affected API
   let exerciserOutput: UsabilityExerciserOutput;
@@ -306,4 +292,14 @@ export async function runUsabilityAgent(
     blockers,
     suggestions,
   };
+}
+
+function formatSessionFailure(failure: SandboxPhaseFailure): string {
+  const diagnostics = failure.diagnostics ? ` diagnostics=${JSON.stringify(failure.diagnostics)}` : '';
+  return `phase=${failure.phase} reason=${failure.reason}${diagnostics}`;
+}
+
+function isTimeoutDispatchFailure(diagnostics: Record<string, unknown>): boolean {
+  const errorText = diagnostics.error;
+  return typeof errorText === 'string' && errorText.includes('workflow timed out');
 }

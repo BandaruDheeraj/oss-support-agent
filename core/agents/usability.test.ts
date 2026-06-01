@@ -24,6 +24,7 @@ import {
 } from './usability';
 
 import { ActionsClient, WorkflowRun, WorkflowRunStatus, WorkflowRunLogs } from '../sandbox-types';
+import type { SandboxSession } from '../sandbox-session';
 
 // --- Test Helpers ---
 
@@ -90,6 +91,29 @@ function makeMockExerciser(overrides: Partial<UsabilityExerciserOutput> = {}): U
       ...overrides,
     }),
   };
+}
+
+function makeMockSandboxSession(overrides: Partial<SandboxSession> = {}): SandboxSession {
+  return Object.assign(
+    {
+      verifyWorkflowReachability: jest.fn().mockResolvedValue({
+        ok: true,
+        phase: 'workflow',
+      }),
+      dispatchWorkflow: jest.fn().mockResolvedValue({
+        ok: true,
+        runId: 100,
+        runUrl: 'https://github.com/support/oss-support-agent/actions/runs/100',
+        conclusion: 'success',
+        stepOutcomes: [],
+        stdout: 'All checks passed',
+        stderr: '',
+        rawLogs: 'All checks passed',
+        exitCode: 0,
+      }),
+    },
+    overrides
+  ) as unknown as SandboxSession;
 }
 
 // --- Tests ---
@@ -368,8 +392,9 @@ describe('runUsabilityAgent', () => {
   it('validates input before proceeding', async () => {
     const exerciser = makeMockExerciser();
     const client = makeMockActionsClient();
+    const session = makeMockSandboxSession();
     await expect(
-      runUsabilityAgent(makeInput({ forkFullName: '' }), exerciser, client)
+      runUsabilityAgent(makeInput({ forkFullName: '' }), exerciser, client, session)
     ).rejects.toThrow(UsabilityAgentError);
     expect(exerciser.exercise).not.toHaveBeenCalled();
   });
@@ -377,43 +402,26 @@ describe('runUsabilityAgent', () => {
   it('triggers workflow dispatch', async () => {
     const client = makeMockActionsClient();
     const exerciser = makeMockExerciser();
-    await runUsabilityAgent(makeInput(), exerciser, client);
-    expect(client.triggerWorkflowDispatch).toHaveBeenCalledWith(
-      'my-org/my-repo',
-      USABILITY_WORKFLOW_FILE,
-      'agent/scope-42',
-      expect.objectContaining({ branch: 'agent/scope-42' })
-    );
-  });
-
-  it('polls for workflow run', async () => {
-    const client = makeMockActionsClient();
-    const exerciser = makeMockExerciser();
-    await runUsabilityAgent(makeInput(), exerciser, client);
-    expect(client.getWorkflowRun).toHaveBeenCalled();
-  });
-
-  it('waits for workflow completion', async () => {
-    const client = makeMockActionsClient();
-    const exerciser = makeMockExerciser();
-    await runUsabilityAgent(makeInput(), exerciser, client);
-    expect(client.waitForWorkflowRun).toHaveBeenCalledWith(
-      'my-org/my-repo',
-      100,
-      15 * 60 * 1000
-    );
+    const session = makeMockSandboxSession();
+    await runUsabilityAgent(makeInput(), exerciser, client, session);
+    expect(session.dispatchWorkflow).toHaveBeenCalledWith({
+      workflowId: USABILITY_WORKFLOW_FILE,
+      timeoutMins: 15,
+      inputs: expect.objectContaining({ branch: 'agent/scope-42' }),
+    });
   });
 
   it('handles timeout', async () => {
-    const client = makeMockActionsClient({
-      waitForWorkflowRun: jest.fn().mockResolvedValue({
-        completed: false,
-        conclusion: null,
-        timedOut: true,
+    const client = makeMockActionsClient();
+    const session = makeMockSandboxSession({
+      dispatchWorkflow: jest.fn().mockResolvedValue({
+        ok: false,
+        reason: 'dispatch_failed',
+        diagnostics: { error: 'workflow timed out after 15 minute(s)' },
       }),
     });
     const exerciser = makeMockExerciser();
-    const result = await runUsabilityAgent(makeInput(), exerciser, client);
+    const result = await runUsabilityAgent(makeInput(), exerciser, client, session);
     expect(result.completed).toBe(false);
     expect(result.timedOut).toBe(true);
     expect(result.blockers).toContain('Usability run timed out — could not complete DX assessment');
@@ -422,7 +430,8 @@ describe('runUsabilityAgent', () => {
   it('exercises the API after workflow completes', async () => {
     const exerciser = makeMockExerciser();
     const client = makeMockActionsClient();
-    await runUsabilityAgent(makeInput(), exerciser, client);
+    const session = makeMockSandboxSession();
+    await runUsabilityAgent(makeInput(), exerciser, client, session);
     expect(exerciser.exercise).toHaveBeenCalledWith(expect.objectContaining({
       forkFullName: 'my-org/my-repo',
       affectedModule: 'src/parser',
@@ -432,7 +441,8 @@ describe('runUsabilityAgent', () => {
   it('returns structured result on success', async () => {
     const exerciser = makeMockExerciser();
     const client = makeMockActionsClient();
-    const result = await runUsabilityAgent(makeInput(), exerciser, client);
+    const session = makeMockSandboxSession();
+    const result = await runUsabilityAgent(makeInput(), exerciser, client, session);
     expect(result.completed).toBe(true);
     expect(result.timedOut).toBe(false);
     expect(result.dxScore).toBeGreaterThan(0);
@@ -449,7 +459,8 @@ describe('runUsabilityAgent', () => {
       }),
     };
     const client = makeMockActionsClient();
-    const result = await runUsabilityAgent(makeInput(), exerciser, client);
+    const session = makeMockSandboxSession();
+    const result = await runUsabilityAgent(makeInput(), exerciser, client, session);
     expect(result.dxScore).toBe(0);
     expect(result.blockers.length).toBeGreaterThan(0);
     expect(result.blockers[0]).toContain('installation');
@@ -458,34 +469,46 @@ describe('runUsabilityAgent', () => {
   it('includes workflow run URL', async () => {
     const client = makeMockActionsClient();
     const exerciser = makeMockExerciser();
-    const result = await runUsabilityAgent(makeInput(), exerciser, client);
+    const session = makeMockSandboxSession();
+    const result = await runUsabilityAgent(makeInput(), exerciser, client, session);
     expect(result.workflowRunUrl).toContain('https://github.com');
   });
 
   it('calculates duration', async () => {
     const exerciser = makeMockExerciser();
     const client = makeMockActionsClient();
-    const result = await runUsabilityAgent(makeInput(), exerciser, client);
+    const session = makeMockSandboxSession();
+    const result = await runUsabilityAgent(makeInput(), exerciser, client, session);
     expect(result.durationSeconds).toBeGreaterThanOrEqual(0);
   });
 
   it('throws UsabilityAgentError on dispatch failure', async () => {
-    const client = makeMockActionsClient({
-      triggerWorkflowDispatch: jest.fn().mockRejectedValue(new Error('API error')),
+    const client = makeMockActionsClient();
+    const session = makeMockSandboxSession({
+      dispatchWorkflow: jest.fn().mockResolvedValue({
+        ok: false,
+        reason: 'dispatch_failed',
+        diagnostics: { error: 'API error' },
+      }),
     });
     const exerciser = makeMockExerciser();
     await expect(
-      runUsabilityAgent(makeInput(), exerciser, client)
+      runUsabilityAgent(makeInput(), exerciser, client, session)
     ).rejects.toThrow(UsabilityAgentError);
   });
 
   it('error has dispatch phase', async () => {
-    const client = makeMockActionsClient({
-      triggerWorkflowDispatch: jest.fn().mockRejectedValue(new Error('API error')),
+    const client = makeMockActionsClient();
+    const session = makeMockSandboxSession({
+      dispatchWorkflow: jest.fn().mockResolvedValue({
+        ok: false,
+        reason: 'dispatch_failed',
+        diagnostics: { error: 'API error' },
+      }),
     });
     const exerciser = makeMockExerciser();
     try {
-      await runUsabilityAgent(makeInput(), exerciser, client);
+      await runUsabilityAgent(makeInput(), exerciser, client, session);
     } catch (e: any) {
       expect(e.phase).toBe('dispatch');
     }
@@ -496,8 +519,9 @@ describe('runUsabilityAgent', () => {
       exercise: jest.fn().mockRejectedValue(new Error('Exercise failed')),
     };
     const client = makeMockActionsClient();
+    const session = makeMockSandboxSession();
     await expect(
-      runUsabilityAgent(makeInput(), exerciser, client)
+      runUsabilityAgent(makeInput(), exerciser, client, session)
     ).rejects.toThrow(UsabilityAgentError);
   });
 
@@ -506,8 +530,9 @@ describe('runUsabilityAgent', () => {
       exercise: jest.fn().mockRejectedValue(new Error('Exercise failed')),
     };
     const client = makeMockActionsClient();
+    const session = makeMockSandboxSession();
     try {
-      await runUsabilityAgent(makeInput(), exerciser, client);
+      await runUsabilityAgent(makeInput(), exerciser, client, session);
     } catch (e: any) {
       expect(e.phase).toBe('exercise');
     }
@@ -526,7 +551,8 @@ describe('runUsabilityAgent', () => {
       }),
     };
     const client = makeMockActionsClient();
-    const result = await runUsabilityAgent(makeInput(), exerciser, client);
+    const session = makeMockSandboxSession();
+    const result = await runUsabilityAgent(makeInput(), exerciser, client, session);
     expect(result.dxScore).toBeLessThan(100);
     expect(result.blockers.length).toBe(1);
     expect(result.suggestions.length).toBe(1);
@@ -536,16 +562,18 @@ describe('runUsabilityAgent', () => {
   it('runs in the same sandbox (uses same workflow dispatch pattern)', async () => {
     const client = makeMockActionsClient();
     const exerciser = makeMockExerciser();
-    await runUsabilityAgent(makeInput({ sandboxServices: ['postgres'] }), exerciser, client);
-    const dispatchCall = (client.triggerWorkflowDispatch as jest.Mock).mock.calls[0];
-    expect(dispatchCall[3].sandbox_services).toBe('postgres');
-    expect(dispatchCall[3].network_policy).toBe('allow:postgres');
+    const session = makeMockSandboxSession();
+    await runUsabilityAgent(makeInput({ sandboxServices: ['postgres'] }), exerciser, client, session);
+    const dispatchCall = (session.dispatchWorkflow as jest.Mock).mock.calls[0][0];
+    expect(dispatchCall.inputs.sandbox_services).toBe('postgres');
+    expect(dispatchCall.inputs.network_policy).toBe('allow:postgres');
   });
 
   it('output is structured for eval agent consumption', async () => {
     const exerciser = makeMockExerciser();
     const client = makeMockActionsClient();
-    const result = await runUsabilityAgent(makeInput(), exerciser, client);
+    const session = makeMockSandboxSession();
+    const result = await runUsabilityAgent(makeInput(), exerciser, client, session);
     // Verify the result has all fields the eval agent and PR body need
     expect(result).toHaveProperty('completed');
     expect(result).toHaveProperty('dxScore');
@@ -561,37 +589,48 @@ describe('runUsabilityAgent', () => {
   it('exercises import paths', async () => {
     const exerciser = makeMockExerciser();
     const client = makeMockActionsClient();
+    const session = makeMockSandboxSession();
     const input = makeInput({ entryPoints: ['import { parse } from "my-repo"'] });
-    await runUsabilityAgent(input, exerciser, client);
+    await runUsabilityAgent(input, exerciser, client, session);
     expect(exerciser.exercise).toHaveBeenCalledWith(
       expect.objectContaining({ entryPoints: ['import { parse } from "my-repo"'] })
     );
   });
 
-  it('handles workflow run not found gracefully', async () => {
-    jest.useFakeTimers();
-    const client = makeMockActionsClient({
-      getWorkflowRun: jest.fn().mockResolvedValue(null),
+  it('fails when workflow reachability check fails', async () => {
+    const client = makeMockActionsClient();
+    const session = makeMockSandboxSession({
+      verifyWorkflowReachability: jest.fn().mockResolvedValue({
+        ok: false,
+        phase: 'workflow',
+        reason: 'workflow_unreachable',
+        diagnostics: { httpStatus: 404 },
+      }),
     });
     const exerciser = makeMockExerciser();
-    // Should still proceed to exercise (workflow run URL will be empty)
-    const promise = runUsabilityAgent(makeInput(), exerciser, client);
-    // Advance through the polling loop (30s ceiling, 2s interval)
-    await jest.advanceTimersByTimeAsync(35_000);
-    const result = await promise;
-    jest.useRealTimers();
-    expect(result.completed).toBe(true);
-    expect(result.workflowRunUrl).toBe('');
+    await expect(runUsabilityAgent(makeInput(), exerciser, client, session)).rejects.toThrow(
+      /reachability failed/
+    );
   });
 
-  it('configurable timeout passed to workflow', async () => {
+  it('configurable timeout passed to workflow dispatch', async () => {
     const client = makeMockActionsClient();
     const exerciser = makeMockExerciser();
-    await runUsabilityAgent(makeInput({ timeoutMinutes: 10 }), exerciser, client);
-    expect(client.waitForWorkflowRun).toHaveBeenCalledWith(
-      'my-org/my-repo',
-      100,
-      10 * 60 * 1000
+    const session = makeMockSandboxSession();
+    await runUsabilityAgent(makeInput({ timeoutMinutes: 10 }), exerciser, client, session);
+    expect(session.dispatchWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workflowId: USABILITY_WORKFLOW_FILE,
+        timeoutMins: 10,
+      })
+    );
+  });
+
+  it('throws when sandbox session is omitted', async () => {
+    const client = makeMockActionsClient();
+    const exerciser = makeMockExerciser();
+    await expect(runUsabilityAgent(makeInput(), exerciser, client)).rejects.toThrow(
+      /SandboxSession is required/
     );
   });
 });

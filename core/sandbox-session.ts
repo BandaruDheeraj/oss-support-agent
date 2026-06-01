@@ -73,8 +73,11 @@ export type SandboxDispatchResult =
   | {
       ok: true;
       runId: number;
+      runUrl: string;
       conclusion: string | null;
       stepOutcomes: Array<{ command: string; exitCode: number | null }>;
+      stdout: string;
+      stderr: string;
       rawLogs: string;
       exitCode: number | null;
     }
@@ -211,6 +214,11 @@ export class SandboxSession {
   }
 
   async verifyAndPushBranch(): Promise<SandboxPhaseResult> {
+    const cached = this.phaseResults.branch;
+    if (cached?.ok) {
+      return cached;
+    }
+
     try {
       let branchSha = await this.gitClient.getBranchSha(this.targetRepo, this.branch);
       if (!branchSha) {
@@ -350,8 +358,11 @@ export class SandboxSession {
     return {
       ok: true,
       runId: run.runId,
+      runUrl: `https://github.com/${this.sandboxWorkflowRepo}/actions/runs/${run.runId}`,
       conclusion: run.conclusion,
       stepOutcomes: [],
+      stdout: run.stdout,
+      stderr: run.stderr,
       rawLogs: run.rawLogs,
       exitCode: run.exitCode,
     };
@@ -474,11 +485,14 @@ export class SandboxSession {
     return {
       ok: true,
       runId: run.runId,
+      runUrl: `https://github.com/${this.sandboxWorkflowRepo}/actions/runs/${run.runId}`,
       conclusion: run.conclusion,
       stepOutcomes: commandBatch.map((command) => ({
         command,
         exitCode: run.exitCode,
       })),
+      stdout: run.stdout,
+      stderr: run.stderr,
       rawLogs: run.rawLogs,
       exitCode: run.exitCode,
     };

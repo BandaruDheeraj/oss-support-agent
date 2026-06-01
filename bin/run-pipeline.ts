@@ -1070,9 +1070,69 @@ async function runVerification(args: {
   const regressionLabels: string[] = [];
   let regressionDetected = false;
   let regressionDiffs: Array<{ category: string; description: string }> = [];
+  const actionsClient = new GitHubActionsClient(token);
+  let verificationSandboxSession: SandboxSession | null = null;
+  let verificationSandboxInitError: string | null = null;
+
+  try {
+    const sandboxWorkflowRepo =
+      manifest.sandbox_workflow_repo?.trim() ||
+      process.env.HARNESS_REPO_FULL_NAME?.trim() ||
+      process.env.GITHUB_REPOSITORY?.trim();
+    if (!sandboxWorkflowRepo) {
+      throw new Error(
+        'sandbox_workflow_repo is required for gha sandbox dispatch and could not be inferred from HARNESS_REPO_FULL_NAME/GITHUB_REPOSITORY.'
+      );
+    }
+    const sandboxWorkflowRef =
+      manifest.sandbox_workflow_ref?.trim() ||
+      process.env.HARNESS_WORKFLOW_REF?.trim() ||
+      'main';
+    const ghClient = new GitHubRestClient(token);
+    const gitClient: GitClient = {
+      getDefaultBranch: (repoName) => ghClient.getDefaultBranch(repoName),
+      getBranchSha: (repoName, currentBranch) => ghClient.getBranchSha(repoName, currentBranch),
+      createBranch: (repoName, currentBranch, sha) => ghClient.createBranch(repoName, currentBranch, sha),
+      pushPendingChanges: async (repoName, currentBranch) => {
+        if (repoName !== forkFullName || currentBranch !== branchName) {
+          throw new Error(
+            `SandboxSession pushPendingChanges target mismatch: expected ${forkFullName}@${branchName}, got ${repoName}@${currentBranch}`
+          );
+        }
+        await workspace.push();
+      },
+      getFileContents: (repoName, filePath, ref) =>
+        ghClient.getFileContents(repoName, filePath, ref),
+    };
+    verificationSandboxSession = new SandboxSession({
+      manifest,
+      targetRepo: forkFullName,
+      sandboxWorkflowRepo,
+      sandboxWorkflowRef,
+      branch: branchName,
+      issueNumber,
+      timeoutMins: manifest.sandbox_timeout_mins ?? 15,
+      actionsClient,
+      gitClient,
+    });
+    const branchPhase = await verificationSandboxSession.verifyAndPushBranch();
+    if (!branchPhase.ok) {
+      throw new Error(
+        `verification sandbox branch preflight failed: phase=${branchPhase.phase} reason=${branchPhase.reason} diagnostics=${JSON.stringify(branchPhase.diagnostics ?? {})}`
+      );
+    }
+  } catch (err: unknown) {
+    verificationSandboxInitError = err instanceof Error ? err.message : String(err);
+  }
 
   try {
     log(`[verify/regression-guard] sandbox_runner=gha; running regression guard`);
+    if (verificationSandboxInitError || !verificationSandboxSession) {
+      throw new Error(
+        verificationSandboxInitError ??
+          'verification sandbox session unavailable for regression guard'
+      );
+    }
     const useRegression = typeof adapter.getRegressionCommands === 'function';
     const testCommands = useRegression
       ? await adapter.getRegressionCommands!()
@@ -1096,8 +1156,12 @@ async function runVerification(args: {
       manifest.sandbox_timeout_mins ?? 15
     );
 
-    const actionsClient = new GitHubActionsClient(token);
-    const regressionResult = await runRegressionGuard(regressionConfig, actionsClient);
+    const regressionResult = await runRegressionGuard(
+      regressionConfig,
+      actionsClient,
+      undefined,
+      verificationSandboxSession
+    );
     regressionSection = generateRegressionSummary(regressionResult);
     regressionDetected = regressionResult.regressionDetected;
     regressionDiffs = regressionResult.diffs.map((d) => ({
@@ -1122,6 +1186,12 @@ async function runVerification(args: {
 
   try {
     log(`[verify/usability] sandbox_runner=gha; running usability agent`);
+    if (verificationSandboxInitError || !verificationSandboxSession) {
+      throw new Error(
+        verificationSandboxInitError ??
+          'verification sandbox session unavailable for usability agent'
+      );
+    }
     const sandboxServices = await adapter.getSandboxServices();
     const serviceNames = sandboxServices.map((s) =>
       typeof s === 'string' ? s : s.name
@@ -1144,9 +1214,13 @@ async function runVerification(args: {
       entryPoints: introspection.entryPoints,
     };
 
-    const actionsClient = new GitHubActionsClient(token);
     const exerciser = new GHAUsabilityExerciser(token, actionsClient);
-    const usabilityResult = await runUsabilityAgent(usabilityInput, exerciser, actionsClient);
+    const usabilityResult = await runUsabilityAgent(
+      usabilityInput,
+      exerciser,
+      actionsClient,
+      verificationSandboxSession
+    );
     usabilitySection = usabilityResult.summary;
     usabilityBlockers = usabilityResult.blockers;
     log(
