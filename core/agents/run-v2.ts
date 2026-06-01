@@ -175,11 +175,16 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
 
   let semanticSuspectSeed = null;
   const useGhaSemanticSearch =
-    language === 'python' && isGhaSandboxDriver(input.sandboxDriver) && !!input.ghActionsSandboxOptions;
+    language === 'python' &&
+    isGhaSandboxDriver(input.sandboxDriver) &&
+    !!input.ghActionsSandboxOptions?.sandboxSession;
   if (useGhaSemanticSearch) {
     const ghaOptions = input.ghActionsSandboxOptions;
     if (!ghaOptions) {
       throw new Error('runReproPipeline: gha semantic search requested without ghActionsSandboxOptions');
+    }
+    if (!ghaOptions.sandboxSession) {
+      throw new Error('runReproPipeline: gha semantic search requested without SandboxSession');
     }
     try {
       const baseConfig = ghaOptions.baseConfig;
@@ -190,6 +195,7 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
         affectedModule: input.affectedModule,
         ghaConfig: {
           actionsClient: ghaOptions.actionsClient,
+          sandboxSession: ghaOptions.sandboxSession,
           repoFullName: baseConfig.repoFullName,
           forkFullName: baseConfig.forkFullName,
           forkCloneUrl:
@@ -217,7 +223,7 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
       log(`[v2-driver] semantic suspect indexing failed (continuing without seed): ${message}`);
     }
   } else if (language === 'python') {
-    log('[v2-driver] semantic suspect indexing skipped (requires gha sandbox mode)');
+    log('[v2-driver] semantic suspect indexing skipped (requires gha sandbox mode with SandboxSession)');
   }
 
   const v2 = await runReproV2({

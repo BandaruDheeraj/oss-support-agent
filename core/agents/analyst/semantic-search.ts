@@ -1,13 +1,10 @@
-import type { ActionsClient, WorkflowRun } from '../../sandbox-types';
+import type { ActionsClient } from '../../sandbox-types';
+import type { SandboxPhaseFailure, SandboxSession } from '../../sandbox-session';
 import type { SemanticConfidence, SuspectSymbol } from './dossier';
 
 const SEMANTIC_MODEL_NAME = 'BAAI/bge-small-en-v1.5';
 const SEMANTIC_TOP_K = 5;
 const SEMANTIC_WORKFLOW_FILE = 'semantic-search.yml';
-const SEMANTIC_RUN_APPEAR_TIMEOUT_MS = 180_000;
-const SEMANTIC_RUN_APPEAR_POLL_MS = 5_000;
-const SEMANTIC_REF_CHECK_ATTEMPTS = 3;
-const SEMANTIC_REF_CHECK_DELAY_MS = 2_000;
 const SEMANTIC_ISSUE_TITLE_MAX_CHARS = 4_000;
 const SEMANTIC_ISSUE_BODY_MAX_CHARS = 60_000;
 const SEMANTIC_LOW_CONFIDENCE_THRESHOLD = 0.6;
@@ -52,6 +49,7 @@ export interface BuildSemanticSuspectSeedArgs {
 
 export interface SemanticSearchGhaConfig {
   actionsClient: ActionsClient;
+  sandboxSession: SandboxSession;
   repoFullName: string;
   forkFullName: string;
   forkCloneUrl: string;
@@ -114,13 +112,16 @@ interface RunSemanticWorkflowArgs {
 
 async function runSemanticWorkflow(args: RunSemanticWorkflowArgs): Promise<string> {
   const { ghaConfig } = args;
-  await verifySemanticDispatchRefs({
-    actionsClient: ghaConfig.actionsClient,
-    workflowRepoFullName: ghaConfig.workflowRepoFullName,
-    workflowDispatchRef: ghaConfig.workflowDispatchRef,
-    forkFullName: ghaConfig.forkFullName,
-    forkBranchName: ghaConfig.branchName,
-  });
+  const branchResult = await ghaConfig.sandboxSession.verifyAndPushBranch();
+  if (!branchResult.ok) {
+    throw new Error(`semantic workflow pre-dispatch branch check failed: ${formatSessionFailure(branchResult)}`);
+  }
+  const workflowResult = await ghaConfig.sandboxSession.verifyWorkflowReachability(SEMANTIC_WORKFLOW_FILE);
+  if (!workflowResult.ok) {
+    throw new Error(
+      `semantic workflow pre-dispatch workflow check failed: ${formatSessionFailure(workflowResult)}`
+    );
+  }
 
   const issueTitle = limitWorkflowInput(args.issueTitle, SEMANTIC_ISSUE_TITLE_MAX_CHARS);
   const issueBody = limitWorkflowInput(args.issueBody, SEMANTIC_ISSUE_BODY_MAX_CHARS);
@@ -130,12 +131,10 @@ async function runSemanticWorkflow(args: RunSemanticWorkflowArgs): Promise<strin
     );
   }
 
-  const dispatchCreatedAt = new Date().toISOString();
-  await ghaConfig.actionsClient.triggerWorkflowDispatch(
-    ghaConfig.workflowRepoFullName,
-    SEMANTIC_WORKFLOW_FILE,
-    ghaConfig.workflowDispatchRef,
-    {
+  const dispatch = await ghaConfig.sandboxSession.dispatchWorkflow({
+    workflowId: SEMANTIC_WORKFLOW_FILE,
+    timeoutMins: ghaConfig.timeoutMinutes,
+    inputs: {
       repo_full_name: ghaConfig.repoFullName,
       fork_clone_url: ghaConfig.forkCloneUrl,
       branch_name: ghaConfig.branchName,
@@ -143,117 +142,34 @@ async function runSemanticWorkflow(args: RunSemanticWorkflowArgs): Promise<strin
       issue_body: issueBody.value,
       affected_module: args.affectedModule,
       top_k: String(SEMANTIC_TOP_K),
-    }
-  );
-
-  const workflowRun = await waitForSemanticRunAppearance({
-    actionsClient: ghaConfig.actionsClient,
-    workflowRepoFullName: ghaConfig.workflowRepoFullName,
-    workflowDispatchRef: ghaConfig.workflowDispatchRef,
-    createdAfter: dispatchCreatedAt,
+    },
   });
-  if (!workflowRun) {
+  if (!dispatch.ok) {
     throw new Error(
-      `semantic workflow run did not appear within ${SEMANTIC_RUN_APPEAR_TIMEOUT_MS}ms after dispatch`
+      `semantic workflow dispatch failed: reason=${dispatch.reason} diagnostics=${JSON.stringify(dispatch.diagnostics)}`
     );
   }
-
-  const runStatus = await ghaConfig.actionsClient.waitForWorkflowRun(
-    ghaConfig.workflowRepoFullName,
-    workflowRun.id,
-    ghaConfig.timeoutMinutes * 60 * 1_000
-  );
-  if (runStatus.timedOut) {
+  if (dispatch.conclusion !== 'success') {
     throw new Error(
-      `semantic workflow timed out after ${ghaConfig.timeoutMinutes} minute(s): ${workflowRun.html_url}`
-    );
-  }
-  if (runStatus.conclusion !== 'success') {
-    throw new Error(
-      `semantic workflow failed with conclusion=${runStatus.conclusion ?? 'unknown'}: ${workflowRun.html_url}`
+      `semantic workflow failed with conclusion=${dispatch.conclusion ?? 'unknown'} run_id=${dispatch.runId}`
     );
   }
 
   const rawArtifact = await ghaConfig.actionsClient.downloadWorkflowRunArtifact?.(
     ghaConfig.workflowRepoFullName,
-    workflowRun.id,
+    dispatch.runId,
     'semantic-output'
   );
   if (!rawArtifact) {
-    throw new Error(`semantic workflow produced no semantic-output artifact: ${workflowRun.html_url}`);
+    throw new Error(`semantic workflow produced no semantic-output artifact: run_id=${dispatch.runId}`);
   }
   return rawArtifact;
 }
 
-async function waitForSemanticRunAppearance(args: {
-  actionsClient: ActionsClient;
-  workflowRepoFullName: string;
-  workflowDispatchRef: string;
-  createdAfter: string;
-}): Promise<WorkflowRun | null> {
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < SEMANTIC_RUN_APPEAR_TIMEOUT_MS) {
-    const run = await args.actionsClient.getWorkflowRun(
-      args.workflowRepoFullName,
-      SEMANTIC_WORKFLOW_FILE,
-      args.workflowDispatchRef,
-      args.createdAfter
-    );
-    if (run) return run;
-    await sleep(SEMANTIC_RUN_APPEAR_POLL_MS);
-  }
-  return null;
-}
-
-async function verifySemanticDispatchRefs(args: {
-  actionsClient: ActionsClient;
-  workflowRepoFullName: string;
-  workflowDispatchRef: string;
-  forkFullName: string;
-  forkBranchName: string;
-}): Promise<void> {
-  if (!args.actionsClient.branchRefExists) return;
-
-  const checks = [
-    {
-      repoFullName: args.workflowRepoFullName,
-      branch: args.workflowDispatchRef,
-      label: 'workflow dispatch ref',
-    },
-    {
-      repoFullName: args.forkFullName,
-      branch: args.forkBranchName,
-      label: 'fork semantic ref',
-    },
-  ] as const;
-
-  const uniqueChecks = checks.filter(
-    (check, index, all) =>
-      all.findIndex(
-        (candidate) =>
-          candidate.repoFullName === check.repoFullName && candidate.branch === check.branch
-      ) === index
-  );
-
-  for (const check of uniqueChecks) {
-    let exists = false;
-    for (let attempt = 1; attempt <= SEMANTIC_REF_CHECK_ATTEMPTS; attempt += 1) {
-      exists = await args.actionsClient.branchRefExists(check.repoFullName, check.branch);
-      if (exists) break;
-      if (attempt < SEMANTIC_REF_CHECK_ATTEMPTS) {
-        await sleep(SEMANTIC_REF_CHECK_DELAY_MS);
-      }
-    }
-    if (!exists) {
-      throw new Error(
-        `semantic workflow pre-dispatch missing ${check.label} "${check.branch}" in ${check.repoFullName}`
-      );
-    }
-  }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function formatSessionFailure(failure: SandboxPhaseFailure): string {
+  const diagnosticText = failure.diagnostics ? ` diagnostics=${JSON.stringify(failure.diagnostics)}` : '';
+  const stepText = failure.failedStep ? ` failedStep=${failure.failedStep}` : '';
+  return `phase=${failure.phase} reason=${failure.reason}${stepText}${diagnosticText}`;
 }
 
 function limitWorkflowInput(

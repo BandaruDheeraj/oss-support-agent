@@ -28,6 +28,13 @@ export interface Recipe {
   suspectPath?: string;
 }
 
+export interface WorkflowDispatchRequest {
+  workflowId: string;
+  inputs: Record<string, string>;
+  timeoutMins?: number;
+  requireSetup?: boolean;
+}
+
 export interface GitFileProbeResult {
   ok: boolean;
   status: number;
@@ -268,11 +275,11 @@ export class SandboxSession {
     }
   }
 
-  async verifyWorkflowReachability(): Promise<SandboxPhaseResult> {
+  async verifyWorkflowReachability(workflowId: string = SANDBOX_WORKFLOW_FILE): Promise<SandboxPhaseResult> {
     try {
       const probe = await this.gitClient.getFileContents(
         this.sandboxWorkflowRepo,
-        '.github/workflows/sandbox.yml',
+        `.github/workflows/${workflowId}`,
         this.sandboxWorkflowRef
       );
       if (!probe.ok) {
@@ -283,6 +290,7 @@ export class SandboxSession {
           diagnostics: {
             sandboxWorkflowRepo: this.sandboxWorkflowRepo,
             sandboxWorkflowRef: this.sandboxWorkflowRef,
+            workflowId,
             httpStatus: probe.status,
             error: probe.error ?? null,
           },
@@ -298,11 +306,55 @@ export class SandboxSession {
         diagnostics: {
           sandboxWorkflowRepo: this.sandboxWorkflowRepo,
           sandboxWorkflowRef: this.sandboxWorkflowRef,
+          workflowId,
           httpStatus: null,
           error: err instanceof Error ? err.message : String(err),
         },
       });
     }
+  }
+
+  async dispatchWorkflow(request: WorkflowDispatchRequest): Promise<SandboxDispatchResult> {
+    this.assertPhaseSucceeded('branch', 'verifyAndPushBranch');
+    this.assertPhaseSucceeded('workflow', 'verifyWorkflowReachability');
+    if (request.requireSetup) {
+      this.assertPhaseSucceeded('setup', 'setupDependencies');
+    }
+
+    if (this.sandboxWorkflowRepo === this.targetRepo) {
+      throw new Error(
+        'SandboxSession.dispatch invariant violated: sandbox.yml lives in the support agent repo; dispatching to targetRepo would cause a 404.'
+      );
+    }
+
+    const run = await this.executeWorkflowDispatch(
+      request.workflowId,
+      request.inputs,
+      request.timeoutMins ?? this.timeoutMins
+    );
+    if (!run.ok) {
+      if (run.reason === 'workflow_not_found' || run.reason === 'ref_not_found') {
+        return {
+          ok: false,
+          reason: run.reason,
+          diagnostics: run.diagnostics,
+        };
+      }
+      return {
+        ok: false,
+        reason: 'dispatch_failed',
+        diagnostics: run.diagnostics,
+      };
+    }
+
+    return {
+      ok: true,
+      runId: run.runId,
+      conclusion: run.conclusion,
+      stepOutcomes: [],
+      rawLogs: run.rawLogs,
+      exitCode: run.exitCode,
+    };
   }
 
   async setupDependencies(spec: InstallSpec): Promise<SandboxPhaseResult> {
@@ -543,14 +595,16 @@ export class SandboxSession {
     };
   }
 
-  private async runCommandInSandbox(commands: string[]): Promise<CommandExecution> {
+  private async executeWorkflowDispatch(
+    workflowId: string,
+    inputs: Record<string, string>,
+    timeoutMins: number
+  ): Promise<CommandExecution> {
     const createdAfter = new Date().toISOString();
-    const inputs = this.buildWorkflowInputs(commands);
-
     try {
       await this.actionsClient.triggerWorkflowDispatch(
         this.sandboxWorkflowRepo,
-        SANDBOX_WORKFLOW_FILE,
+        workflowId,
         this.sandboxWorkflowRef,
         inputs
       );
@@ -563,6 +617,7 @@ export class SandboxSession {
           diagnostics: {
             sandboxWorkflowRepo: this.sandboxWorkflowRepo,
             sandboxWorkflowRef: this.sandboxWorkflowRef,
+            workflowId,
             httpStatus: 404,
           },
           stdout: '',
@@ -578,6 +633,7 @@ export class SandboxSession {
           diagnostics: {
             sandboxWorkflowRepo: this.sandboxWorkflowRepo,
             sandboxWorkflowRef: this.sandboxWorkflowRef,
+            workflowId,
             httpStatus: 422,
           },
           stdout: '',
@@ -592,6 +648,7 @@ export class SandboxSession {
         diagnostics: {
           sandboxWorkflowRepo: this.sandboxWorkflowRepo,
           sandboxWorkflowRef: this.sandboxWorkflowRef,
+          workflowId,
           error: err instanceof Error ? err.message : String(err),
         },
         stdout: '',
@@ -601,7 +658,7 @@ export class SandboxSession {
       };
     }
 
-    const workflowRun = await this.waitForRun(createdAfter);
+    const workflowRun = await this.waitForRun(workflowId, createdAfter, timeoutMins);
     if (!workflowRun) {
       return {
         ok: false,
@@ -609,6 +666,7 @@ export class SandboxSession {
         diagnostics: {
           sandboxWorkflowRepo: this.sandboxWorkflowRepo,
           sandboxWorkflowRef: this.sandboxWorkflowRef,
+          workflowId,
           error: 'workflow run did not appear after dispatch',
         },
         stdout: '',
@@ -621,7 +679,7 @@ export class SandboxSession {
     const runStatus = await this.actionsClient.waitForWorkflowRun(
       this.sandboxWorkflowRepo,
       workflowRun.id,
-      this.timeoutMins * 60 * 1_000
+      timeoutMins * 60 * 1_000
     );
     if (runStatus.timedOut) {
       return {
@@ -630,7 +688,8 @@ export class SandboxSession {
         diagnostics: {
           sandboxWorkflowRepo: this.sandboxWorkflowRepo,
           sandboxWorkflowRef: this.sandboxWorkflowRef,
-          error: `workflow timed out after ${this.timeoutMins} minute(s)`,
+          workflowId,
+          error: `workflow timed out after ${timeoutMins} minute(s)`,
           runId: workflowRun.id,
         },
         stdout: '',
@@ -662,6 +721,7 @@ export class SandboxSession {
         diagnostics: {
           sandboxWorkflowRepo: this.sandboxWorkflowRepo,
           sandboxWorkflowRef: this.sandboxWorkflowRef,
+          workflowId,
           runId: workflowRun.id,
           error: err instanceof Error ? err.message : String(err),
         },
@@ -673,14 +733,27 @@ export class SandboxSession {
     }
   }
 
-  private async waitForRun(createdAfter: string): Promise<WorkflowRun | null> {
-    const maxWaitMs = Math.min(this.timeoutMins * 60 * 1_000, 60_000);
+  private async runCommandInSandbox(commands: string[]): Promise<CommandExecution> {
+    const inputs = this.buildWorkflowInputs(commands);
+    return this.executeWorkflowDispatch(
+      SANDBOX_WORKFLOW_FILE,
+      inputs,
+      this.timeoutMins
+    );
+  }
+
+  private async waitForRun(
+    workflowId: string,
+    createdAfter: string,
+    timeoutMins: number
+  ): Promise<WorkflowRun | null> {
+    const maxWaitMs = Math.min(timeoutMins * 60 * 1_000, 60_000);
     const pollIntervalMs = 2_000;
     const started = Date.now();
     while (Date.now() - started < maxWaitMs) {
       const run = await this.actionsClient.getWorkflowRun(
         this.sandboxWorkflowRepo,
-        SANDBOX_WORKFLOW_FILE,
+        workflowId,
         this.sandboxWorkflowRef,
         createdAfter
       );
