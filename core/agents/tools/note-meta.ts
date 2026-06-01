@@ -118,6 +118,7 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
     }));
     const seededSuspectFiles = normalizeSuspectFiles(handles.semanticSuspectSeed?.suspectFiles ?? []);
     const seededSuspectSymbols = handles.semanticSuspectSeed?.suspectSymbols ?? [];
+    const seededSemanticConfidence = handles.semanticSuspectSeed?.semanticConfidence;
     const suspectFiles = mergeSuspectFiles(seededSuspectFiles, args.suspectFiles ?? []);
     const suspectSymbols = mergeSuspectSymbols(seededSuspectSymbols, args.suspectSymbols);
     if (suspectFiles.length === 0 && suspectSymbols.length > 0) {
@@ -186,6 +187,7 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       evidence,
       suspectFiles,
       suspectSymbols,
+      ...(seededSemanticConfidence ? { semanticConfidence: seededSemanticConfidence } : {}),
       preconditions,
       ...(oracleSpec ? { oracleSpec } : {}),
       openQuestions: args.openQuestions,

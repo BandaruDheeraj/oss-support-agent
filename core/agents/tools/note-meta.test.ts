@@ -112,6 +112,11 @@ describe('record_evidence — server-stamped source defaults', () => {
               reasoning: 'semantic hit',
             },
           ],
+          semanticConfidence: {
+            top_score: 0.41,
+            low_confidence: true,
+            diagnostics: 'semantic top_score=0.410 below threshold 0.600; suspects are low-confidence',
+          },
         },
       })
     );
@@ -126,6 +131,11 @@ describe('record_evidence — server-stamped source defaults', () => {
         reasoning: 'semantic hit',
       },
     ]);
+    expect(snap!.body.semanticConfidence).toEqual({
+      top_score: 0.41,
+      low_confidence: true,
+      diagnostics: 'semantic top_score=0.410 below threshold 0.600; suspects are low-confidence',
+    });
   });
 
   it('derives oracleSpec when omitted from suspectSymbols + preconditions', async () => {

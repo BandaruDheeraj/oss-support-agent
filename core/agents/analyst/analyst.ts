@@ -37,7 +37,7 @@ You are read-only. You can call: read_file, grep, grep_with_context, list_dir, r
 Procedure:
 1. Call read_issue_repo_context (or gh_issue + gh_pr) to anchor yourself.
 2. Read the issue body carefully. Note any version info, stack traces, repro snippets.
-2b. If a semantic suspect seed is provided in the user prompt, treat it as your PRIMARY suspect-file/suspect-symbol starting point and verify/refine it with direct file reads.
+2b. If a semantic suspect seed is provided in the user prompt, treat it as your PRIMARY suspect-file/suspect-symbol starting point and verify/refine it with direct file reads. The seed includes semanticConfidence metadata (top_score, low_confidence, diagnostics).
 3. Locate the affected symbols in the repo using read_symbol_context (or grep/find_symbol/find_callers).
 4. Open the relevant files with read_file. Open recent commits with git_log/git_blame if behaviour changed.
 5. Form a list of suspect files + suspect symbols, open questions, and confidence level.
@@ -89,6 +89,9 @@ Provide \`oracleSpec\` with EXACTLY these two fields:
     markers should come from your satisfactionModes and be easy to grep in test code.
 
 Downstream stages are deterministic and consume this struct directly. Keep it concise, machine-checkable, and tied to your evidence.
+
+LOW-CONFIDENCE semantic seed handling:
+When \`semanticConfidence.low_confidence\` is true, you MUST explicitly state in your dossier summary that semantic suspects are low-confidence. You MUST carry that uncertainty into \`oracleSpec\`: only include suspect_path_assertions you can justify from direct file reads / concrete evidence, and avoid claiming suspect-path evidence you cannot verify.
 
 CANDIDATE REPRO (optional, high-leverage):
 When you identified at least one suspect symbol, can write a single deterministic exercise call that references a suspect symbol, and the failure mode fits one of the two templates below, you MUST include a \`candidateRepro\` field on record_evidence (even if confidence is only low/medium). A downstream deterministic Builder will use it to author the failing test WITHOUT another LLM round-trip — this dramatically reduces failed repros caused by Prober drift.
@@ -158,11 +161,13 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
           indexedFileCount: args.semanticSuspectSeed.indexedFileCount,
           suspectFiles: args.semanticSuspectSeed.suspectFiles,
           suspectSymbols: args.semanticSuspectSeed.suspectSymbols,
+          semanticConfidence: args.semanticSuspectSeed.semanticConfidence,
         },
         null,
         2
       )}\n` +
-      `You MUST treat these suspectFiles/suspectSymbols as the primary starting point and carry them into record_evidence unless direct file reads disprove them.`
+      `You MUST treat these suspectFiles/suspectSymbols as the primary starting point and carry them into record_evidence unless direct file reads disprove them. ` +
+      `If semanticConfidence.low_confidence is true, explicitly state that uncertainty in your dossier summary and avoid unverified suspect_path assertions.`
     : '';
 
   const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\n${args.issue.body}\n\nRepo: ${args.repo.fullName} (affected module: ${args.repo.affectedModule}, language: ${args.repo.language})${carry}${semanticSeed}\n\nInvestigate and produce an EvidenceDossier via record_evidence.`;

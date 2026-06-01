@@ -28,6 +28,7 @@ function createActionsClient(overrides: Partial<ActionsClient> = {}): ActionsCli
         cacheKey: 'seed',
         indexedFileCount: 23,
         instrumentationDirs: ['python/openinference-instrumentation'],
+        top_score: 0.91,
         results: [
           {
             file: 'python/openinference-instrumentation/openinference/instrumentation/demo.py',
@@ -67,6 +68,11 @@ describe('buildSemanticSuspectSeed', () => {
     expect(result).toEqual(
       expect.objectContaining({
         suspectFiles: ['python/openinference-instrumentation/openinference/instrumentation/demo.py'],
+        semanticConfidence: {
+          top_score: 0.91,
+          low_confidence: false,
+          diagnostics: expect.stringContaining('meets threshold 0.600'),
+        },
       })
     );
     expect(result?.suspectSymbols).toEqual([
@@ -113,6 +119,7 @@ describe('buildSemanticSuspectSeed', () => {
           '  "cacheKey": "seed",',
           '  "indexedFileCount": 7,',
           '  "instrumentationDirs": ["python/openinference-instrumentation"],',
+          '  "top_score": 0.82,',
           '  "results": [',
           '    {',
           '      "file": "python/openinference-instrumentation/openinference/instrumentation/demo.py",',
@@ -146,8 +153,59 @@ describe('buildSemanticSuspectSeed', () => {
     expect(result).toEqual(
       expect.objectContaining({
         suspectFiles: ['python/openinference-instrumentation/openinference/instrumentation/demo.py'],
+        semanticConfidence: {
+          top_score: 0.82,
+          low_confidence: false,
+          diagnostics: expect.stringContaining('meets threshold 0.600'),
+        },
       })
     );
+  });
+
+  it('marks semantic seed as low-confidence when top_score is below threshold', async () => {
+    const actionsClient = createActionsClient({
+      branchRefExists: jest.fn().mockResolvedValue(true),
+      downloadWorkflowRunArtifact: jest.fn().mockResolvedValue(
+        JSON.stringify({
+          model: 'BAAI/bge-small-en-v1.5',
+          cacheHit: false,
+          cacheKey: 'seed-low',
+          indexedFileCount: 4,
+          instrumentationDirs: ['python/openinference-instrumentation'],
+          top_score: 0.41,
+          results: [
+            {
+              file: 'python/openinference-instrumentation/openinference/instrumentation/demo.py',
+              score: 0.41,
+              primaryClass: 'DemoClass',
+              primaryFunction: 'demo_function',
+            },
+          ],
+        })
+      ),
+    });
+
+    const result = await buildSemanticSuspectSeed({
+      workspaceDir: '/tmp/workspace',
+      issueTitle: 'Low confidence seed',
+      issueBody: 'Body',
+      ghaConfig: {
+        actionsClient,
+        repoFullName: 'BandaruDheeraj/openinference',
+        forkFullName: 'BandaruDheeraj/openinference',
+        forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
+        branchName: 'agent/scope-53',
+        workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
+        workflowDispatchRef: 'main',
+        timeoutMinutes: 15,
+      },
+    });
+
+    expect(result?.semanticConfidence).toEqual({
+      top_score: 0.41,
+      low_confidence: true,
+      diagnostics: expect.stringContaining('below threshold 0.600'),
+    });
   });
 
   it('returns null when semantic workflow artifact has no suspect results', async () => {

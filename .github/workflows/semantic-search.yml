@@ -162,6 +162,7 @@ jobs:
                   "cacheKey": "workflow-fallback",
                   "indexedFileCount": 0,
                   "instrumentationDirs": [],
+                  "top_score": None,
                   "results": [],
                   "diagnostics": {
                       "reason": reason,
@@ -173,13 +174,22 @@ jobs:
                   },
               }
               print(f"[semantic-search] fallback output generated reason={reason} script_exit={script_exit}")
+          if not isinstance(data.get("top_score"), (int, float)):
+              scores = []
+              for item in data.get("results", []):
+                  if not isinstance(item, dict):
+                      continue
+                  score = item.get("score")
+                  if isinstance(score, (int, float)):
+                      scores.append(float(score))
+              data["top_score"] = max(scores) if scores else None
 
           output_path.write_text(json.dumps(data), encoding="utf-8")
           if not isinstance(data.get("results"), list):
               raise SystemExit("semantic output missing results list")
           print(
               f"[semantic-search] indexed={data.get('indexedFileCount', 0)} "
-              f"results={len(data['results'])}"
+              f"results={len(data['results'])} top_score={data.get('top_score')}"
           )
           print(
               f"[semantic-search] script_exit={script_exit} "

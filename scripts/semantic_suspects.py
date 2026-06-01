@@ -245,6 +245,7 @@ def main() -> int:
         "instrumentationDirs": [
           _normalize_rel_path(str(d.relative_to(workspace_dir))) for d in instrumentation_dirs
         ],
+        "top_score": None,
         "results": [],
       }
     )
@@ -290,6 +291,12 @@ def main() -> int:
     if len(results) >= top_k:
       break
 
+  top_score: float | None = None
+  scored = [entry.get("score") for entry in results]
+  numeric_scores = [float(score) for score in scored if isinstance(score, (float, int))]
+  if numeric_scores:
+    top_score = max(numeric_scores)
+
   _emit_json(
     {
       "model": model_name,
@@ -299,6 +306,7 @@ def main() -> int:
       "instrumentationDirs": [
         _normalize_rel_path(str(d.relative_to(workspace_dir))) for d in instrumentation_dirs
       ],
+      "top_score": top_score,
       "results": results,
     }
   )

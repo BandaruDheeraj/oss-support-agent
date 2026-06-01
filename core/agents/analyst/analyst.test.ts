@@ -106,6 +106,7 @@ describe('runAnalyst parse-recovery', () => {
     const systemPrompt = mockedRunAgentLoop.mock.calls[0][0].system;
     expect(systemPrompt).toContain('you MUST include a `candidateRepro` field on record_evidence');
     expect(systemPrompt).toContain('Do NOT omit candidateRepro solely because of uncertainty');
+    expect(systemPrompt).toContain('semanticConfidence.low_confidence');
   });
 
   it('injects semantic suspect seed into the analyst user prompt', async () => {
@@ -133,6 +134,11 @@ describe('runAnalyst parse-recovery', () => {
             reasoning: 'semantic hit',
           },
         ],
+        semanticConfidence: {
+          top_score: 0.45,
+          low_confidence: true,
+          diagnostics: 'semantic top_score=0.450 below threshold 0.600; suspects are low-confidence',
+        },
       },
     });
 
@@ -140,6 +146,8 @@ describe('runAnalyst parse-recovery', () => {
     expect(userPrompt).toContain('Semantic retrieval seed (PRIMARY suspect triage input)');
     expect(userPrompt).toContain('"suspectFiles": [');
     expect(userPrompt).toContain('"suspectSymbols": [');
+    expect(userPrompt).toContain('"semanticConfidence": {');
+    expect(userPrompt).toContain('explicitly state that uncertainty');
   });
 
   it('retries once after record_evidence JSON parse failure', async () => {

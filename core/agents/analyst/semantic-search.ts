@@ -1,5 +1,5 @@
 import type { ActionsClient, WorkflowRun } from '../../sandbox-types';
-import type { SuspectSymbol } from './dossier';
+import type { SemanticConfidence, SuspectSymbol } from './dossier';
 
 const SEMANTIC_MODEL_NAME = 'BAAI/bge-small-en-v1.5';
 const SEMANTIC_TOP_K = 5;
@@ -10,6 +10,7 @@ const SEMANTIC_REF_CHECK_ATTEMPTS = 3;
 const SEMANTIC_REF_CHECK_DELAY_MS = 2_000;
 const SEMANTIC_ISSUE_TITLE_MAX_CHARS = 4_000;
 const SEMANTIC_ISSUE_BODY_MAX_CHARS = 60_000;
+const SEMANTIC_LOW_CONFIDENCE_THRESHOLD = 0.6;
 
 interface SemanticScriptResultItem {
   file: string;
@@ -24,6 +25,7 @@ interface SemanticScriptResult {
   cacheKey: string;
   indexedFileCount: number;
   instrumentationDirs: string[];
+  topScore: number | null;
   results: SemanticScriptResultItem[];
 }
 
@@ -36,6 +38,7 @@ export interface SemanticSuspectSeed {
   instrumentationDirs: string[];
   suspectFiles: string[];
   suspectSymbols: SuspectSymbol[];
+  semanticConfidence: SemanticConfidence;
 }
 
 export interface BuildSemanticSuspectSeedArgs {
@@ -79,6 +82,7 @@ export async function buildSemanticSuspectSeed(
   const parsed = parseSemanticScriptResult(workflowOutput);
   const suspectFiles = parsed.results.map((r) => normalizeRepoPath(r.file)).filter((p) => p.length > 0);
   const suspectSymbols = dedupeSuspectSymbols(parsed.results.flatMap(resultToSuspectSymbols));
+  const semanticConfidence = buildSemanticConfidence(parsed.topScore);
 
   if (suspectFiles.length === 0 || suspectSymbols.length === 0) {
     log(
@@ -96,6 +100,7 @@ export async function buildSemanticSuspectSeed(
     instrumentationDirs: parsed.instrumentationDirs.map(normalizeRepoPath),
     suspectFiles,
     suspectSymbols,
+    semanticConfidence,
   };
 }
 
@@ -286,7 +291,42 @@ function parseSemanticScriptResult(stdout: string): SemanticScriptResult {
     instrumentationDirs: Array.isArray(p.instrumentationDirs)
       ? p.instrumentationDirs.filter((v): v is string => typeof v === 'string')
       : [],
+    topScore: parseTopScore(p.top_score, p.results),
     results: p.results.map(parseResultItem).filter((v): v is SemanticScriptResultItem => v !== null),
+  };
+}
+
+function parseTopScore(rawTopScore: unknown, rawResults: unknown): number | null {
+  if (typeof rawTopScore === 'number' && Number.isFinite(rawTopScore)) {
+    return rawTopScore;
+  }
+  if (!Array.isArray(rawResults)) {
+    return null;
+  }
+  const scores = rawResults
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null;
+      const score = (entry as Record<string, unknown>).score;
+      return typeof score === 'number' && Number.isFinite(score) ? score : null;
+    })
+    .filter((score): score is number => score !== null);
+  return scores.length > 0 ? Math.max(...scores) : null;
+}
+
+function buildSemanticConfidence(topScore: number | null): SemanticConfidence {
+  const roundedTopScore = topScore === null ? null : Number(topScore.toFixed(6));
+  const lowConfidence = roundedTopScore !== null && roundedTopScore < SEMANTIC_LOW_CONFIDENCE_THRESHOLD;
+  const thresholdText = SEMANTIC_LOW_CONFIDENCE_THRESHOLD.toFixed(3);
+  const diagnostics =
+    roundedTopScore === null
+      ? 'semantic top_score unavailable; confidence remains unverified'
+      : lowConfidence
+        ? `semantic top_score=${roundedTopScore.toFixed(3)} below threshold ${thresholdText}; suspects are low-confidence`
+        : `semantic top_score=${roundedTopScore.toFixed(3)} meets threshold ${thresholdText}; suspects are confidence-qualified`;
+  return {
+    top_score: roundedTopScore,
+    low_confidence: lowConfidence,
+    diagnostics,
   };
 }
 

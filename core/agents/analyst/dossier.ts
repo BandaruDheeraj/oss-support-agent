@@ -62,6 +62,12 @@ export const SuspectSymbolSchema = z.object({
 export type SuspectSymbol = z.infer<typeof SuspectSymbolSchema>;
 export const SuspectFileSchema = z.string();
 export type SuspectFile = z.infer<typeof SuspectFileSchema>;
+export const SemanticConfidenceSchema = z.object({
+  top_score: z.number().nullable(),
+  low_confidence: z.boolean(),
+  diagnostics: z.string().min(1),
+});
+export type SemanticConfidence = z.infer<typeof SemanticConfidenceSchema>;
 
 /**
  * Structured oracle spec consumed by downstream deterministic gates.
@@ -701,6 +707,11 @@ export const DossierBodySchema = z.object({
   suspectFiles: z.array(SuspectFileSchema).optional(),
   suspectSymbols: z.array(SuspectSymbolSchema),
   /**
+   * Semantic retrieval confidence metadata emitted by pre-Analyst retrieval.
+   * Optional for backward compatibility with legacy snapshots.
+   */
+  semanticConfidence: SemanticConfidenceSchema.optional(),
+  /**
    * Preconditions identified by the Analyst. Defaults to [] so legacy
    * dossier snapshots (pre-feature) deserialize successfully.
    */
@@ -794,6 +805,12 @@ export function snapshotIdFor(body: DossierBody): string {
   if (!Array.isArray(suspectFiles) || suspectFiles.length === 0) {
     delete forHash.suspectFiles;
   }
+  // Same for semanticConfidence (added after semantic top_score wiring).
+  // Absent fields on legacy snapshots must canonicalize-out identically.
+  const semanticConfidence = (body as { semanticConfidence?: SemanticConfidence }).semanticConfidence;
+  if (semanticConfidence == null) {
+    delete forHash.semanticConfidence;
+  }
   // Same for reproTargets (analyst-authored hints, added in Phase 8). Both
   // absent and "present but both arrays empty" MUST canonicalize-out
   // identically, otherwise a body that defaults the field through the
@@ -874,6 +891,7 @@ export class DossierStore {
       DossierBody,
       | 'parentSnapshotId'
       | 'suspectFiles'
+      | 'semanticConfidence'
       | 'preconditions'
       | 'oracleSpec'
       | 'reproRecipe'
@@ -882,6 +900,7 @@ export class DossierStore {
     > & {
       parentSnapshotId?: string | null;
       suspectFiles?: SuspectFile[];
+      semanticConfidence?: SemanticConfidence;
       preconditions?: Precondition[];
       oracleSpec?: ReproOracleSpec;
       reproRecipe?: ReproRecipe;
