@@ -14,7 +14,11 @@ export {
   runWithSpan,
   NoopTracer,
   activeBackend,
+  getObservabilityAdapterContracts,
+  getObservabilityDiagnostics,
+  runObservabilityStartupSmoke,
   getObservabilityConfigErrors,
   assertObservabilityConfigured,
   _resetTracer,
 } from './tracer';
+export type { AdapterDiagnostics } from './adapter-health';

@@ -6,8 +6,11 @@ _Auto-generated from each platform adapter's `getSetupNotes()` after the eval ru
 
 - No local Phoenix endpoint configured — skipped dataset auto-create. Cloud Arize requires dataset creation via the dashboard or its tabular API; there is no symmetrical local/cloud "create dataset" call.
 - Arize/Phoenix needed FOUR OTel + OpenInference packages to manually instrument: @opentelemetry/sdk-trace-base, @opentelemetry/exporter-trace-otlp-http, @opentelemetry/resources, @arizeai/openinference-semantic-conventions. No single "phoenix-sdk" package wraps these.
+- We intentionally avoided the OpenInference auto-instrumentation patchers for this benchmark so all three platforms received equivalent manually-emitted spans; that increased setup and maintenance burden in the Arize path.
+- Dual-export (local Phoenix + cloud Arize in one run) requires two independent OTLP exporters and two BatchSpanProcessor instances; this is not a one-flag switch and is lightly documented.
 - Cloud Phoenix expected the auth header name "api_key" (snake_case) — different from the typical "Authorization: Bearer …" convention. Discovered via 401 responses, not from a single canonical doc page.
 - Cloud Phoenix additionally requires a "space_id" header — ARIZE_SPACE_KEY in env. This adapter accepts ARIZE_SPACE_ID as an alias. Local Phoenix has no concept of a space; setup divergence between cloud and local is not a one-line config change.
+- Older Phoenix builds can return 404 on `/healthz` while still accepting OTLP traces; health checks must treat that as "possibly healthy" and verify span delivery separately.
 - Pipeline RunSummary is emitted as one OTel CHAIN span plus per-issue EVALUATOR spans. Phoenix's experiments UI can aggregate these metrics, but the JS ecosystem still lacks a first-class "log evaluation row" helper comparable to Braintrust's Eval().
 
 ## langsmith

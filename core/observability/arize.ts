@@ -21,6 +21,12 @@ import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
 import type { Span, StartSpanOpts, Tracer } from './tracer';
+import {
+  deliverWithRetryAndSpool,
+  markAdapterEnabled,
+  recordAdapterDropped,
+  recordAdapterSent,
+} from './adapter-health';
 import { redactIo } from './io-redact';
 
 function parseHeaders(raw: string | undefined): Record<string, string> {
@@ -90,14 +96,17 @@ export class ArizeTracer implements Tracer {
       // Do NOT register globally — that would conflict with the existing
       // initTracing() global provider. Instead, build a private Tracer.
       this.otelTracer = this.provider.getTracer('oss-support-agent.observability');
+      markAdapterEnabled('arize', true);
     } catch (err) {
       this.initError = err instanceof Error ? err : new Error(String(err));
+      markAdapterEnabled('arize', false, this.initError.message);
     }
   }
 
   startSpan(name: string, opts: StartSpanOpts = {}): Span {
     if (!this.otelTracer) {
       this.warnInitFailureOnce();
+      recordAdapterDropped('arize', this.initError ?? 'arize not initialized');
       return new NoopArizeSpan();
     }
     const parentOtel = opts.parent ? (opts.parent as unknown as { [otelSpanSymbol]?: OtelSpan })[otelSpanSymbol] : undefined;
@@ -138,6 +147,7 @@ export class ArizeTracer implements Tracer {
       },
       end() {
         otelSpan.end();
+        recordAdapterSent('arize');
       },
     };
     return wrapped;
@@ -145,14 +155,12 @@ export class ArizeTracer implements Tracer {
 
   async flush(): Promise<void> {
     if (!this.provider) return;
-    try {
-      await this.provider.forceFlush();
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[observability:arize] flush failed: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
+    await deliverWithRetryAndSpool({
+      adapter: 'arize',
+      operation: 'forceFlush',
+      payload: null,
+      run: () => this.provider!.forceFlush(),
+    });
   }
 
   private warnedInitFailure = false;

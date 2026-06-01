@@ -176,9 +176,9 @@ The harness ships a pluggable observability layer that emits one parent span per
 | `langsmith` | LangSmith | Requires `LANGSMITH_API_KEY`. Spans appear in the LangSmith project named by `LANGSMITH_PROJECT` (default `oss-support-agent`). |
 | `arize` | Arize / Phoenix | OTLP/HTTP exporter; set `ARIZE_ENDPOINT` (Arize Cloud) or `PHOENIX_OTLP_ENDPOINT` (self-hosted). Add `ARIZE_API_KEY` + `ARIZE_SPACE_ID` for Arize Cloud. Spans carry OpenInference semantic conventions. |
 | `braintrust` | Braintrust | Requires `BRAINTRUST_API_KEY`. Project name comes from `BRAINTRUST_PROJECT` (default `oss-support-agent`). |
-| `all` | LangSmith + Arize + Braintrust | Fans out the same spans to all three backends in one run; each backend is isolated so one failure does not block the others. |
+| `all` | LangSmith + Arize + Braintrust | Fans out the same spans to all three backends in one run. Startup is fail-fast on missing config, includes per-adapter contract logs, emits a `telemetry_smoke` span to each enabled backend, and tracks adapter delivery counters (`sent`, `failed`, `dropped`) exposed by `/healthz`. |
 
-When `OBSERVABILITY_BACKEND=all`, the live server now validates that all required backend env vars are present at startup and exits with a fatal error if any are missing. This prevents silent runs where tool/evaluator spans are dropped for one platform.
+Adapter delivery now retries transient provider failures with exponential backoff and writes a local spool fallback when retries are exhausted. Configure `OBSERVABILITY_RETRY_ATTEMPTS`, `OBSERVABILITY_RETRY_BASE_MS`, and `OBSERVABILITY_SPOOL_DIR` as needed.
 
 ### What gets traced
 
@@ -217,3 +217,93 @@ Set `OBSERVABILITY_REDACT_IO=true` to replace each span's input/output payload w
 ### Adding a backend
 
 Drop a new file under `core/observability/<backend>.ts` that exports a class implementing `Tracer` from `./tracer`, then add the lazy-require branch in the factory in `tracer.ts`. No call sites need to change.
+
+## Agent skill: observability-gap-analysis
+
+This repo includes a reusable skill for competitive observability analysis:
+
+- `.github/skills/observability-gap-analysis/SKILL.md` (Copilot)
+- `.claude/skills/observability-gap-analysis/SKILL.md` (Claude-compatible hosts)
+- `.agents/skills/observability-gap-analysis/SKILL.md` (generic agent hosts)
+
+Use it when you want an agent to compare **Arize AX + OpenInference** against **Braintrust + LangSmith** and produce an evidence-backed, prioritized backlog split into:
+
+1. Arize AX platform items
+2. OpenInference spec/SDK items
+
+The skill now also persists findings for future runs:
+
+- Canonical ledger in `evals/COMPETITIVE-ANALYSIS-TEMPLATE.md` (`## 8` and `## 9` sections)
+- Per-run structured artifact in `evals/gap-runs/<timestamp>.json`
+- Latest artifact pointer in `evals/gap-runs/latest.json`
+- Each gap must capture competitor-specific ease (`how they do it`) and a single owner label: `arize-ax` or `openinference`
+
+## Agent skill: observability-gap-one-pagers
+
+This repo also includes a follow-on skill that turns persisted gaps into one-page briefs:
+
+- `.github/skills/observability-gap-one-pagers/SKILL.md` (Copilot)
+- `.claude/skills/observability-gap-one-pagers/SKILL.md` (Claude-compatible hosts)
+- `.agents/skills/observability-gap-one-pagers/SKILL.md` (generic agent hosts)
+
+Use it after `observability-gap-analysis` when you want one document per gap that clearly states:
+
+1. What the competitor does (and why it is easier)
+2. What oss-support-agent does today
+3. The exact gap
+4. The proposed fix and measurable success criteria
+
+Persisted outputs for this workflow:
+
+- Per-gap pages in `evals/gap-one-pagers/<gap_id>.md`
+- Index in `evals/gap-one-pagers/index.md`
+- Latest pointer in `evals/gap-one-pagers/latest.json`
+- Authoring template in `evals/gap-one-pagers/TEMPLATE.md`
+
+## How to use the skills (end-to-end)
+
+### 1) Run competitive gap analysis
+
+Use `observability-gap-analysis` first.
+
+Example prompts:
+
+- "Use observability-gap-analysis on current setup and persist findings."
+- "Run observability-gap-analysis for OpenInference vs Braintrust/LangSmith setup friction."
+
+Expected outputs:
+
+- `evals/gap-runs/<timestamp>.json`
+- `evals/gap-runs/latest.json` (updated pointer)
+- `evals/COMPETITIVE-ANALYSIS-TEMPLATE.md` sections `## 8` and `## 9` (updated ledger/history)
+
+### 2) Generate one-pagers from persisted gaps
+
+Use `observability-gap-one-pagers` after step 1.
+
+Example prompts:
+
+- "Use observability-gap-one-pagers for all current non-rejected gaps."
+- "Use observability-gap-one-pagers for AX-001, AX-005, and OI-002 only."
+
+Expected outputs:
+
+- `evals/gap-one-pagers/<gap_id>.md` (one file per gap)
+- `evals/gap-one-pagers/index.md` (updated index table)
+- `evals/gap-one-pagers/latest.json` (updated pointer + generated gap IDs)
+
+### 3) Typical operating loop
+
+1. Re-run `observability-gap-analysis` after new integration/eval work.
+2. Re-run `observability-gap-one-pagers` to refresh product-ready briefs.
+3. Use the one-pagers as implementation specs and roadmap inputs.
+
+### Host note
+
+These skills are mirrored for multiple agent hosts:
+
+- Copilot: `.github/skills/...`
+- Claude-compatible: `.claude/skills/...`
+- Generic agent hosts: `.agents/skills/...`
+
+If your host does not auto-discover repository skills, open the relevant `SKILL.md` and follow it manually.

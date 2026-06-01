@@ -12,6 +12,16 @@
  * through call signatures.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
+import {
+  getAdapterDiagnostics,
+  initializeAdapterDiagnostics,
+  markAdapterEnabled,
+  markAdapterSmoke,
+  recordAdapterDropped,
+  resetAdapterDiagnostics,
+  type AdapterDiagnostics,
+  type AdapterName,
+} from './adapter-health';
 
 export type SpanKind = 'phase' | 'llm' | 'tool' | 'evaluator';
 
@@ -82,9 +92,13 @@ export class NoopTracer implements Tracer {
 /* -------------------------------------------------------------------------- */
 
 export type BackendName = 'langsmith' | 'arize' | 'braintrust' | 'all' | 'none';
+type ConcreteBackendName = AdapterName;
+
+const CONCRETE_BACKENDS: ConcreteBackendName[] = ['langsmith', 'arize', 'braintrust'];
 
 let cached: Tracer | null = null;
 let cachedBackend: BackendName | null = null;
+let cachedAdapters: Array<{ name: AdapterName; tracer: Tracer }> = [];
 let warnedUnknown = false;
 
 function resolveBackend(raw: string | undefined): BackendName {
@@ -112,24 +126,50 @@ function hasValue(raw: string | undefined): boolean {
   return Boolean(raw && raw.trim().length > 0);
 }
 
-function missingConfigForBackend(backend: BackendName): string[] {
+function missingConfigForAdapter(adapter: AdapterName): string[] {
   const missing: string[] = [];
-  if (backend === 'langsmith' || backend === 'all') {
+  if (adapter === 'langsmith') {
     if (!hasValue(process.env.LANGSMITH_API_KEY) && !hasValue(process.env.LANGCHAIN_API_KEY)) {
       missing.push('LANGSMITH_API_KEY (or LANGCHAIN_API_KEY)');
     }
   }
-  if (backend === 'arize' || backend === 'all') {
+  if (adapter === 'arize') {
     if (!hasValue(process.env.ARIZE_ENDPOINT) && !hasValue(process.env.PHOENIX_OTLP_ENDPOINT)) {
       missing.push('ARIZE_ENDPOINT (or PHOENIX_OTLP_ENDPOINT)');
     }
   }
-  if (backend === 'braintrust' || backend === 'all') {
+  if (adapter === 'braintrust') {
     if (!hasValue(process.env.BRAINTRUST_API_KEY)) {
       missing.push('BRAINTRUST_API_KEY');
     }
   }
   return missing;
+}
+
+export interface ObservabilityAdapterContract {
+  adapter: AdapterName;
+  requested: boolean;
+  missing_env: string[];
+}
+
+function requestedAdapters(backend: BackendName): Set<AdapterName> {
+  if (backend === 'all') return new Set(CONCRETE_BACKENDS);
+  if (backend === 'langsmith' || backend === 'arize' || backend === 'braintrust') {
+    return new Set([backend]);
+  }
+  return new Set();
+}
+
+export function getObservabilityAdapterContracts(
+  rawBackend = process.env.OBSERVABILITY_BACKEND
+): ObservabilityAdapterContract[] {
+  const backend = resolveBackend(rawBackend);
+  const requested = requestedAdapters(backend);
+  return CONCRETE_BACKENDS.map((adapter) => ({
+    adapter,
+    requested: requested.has(adapter),
+    missing_env: missingConfigForAdapter(adapter),
+  }));
 }
 
 /**
@@ -151,7 +191,9 @@ export function getObservabilityConfigErrors(rawBackend = process.env.OBSERVABIL
   }
   const backend = resolveBackend(rawBackend);
   if (backend === 'none') return [];
-  return missingConfigForBackend(backend);
+  return getObservabilityAdapterContracts(rawBackend)
+    .filter((contract) => contract.requested && contract.missing_env.length > 0)
+    .flatMap((contract) => contract.missing_env.map((name) => `${contract.adapter}: ${name}`));
 }
 
 /**
@@ -172,27 +214,37 @@ export function getTracer(): Tracer {
   if (cached) return cached;
   const backend = resolveBackend(process.env.OBSERVABILITY_BACKEND);
   cachedBackend = backend;
-  cached = instantiate(backend);
-  return cached;
+  const contracts = getObservabilityAdapterContracts(process.env.OBSERVABILITY_BACKEND);
+  initializeAdapterDiagnostics(contracts);
+  const result = instantiate(backend);
+  cached = result.tracer;
+  cachedAdapters = result.adapters;
+  return result.tracer;
 }
 
-function instantiate(backend: BackendName): Tracer {
-  if (backend === 'none') return new NoopTracer();
+function instantiate(backend: BackendName): {
+  tracer: Tracer;
+  adapters: Array<{ name: AdapterName; tracer: Tracer }>;
+} {
+  if (backend === 'none') return { tracer: new NoopTracer(), adapters: [] };
   if (backend === 'all') return instantiateAll();
   // Lazy require so we don't load SDK modules when not selected.
   if (backend === 'langsmith') {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { LangSmithTracer } = require('./langsmith') as typeof import('./langsmith');
-    return new LangSmithTracer();
+    const tracer = new LangSmithTracer();
+    return { tracer, adapters: [{ name: 'langsmith', tracer }] };
   }
   if (backend === 'arize') {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { ArizeTracer } = require('./arize') as typeof import('./arize');
-    return new ArizeTracer();
+    const tracer = new ArizeTracer();
+    return { tracer, adapters: [{ name: 'arize', tracer }] };
   }
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const { BraintrustTracer } = require('./braintrust') as typeof import('./braintrust');
-  return new BraintrustTracer();
+  const tracer = new BraintrustTracer();
+  return { tracer, adapters: [{ name: 'braintrust', tracer }] };
 }
 
 /**
@@ -200,12 +252,16 @@ function instantiate(backend: BackendName): Tracer {
  * Any individual tracer that fails to initialise is skipped with a console.warn —
  * a misconfigured platform must never block the agent or the other platforms.
  */
-function instantiateAll(): Tracer {
-  const children: Array<{ name: string; tracer: Tracer }> = [];
-  const tryInit = (name: string, factory: () => Tracer): void => {
+function instantiateAll(): {
+  tracer: Tracer;
+  adapters: Array<{ name: AdapterName; tracer: Tracer }>;
+} {
+  const children: Array<{ name: AdapterName; tracer: Tracer }> = [];
+  const tryInit = (name: AdapterName, factory: () => Tracer): void => {
     try {
       children.push({ name, tracer: factory() });
     } catch (err) {
+      markAdapterEnabled(name, false, err instanceof Error ? err.message : String(err));
       // eslint-disable-next-line no-console
       console.warn(
         `[observability] Failed to initialise ${name} for OBSERVABILITY_BACKEND=all: ` +
@@ -233,9 +289,9 @@ function instantiateAll(): Tracer {
     console.warn(
       `[observability] OBSERVABILITY_BACKEND=all but no backend initialised; using NoopTracer.`
     );
-    return new NoopTracer();
+    return { tracer: new NoopTracer(), adapters: [] };
   }
-  return new MultiTracer(children);
+  return { tracer: new MultiTracer(children), adapters: children };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -244,11 +300,11 @@ function instantiateAll(): Tracer {
 
 class MultiSpan implements Span {
   // public so MultiTracer can route parent-child relationships per backend
-  public readonly entries: ReadonlyArray<{ name: string; span: Span }>;
-  constructor(entries: Array<{ name: string; span: Span }>) {
+  public readonly entries: ReadonlyArray<{ name: AdapterName; span: Span }>;
+  constructor(entries: Array<{ name: AdapterName; span: Span }>) {
     this.entries = entries;
   }
-  private safe(op: string, fn: (e: { name: string; span: Span }) => void): void {
+  private safe(op: string, fn: (e: { name: AdapterName; span: Span }) => void): void {
     for (const e of this.entries) {
       try {
         fn(e);
@@ -280,7 +336,7 @@ class MultiSpan implements Span {
 
 class MultiTracer implements Tracer {
   constructor(
-    private readonly children: Array<{ name: string; tracer: Tracer }>
+    private readonly children: Array<{ name: AdapterName; tracer: Tracer }>
   ) {}
   startSpan(name: string, opts?: StartSpanOpts): Span {
     // If a MultiSpan parent is supplied, route each child tracer's startSpan
@@ -288,7 +344,7 @@ class MultiTracer implements Tracer {
     // would be lost (each backend has its own internal span ID space).
     const parentEntries =
       opts?.parent instanceof MultiSpan ? opts.parent.entries : null;
-    const entries: Array<{ name: string; span: Span }> = [];
+    const entries: Array<{ name: AdapterName; span: Span }> = [];
     for (const c of this.children) {
       try {
         const childParent = parentEntries?.find((p) => p.name === c.name)?.span;
@@ -297,6 +353,7 @@ class MultiTracer implements Tracer {
           : { ...opts, parent: undefined };
         entries.push({ name: c.name, span: c.tracer.startSpan(name, childOpts) });
       } catch (err) {
+        recordAdapterDropped(c.name, err);
         // eslint-disable-next-line no-console
         console.error(
           `[observability] ${c.name}.startSpan(${name}) failed: ` +
@@ -312,6 +369,7 @@ class MultiTracer implements Tracer {
         try {
           await c.tracer.flush();
         } catch (err) {
+          recordAdapterDropped(c.name, err);
           // eslint-disable-next-line no-console
           console.error(
             `[observability] ${c.name}.flush failed: ` +
@@ -323,11 +381,89 @@ class MultiTracer implements Tracer {
   }
 }
 
+export function getObservabilityDiagnostics(): AdapterDiagnostics[] {
+  return getAdapterDiagnostics();
+}
+
+export interface ObservabilitySmokeResult {
+  adapter: AdapterName;
+  ok: boolean;
+  detail: string;
+}
+
+function counterSnapshotByAdapter(): Record<AdapterName, AdapterDiagnostics['delivery']> {
+  const snapshot = {} as Record<AdapterName, AdapterDiagnostics['delivery']>;
+  for (const entry of getAdapterDiagnostics()) {
+    snapshot[entry.adapter] = { ...entry.delivery };
+  }
+  return snapshot;
+}
+
+export async function runObservabilityStartupSmoke(): Promise<ObservabilitySmokeResult[]> {
+  getTracer();
+  const diagnostics = getAdapterDiagnostics();
+  const enabledAdapters = new Set(
+    diagnostics.filter((d) => d.requested && d.enabled).map((d) => d.adapter)
+  );
+  const results: ObservabilitySmokeResult[] = [];
+  const deployId = process.env.RENDER_GIT_COMMIT || process.env.RENDER_DEPLOY_ID || 'local';
+
+  for (const adapterEntry of cachedAdapters) {
+    if (!enabledAdapters.has(adapterEntry.name)) continue;
+
+    const before = counterSnapshotByAdapter()[adapterEntry.name] ?? {
+      sent: 0,
+      failed: 0,
+      dropped: 0,
+      retries: 0,
+      spooled: 0,
+    };
+
+    try {
+      const span = adapterEntry.tracer.startSpan('telemetry_smoke', {
+        kind: 'evaluator',
+        attributes: {
+          'telemetry.synthetic': true,
+          'telemetry.adapter': adapterEntry.name,
+          'telemetry.deploy_id': deployId,
+        },
+      });
+      span.setInput({ synthetic: true, adapter: adapterEntry.name, deployId });
+      span.setOutput({ ok: true });
+      span.end();
+      await adapterEntry.tracer.flush();
+
+      const after = counterSnapshotByAdapter()[adapterEntry.name] ?? before;
+      const sentDelta = after.sent - before.sent;
+      const failureDelta = after.failed - before.failed;
+      const droppedDelta = after.dropped - before.dropped;
+
+      if (failureDelta > 0 || droppedDelta > 0 || sentDelta <= 0) {
+        const detail = `sentΔ=${sentDelta}, failedΔ=${failureDelta}, droppedΔ=${droppedDelta}`;
+        markAdapterSmoke(adapterEntry.name, false, detail);
+        results.push({ adapter: adapterEntry.name, ok: false, detail });
+      } else {
+        const detail = `sentΔ=${sentDelta}`;
+        markAdapterSmoke(adapterEntry.name, true);
+        results.push({ adapter: adapterEntry.name, ok: true, detail });
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      markAdapterSmoke(adapterEntry.name, false, detail);
+      recordAdapterDropped(adapterEntry.name, err);
+      results.push({ adapter: adapterEntry.name, ok: false, detail });
+    }
+  }
+  return results;
+}
+
 /** Test-only: reset the cached tracer so factory selection can be re-run. */
 export function _resetTracer(): void {
   cached = null;
   cachedBackend = null;
+  cachedAdapters = [];
   warnedUnknown = false;
+  resetAdapterDiagnostics();
 }
 
 /** Returns the backend name that getTracer() resolved to, or null if not yet called. */
