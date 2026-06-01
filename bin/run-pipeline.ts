@@ -2598,6 +2598,18 @@ export async function runPipeline(args: {
       );
     }
 
+    if (reproOutcome.status === 'not_runnable') {
+      runDiagnostics = {
+        status: 'repro-not-runnable',
+        reason: reproOutcome.message,
+      };
+      return finish(
+        await haltForReproNotRunnable({
+          reason: reproOutcome.message,
+        })
+      );
+    }
+
     const alreadyFixed = classifyAlreadyFixedOnMain(reproOutcome);
     if (alreadyFixed.alreadyFixedOnMain) {
       return finish(

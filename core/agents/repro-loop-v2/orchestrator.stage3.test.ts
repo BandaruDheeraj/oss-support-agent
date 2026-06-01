@@ -174,6 +174,24 @@ function makeOracleResult(args: {
   };
 }
 
+function makeCandidateRepro(path = 'tests/repro/test_issue_42_candidate_seed.py') {
+  return {
+    version: 1 as const,
+    source: 'direct_call' as const,
+    failureMode: 'unexpected_exception' as const,
+    expectedExceptionType: 'AssertionError',
+    candidateTestPath: path,
+    imports: ['from src.module import broken_symbol'],
+    setup: '',
+    exerciseCall: 'broken_symbol()',
+    sentinel: 'REPRO_BROKEN_SYMBOL_SEED_42',
+    pipInstalls: [],
+    requiresCredentials: [],
+    preconditionsSatisfied: [],
+    rationale: 'seeded deterministic candidate',
+  };
+}
+
 beforeEach(() => {
   jest.resetAllMocks();
   runAnalystMock.mockImplementation(async (args: RunAnalystArgs) => {
@@ -194,6 +212,7 @@ beforeEach(() => {
       openQuestions: [],
       summary: 'seed dossier',
       confidence: 'medium',
+      candidateRepro: makeCandidateRepro(),
       oracleSpec: {
         suspect_path_assertions: [{ kind: 'symbol', needle: 'broken_symbol', file: 'src/module.py' }],
         precondition_assertions: [],
@@ -240,6 +259,70 @@ describe('runReproV2 stage3 orchestration', () => {
       routeId: 'openrouter:k1:m1',
       modelId: 'anthropic/claude-sonnet-4.5',
     });
+    expect(runReproBuilderMock).not.toHaveBeenCalled();
+    expect(runReproProberMock).not.toHaveBeenCalled();
+    expect(runDeterministicOracleMock).not.toHaveBeenCalled();
+  });
+
+  test('hard-stops as not_runnable when semantic-seeded analyst dossier omits candidateRepro', async () => {
+    runAnalystMock.mockImplementationOnce(async (args: RunAnalystArgs) => {
+      const snapshot = args.dossier.append({
+        issueNumber: args.issue.number,
+        attemptId: args.attemptId,
+        evidence: [
+          {
+            id: 'e1',
+            kind: 'file_excerpt',
+            source: 'src/module.py',
+            summary: 'suspect summary',
+            recordedAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+          },
+        ],
+        suspectSymbols: [{ file: 'src/module.py', symbol: 'broken_symbol', reasoning: 'Issue stacktrace points here' }],
+        preconditions: [],
+        openQuestions: [],
+        summary: 'seed dossier without candidate',
+        confidence: 'medium',
+      });
+      return {
+        snapshot,
+        terminated: 'done',
+        toolCalls: 1,
+        transcriptSummary: 'ok',
+      };
+    });
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-not-runnable',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      semanticSuspectSeed: {
+        model: 'BAAI/bge-small-en-v1.5',
+        query: 'issue query',
+        cacheHit: true,
+        cacheKey: 'seed-cache',
+        indexedFileCount: 12,
+        instrumentationDirs: ['src'],
+        suspectFiles: ['src/module.py'],
+        suspectSymbols: [
+          {
+            file: 'src/module.py',
+            symbol: 'broken_symbol',
+            reasoning: 'semantic hit',
+          },
+        ],
+        semanticConfidence: {
+          top_score: 0.74,
+          low_confidence: false,
+          diagnostics: 'semantic top_score=0.740',
+        },
+      },
+    });
+
+    expect(outcome.status).toBe('not_runnable');
+    expect(outcome.message).toContain('candidateRepro');
     expect(runReproBuilderMock).not.toHaveBeenCalled();
     expect(runReproProberMock).not.toHaveBeenCalled();
     expect(runDeterministicOracleMock).not.toHaveBeenCalled();

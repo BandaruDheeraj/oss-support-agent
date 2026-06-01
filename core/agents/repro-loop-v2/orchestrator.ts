@@ -123,7 +123,13 @@ export interface ReproCandidateEvaluation {
 }
 
 export interface ReproV2Outcome {
-  status: 'reproduced' | 'credentials_required' | 'not_reproduced' | 'sandbox_failed' | 'api_unavailable';
+  status:
+    | 'reproduced'
+    | 'credentials_required'
+    | 'not_reproduced'
+    | 'not_runnable'
+    | 'sandbox_failed'
+    | 'api_unavailable';
   dossier: DossierStore;
   /** The recipe authored by the selected candidate (when reproduced). */
   recipe?: ReproRecipe;
@@ -186,11 +192,16 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   const candidates: ReproCandidateEvaluation[] = [];
 
   // Stage A: Analyst (skipped if dossier was passed in)
-  if (!args.dossier || !dossier.latest()) {
+  const analystRanThisAttempt = !args.dossier || !dossier.latest();
+  if (analystRanThisAttempt) {
+    const analystWorkspace = createAnalystSemanticScopedWorkspace(
+      args.workspace,
+      args.semanticSuspectSeed ?? null
+    );
     const analyst = await runAnalyst({
       issue: args.issue,
       repo: args.repo,
-      workspace: args.workspace,
+      workspace: analystWorkspace,
       sandbox: args.sandbox,
       attemptId: args.attemptId,
       dossier,
@@ -225,6 +236,22 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   }
 
   const snapshot = dossier.latest()!;
+  const hasSemanticSeedScope =
+    !!args.semanticSuspectSeed &&
+    ((args.semanticSuspectSeed.suspectFiles?.length ?? 0) > 0 ||
+      (args.semanticSuspectSeed.suspectSymbols?.length ?? 0) > 0);
+  const suspectSymbols = snapshot.body.suspectSymbols ?? [];
+  if (analystRanThisAttempt && hasSemanticSeedScope && suspectSymbols.length > 0 && !snapshot.body.candidateRepro) {
+    return {
+      status: 'not_runnable',
+      dossier,
+      candidates,
+      message:
+        `Analyst dossier is missing required candidateRepro for semantic-seeded repro ` +
+        `(suspectSymbols=${suspectSymbols.length}). Halting before Builder/Prober.`,
+    };
+  }
+
   const oracleSpec =
     snapshot.body.oracleSpec ??
     buildReproOracleSpec(snapshot.body.suspectSymbols, snapshot.body.preconditions) ??
@@ -744,6 +771,105 @@ function appendRecipeSnapshot(args: {
     attemptId: args.attemptId,
     reproRecipe: args.recipe,
   });
+}
+
+function createAnalystSemanticScopedWorkspace(
+  workspace: WorkspaceReader & WorkspaceWriter,
+  semanticSuspectSeed: SemanticSuspectSeed | null
+): WorkspaceReader & WorkspaceWriter {
+  const allowedFiles = dedupeNormalizedPaths(semanticSuspectSeed?.suspectFiles ?? []);
+  if (allowedFiles.length === 0) return workspace;
+
+  const allowedFileSet = new Set(allowedFiles);
+  return {
+    ...workspace,
+    async readFile(path: string): Promise<string | null> {
+      const normalized = normalizeRepoPath(path);
+      if (!allowedFileSet.has(normalized)) return null;
+      return workspace.readFile(path);
+    },
+    async listDir(path: string): Promise<{ name: string; isDir: boolean }[]> {
+      const normalizedDir = normalizeRepoPath(path);
+      if (
+        normalizedDir !== '.' &&
+        !allowedFiles.some((filePath) => isPathWithinDirectory(filePath, normalizedDir))
+      ) {
+        return [];
+      }
+      const entries = await workspace.listDir(path);
+      return entries.filter((entry) => {
+        const entryPath = normalizeRepoPath(
+          normalizedDir === '.' ? entry.name : `${normalizedDir}/${entry.name}`
+        );
+        if (entry.isDir) {
+          return allowedFiles.some((filePath) => isPathWithinDirectory(filePath, entryPath));
+        }
+        return allowedFileSet.has(entryPath);
+      });
+    },
+    async grep(
+      pattern: string,
+      paths: string[] | undefined,
+      flags: { caseInsensitive?: boolean }
+    ): Promise<ReturnType<WorkspaceReader['grep']> extends Promise<infer T> ? T : never> {
+      const scopedPaths = clampPathsToAllowedFiles(paths, allowedFiles);
+      return workspace.grep(pattern, scopedPaths, flags);
+    },
+    async gitLog(
+      path: string | undefined,
+      n: number
+    ): Promise<ReturnType<WorkspaceReader['gitLog']> extends Promise<infer T> ? T : never> {
+      if (!path) {
+        return workspace.gitLog(allowedFiles[0], n);
+      }
+      const normalized = normalizeRepoPath(path);
+      if (!allowedFileSet.has(normalized)) return [];
+      return workspace.gitLog(path, n);
+    },
+    async gitBlame(
+      path: string,
+      lineStart?: number,
+      lineEnd?: number
+    ): Promise<ReturnType<WorkspaceReader['gitBlame']> extends Promise<infer T> ? T : never> {
+      const normalized = normalizeRepoPath(path);
+      if (!allowedFileSet.has(normalized)) return [];
+      return workspace.gitBlame(path, lineStart, lineEnd);
+    },
+  };
+}
+
+function normalizeRepoPath(path: string): string {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').trim();
+  return normalized.length > 0 ? normalized : '.';
+}
+
+function dedupeNormalizedPaths(paths: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    const normalized = normalizeRepoPath(raw);
+    if (normalized === '.' || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function isPathWithinDirectory(filePath: string, directoryPath: string): boolean {
+  const normalizedDir = normalizeRepoPath(directoryPath);
+  if (normalizedDir === '.') return true;
+  const normalizedFile = normalizeRepoPath(filePath);
+  return normalizedFile === normalizedDir || normalizedFile.startsWith(`${normalizedDir}/`);
+}
+
+function clampPathsToAllowedFiles(paths: string[] | undefined, allowedFiles: string[]): string[] {
+  if (!paths || paths.length === 0) return allowedFiles;
+  const requested = dedupeNormalizedPaths(paths);
+  if (requested.length === 0) return allowedFiles;
+  const scoped = requested.filter((candidatePath) =>
+    allowedFiles.some((filePath) => isPathWithinDirectory(filePath, candidatePath))
+  );
+  return scoped.length > 0 ? scoped : allowedFiles;
 }
 
 function createAsyncLock(): AsyncLock {
