@@ -2,6 +2,7 @@ import {
   buildApiUnavailableRunDiagnostics,
   buildNotReproducedRunDiagnostics,
   classifyAlreadyFixedOnMain,
+  classifyNotReproducedAsApiUnavailable,
   ReproStageTimeoutError,
   resolveReproStageTimeoutMs,
   runReproPipelineWithTimeout,
@@ -290,6 +291,149 @@ describe('buildApiUnavailableRunDiagnostics', () => {
   test('returns null for non-api_unavailable outcomes', () => {
     const diagnostics = buildApiUnavailableRunDiagnostics(makeOutcome({ status: 'not_reproduced' }));
     expect(diagnostics).toBeNull();
+  });
+});
+
+describe('classifyNotReproducedAsApiUnavailable', () => {
+  test('classifies not_reproduced as api unavailable when quota failure happened before any repro execution', () => {
+    const outcome = makeOutcome({
+      status: 'not_reproduced',
+      message: 'Deterministic repro oracle rejected all 4 candidates.',
+      candidates: [
+        {
+          candidateId: 'candidate-0',
+          source: 'builder',
+          sampleIndex: 0,
+          status: 'generation_failed',
+          message: 'Builder did not produce a candidate recipe.',
+          builderRejectStage: 'no_candidate',
+        },
+        {
+          candidateId: 'candidate-1',
+          source: 'prober',
+          sampleIndex: 1,
+          status: 'generation_failed',
+          message: 'Prober sample terminated without recipe (Key limit exceeded (total limit).)',
+          prober: {
+            terminated: 'error',
+            reason: 'Key limit exceeded (total limit).',
+            turns: 0,
+            toolCalls: 0,
+            toolCallsByTier: {
+              read: 0,
+              note: 0,
+              'write-test': 0,
+              mutation: 0,
+              sandbox: 0,
+              meta: 0,
+            },
+            transcriptSummary: 'run_repro(0)',
+            text: '',
+            recipeSnapshot: null,
+            recipe: null,
+            verbatimIncompatibleHint: false,
+            transcript: [],
+            ranReproCount: 0,
+            lastReproExitCode: null,
+            verifiedSummary: 'run_repro_ok=0',
+          },
+        } as any,
+      ],
+    });
+
+    const classified = classifyNotReproducedAsApiUnavailable(outcome);
+
+    expect(classified).toEqual({
+      reason:
+        'LLM provider unavailable before repro execution (prober/candidate-1): Key limit exceeded (total limit).',
+      failureReason: 'Key limit exceeded (total limit).',
+    });
+  });
+
+  test('does not classify when repro execution actually happened', () => {
+    const outcome = makeOutcome({
+      status: 'not_reproduced',
+      candidates: [
+        {
+          candidateId: 'candidate-0',
+          source: 'builder',
+          sampleIndex: 0,
+          status: 'invalid',
+          message: 'Deterministic repro oracle rejected candidate.',
+          executor: {
+            ...makeExecutor('reproduced', 'failing'),
+            runs: [
+              {
+                runId: 1,
+                exitCode: 1,
+                stdoutTail: '',
+                stderrTail: 'AssertionError',
+                durationMs: 10,
+                sentinelObserved: true,
+                signatureObserved: true,
+              },
+              {
+                runId: 2,
+                exitCode: 1,
+                stdoutTail: '',
+                stderrTail: 'AssertionError',
+                durationMs: 12,
+                sentinelObserved: true,
+                signatureObserved: true,
+              },
+            ],
+          },
+          oracle: {
+            verdict: 'invalid',
+            criteria: {
+              baseline_head_fails: true,
+              reliable_failures: true,
+              suspect_path_assertions: false,
+              precondition_assertions: true,
+              ast_preflight: true,
+            },
+            message: 'missing suspect_path_assertions',
+            executor: {} as any,
+            suspectPathAssertionResult: { passed: false, missing: [] },
+            preconditionAssertionResult: { passed: true, missingMarkers: [] },
+            astReason: null,
+            credentialsTerminal: null,
+          },
+        } as any,
+        {
+          candidateId: 'candidate-1',
+          source: 'prober',
+          sampleIndex: 1,
+          status: 'generation_failed',
+          message: 'Prober sample terminated without recipe ([rate-limited] 429)',
+          prober: {
+            terminated: 'error',
+            reason: '[rate-limited] 429',
+            turns: 2,
+            toolCalls: 3,
+            toolCallsByTier: {
+              read: 1,
+              note: 0,
+              'write-test': 0,
+              mutation: 0,
+              sandbox: 2,
+              meta: 0,
+            },
+            transcriptSummary: 'run_repro(0)',
+            text: '',
+            recipeSnapshot: null,
+            recipe: null,
+            verbatimIncompatibleHint: false,
+            transcript: [],
+            ranReproCount: 0,
+            lastReproExitCode: null,
+            verifiedSummary: 'run_repro_ok=0',
+          },
+        } as any,
+      ],
+    });
+
+    expect(classifyNotReproducedAsApiUnavailable(outcome)).toBeNull();
   });
 });
 

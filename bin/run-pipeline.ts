@@ -764,6 +764,22 @@ export function classifyAlreadyFixedOnMain(outcome: ReproPipelineOutcome): {
   return { alreadyFixedOnMain: false };
 }
 
+export function classifyNotReproducedAsApiUnavailable(
+  outcome: ReproPipelineOutcome
+): { reason: string; failureReason: string } | null {
+  if (outcome.status !== 'not_reproduced') return null;
+  const diagnostics = buildNotReproducedRunDiagnostics(outcome);
+  const quotaFailure = diagnostics?.llm_quota_failure;
+  if (!quotaFailure) return null;
+  if (diagnostics.run_repro.any_executed) return null;
+  const stage =
+    quotaFailure.stage + (quotaFailure.candidate_id ? `/${quotaFailure.candidate_id}` : '');
+  return {
+    reason: `LLM provider unavailable before repro execution (${stage}): ${quotaFailure.reason}`,
+    failureReason: quotaFailure.reason,
+  };
+}
+
 export interface NotReproducedRunDiagnostics {
   reason: string;
   semantic_confidence: {
@@ -824,7 +840,7 @@ export interface ApiUnavailableRunDiagnostics {
 }
 
 const LLM_QUOTA_FAILURE_PATTERN =
-  /\[credits-exhausted\]|\[rate-limited\]|insufficient credit|quota exceeded|payment required|\b(?:402|429)\b/i;
+  /\[credits-exhausted\]|\[rate-limited\]|insufficient credit|quota exceeded|payment required|key limit exceeded|\b(?:402|429)\b/i;
 
 function isLlmQuotaFailure(reason: string | null | undefined): boolean {
   if (!reason) return false;
@@ -2201,6 +2217,24 @@ export async function runPipeline(args: {
       return finish(
         await haltForAlreadyFixedOnMain({
           reason: alreadyFixed.reason ?? reproOutcome.message,
+        })
+      );
+    }
+
+    const apiUnavailableFromNotReproduced = classifyNotReproducedAsApiUnavailable(reproOutcome);
+    if (apiUnavailableFromNotReproduced) {
+      runDiagnostics = {
+        reason: apiUnavailableFromNotReproduced.reason,
+        api_preflight: {
+          stage: 'unknown',
+          route_id: null,
+          model_id: null,
+          failure_reason: apiUnavailableFromNotReproduced.failureReason,
+        },
+      };
+      return finish(
+        await haltForApiUnavailable({
+          reason: apiUnavailableFromNotReproduced.reason,
         })
       );
     }
