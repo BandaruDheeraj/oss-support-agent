@@ -34,6 +34,11 @@ export interface DeterministicExecutorArgs {
    * package name without its `python/instrumentation/` repo prefix.
    */
   editableInstallFallbacks?: string[];
+  /**
+   * Suspect-path needles forwarded to SandboxSession-backed repro execution so
+   * the session can report whether failing output exercised suspect code.
+   */
+  suspectPathNeedles?: string[];
 }
 
 export interface DeterministicExecutorRun {
@@ -189,8 +194,12 @@ export async function runReproExecutorFromRecipe(
 
   // (5) run × 2
   const runs: DeterministicExecutorRun[] = [];
+  const reproOptions =
+    args.suspectPathNeedles && args.suspectPathNeedles.length > 0
+      ? { suspectPathNeedles: args.suspectPathNeedles }
+      : undefined;
   for (let i = 0; i < 2; i++) {
-    const r = await args.sandbox.runRepro();
+    const r = await args.sandbox.runRepro(reproOptions);
     runs.push(observe(r, sentinelString, expectedFailureSignature));
   }
 

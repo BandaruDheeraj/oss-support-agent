@@ -162,6 +162,7 @@ function makeOracleResult(args: {
       missingMarkers: [],
     },
     astReason: criteria.ast_preflight ? null : 'AST preflight failed',
+    sandboxResult: null,
     credentialsTerminal:
       args.verdict === 'credentials_required'
         ? {
@@ -275,6 +276,35 @@ describe('runReproV2 stage3 orchestration', () => {
     expect(rankValidReproCandidatesMock).not.toHaveBeenCalled();
     expect(outcome.status).toBe('not_reproduced');
     expect(outcome.candidates).toHaveLength(4);
+  });
+
+  test('returns sandbox_failed when all candidates fail sandbox lifecycle before runnable repro evidence', async () => {
+    runReproBuilderMock.mockResolvedValue({
+      ok: true,
+      recipe: makeRecipe('builder'),
+      reason: 'Builder produced candidate',
+      runs: [],
+    });
+    runReproProberMock.mockResolvedValue(makeProberResult(makeRecipe('candidate-prober')));
+    runDeterministicOracleMock.mockResolvedValue(
+      makeOracleResult({
+        verdict: 'sandbox_failed',
+        message: 'Sandbox execution failed before runnable repro evidence: branch_push_unconfirmed',
+      })
+    );
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-sandbox-failed',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      proberSampleCount: 1,
+    });
+
+    expect(outcome.status).toBe('sandbox_failed');
+    expect(outcome.candidates.every((candidate) => candidate.status === 'sandbox_failed')).toBe(true);
+    expect(outcome.message).toContain('sandbox_failed');
   });
 
   test('halts with sandbox_setup_failed before prober sampling when OpenInference preflight fails', async () => {

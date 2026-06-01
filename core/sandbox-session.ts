@@ -26,6 +26,7 @@ export interface Recipe {
   commands: string[];
   sentinel?: string;
   suspectPath?: string;
+  suspectPathNeedles?: string[];
 }
 
 export interface WorkflowDispatchRequest {
@@ -471,7 +472,12 @@ export class SandboxSession {
 
     const failureOutput = run.exitCode !== 0 ? run.stderr || run.stdout : '';
     const sentinelMatched = !!recipe.sentinel && failureOutput.includes(recipe.sentinel);
-    const suspectPathHit = !!recipe.suspectPath && failureOutput.includes(recipe.suspectPath);
+    const suspectNeedles = recipe.suspectPathNeedles && recipe.suspectPathNeedles.length > 0
+      ? recipe.suspectPathNeedles
+      : recipe.suspectPath
+        ? [recipe.suspectPath]
+        : [];
+    const suspectPathHit = suspectNeedles.some((needle) => failureOutput.includes(needle));
 
     this.lastDispatch = {
       ok: true,

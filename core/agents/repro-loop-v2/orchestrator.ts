@@ -45,6 +45,7 @@ type CandidateSource = 'builder' | 'prober';
 type CandidateStatus =
   | 'generation_failed'
   | 'setup_failed'
+  | 'sandbox_failed'
   | 'invalid'
   | 'valid'
   | 'credentials_required';
@@ -122,7 +123,7 @@ export interface ReproCandidateEvaluation {
 }
 
 export interface ReproV2Outcome {
-  status: 'reproduced' | 'credentials_required' | 'not_reproduced' | 'api_unavailable';
+  status: 'reproduced' | 'credentials_required' | 'not_reproduced' | 'sandbox_failed' | 'api_unavailable';
   dossier: DossierStore;
   /** The recipe authored by the selected candidate (when reproduced). */
   recipe?: ReproRecipe;
@@ -373,6 +374,12 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       continue;
     }
 
+    if (oracle.verdict === 'sandbox_failed') {
+      candidate.status = 'sandbox_failed';
+      candidate.message = oracle.message;
+      continue;
+    }
+
     candidate.status = 'invalid';
     if (candidate.prober) {
       // Keep transcript-based credential detection unchanged.
@@ -454,6 +461,20 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       selectedCandidateId: credentialCandidate.candidateId,
       candidates,
       message: `Repro halted on missing credentials (${credentialCandidate.credentialsTerminal.matchedPattern ?? 'unknown pattern'}): ${credentialCandidate.credentialsTerminal.inferredEnvVars.join(', ')}`,
+    };
+  }
+
+  const allSandboxFailed =
+    candidates.length > 0 &&
+    candidates.every((candidate) => candidate.status === 'sandbox_failed');
+  if (allSandboxFailed) {
+    return {
+      status: 'sandbox_failed',
+      dossier,
+      ...(builder ? { builder } : {}),
+      ...(builderRejectStage ? { builderRejectStage } : {}),
+      candidates,
+      message: buildSandboxFailedMessage(candidates),
     };
   }
 
@@ -752,6 +773,7 @@ function createSerializedSandboxView(base: SandboxHandle, lock: AsyncLock): Sand
     runTests: (command) => lock(() => base.runTests(command)),
     pythonModuleCheck: (name) => lock(() => base.pythonModuleCheck(name)),
     listPackages: () => lock(() => base.listPackages()),
+    getSandboxResult: () => base.getSandboxResult?.() ?? null,
     setReproTestPath: (path) => {
       reproTestPath = path;
     },
@@ -840,6 +862,16 @@ function buildNoReproMessage(candidates: ReproCandidateEvaluation[]): string {
     );
   }
   return `Deterministic repro oracle rejected all ${candidates.length} candidates.`;
+}
+
+function buildSandboxFailedMessage(candidates: ReproCandidateEvaluation[]): string {
+  const details = candidates
+    .map((candidate) => `${candidate.candidateId}=${candidate.message}`)
+    .join(' | ');
+  return (
+    `sandbox_failed: all ${candidates.length} candidate(s) failed sandbox lifecycle before runnable repro evidence.` +
+    (details ? ` Details: ${details}` : '')
+  );
 }
 
 /**

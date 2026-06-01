@@ -5,7 +5,13 @@
 import { runSandbox } from '../../sandbox';
 import type { ActionsClient, SandboxConfig } from '../../sandbox-types';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
-import type { InstallSpec, SandboxPhaseFailure, SandboxPhaseResult, SandboxSession } from '../../sandbox-session';
+import type {
+  InstallSpec,
+  SandboxPhaseFailure,
+  SandboxPhaseResult,
+  SandboxResult as SandboxSessionResult,
+  SandboxSession,
+} from '../../sandbox-session';
 import { resolveSkippablePipInstall } from './pip-spec';
 import { buildPipInstallCommand } from './sandbox-local';
 import { buildPythonModuleCheckSnippet } from './python-module-check';
@@ -163,12 +169,20 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
     });
   };
 
-  const runCommands = async (commands: readonly string[]): Promise<SandboxRun> => {
+  const runCommands = async (
+    commands: readonly string[],
+    options?: { suspectPathNeedles?: string[] }
+  ): Promise<SandboxRun> => {
     await ensureReadyForDispatch();
     log(`[sandbox-gh] dispatching: ${commands.join(' && ')}`);
     const start = Date.now();
     if (opts.sandboxSession) {
-      const dispatch = await opts.sandboxSession.dispatch({ commands: [...commands] });
+      const dispatch = await opts.sandboxSession.dispatch({
+        commands: [...commands],
+        ...(options?.suspectPathNeedles && options.suspectPathNeedles.length > 0
+          ? { suspectPathNeedles: options.suspectPathNeedles }
+          : {}),
+      });
       const dur = Date.now() - start;
       if (!dispatch.ok) {
         throw new Error(
@@ -191,9 +205,12 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
     );
   };
 
-  const runOne = async (cmd: string): Promise<SandboxRun> => {
+  const runOne = async (
+    cmd: string,
+    options?: { suspectPathNeedles?: string[] }
+  ): Promise<SandboxRun> => {
     if (opts.sandboxSession) {
-      return runCommands([cmd]);
+      return runCommands([cmd], options);
     }
     const commands = [...buildInstallCommands(stickyPipInstalls), cmd];
     return runCommands(commands);
@@ -203,13 +220,13 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
     setReproTestPath(p: string) {
       opts.reproTestPath = p;
     },
-    async runRepro() {
+    async runRepro(options?: { suspectPathNeedles?: string[] }) {
       const reproPath = opts.reproTestPath;
       if (!reproPath) {
         return asRun('', '[sandbox-gh] reproTestPath not configured', 2, 0);
       }
       const tpl = opts.reproRunner ?? 'pytest -xvs {path}';
-      return runOne(tpl.replace('{path}', reproPath));
+      return runOne(tpl.replace('{path}', reproPath), options);
     },
     async runTests(scopePath?: string) {
       const base = opts.testCommand ?? 'pytest -q';
@@ -328,6 +345,9 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
       }
 
       return { ok: true, phase: 'setup', installManifest: [] };
+    },
+    getSandboxResult(): SandboxSessionResult | null {
+      return opts.sandboxSession ? opts.sandboxSession.result() : null;
     },
   };
 

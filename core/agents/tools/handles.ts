@@ -8,7 +8,11 @@ import type { DossierStore } from '../analyst/dossier';
 import type { SemanticSuspectSeed } from '../analyst/semantic-search';
 import type { InvestigationNotesStore } from '../fix-loop/investigation-notes';
 import type { HypothesisTracker } from '../fix-loop/hypotheses';
-import type { InstallSpec, SandboxPhaseResult } from '../../sandbox-session';
+import type {
+  InstallSpec,
+  SandboxPhaseResult,
+  SandboxResult as SandboxSessionResult,
+} from '../../sandbox-session';
 
 export interface WorkspaceReader {
   /** Read a repo file at the agent's working ref. Returns null if not found. */
@@ -66,7 +70,7 @@ export interface SandboxHandle {
   /** Set the canonical repro test path AFTER it has been chosen (repro-loop). */
   setReproTestPath(p: string): void;
   /** Run the recorded repro test. Returns full result. */
-  runRepro(): Promise<SandboxRun>;
+  runRepro(options?: { suspectPathNeedles?: string[] }): Promise<SandboxRun>;
   /** Run the broader test command. */
   runTests(scopePath?: string): Promise<SandboxRun>;
   /** Run a bounded python snippet (no shell). */
@@ -85,6 +89,8 @@ export interface SandboxHandle {
   listPackages(): Promise<{ name: string; version: string }[]>;
   /** Session-owned dependency setup for deterministic repro runs. */
   setupDependencies?(spec: InstallSpec): Promise<SandboxPhaseResult>;
+  /** Latest lifecycle result when sandbox operations are owned by SandboxSession. */
+  getSandboxResult?(): SandboxSessionResult | null;
 }
 
 export interface SandboxRun {

@@ -813,7 +813,7 @@ export interface NotReproducedRunDiagnostics {
       source: ReproCandidateEvaluation['source'];
       status: ReproCandidateEvaluation['status'];
       oracle_executed: boolean;
-      verdict: 'valid' | 'invalid' | 'credentials_required' | null;
+      verdict: 'valid' | 'invalid' | 'credentials_required' | 'sandbox_failed' | null;
       failed_criteria: string[];
       criteria: Record<string, boolean> | null;
       suspect_path_evidence_present: boolean | null;
@@ -869,6 +869,9 @@ function summarizeOracleCandidate(
   const failedCriteria = Object.entries(oracle.criteria)
     .filter(([, passed]) => !passed)
     .map(([criterion]) => criterion);
+  if (oracle.verdict === 'sandbox_failed') {
+    failedCriteria.unshift('sandbox_failed');
+  }
   return {
     candidate_id: candidate.candidateId,
     source: candidate.source,
@@ -2110,6 +2113,50 @@ export async function runPipeline(args: {
       });
     };
 
+    const haltForSandboxFailed = async (args: {
+      reason: string;
+    }): Promise<PipelineResult> => {
+      const issueUrl = "https://github.com/" + repoFullName + "/issues/" + issueNumber;
+      const branchUrl = "https://github.com/" + fork.forkFullName + "/tree/" + fork.branchName;
+      const appendBody = [
+        "The sandbox lifecycle failed before any runnable repro evidence could be produced, so no PR will be opened.",
+        '',
+        "Reason: " + args.reason,
+        '',
+        "Inspect the agent branch: " + branchUrl,
+        '',
+        "What to do:",
+        "  1. Inspect sandbox diagnostics for branch/workflow/setup/dispatch failures.",
+        "  2. Fix the sandbox failure and re-apply the trigger label to resume.",
+        '',
+        "Issue: " + issueUrl,
+        '',
+        "Run: " + runId,
+      ].join('\n');
+      return haltAndEmail({
+        label: 'awaiting-repro-fix',
+        kind: 'repro_unreachable',
+        context: buildHaltContext({
+          attemptId: runId,
+          recipient: manifest.pm_email,
+          issueNumber,
+          issueUrl,
+          failureSnippet: args.reason,
+          dossier: reproDossier,
+        }),
+        appendBody,
+        commentBody:
+          "⛔ **Sandbox failed before runnable repro evidence.** " +
+          args.reason +
+          "\n\nNo PR has been opened — the maintainer has been emailed with details. Re-trigger after fixing the sandbox failure.",
+        result: {
+          status: 'sandbox-failed',
+          reason: args.reason,
+        },
+        logTag: "sandbox-failed: " + args.reason,
+      });
+    };
+
     const haltForApiUnavailable = async (args: { reason: string }): Promise<PipelineResult> => {
       const issueUrl = "https://github.com/" + repoFullName + "/issues/" + issueNumber;
       const appendBody = [
@@ -2320,6 +2367,14 @@ export async function runPipeline(args: {
       runDiagnostics = buildApiUnavailableRunDiagnostics(reproOutcome);
       return finish(
         await haltForApiUnavailable({
+          reason: reproOutcome.message,
+        })
+      );
+    }
+
+    if (reproOutcome.status === 'sandbox_failed') {
+      return finish(
+        await haltForSandboxFailed({
           reason: reproOutcome.message,
         })
       );

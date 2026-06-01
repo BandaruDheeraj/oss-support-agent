@@ -110,7 +110,7 @@ export function createLocalSandboxAdapter(
     setReproTestPath(p: string) {
       opts.reproTestPath = p;
     },
-    async runRepro() {
+    async runRepro(_options?: { suspectPathNeedles?: string[] }) {
       const reproPath = opts.reproTestPath;
       if (!reproPath) {
         return {
@@ -248,6 +248,9 @@ export function createLocalSandboxAdapter(
         };
       });
       return { ok: true, phase: 'setup', installManifest };
+    },
+    getSandboxResult() {
+      return null;
     },
   };
 
