@@ -98,14 +98,15 @@ describe('LangSmithTracer', () => {
     expect(childCall.parent_run_id).toBe(parentCall.id);
   });
 
-  it('swallows createRun errors without throwing to the caller', async () => {
+  it('retries createRun transient errors without throwing to the caller', async () => {
     createRunMock.mockRejectedValueOnce(new Error('network down'));
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const tracer = new LangSmithTracer();
     const span = tracer.startSpan('llm.x', { kind: 'llm' });
     span.end();
     await tracer.flush();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('createRun failed'));
+    expect(createRunMock).toHaveBeenCalledTimes(2);
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('createRun failed'));
     warn.mockRestore();
   });
 

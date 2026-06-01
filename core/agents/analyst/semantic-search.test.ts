@@ -43,26 +43,52 @@ function createActionsClient(overrides: Partial<ActionsClient> = {}): ActionsCli
   };
 }
 
+function createSandboxSessionMock(overrides: Record<string, unknown> = {}): any {
+  return {
+    verifyAndPushBranch: jest
+      .fn()
+      .mockResolvedValue({ ok: true, phase: 'branch', sha: 'abc123' }),
+    verifyWorkflowReachability: jest.fn().mockResolvedValue({ ok: true, phase: 'workflow' }),
+    dispatchWorkflow: jest.fn().mockResolvedValue({
+      ok: true,
+      runId: 101,
+      conclusion: 'success',
+      stepOutcomes: [],
+      rawLogs: '',
+      exitCode: 0,
+    }),
+    ...overrides,
+  };
+}
+
+function buildGhaConfig(
+  actionsClient: ActionsClient,
+  sandboxSession: any,
+  branchName: string = 'agent/scope-52'
+) {
+  return {
+    actionsClient,
+    sandboxSession,
+    repoFullName: 'BandaruDheeraj/openinference',
+    forkFullName: 'BandaruDheeraj/openinference',
+    forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
+    branchName,
+    workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
+    workflowDispatchRef: 'main',
+    timeoutMinutes: 15,
+  };
+}
+
 describe('buildSemanticSuspectSeed', () => {
   it('dispatches semantic workflow and maps suspect files/symbols from artifact output', async () => {
-    const actionsClient = createActionsClient({
-      branchRefExists: jest.fn().mockResolvedValue(true),
-    });
+    const actionsClient = createActionsClient();
+    const sandboxSession = createSandboxSessionMock();
     const result = await buildSemanticSuspectSeed({
       workspaceDir: '/tmp/workspace',
       issueTitle: 'Agent crashes when tracing tool calls',
       issueBody: 'Regression appears in instrumentation path.',
       affectedModule: 'python/openinference-instrumentation',
-      ghaConfig: {
-        actionsClient,
-        repoFullName: 'BandaruDheeraj/openinference',
-        forkFullName: 'BandaruDheeraj/openinference',
-        forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
-        branchName: 'agent/scope-52',
-        workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
-        workflowDispatchRef: 'main',
-        timeoutMinutes: 15,
-      },
+      ghaConfig: buildGhaConfig(actionsClient, sandboxSession),
     });
 
     expect(result).toEqual(
@@ -80,15 +106,20 @@ describe('buildSemanticSuspectSeed', () => {
       expect.objectContaining({ symbol: 'demo_function' }),
     ]);
 
-    expect(actionsClient.triggerWorkflowDispatch).toHaveBeenCalledWith(
-      'BandaruDheeraj/oss-support-agent',
-      'semantic-search.yml',
-      'main',
+    expect(sandboxSession.verifyAndPushBranch).toHaveBeenCalledTimes(1);
+    expect(sandboxSession.verifyWorkflowReachability).toHaveBeenCalledWith(
+      'semantic-search.yml'
+    );
+    expect(sandboxSession.dispatchWorkflow).toHaveBeenCalledWith(
       expect.objectContaining({
-        repo_full_name: 'BandaruDheeraj/openinference',
-        branch_name: 'agent/scope-52',
-        issue_title: 'Agent crashes when tracing tool calls',
-        issue_body: 'Regression appears in instrumentation path.',
+        workflowId: 'semantic-search.yml',
+        timeoutMins: 15,
+        inputs: expect.objectContaining({
+          repo_full_name: 'BandaruDheeraj/openinference',
+          branch_name: 'agent/scope-52',
+          issue_title: 'Agent crashes when tracing tool calls',
+          issue_body: 'Regression appears in instrumentation path.',
+        }),
       })
     );
     expect(actionsClient.downloadWorkflowRunArtifact).toHaveBeenCalledWith(
@@ -108,8 +139,8 @@ describe('buildSemanticSuspectSeed', () => {
   });
 
   it('parses pretty JSON wrapped by noisy workflow output', async () => {
+    const sandboxSession = createSandboxSessionMock();
     const actionsClient = createActionsClient({
-      branchRefExists: jest.fn().mockResolvedValue(true),
       downloadWorkflowRunArtifact: jest.fn().mockResolvedValue(
         [
           '[semantic-search] script_exit=1 raw_bytes=321 stderr_bytes=45',
@@ -138,16 +169,7 @@ describe('buildSemanticSuspectSeed', () => {
       workspaceDir: '/tmp/workspace',
       issueTitle: 'Wrapped JSON payload',
       issueBody: 'Body',
-      ghaConfig: {
-        actionsClient,
-        repoFullName: 'BandaruDheeraj/openinference',
-        forkFullName: 'BandaruDheeraj/openinference',
-        forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
-        branchName: 'agent/scope-53',
-        workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
-        workflowDispatchRef: 'main',
-        timeoutMinutes: 15,
-      },
+      ghaConfig: buildGhaConfig(actionsClient, sandboxSession, 'agent/scope-53'),
     });
 
     expect(result).toEqual(
@@ -163,8 +185,8 @@ describe('buildSemanticSuspectSeed', () => {
   });
 
   it('marks semantic seed as low-confidence when top_score is below threshold', async () => {
+    const sandboxSession = createSandboxSessionMock();
     const actionsClient = createActionsClient({
-      branchRefExists: jest.fn().mockResolvedValue(true),
       downloadWorkflowRunArtifact: jest.fn().mockResolvedValue(
         JSON.stringify({
           model: 'BAAI/bge-small-en-v1.5',
@@ -189,16 +211,7 @@ describe('buildSemanticSuspectSeed', () => {
       workspaceDir: '/tmp/workspace',
       issueTitle: 'Low confidence seed',
       issueBody: 'Body',
-      ghaConfig: {
-        actionsClient,
-        repoFullName: 'BandaruDheeraj/openinference',
-        forkFullName: 'BandaruDheeraj/openinference',
-        forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
-        branchName: 'agent/scope-53',
-        workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
-        workflowDispatchRef: 'main',
-        timeoutMinutes: 15,
-      },
+      ghaConfig: buildGhaConfig(actionsClient, sandboxSession, 'agent/scope-53'),
     });
 
     expect(result?.semanticConfidence).toEqual({
@@ -209,8 +222,8 @@ describe('buildSemanticSuspectSeed', () => {
   });
 
   it('returns null when semantic workflow artifact has no suspect results', async () => {
+    const sandboxSession = createSandboxSessionMock();
     const actionsClient = createActionsClient({
-      branchRefExists: jest.fn().mockResolvedValue(true),
       downloadWorkflowRunArtifact: jest.fn().mockResolvedValue(
         JSON.stringify({
           model: 'BAAI/bge-small-en-v1.5',
@@ -231,16 +244,7 @@ describe('buildSemanticSuspectSeed', () => {
       workspaceDir: '/tmp/workspace',
       issueTitle: 'No semantic output',
       issueBody: 'Body',
-      ghaConfig: {
-        actionsClient,
-        repoFullName: 'BandaruDheeraj/openinference',
-        forkFullName: 'BandaruDheeraj/openinference',
-        forkCloneUrl: 'https://github.com/BandaruDheeraj/openinference.git',
-        branchName: 'agent/scope-54',
-        workflowRepoFullName: 'BandaruDheeraj/oss-support-agent',
-        workflowDispatchRef: 'main',
-        timeoutMinutes: 15,
-      },
+      ghaConfig: buildGhaConfig(actionsClient, sandboxSession, 'agent/scope-54'),
     });
 
     expect(result).toBeNull();

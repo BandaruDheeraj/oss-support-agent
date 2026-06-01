@@ -14,6 +14,7 @@ import type {
   SuspectSymbol,
 } from '../analyst/dossier';
 import type { RepoHandle, SandboxHandle, WorkspaceWriter } from '../tools/handles';
+import type { SandboxResult as SandboxSessionResult } from '../../sandbox-session';
 
 export interface DeterministicReproOracleArgs {
   attemptId: string;
@@ -47,13 +48,14 @@ export interface DeterministicReproOracleCriteria {
 }
 
 export interface DeterministicReproOracleResult {
-  verdict: 'valid' | 'invalid' | 'credentials_required';
+  verdict: 'valid' | 'invalid' | 'credentials_required' | 'sandbox_failed';
   criteria: DeterministicReproOracleCriteria;
   message: string;
   executor: DeterministicExecutorResult;
   suspectPathAssertionResult: OracleSuspectAssertionResult;
   preconditionAssertionResult: OraclePreconditionAssertionResult;
   astReason: string | null;
+  sandboxResult: SandboxSessionResult | null;
   credentialsTerminal:
     | {
         inferredEnvVars: string[];
@@ -87,6 +89,19 @@ export function evaluatePreconditionAssertions(
   return {
     passed: missingMarkers.length === 0,
     missingMarkers: Array.from(new Set(missingMarkers)),
+  };
+}
+
+function evaluateSuspectPathAssertionsFromSandboxResult(
+  suspectPathHit: boolean,
+  assertions: ReproOracleSuspectPathAssertion[]
+): OracleSuspectAssertionResult {
+  if (assertions.length === 0) {
+    return { passed: true, missing: [] };
+  }
+  return {
+    passed: suspectPathHit,
+    missing: suspectPathHit ? [] : assertions,
   };
 }
 
@@ -126,14 +141,33 @@ export async function runDeterministicReproOracle(
     suspectSymbols
   );
 
-  const executor = await runReproExecutorFromRecipe({
-    attemptId: args.attemptId,
-    recipe: args.recipe,
-    workspace: args.workspace,
-    sandbox: args.sandbox,
-    env: args.env,
-    editableInstallFallbacks: args.editableInstallFallbacks,
-  });
+  const suspectPathNeedles = args.oracleSpec.suspect_path_assertions
+    .map((assertion) => assertion.needle)
+    .filter((needle): needle is string => typeof needle === 'string' && needle.length > 0);
+
+  let executor: DeterministicExecutorResult;
+  try {
+    executor = await runReproExecutorFromRecipe({
+      attemptId: args.attemptId,
+      recipe: args.recipe,
+      workspace: args.workspace,
+      sandbox: args.sandbox,
+      env: args.env,
+      editableInstallFallbacks: args.editableInstallFallbacks,
+      suspectPathNeedles,
+    });
+  } catch (err) {
+    const sandboxResult = readSandboxResult(args.sandbox);
+    if (sandboxResult && isSandboxNonRunnable(sandboxResult)) {
+      return buildSandboxFailedOracleResult({
+        sandboxResult,
+        preconditionAssertionResult,
+        ast,
+        fallbackMessage: err instanceof Error ? err.message : String(err),
+      });
+    }
+    throw err;
+  }
 
   if (executor.outcome === 'credentials_missing') {
     return {
@@ -150,6 +184,7 @@ export async function runDeterministicReproOracle(
       suspectPathAssertionResult: { passed: false, missing: args.oracleSpec.suspect_path_assertions },
       preconditionAssertionResult,
       astReason: ast.ok ? null : ast.reason,
+      sandboxResult: null,
       credentialsTerminal: {
         inferredEnvVars: executor.missingCredentials,
         matchedPattern: 'recipe.requiresCredentials',
@@ -174,21 +209,36 @@ export async function runDeterministicReproOracle(
       suspectPathAssertionResult: { passed: false, missing: args.oracleSpec.suspect_path_assertions },
       preconditionAssertionResult,
       astReason: ast.ok ? null : ast.reason,
+      sandboxResult: null,
       credentialsTerminal: credFromRuns,
     };
+  }
+
+  const sandboxResult = readSandboxResult(args.sandbox);
+  if (sandboxResult && isSandboxNonRunnable(sandboxResult)) {
+    return buildSandboxFailedOracleResult({
+      sandboxResult,
+      preconditionAssertionResult,
+      ast,
+      executor,
+    });
   }
 
   const baseline_head_fails = (executor.runs[0]?.exitCode ?? 0) !== 0;
   const reliable_failures = executor.runs.filter((r) => r.exitCode !== 0).length >= 2;
   const relaxSuspectPathAssertion = args.semanticConfidence?.low_confidence === true;
-  const failingOutput = executor.runs
-    .filter((r) => r.exitCode !== 0)
-    .map((r) => `${r.stderrTail}\n${r.stdoutTail}`)
-    .join('\n');
-  const suspectPathAssertionResult = evaluateSuspectPathAssertions(
-    failingOutput,
-    args.oracleSpec.suspect_path_assertions
-  );
+  const suspectPathAssertionResult = sandboxResult
+    ? evaluateSuspectPathAssertionsFromSandboxResult(
+        sandboxResult.suspectPathHit,
+        args.oracleSpec.suspect_path_assertions
+      )
+    : evaluateSuspectPathAssertions(
+        executor.runs
+          .filter((r) => r.exitCode !== 0)
+          .map((r) => `${r.stderrTail}\n${r.stdoutTail}`)
+          .join('\n'),
+        args.oracleSpec.suspect_path_assertions
+      );
   const criteria: DeterministicReproOracleCriteria = {
     baseline_head_fails,
     reliable_failures,
@@ -210,6 +260,7 @@ export async function runDeterministicReproOracle(
       suspectPathAssertionResult,
       preconditionAssertionResult,
       astReason: ast.ok ? null : ast.reason,
+      sandboxResult,
       credentialsTerminal: null,
     };
   }
@@ -222,6 +273,7 @@ export async function runDeterministicReproOracle(
     suspectPathAssertionResult,
     preconditionAssertionResult,
     astReason: ast.ok ? null : ast.reason,
+    sandboxResult,
     credentialsTerminal: null,
   };
 }
@@ -277,4 +329,59 @@ function detectCredentialsFromRuns(
     };
   }
   return null;
+}
+
+function readSandboxResult(sandbox: SandboxHandle): SandboxSessionResult | null {
+  return sandbox.getSandboxResult ? sandbox.getSandboxResult() : null;
+}
+
+function isSandboxNonRunnable(result: SandboxSessionResult): boolean {
+  return result.reproStatus === 'not_executed' || result.reproStatus === 'errored';
+}
+
+function buildSandboxFailedOracleResult(args: {
+  sandboxResult: SandboxSessionResult;
+  preconditionAssertionResult: OraclePreconditionAssertionResult;
+  ast: { ok: true } | { ok: false; reason: string };
+  executor?: DeterministicExecutorResult;
+  fallbackMessage?: string;
+}): DeterministicReproOracleResult {
+  const detail =
+    args.sandboxResult.phaseFailures.length > 0
+      ? args.sandboxResult.phaseFailures
+          .map((failure) => `${failure.phase}:${failure.reason}`)
+          .join(', ')
+      : args.sandboxResult.failureOutput || args.fallbackMessage || 'sandbox execution failed';
+  return {
+    verdict: 'sandbox_failed',
+    criteria: {
+      baseline_head_fails: false,
+      reliable_failures: false,
+      suspect_path_assertions: false,
+      precondition_assertions: args.preconditionAssertionResult.passed,
+      ast_preflight: args.ast.ok,
+    },
+    message: `Sandbox execution failed before runnable repro evidence: ${detail}`,
+    executor:
+      args.executor ??
+      {
+        outcome: 'preflight_failed',
+        candidateTestPath: '',
+        sentinelString: '',
+        expectedFailureSignature: null,
+        ranReproCount: 0,
+        lastReproExitCode: null,
+        runs: [],
+        reproducedReliably: false,
+        signatureMatched: false,
+        missingCredentials: [],
+        installFailures: [],
+        reason: detail,
+      },
+    suspectPathAssertionResult: { passed: false, missing: [] },
+    preconditionAssertionResult: args.preconditionAssertionResult,
+    astReason: args.ast.ok ? null : args.ast.reason,
+    sandboxResult: args.sandboxResult,
+    credentialsTerminal: null,
+  };
 }

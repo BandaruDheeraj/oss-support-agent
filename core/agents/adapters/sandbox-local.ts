@@ -15,6 +15,7 @@ import { ensurePythonVenv } from '../../../bin/clients/local-sandbox';
 import type { SandboxHandle, SandboxRun } from '../tools/handles';
 import { resolveSkippablePipInstall } from './pip-spec';
 import { buildPythonModuleCheckSnippet } from './python-module-check';
+import type { InstallSpec, PackageVersion, SandboxPhaseResult } from '../../sandbox-session';
 
 /**
  * Build a `pip install <args>` command from a free-form spec.
@@ -109,7 +110,7 @@ export function createLocalSandboxAdapter(
     setReproTestPath(p: string) {
       opts.reproTestPath = p;
     },
-    async runRepro() {
+    async runRepro(_options?: { suspectPathNeedles?: string[] }) {
       const reproPath = opts.reproTestPath;
       if (!reproPath) {
         return {
@@ -172,7 +173,95 @@ export function createLocalSandboxAdapter(
         return [];
       }
     },
+    async setupDependencies(spec: InstallSpec): Promise<SandboxPhaseResult> {
+      const steps = [
+        {
+          step: 1,
+          run: () => handle.pipInstall(`-e ${spec.semanticConventionsPath}`),
+        },
+        {
+          step: 2,
+          run: () => handle.pipInstall(`-e ${spec.instrumentationCorePath}`),
+        },
+        {
+          step: 3,
+          run: () => handle.pipInstall(`-e ${spec.instrumentationPackagePath}`),
+        },
+        {
+          step: 4,
+          run: () =>
+            spec.thirdPartyDeps.length > 0
+              ? handle.pipInstall(spec.thirdPartyDeps.join(' '))
+              : Promise.resolve({ exitCode: 0, stdout: '', stderr: '', durationMs: 0 }),
+        },
+        {
+          step: 5,
+          run: () =>
+            handle.runPython(
+              `from ${spec.importVerification.modulePath} import ${spec.importVerification.className}\nprint("import_ok")`
+            ),
+        },
+      ];
+
+      for (const step of steps) {
+        const run = await step.run();
+        const output = `${run.stdout}\n${run.stderr}`;
+        if (step.step === 5) {
+          if (run.exitCode !== 0 || !output.includes('import_ok')) {
+            return {
+              ok: false,
+              phase: 'setup',
+              reason: 'import_verification_failed',
+              failedStep: 5,
+              stdout: run.stdout,
+              stderr: run.stderr,
+            };
+          }
+        } else if (run.exitCode !== 0) {
+          return {
+            ok: false,
+            phase: 'setup',
+            reason: 'dependency_setup_failed',
+            failedStep: step.step,
+            stdout: run.stdout,
+            stderr: run.stderr,
+          };
+        }
+      }
+
+      const packageVersions = await handle.listPackages();
+      const versionByName = new Map(
+        packageVersions.map((pkg) => [pkg.name.toLowerCase(), pkg.version])
+      );
+      const orderedReplaySpecs = [
+        `-e ${spec.semanticConventionsPath}`,
+        `-e ${spec.instrumentationCorePath}`,
+        `-e ${spec.instrumentationPackagePath}`,
+        ...spec.thirdPartyDeps,
+      ];
+      const installManifest: PackageVersion[] = orderedReplaySpecs.map((replaySpec) => {
+        const derivedName = deriveInstallName(replaySpec);
+        return {
+          name: derivedName,
+          version: versionByName.get(derivedName.toLowerCase()) ?? 'unknown',
+          replaySpec,
+        };
+      });
+      return { ok: true, phase: 'setup', installManifest };
+    },
+    getSandboxResult() {
+      return null;
+    },
   };
 
   return handle;
+}
+
+function deriveInstallName(spec: string): string {
+  if (spec.startsWith('-e ')) {
+    const editablePath = spec.slice(3).trim();
+    const segments = editablePath.split('/').filter((segment) => segment.length > 0);
+    return segments[segments.length - 1] ?? editablePath;
+  }
+  return spec.trim().split(/\s+/)[0] ?? spec.trim();
 }

@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Observability Gap Run Artifact",
+  "type": "object",
+  "required": [
+    "run_id",
+    "generated_at",
+    "scope",
+    "repo",
+    "findings",
+    "summary"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "scope": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "setup",
+          "evals",
+          "debugging",
+          "monitoring",
+          "sdk"
+        ]
+      }
+    },
+    "repo": {
+      "type": "object",
+      "required": [
+        "name",
+        "branch"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "branch": {
+          "type": "string"
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "gap_id",
+          "owner",
+          "status",
+          "priority",
+          "job",
+          "observed_friction",
+          "competitor_platform",
+          "competitor_mechanism",
+          "why_competitor_easier",
+          "current_behavior_in_oss_support_agent",
+          "proposed_fix",
+          "success_metric",
+          "evidence",
+          "integration_context"
+        ],
+        "properties": {
+          "gap_id": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string",
+            "enum": [
+              "arize-ax",
+              "openinference"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "new",
+              "in-progress",
+              "shipped",
+              "validated",
+              "rejected"
+            ]
+          },
+          "priority": {
+            "type": "string",
+            "enum": [
+              "P0",
+              "P1",
+              "P2"
+            ]
+          },
+          "job": {
+            "type": "string"
+          },
+          "observed_friction": {
+            "type": "string"
+          },
+          "competitor_platform": {
+            "type": "string",
+            "enum": [
+              "braintrust",
+              "langsmith"
+            ]
+          },
+          "competitor_mechanism": {
+            "type": "string"
+          },
+          "why_competitor_easier": {
+            "type": "string"
+          },
+          "current_behavior_in_oss_support_agent": {
+            "type": "string"
+          },
+          "root_cause": {
+            "type": "string"
+          },
+          "proposed_fix": {
+            "type": "string"
+          },
+          "success_metric": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "type",
+                "source"
+              ],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": [
+                    "code",
+                    "doc",
+                    "metric",
+                    "run-output"
+                  ]
+                },
+                "source": {
+                  "type": "string"
+                },
+                "note": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "integration_context": {
+            "type": "object",
+            "required": [
+              "components"
+            ],
+            "properties": {
+              "components": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "workflows": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "new_gaps",
+        "updated_gaps",
+        "validated_gaps"
+      ],
+      "properties": {
+        "new_gaps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated_gaps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "validated_gaps": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

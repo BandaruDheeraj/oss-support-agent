@@ -22,6 +22,7 @@ import { detectCredentialError } from '../../credentials-check';
 import type { IssueCodeSnippet } from './repro-hints';
 import { deriveEditableInstallsFromSuspectPaths, mergeEditableInstallCandidates } from './repro-hints';
 import type { SemanticSuspectSeed } from '../analyst/semantic-search';
+import type { InstallSpec } from '../../sandbox-session';
 
 const DEFAULT_PROBER_SAMPLE_COUNT = 3;
 const DEFAULT_PROBER_TEMPERATURE = 0.7;
@@ -29,50 +30,22 @@ const PROBER_SAMPLE_COUNT_ENV = 'OSA_REPRO_PROBER_SAMPLES';
 const PROBER_TEMPERATURE_ENV = 'OSA_REPRO_PROBER_TEMPERATURE';
 const OPENINFERENCE_REPO_SUFFIX = '/openinference';
 
-type ProberSandboxPreflightStep =
-  | {
-      kind: 'pip_install';
-      label: string;
-      spec: string;
-    }
-  | {
-      kind: 'run_python';
-      label: string;
-      snippet: string;
-    };
-
-const OPENINFERENCE_PROBER_PREFLIGHT_STEPS: readonly ProberSandboxPreflightStep[] = [
-  {
-    kind: 'pip_install',
-    label: 'pip install -e python/openinference-semantic-conventions',
-    spec: '-e python/openinference-semantic-conventions',
+const OPENINFERENCE_PROBER_INSTALL_SPEC: InstallSpec = {
+  semanticConventionsPath: 'python/openinference-semantic-conventions',
+  instrumentationCorePath: 'python/openinference-instrumentation',
+  instrumentationPackagePath: 'python/instrumentation/openinference-instrumentation-smolagents',
+  thirdPartyDeps: ['smolagents'],
+  importVerification: {
+    modulePath: 'openinference.instrumentation.smolagents',
+    className: 'SmolagentsInstrumentor',
   },
-  {
-    kind: 'pip_install',
-    label: 'pip install -e python/openinference-instrumentation',
-    spec: '-e python/openinference-instrumentation',
-  },
-  {
-    kind: 'pip_install',
-    label: 'pip install -e python/instrumentation/openinference-instrumentation-smolagents',
-    spec: '-e python/instrumentation/openinference-instrumentation-smolagents',
-  },
-  {
-    kind: 'pip_install',
-    label: 'pip install smolagents',
-    spec: 'smolagents',
-  },
-  {
-    kind: 'run_python',
-    label: 'python -c "from openinference.instrumentation.smolagents import SmolagentsInstrumentor"',
-    snippet: 'from openinference.instrumentation.smolagents import SmolagentsInstrumentor',
-  },
-] as const;
+};
 
 type CandidateSource = 'builder' | 'prober';
 type CandidateStatus =
   | 'generation_failed'
   | 'setup_failed'
+  | 'sandbox_failed'
   | 'invalid'
   | 'valid'
   | 'credentials_required';
@@ -150,7 +123,13 @@ export interface ReproCandidateEvaluation {
 }
 
 export interface ReproV2Outcome {
-  status: 'reproduced' | 'credentials_required' | 'not_reproduced' | 'api_unavailable';
+  status:
+    | 'reproduced'
+    | 'credentials_required'
+    | 'not_reproduced'
+    | 'not_runnable'
+    | 'sandbox_failed'
+    | 'api_unavailable';
   dossier: DossierStore;
   /** The recipe authored by the selected candidate (when reproduced). */
   recipe?: ReproRecipe;
@@ -213,11 +192,16 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   const candidates: ReproCandidateEvaluation[] = [];
 
   // Stage A: Analyst (skipped if dossier was passed in)
-  if (!args.dossier || !dossier.latest()) {
+  const analystRanThisAttempt = !args.dossier || !dossier.latest();
+  if (analystRanThisAttempt) {
+    const analystWorkspace = createAnalystSemanticScopedWorkspace(
+      args.workspace,
+      args.semanticSuspectSeed ?? null
+    );
     const analyst = await runAnalyst({
       issue: args.issue,
       repo: args.repo,
-      workspace: args.workspace,
+      workspace: analystWorkspace,
       sandbox: args.sandbox,
       attemptId: args.attemptId,
       dossier,
@@ -252,6 +236,22 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   }
 
   const snapshot = dossier.latest()!;
+  const hasSemanticSeedScope =
+    !!args.semanticSuspectSeed &&
+    ((args.semanticSuspectSeed.suspectFiles?.length ?? 0) > 0 ||
+      (args.semanticSuspectSeed.suspectSymbols?.length ?? 0) > 0);
+  const suspectSymbols = snapshot.body.suspectSymbols ?? [];
+  if (analystRanThisAttempt && hasSemanticSeedScope && suspectSymbols.length > 0 && !snapshot.body.candidateRepro) {
+    return {
+      status: 'not_runnable',
+      dossier,
+      candidates,
+      message:
+        `Analyst dossier is missing required candidateRepro for semantic-seeded repro ` +
+        `(suspectSymbols=${suspectSymbols.length}). Halting before Builder/Prober.`,
+    };
+  }
+
   const oracleSpec =
     snapshot.body.oracleSpec ??
     buildReproOracleSpec(snapshot.body.suspectSymbols, snapshot.body.preconditions) ??
@@ -401,6 +401,12 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       continue;
     }
 
+    if (oracle.verdict === 'sandbox_failed') {
+      candidate.status = 'sandbox_failed';
+      candidate.message = oracle.message;
+      continue;
+    }
+
     candidate.status = 'invalid';
     if (candidate.prober) {
       // Keep transcript-based credential detection unchanged.
@@ -485,6 +491,20 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     };
   }
 
+  const allSandboxFailed =
+    candidates.length > 0 &&
+    candidates.every((candidate) => candidate.status === 'sandbox_failed');
+  if (allSandboxFailed) {
+    return {
+      status: 'sandbox_failed',
+      dossier,
+      ...(builder ? { builder } : {}),
+      ...(builderRejectStage ? { builderRejectStage } : {}),
+      candidates,
+      message: buildSandboxFailedMessage(candidates),
+    };
+  }
+
   return {
     status: 'not_reproduced',
     dossier,
@@ -516,28 +536,33 @@ async function runOpenInferenceProberPreflight(args: {
   sandbox: SandboxHandle;
   attemptId: string;
 }): Promise<{ ok: true } | { ok: false; message: string }> {
-  for (const step of OPENINFERENCE_PROBER_PREFLIGHT_STEPS) {
-    try {
-      const run =
-        step.kind === 'pip_install'
-          ? await args.sandbox.pipInstall(step.spec)
-          : await args.sandbox.runPython(step.snippet);
-      if (run.exitCode !== 0) {
-        const tail = collapseWhitespace(run.stderr || run.stdout).slice(-600);
-        const message =
-          `sandbox_setup_failed: ${step.label} failed (exitCode=${run.exitCode}).` +
-          (tail ? ` Output tail: ${tail}` : '');
-        // eslint-disable-next-line no-console
-        console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
-        return { ok: false, message };
-      }
-    } catch (err) {
-      const detail = collapseWhitespace(err instanceof Error ? err.message : String(err));
-      const message = `sandbox_setup_failed: ${step.label} threw: ${detail}`;
+  if (!args.sandbox.setupDependencies) {
+    const message =
+      'sandbox_setup_failed: sandbox adapter does not implement setupDependencies required for openinference preflight.';
+    // eslint-disable-next-line no-console
+    console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
+    return { ok: false, message };
+  }
+
+  try {
+    const setup = await args.sandbox.setupDependencies(OPENINFERENCE_PROBER_INSTALL_SPEC);
+    if (!setup.ok) {
+      const tail = collapseWhitespace(setup.stderr || setup.stdout || '').slice(-600);
+      const message =
+        `sandbox_setup_failed: openinference setup phase=${setup.phase} reason=${setup.reason}` +
+        (setup.failedStep ? ` failedStep=${setup.failedStep}` : '') +
+        (tail ? ` output_tail=${tail}` : '') +
+        (setup.diagnostics ? ` diagnostics=${JSON.stringify(setup.diagnostics)}` : '');
       // eslint-disable-next-line no-console
       console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
       return { ok: false, message };
     }
+  } catch (err) {
+    const detail = collapseWhitespace(err instanceof Error ? err.message : String(err));
+    const message = `sandbox_setup_failed: openinference setup threw: ${detail}`;
+    // eslint-disable-next-line no-console
+    console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
+    return { ok: false, message };
   }
   return { ok: true };
 }
@@ -748,6 +773,105 @@ function appendRecipeSnapshot(args: {
   });
 }
 
+function createAnalystSemanticScopedWorkspace(
+  workspace: WorkspaceReader & WorkspaceWriter,
+  semanticSuspectSeed: SemanticSuspectSeed | null
+): WorkspaceReader & WorkspaceWriter {
+  const allowedFiles = dedupeNormalizedPaths(semanticSuspectSeed?.suspectFiles ?? []);
+  if (allowedFiles.length === 0) return workspace;
+
+  const allowedFileSet = new Set(allowedFiles);
+  return {
+    ...workspace,
+    async readFile(path: string): Promise<string | null> {
+      const normalized = normalizeRepoPath(path);
+      if (!allowedFileSet.has(normalized)) return null;
+      return workspace.readFile(path);
+    },
+    async listDir(path: string): Promise<{ name: string; isDir: boolean }[]> {
+      const normalizedDir = normalizeRepoPath(path);
+      if (
+        normalizedDir !== '.' &&
+        !allowedFiles.some((filePath) => isPathWithinDirectory(filePath, normalizedDir))
+      ) {
+        return [];
+      }
+      const entries = await workspace.listDir(path);
+      return entries.filter((entry) => {
+        const entryPath = normalizeRepoPath(
+          normalizedDir === '.' ? entry.name : `${normalizedDir}/${entry.name}`
+        );
+        if (entry.isDir) {
+          return allowedFiles.some((filePath) => isPathWithinDirectory(filePath, entryPath));
+        }
+        return allowedFileSet.has(entryPath);
+      });
+    },
+    async grep(
+      pattern: string,
+      paths: string[] | undefined,
+      flags: { caseInsensitive?: boolean }
+    ): Promise<ReturnType<WorkspaceReader['grep']> extends Promise<infer T> ? T : never> {
+      const scopedPaths = clampPathsToAllowedFiles(paths, allowedFiles);
+      return workspace.grep(pattern, scopedPaths, flags);
+    },
+    async gitLog(
+      path: string | undefined,
+      n: number
+    ): Promise<ReturnType<WorkspaceReader['gitLog']> extends Promise<infer T> ? T : never> {
+      if (!path) {
+        return workspace.gitLog(allowedFiles[0], n);
+      }
+      const normalized = normalizeRepoPath(path);
+      if (!allowedFileSet.has(normalized)) return [];
+      return workspace.gitLog(path, n);
+    },
+    async gitBlame(
+      path: string,
+      lineStart?: number,
+      lineEnd?: number
+    ): Promise<ReturnType<WorkspaceReader['gitBlame']> extends Promise<infer T> ? T : never> {
+      const normalized = normalizeRepoPath(path);
+      if (!allowedFileSet.has(normalized)) return [];
+      return workspace.gitBlame(path, lineStart, lineEnd);
+    },
+  };
+}
+
+function normalizeRepoPath(path: string): string {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').trim();
+  return normalized.length > 0 ? normalized : '.';
+}
+
+function dedupeNormalizedPaths(paths: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of paths) {
+    const normalized = normalizeRepoPath(raw);
+    if (normalized === '.' || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function isPathWithinDirectory(filePath: string, directoryPath: string): boolean {
+  const normalizedDir = normalizeRepoPath(directoryPath);
+  if (normalizedDir === '.') return true;
+  const normalizedFile = normalizeRepoPath(filePath);
+  return normalizedFile === normalizedDir || normalizedFile.startsWith(`${normalizedDir}/`);
+}
+
+function clampPathsToAllowedFiles(paths: string[] | undefined, allowedFiles: string[]): string[] {
+  if (!paths || paths.length === 0) return allowedFiles;
+  const requested = dedupeNormalizedPaths(paths);
+  if (requested.length === 0) return allowedFiles;
+  const scoped = requested.filter((candidatePath) =>
+    allowedFiles.some((filePath) => isPathWithinDirectory(filePath, candidatePath))
+  );
+  return scoped.length > 0 ? scoped : allowedFiles;
+}
+
 function createAsyncLock(): AsyncLock {
   let queue = Promise.resolve();
   return async function withLock<T>(task: () => Promise<T>): Promise<T> {
@@ -775,6 +899,7 @@ function createSerializedSandboxView(base: SandboxHandle, lock: AsyncLock): Sand
     runTests: (command) => lock(() => base.runTests(command)),
     pythonModuleCheck: (name) => lock(() => base.pythonModuleCheck(name)),
     listPackages: () => lock(() => base.listPackages()),
+    getSandboxResult: () => base.getSandboxResult?.() ?? null,
     setReproTestPath: (path) => {
       reproTestPath = path;
     },
@@ -863,6 +988,16 @@ function buildNoReproMessage(candidates: ReproCandidateEvaluation[]): string {
     );
   }
   return `Deterministic repro oracle rejected all ${candidates.length} candidates.`;
+}
+
+function buildSandboxFailedMessage(candidates: ReproCandidateEvaluation[]): string {
+  const details = candidates
+    .map((candidate) => `${candidate.candidateId}=${candidate.message}`)
+    .join(' | ');
+  return (
+    `sandbox_failed: all ${candidates.length} candidate(s) failed sandbox lifecycle before runnable repro evidence.` +
+    (details ? ` Details: ${details}` : '')
+  );
 }
 
 /**

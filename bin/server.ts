@@ -25,7 +25,13 @@ import 'dotenv/config';
 import { verifySignature } from '../core/webhook/signature';
 import type { IssueEvent } from '../core/webhook/types';
 import { loadAdapter } from '../core/adapter-loader';
-import { assertObservabilityConfigured, getTracer } from '../core/observability';
+import {
+  assertObservabilityConfigured,
+  getObservabilityAdapterContracts,
+  getObservabilityDiagnostics,
+  getTracer,
+  runObservabilityStartupSmoke,
+} from '../core/observability';
 
 import { FsManifestRegistry } from './clients/manifest-registry';
 import { runPipeline, defaultWorkspaceRoot } from './run-pipeline';
@@ -214,25 +220,48 @@ async function processIssueEvent(
   };
 }
 
-function startServer(): void {
+async function startServer(): Promise<void> {
   const env = loadEnv();
+  const baseLog = (msg: string) => {
+    const ts = new Date().toISOString();
+    // eslint-disable-next-line no-console
+    console.log(`${ts} [server] ${msg}`);
+  };
+
+  const contracts = getObservabilityAdapterContracts();
+  for (const contract of contracts) {
+    baseLog(
+      `[observability] adapter=${contract.adapter} requested=${contract.requested} ` +
+        `missing_env=${contract.missing_env.length > 0 ? contract.missing_env.join(',') : 'none'}`
+    );
+  }
+
   try {
     assertObservabilityConfigured();
     // Prime the tracer once at startup so configuration problems surface before
     // we accept webhook traffic.
     getTracer();
+    const smoke = await runObservabilityStartupSmoke();
+    const diagnostics = getObservabilityDiagnostics();
+    for (const adapter of diagnostics) {
+      baseLog(
+        `[observability] adapter=${adapter.adapter} enabled=${adapter.enabled} ` +
+          `connected=${adapter.connected === null ? 'unknown' : adapter.connected} ` +
+          `sent=${adapter.delivery.sent} failed=${adapter.delivery.failed} dropped=${adapter.delivery.dropped}`
+      );
+    }
+    for (const check of smoke) {
+      baseLog(
+        `[observability] telemetry_smoke adapter=${check.adapter} ` +
+          `${check.ok ? 'connected' : 'failed'} (${check.detail})`
+      );
+    }
   } catch (err: any) {
     // eslint-disable-next-line no-console
     console.error(`[fatal] ${err?.message ?? err}`);
     process.exit(1);
   }
   const registry = new FsManifestRegistry(env.REPO_ROOT);
-
-  const baseLog = (msg: string) => {
-    const ts = new Date().toISOString();
-    // eslint-disable-next-line no-console
-    console.log(`${ts} [server] ${msg}`);
-  };
 
   const live = buildLiveDeps(process.env, {
     token: env.GITHUB_TOKEN,
@@ -248,7 +277,16 @@ function startServer(): void {
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/healthz') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', live: !!live }));
+      res.end(
+        JSON.stringify({
+          status: 'ok',
+          live: !!live,
+          observability: {
+            backend: process.env.OBSERVABILITY_BACKEND ?? 'none',
+            adapters: getObservabilityDiagnostics(),
+          },
+        })
+      );
       return;
     }
 
@@ -345,7 +383,11 @@ function startServer(): void {
 }
 
 if (require.main === module) {
-  startServer();
+  void startServer().catch((err: any) => {
+    // eslint-disable-next-line no-console
+    console.error(`[fatal] ${err?.message ?? err}`);
+    process.exit(1);
+  });
 }
 
 export { startServer, processIssueEvent };

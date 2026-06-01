@@ -25,6 +25,7 @@ import {
 } from './regression-guard';
 
 import { ActionsClient, WorkflowRun, WorkflowRunStatus, WorkflowRunLogs } from '../sandbox-types';
+import type { SandboxSession } from '../sandbox-session';
 
 // --- Helpers ---
 
@@ -87,6 +88,31 @@ function makeMockClient(overrides?: Partial<ActionsClient>): ActionsClient {
     uploadArtifact: jest.fn().mockResolvedValue('artifact-url'),
     ...overrides,
   };
+}
+
+function makeMockSandboxSession(overrides: Partial<SandboxSession> = {}): SandboxSession {
+  let callCount = 0;
+  const base = {
+    verifyWorkflowReachability: jest.fn().mockResolvedValue({
+      ok: true,
+      phase: 'workflow',
+    }),
+    dispatchWorkflow: jest.fn().mockImplementation(() => {
+      callCount += 1;
+      return Promise.resolve({
+        ok: true,
+        runId: 100 + callCount,
+        runUrl: `https://github.com/support/oss-support-agent/actions/runs/${100 + callCount}`,
+        conclusion: 'success',
+        stepOutcomes: [],
+        stdout: 'Tests passed: 42',
+        stderr: '',
+        rawLogs: 'Tests passed: 42',
+        exitCode: 0,
+      });
+    }),
+  };
+  return Object.assign(base, overrides) as unknown as SandboxSession;
 }
 
 // --- Tests ---
@@ -440,74 +466,107 @@ describe('Regression Guard (US-016)', () => {
   describe('runRegressionGuard - integration', () => {
     it('validates config before running', async () => {
       const client = makeMockClient();
+      const session = makeMockSandboxSession();
       await expect(
-        runRegressionGuard(makeConfig({ forkFullName: '' }), client, 1)
+        runRegressionGuard(makeConfig({ forkFullName: '' }), client, 1, session)
       ).rejects.toThrow(RegressionGuardError);
-      expect(client.triggerWorkflowDispatch).not.toHaveBeenCalled();
+      expect(session.dispatchWorkflow).not.toHaveBeenCalled();
     });
 
     it('triggers workflow dispatch for both branches in parallel', async () => {
       const client = makeMockClient();
-      await runRegressionGuard(makeConfig(), client, 1);
-      expect(client.triggerWorkflowDispatch).toHaveBeenCalledTimes(2);
+      const session = makeMockSandboxSession();
+      await runRegressionGuard(makeConfig(), client, 1, session);
+      expect(session.dispatchWorkflow).toHaveBeenCalledTimes(2);
 
-      const calls = (client.triggerWorkflowDispatch as jest.Mock).mock.calls;
-      const branches = calls.map((c: any[]) => c[2]);
+      const calls = (session.dispatchWorkflow as jest.Mock).mock.calls;
+      const branches = calls.map((c: any[]) => c[0].inputs.branch);
       expect(branches).toContain('agent/scope-42');
       expect(branches).toContain('main');
     });
 
     it('uses REGRESSION_WORKFLOW_FILE for dispatch', async () => {
       const client = makeMockClient();
-      await runRegressionGuard(makeConfig(), client, 1);
-      const calls = (client.triggerWorkflowDispatch as jest.Mock).mock.calls;
-      expect(calls[0][1]).toBe(REGRESSION_WORKFLOW_FILE);
-      expect(calls[1][1]).toBe(REGRESSION_WORKFLOW_FILE);
+      const session = makeMockSandboxSession();
+      await runRegressionGuard(makeConfig(), client, 1, session);
+      const calls = (session.dispatchWorkflow as jest.Mock).mock.calls;
+      expect(calls[0][0].workflowId).toBe(REGRESSION_WORKFLOW_FILE);
+      expect(calls[1][0].workflowId).toBe(REGRESSION_WORKFLOW_FILE);
     });
 
     it('returns no regression when outputs match', async () => {
       const client = makeMockClient();
-      const result = await runRegressionGuard(makeConfig(), client, 1);
+      const session = makeMockSandboxSession();
+      const result = await runRegressionGuard(makeConfig(), client, 1, session);
       expect(result.regressionDetected).toBe(false);
       expect(result.diffs).toHaveLength(0);
     });
 
     it('detects regression when fork has different exit code', async () => {
+      const client = makeMockClient();
       let callCount = 0;
-      const client = makeMockClient({
-        getWorkflowRunLogs: jest.fn().mockImplementation(() => {
-          callCount++;
-          // First call is for fork (exit 1), second for upstream (exit 0)
+      const session = makeMockSandboxSession({
+        dispatchWorkflow: jest.fn().mockImplementation(() => {
+          callCount += 1;
           if (callCount === 1) {
-            return Promise.resolve({ stdout: 'FAIL', stderr: 'error', exitCode: 1 });
+            return Promise.resolve({
+              ok: true,
+              runId: 101,
+              runUrl: 'https://github.com/support/oss-support-agent/actions/runs/101',
+              conclusion: 'failure',
+              stepOutcomes: [],
+              stdout: 'FAIL',
+              stderr: 'error',
+              rawLogs: 'FAIL\nerror',
+              exitCode: 1,
+            });
           }
-          return Promise.resolve({ stdout: 'PASS', stderr: '', exitCode: 0 });
+          return Promise.resolve({
+            ok: true,
+            runId: 102,
+            runUrl: 'https://github.com/support/oss-support-agent/actions/runs/102',
+            conclusion: 'success',
+            stepOutcomes: [],
+            stdout: 'PASS',
+            stderr: '',
+            rawLogs: 'PASS',
+            exitCode: 0,
+          });
         }),
       });
-      const result = await runRegressionGuard(makeConfig(), client, 1);
+      const result = await runRegressionGuard(makeConfig(), client, 1, session);
       expect(result.regressionDetected).toBe(true);
       expect(result.diffs.find((d) => d.category === 'exit_code')).toBeDefined();
     });
 
     it('detects regression when stdout differs', async () => {
+      const client = makeMockClient();
       let callCount = 0;
-      const client = makeMockClient({
-        getWorkflowRunLogs: jest.fn().mockImplementation(() => {
-          callCount++;
-          if (callCount === 1) {
-            return Promise.resolve({ stdout: 'Tests: 43 passed', stderr: '', exitCode: 0 });
-          }
-          return Promise.resolve({ stdout: 'Tests: 42 passed', stderr: '', exitCode: 0 });
+      const session = makeMockSandboxSession({
+        dispatchWorkflow: jest.fn().mockImplementation(() => {
+          callCount += 1;
+          return Promise.resolve({
+            ok: true,
+            runId: 100 + callCount,
+            runUrl: `https://github.com/support/oss-support-agent/actions/runs/${100 + callCount}`,
+            conclusion: 'success',
+            stepOutcomes: [],
+            stdout: callCount === 1 ? 'Tests: 43 passed' : 'Tests: 42 passed',
+            stderr: '',
+            rawLogs: callCount === 1 ? 'Tests: 43 passed' : 'Tests: 42 passed',
+            exitCode: 0,
+          });
         }),
       });
-      const result = await runRegressionGuard(makeConfig(), client, 1);
+      const result = await runRegressionGuard(makeConfig(), client, 1, session);
       expect(result.regressionDetected).toBe(true);
       expect(result.diffs.find((d) => d.category === 'stdout')).toBeDefined();
     });
 
     it('includes both branch results in output', async () => {
       const client = makeMockClient();
-      const result = await runRegressionGuard(makeConfig(), client, 1);
+      const session = makeMockSandboxSession();
+      const result = await runRegressionGuard(makeConfig(), client, 1, session);
       expect(result.forkResult).toBeDefined();
       expect(result.forkResult.branch).toBe('agent/scope-42');
       expect(result.upstreamResult).toBeDefined();
@@ -516,111 +575,149 @@ describe('Regression Guard (US-016)', () => {
 
     it('includes summary in result', async () => {
       const client = makeMockClient();
-      const result = await runRegressionGuard(makeConfig(), client, 1);
+      const session = makeMockSandboxSession();
+      const result = await runRegressionGuard(makeConfig(), client, 1, session);
       expect(result.summary).toContain('No Regressions Detected');
     });
 
     it('handles timeout on fork branch', async () => {
+      const client = makeMockClient();
       let callCount = 0;
-      const client = makeMockClient({
-        waitForWorkflowRun: jest.fn().mockImplementation(() => {
-          callCount++;
+      const session = makeMockSandboxSession({
+        dispatchWorkflow: jest.fn().mockImplementation(() => {
+          callCount += 1;
           if (callCount === 1) {
-            return Promise.resolve({ completed: false, conclusion: null, timedOut: true });
+            return Promise.resolve({
+              ok: false,
+              reason: 'dispatch_failed',
+              diagnostics: { error: 'workflow timed out after 15 minute(s)' },
+            });
           }
-          return Promise.resolve({ completed: true, conclusion: 'success', timedOut: false });
+          return Promise.resolve({
+            ok: true,
+            runId: 102,
+            runUrl: 'https://github.com/support/oss-support-agent/actions/runs/102',
+            conclusion: 'success',
+            stepOutcomes: [],
+            stdout: 'PASS',
+            stderr: '',
+            rawLogs: 'PASS',
+            exitCode: 0,
+          });
         }),
       });
-      const result = await runRegressionGuard(makeConfig(), client, 1);
+      const result = await runRegressionGuard(makeConfig(), client, 1, session);
       expect(result.regressionDetected).toBe(true);
       expect(result.diffs.find((d) => d.category === 'timeout')).toBeDefined();
     });
 
     it('throws RegressionGuardError on dispatch failure', async () => {
-      const client = makeMockClient({
-        triggerWorkflowDispatch: jest.fn().mockRejectedValue(new Error('dispatch failed')),
+      const client = makeMockClient();
+      const session = makeMockSandboxSession({
+        dispatchWorkflow: jest.fn().mockResolvedValue({
+          ok: false,
+          reason: 'dispatch_failed',
+          diagnostics: { error: 'dispatch failed' },
+        }),
       });
       await expect(
-        runRegressionGuard(makeConfig(), client, 1)
+        runRegressionGuard(makeConfig(), client, 1, session)
       ).rejects.toThrow(RegressionGuardError);
     });
 
-    it('throws RegressionGuardError when workflow run does not appear', async () => {
-      const client = makeMockClient({
-        getWorkflowRun: jest.fn().mockResolvedValue(null),
+    it('throws RegressionGuardError when workflow is unreachable', async () => {
+      const client = makeMockClient();
+      const session = makeMockSandboxSession({
+        verifyWorkflowReachability: jest.fn().mockResolvedValue({
+          ok: false,
+          phase: 'workflow',
+          reason: 'workflow_unreachable',
+          diagnostics: { httpStatus: 404 },
+        }),
       });
       await expect(
-        runRegressionGuard(makeConfig(), client, 1)
-      ).rejects.toThrow(/did not appear/);
-    });
-
-    it('throws RegressionGuardError on log retrieval failure', async () => {
-      const client = makeMockClient({
-        getWorkflowRunLogs: jest.fn().mockRejectedValue(new Error('logs unavailable')),
-      });
-      await expect(
-        runRegressionGuard(makeConfig(), client, 1)
-      ).rejects.toThrow(RegressionGuardError);
+        runRegressionGuard(makeConfig(), client, 1, session)
+      ).rejects.toThrow(/reachability failed/);
     });
 
     it('includes branch name in error', async () => {
-      const client = makeMockClient({
-        triggerWorkflowDispatch: jest.fn().mockRejectedValue(new Error('fail')),
+      const client = makeMockClient();
+      const session = makeMockSandboxSession({
+        dispatchWorkflow: jest.fn().mockResolvedValue({
+          ok: false,
+          reason: 'dispatch_failed',
+          diagnostics: { error: 'fail' },
+        }),
       });
       try {
-        await runRegressionGuard(makeConfig(), client, 1);
+        await runRegressionGuard(makeConfig(), client, 1, session);
       } catch (err) {
         expect((err as RegressionGuardError).branch).toBeDefined();
         expect((err as RegressionGuardError).phase).toBe('trigger');
       }
     });
 
-    it('runs tests on the correct fork repo', async () => {
-      const client = makeMockClient();
-      await runRegressionGuard(makeConfig({ forkFullName: 'test-org/test-repo' }), client, 1);
-      const calls = (client.triggerWorkflowDispatch as jest.Mock).mock.calls;
-      expect(calls[0][0]).toBe('test-org/test-repo');
-      expect(calls[1][0]).toBe('test-org/test-repo');
-    });
-
     it('passes correct test_command in workflow inputs', async () => {
       const client = makeMockClient();
-      await runRegressionGuard(makeConfig({ testCommand: 'pytest -v' }), client, 1);
-      const calls = (client.triggerWorkflowDispatch as jest.Mock).mock.calls;
-      expect(calls[0][3].test_command).toBe('pytest -v');
-      expect(calls[1][3].test_command).toBe('pytest -v');
+      const session = makeMockSandboxSession();
+      await runRegressionGuard(makeConfig({ testCommand: 'pytest -v' }), client, 1, session);
+      const calls = (session.dispatchWorkflow as jest.Mock).mock.calls;
+      expect(calls[0][0].inputs.test_command).toBe('pytest -v');
+      expect(calls[1][0].inputs.test_command).toBe('pytest -v');
     });
 
     it('uses configurable timeout', async () => {
       const client = makeMockClient();
-      await runRegressionGuard(makeConfig({ timeoutMinutes: 30 }), client, 1);
-      const calls = (client.waitForWorkflowRun as jest.Mock).mock.calls;
-      // timeout should be 30 * 60 * 1000 = 1800000ms
-      expect(calls[0][2]).toBe(1800000);
-      expect(calls[1][2]).toBe(1800000);
+      const session = makeMockSandboxSession();
+      await runRegressionGuard(makeConfig({ timeoutMinutes: 30 }), client, 1, session);
+      const calls = (session.dispatchWorkflow as jest.Mock).mock.calls;
+      expect(calls[0][0].timeoutMins).toBe(30);
+      expect(calls[1][0].timeoutMins).toBe(30);
     });
 
     it('each branch run is fully isolated (fresh checkout)', async () => {
       const client = makeMockClient();
-      await runRegressionGuard(makeConfig(), client, 1);
-      const triggerCalls = (client.triggerWorkflowDispatch as jest.Mock).mock.calls;
+      const session = makeMockSandboxSession();
+      await runRegressionGuard(makeConfig(), client, 1, session);
+      const triggerCalls = (session.dispatchWorkflow as jest.Mock).mock.calls;
       // Each run specifies its own branch
-      expect(triggerCalls[0][3].branch).toBe('agent/scope-42');
-      expect(triggerCalls[1][3].branch).toBe('main');
+      expect(triggerCalls[0][0].inputs.branch).toBe('agent/scope-42');
+      expect(triggerCalls[1][0].inputs.branch).toBe('main');
     });
 
     it('regression details suitable for PR body and per-issue verdicts', async () => {
+      const client = makeMockClient();
       let callCount = 0;
-      const client = makeMockClient({
-        getWorkflowRunLogs: jest.fn().mockImplementation(() => {
-          callCount++;
+      const session = makeMockSandboxSession({
+        dispatchWorkflow: jest.fn().mockImplementation(() => {
+          callCount += 1;
           if (callCount === 1) {
-            return Promise.resolve({ stdout: 'FAIL: test_regression', stderr: 'AssertionError', exitCode: 1 });
+            return Promise.resolve({
+              ok: true,
+              runId: 101,
+              runUrl: 'https://github.com/support/oss-support-agent/actions/runs/101',
+              conclusion: 'failure',
+              stepOutcomes: [],
+              stdout: 'FAIL: test_regression',
+              stderr: 'AssertionError',
+              rawLogs: 'FAIL: test_regression\nAssertionError',
+              exitCode: 1,
+            });
           }
-          return Promise.resolve({ stdout: 'PASS: all tests', stderr: '', exitCode: 0 });
+          return Promise.resolve({
+            ok: true,
+            runId: 102,
+            runUrl: 'https://github.com/support/oss-support-agent/actions/runs/102',
+            conclusion: 'success',
+            stepOutcomes: [],
+            stdout: 'PASS: all tests',
+            stderr: '',
+            rawLogs: 'PASS: all tests',
+            exitCode: 0,
+          });
         }),
       });
-      const result = await runRegressionGuard(makeConfig(), client, 1);
+      const result = await runRegressionGuard(makeConfig(), client, 1, session);
       expect(result.regressionDetected).toBe(true);
       // Summary is suitable for PR body
       expect(result.summary).toContain('Behavioural Changes Detected');
@@ -631,6 +728,13 @@ describe('Regression Guard (US-016)', () => {
         expect(diff.upstream).toBeDefined();
         expect(diff.fork).toBeDefined();
       }
+    });
+
+    it('throws when sandbox session is omitted', async () => {
+      const client = makeMockClient();
+      await expect(runRegressionGuard(makeConfig(), client, 1)).rejects.toThrow(
+        /SandboxSession is required/
+      );
     });
   });
 

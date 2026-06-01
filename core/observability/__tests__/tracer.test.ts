@@ -72,9 +72,9 @@ describe('tracer factory', () => {
     process.env.OBSERVABILITY_BACKEND = 'all';
     expect(getObservabilityConfigErrors()).toEqual(
       expect.arrayContaining([
-        'LANGSMITH_API_KEY (or LANGCHAIN_API_KEY)',
-        'ARIZE_ENDPOINT (or PHOENIX_OTLP_ENDPOINT)',
-        'BRAINTRUST_API_KEY',
+        'langsmith: LANGSMITH_API_KEY (or LANGCHAIN_API_KEY)',
+        'arize: ARIZE_ENDPOINT (or PHOENIX_OTLP_ENDPOINT)',
+        'braintrust: BRAINTRUST_API_KEY',
       ])
     );
   });

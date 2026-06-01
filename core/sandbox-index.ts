@@ -17,9 +17,11 @@ export {
 } from './sandbox-types';
 
 export {
-  validateSandboxConfig,
-  buildWorkflowInputs,
-  createSandboxConfig,
-  buildSandboxArtifact,
-  runSandbox,
-} from './sandbox';
+  SandboxSession,
+  SandboxConfigError,
+  type SandboxResult as SandboxSessionResult,
+  type SandboxPhaseResult,
+  type SandboxPhaseFailure,
+  type InstallSpec,
+  type PackageVersion,
+} from './sandbox-session';

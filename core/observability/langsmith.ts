@@ -12,6 +12,11 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { Span, StartSpanOpts, Tracer } from './tracer';
+import {
+  deliverWithRetryAndSpool,
+  markAdapterEnabled,
+  recordAdapterDropped,
+} from './adapter-health';
 import { redactIo } from './io-redact';
 
 type LangSmithClient = {
@@ -74,6 +79,10 @@ export class LangSmithTracer implements Tracer {
   private client: LangSmithClient | null = null;
   private readonly project: string;
   private readonly pending = new Set<Promise<unknown>>();
+  private readonly maxPending = (() => {
+    const parsed = Number.parseInt(process.env.OBSERVABILITY_MAX_PENDING ?? '2000', 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 2000;
+  })();
   private initError: Error | null = null;
 
   constructor() {
@@ -92,8 +101,10 @@ export class LangSmithTracer implements Tracer {
         apiKey,
         apiUrl: process.env.LANGSMITH_ENDPOINT || process.env.LANGCHAIN_ENDPOINT,
       });
+      markAdapterEnabled('langsmith', true);
     } catch (err) {
       this.initError = err instanceof Error ? err : new Error(String(err));
+      markAdapterEnabled('langsmith', false, this.initError.message);
       // Defer warning to first startSpan so importing the module is side-effect free.
     }
   }
@@ -101,6 +112,7 @@ export class LangSmithTracer implements Tracer {
   startSpan(name: string, opts: StartSpanOpts = {}): Span {
     if (!this.client) {
       this.warnInitFailureOnce();
+      recordAdapterDropped('langsmith', this.initError ?? 'langsmith not initialized');
       return new NoopLangSmithSpan();
     }
 
@@ -122,22 +134,28 @@ export class LangSmithTracer implements Tracer {
     const project = this.project;
     const tracer = this;
 
-    const created = client
-      .createRun({
+    const created = deliverWithRetryAndSpool({
+      adapter: 'langsmith',
+      operation: 'createRun',
+      payload: {
         id: state.id,
         name,
         run_type: state.runType,
-        start_time: state.startTimeMs,
-        inputs: state.inputs,
-        extra: { metadata: state.attrs },
         parent_run_id: state.parentId ?? undefined,
         project_name: project,
-      })
-      .catch((err) => {
-        // Never let telemetry failures escape.
-        // eslint-disable-next-line no-console
-        console.warn(`[observability:langsmith] createRun failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
+      },
+      run: () =>
+        client.createRun({
+          id: state.id,
+          name,
+          run_type: state.runType,
+          start_time: state.startTimeMs,
+          inputs: state.inputs,
+          extra: { metadata: state.attrs },
+          parent_run_id: state.parentId ?? undefined,
+          project_name: project,
+        }),
+    });
     this.track(created);
 
     const span: Span & { [kSymbol]: LangSmithSpanState } = {
@@ -164,37 +182,43 @@ export class LangSmithTracer implements Tracer {
         };
         if (state.error) patch.error = state.error;
         if (state.inputs && Object.keys(state.inputs).length > 0) patch.inputs = state.inputs;
-        const upd = client
-          .updateRun(state.id, patch)
-          .catch((err) => {
-            // eslint-disable-next-line no-console
-            console.warn(`[observability:langsmith] updateRun failed: ${err instanceof Error ? err.message : String(err)}`);
-          });
+        const upd = deliverWithRetryAndSpool({
+          adapter: 'langsmith',
+          operation: 'updateRun',
+          payload: {
+            id: state.id,
+            hasError: Boolean(state.error),
+            hasOutputs: Boolean(state.outputs),
+          },
+          run: () => client.updateRun(state.id, patch),
+        });
         tracer.track(upd);
 
         const evaluation = extractEvaluation(state.attrs);
         if (evaluation && client.createFeedback) {
-          const feedback = client
-            .createFeedback(state.id, evaluation.key, {
+          const feedback = deliverWithRetryAndSpool({
+            adapter: 'langsmith',
+            operation: 'createFeedback',
+            payload: {
+              id: state.id,
+              key: evaluation.key,
               score: evaluation.score,
-              value: evaluation.label,
-              sourceInfo: {
-                stage: state.attrs['evaluation.stage'] ?? null,
-                issue_number: state.attrs['evaluation.issue_number'] ?? null,
-                attempt_id: state.attrs['evaluation.attempt_id'] ?? null,
-                run_id: state.attrs['evaluation.run_id'] ?? null,
-                repo: state.attrs['evaluation.repo'] ?? null,
-                status: state.attrs['evaluation.status'] ?? null,
-              },
-            })
-            .catch((err) => {
-              // eslint-disable-next-line no-console
-              console.warn(
-                `[observability:langsmith] createFeedback failed: ${
-                  err instanceof Error ? err.message : String(err)
-                }`
-              );
-            });
+              label: evaluation.label,
+            },
+            run: () =>
+              client.createFeedback!(state.id, evaluation.key, {
+                score: evaluation.score,
+                value: evaluation.label,
+                sourceInfo: {
+                  stage: state.attrs['evaluation.stage'] ?? null,
+                  issue_number: state.attrs['evaluation.issue_number'] ?? null,
+                  attempt_id: state.attrs['evaluation.attempt_id'] ?? null,
+                  run_id: state.attrs['evaluation.run_id'] ?? null,
+                  repo: state.attrs['evaluation.repo'] ?? null,
+                  status: state.attrs['evaluation.status'] ?? null,
+                },
+              }),
+          });
           tracer.track(feedback);
         }
       },
@@ -206,16 +230,20 @@ export class LangSmithTracer implements Tracer {
     const inFlight = Array.from(this.pending);
     await Promise.allSettled(inFlight);
     if (this.client?.awaitPendingTraceBatches) {
-      try {
-        await this.client.awaitPendingTraceBatches();
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.warn(`[observability:langsmith] flush failed: ${err instanceof Error ? err.message : String(err)}`);
-      }
+      await deliverWithRetryAndSpool({
+        adapter: 'langsmith',
+        operation: 'awaitPendingTraceBatches',
+        payload: { pending: inFlight.length },
+        run: () => this.client!.awaitPendingTraceBatches!(),
+      });
     }
   }
 
   private track(p: Promise<unknown>): void {
+    if (this.pending.size >= this.maxPending) {
+      recordAdapterDropped('langsmith', `pending queue exceeded max=${this.maxPending}`);
+      return;
+    }
     this.pending.add(p);
     p.finally(() => this.pending.delete(p)).catch(() => undefined);
   }

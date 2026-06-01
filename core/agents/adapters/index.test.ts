@@ -30,6 +30,7 @@ describe('sandbox adapter driver resolution', () => {
       sandboxServices: [] as string[],
       timeoutMinutes: 15,
     },
+    sandboxSession: { verifyAndPushBranch: jest.fn() } as any,
   };
   const priorDriver = process.env.OSA_SANDBOX_DRIVER;
 
@@ -66,7 +67,7 @@ describe('sandbox adapter driver resolution', () => {
     expect(selectSandboxDriver()).toBe('gh-actions');
   });
 
-  it('creates the GitHub Actions adapter when driver is gha', async () => {
+  it('creates the GitHub Actions adapter when driver is gha', () => {
     const adapter = createSandboxAdapter({
       driver: 'gha',
       workspace,
@@ -74,16 +75,40 @@ describe('sandbox adapter driver resolution', () => {
     });
 
     expect(createGhActionsSandboxAdapterMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        ...ghActionsOptions,
-        beforeDispatch: expect.any(Function),
-      })
+      expect.objectContaining(ghActionsOptions)
     );
-    const ghArgs = createGhActionsSandboxAdapterMock.mock.calls[0][0];
-    await ghArgs.beforeDispatch?.();
-    expect(workspace.push).toHaveBeenCalledTimes(1);
     expect(createLocalSandboxAdapterMock).not.toHaveBeenCalled();
     expect(adapter).toBe(ghaHandle);
+  });
+
+  it('throws when gh-actions options are missing sandboxSession', () => {
+    const { sandboxSession, ...withoutSession } = ghActionsOptions;
+    expect(() =>
+      createSandboxAdapter({
+        driver: 'gha',
+        workspace,
+        ghActionsOptions: withoutSession as any,
+      })
+    ).toThrow('createSandboxAdapter: gh-actions driver requires ghActionsOptions.sandboxSession');
+  });
+
+  it('passes through sandboxSession when provided', () => {
+    const sandboxSession = { verifyAndPushBranch: jest.fn() } as any;
+    createSandboxAdapter({
+      driver: 'gha',
+      workspace,
+      ghActionsOptions: {
+        ...ghActionsOptions,
+        sandboxSession,
+      },
+    });
+
+    expect(createGhActionsSandboxAdapterMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ...ghActionsOptions,
+        sandboxSession,
+      })
+    );
   });
 
   it('creates the local adapter for local driver', () => {

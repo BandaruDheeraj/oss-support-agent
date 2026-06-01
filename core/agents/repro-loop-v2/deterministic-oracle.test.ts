@@ -1,5 +1,6 @@
 import { runDeterministicReproOracle } from './deterministic-oracle';
 import type { ReproRecipe, ReproOracleSpec, SuspectSymbol } from '../analyst/dossier';
+import type { SandboxResult as SandboxSessionResult } from '../../sandbox-session';
 
 class FakeWorkspace {
   private readonly files = new Map<string, string>();
@@ -26,12 +27,18 @@ class FakeWorkspace {
 
 class FakeSandbox {
   private runIndex = 0;
-  constructor(private readonly reproRuns: Array<{ exitCode: number; stdout: string; stderr: string }>) {}
+  constructor(
+    private readonly reproRuns: Array<{ exitCode: number; stdout: string; stderr: string; throwError?: string }>,
+    private readonly sandboxResult: SandboxSessionResult | null = null
+  ) {}
   setReproTestPath(): void {}
   runRepro(): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number }> {
     const r =
       this.reproRuns[this.runIndex++] ??
       this.reproRuns[this.reproRuns.length - 1] ?? { exitCode: 1, stdout: '', stderr: 'fallback failure' };
+    if (r.throwError) {
+      throw new Error(r.throwError);
+    }
     return Promise.resolve({ exitCode: r.exitCode, stdout: r.stdout, stderr: r.stderr, durationMs: 5 });
   }
   runTests(): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number }> {
@@ -48,6 +55,9 @@ class FakeSandbox {
   }
   listPackages(): Promise<{ name: string; version: string }[]> {
     return Promise.resolve([]);
+  }
+  getSandboxResult(): SandboxSessionResult | null {
+    return this.sandboxResult;
   }
 }
 
@@ -292,5 +302,45 @@ describe('runDeterministicReproOracle', () => {
 
     expect(result.verdict).toBe('credentials_required');
     expect(result.credentialsTerminal?.inferredEnvVars).toEqual(['OPENAI_API_KEY']);
+  });
+
+  it('returns sandbox_failed when SandboxSession reports not_executed/errored repro status', async () => {
+    const workspace = new FakeWorkspace();
+    const sandboxResult: SandboxSessionResult = {
+      ok: false,
+      reproStatus: 'not_executed',
+      failureOutput: '',
+      sentinelMatched: false,
+      suspectPathHit: false,
+      installManifest: [],
+      phaseFailures: [
+        {
+          ok: false,
+          phase: 'workflow',
+          reason: 'workflow_unreachable',
+          diagnostics: { httpStatus: 404 },
+        },
+      ],
+      rawLogs: 'dispatch failed',
+    };
+    const sandbox = new FakeSandbox(
+      [{ exitCode: 1, stdout: '', stderr: '', throwError: 'sandbox dispatch failed' }],
+      sandboxResult
+    );
+
+    const result = await runDeterministicReproOracle({
+      attemptId: 'attempt-sandbox-failed',
+      recipe: baseRecipe,
+      oracleSpec: baseOracleSpec,
+      suspectSymbols: baseSuspects,
+      repoLanguage: 'python',
+      workspace,
+      sandbox,
+      env: {},
+    });
+
+    expect(result.verdict).toBe('sandbox_failed');
+    expect(result.sandboxResult?.reproStatus).toBe('not_executed');
+    expect(result.sandboxResult?.phaseFailures[0]?.reason).toBe('workflow_unreachable');
   });
 });

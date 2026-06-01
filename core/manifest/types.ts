@@ -33,6 +33,10 @@ export interface Manifest {
    * Defaults to 'local' when absent.
    */
   sandbox_runner?: 'local' | 'gha';
+  /** Repo that hosts shared workflows (e.g. BandaruDheeraj/oss-support-agent). */
+  sandbox_workflow_repo?: string;
+  /** Ref to dispatch workflows from in sandbox_workflow_repo (default: main). */
+  sandbox_workflow_ref?: string;
 }
 
 export interface ManifestValidationError {

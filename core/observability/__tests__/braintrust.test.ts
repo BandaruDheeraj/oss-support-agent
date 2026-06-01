@@ -100,15 +100,17 @@ describe('BraintrustTracer', () => {
     warn.mockRestore();
   });
 
-  it('swallows log failures without throwing to the caller', () => {
+  it('retries log failures without throwing to the caller', async () => {
     childLogMock.mockImplementationOnce(() => {
-      throw new Error('bt down');
+      throw new Error('network down');
     });
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     const tracer = new BraintrustTracer();
     const span = tracer.startSpan('llm.y', { kind: 'llm' });
     expect(() => span.end()).not.toThrow();
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('log failed'));
+    await tracer.flush();
+    expect(childLogMock).toHaveBeenCalledTimes(2);
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('log failed'));
     warn.mockRestore();
   });
 

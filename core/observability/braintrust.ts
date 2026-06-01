@@ -9,6 +9,12 @@
  *   BRAINTRUST_PROJECT  (default: oss-support-agent)
  */
 import type { Span, StartSpanOpts, Tracer } from './tracer';
+import {
+  deliverWithRetryAndSpool,
+  markAdapterEnabled,
+  recordAdapterDropped,
+  recordAdapterFailed,
+} from './adapter-health';
 import { redactIo } from './io-redact';
 
 type BtSpan = {
@@ -58,6 +64,11 @@ function extractEvaluation(
 export class BraintrustTracer implements Tracer {
   private logger: BtLogger | null = null;
   private initError: Error | null = null;
+  private readonly pending = new Set<Promise<unknown>>();
+  private readonly maxPending = (() => {
+    const parsed = Number.parseInt(process.env.OBSERVABILITY_MAX_PENDING ?? '2000', 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 2000;
+  })();
 
   constructor() {
     try {
@@ -74,14 +85,17 @@ export class BraintrustTracer implements Tracer {
         apiUrl: process.env.BRAINTRUST_API_URL,
         asyncFlush: true,
       });
+      markAdapterEnabled('braintrust', true);
     } catch (err) {
       this.initError = err instanceof Error ? err : new Error(String(err));
+      markAdapterEnabled('braintrust', false, this.initError.message);
     }
   }
 
   startSpan(name: string, opts: StartSpanOpts = {}): Span {
     if (!this.logger) {
       this.warnInitFailureOnce();
+      recordAdapterDropped('braintrust', this.initError ?? 'braintrust not initialized');
       return new NoopBtSpan();
     }
     const parentBt = opts.parent ? (opts.parent as unknown as { [btSpanSymbol]?: BtSpan })[btSpanSymbol] : undefined;
@@ -94,6 +108,7 @@ export class BraintrustTracer implements Tracer {
         spanAttributes: opts.attributes ?? {},
       });
     } catch (err) {
+      recordAdapterDropped('braintrust', err);
       // eslint-disable-next-line no-console
       console.warn(
         `[observability:braintrust] startSpan failed: ${err instanceof Error ? err.message : String(err)}`
@@ -104,6 +119,7 @@ export class BraintrustTracer implements Tracer {
     const buffer: { input?: unknown; output?: unknown; metadata: Record<string, unknown>; error?: string } = {
       metadata: { ...(opts.attributes ?? {}) },
     };
+    const tracer = this;
 
     const wrapped: Span & { [btSpanSymbol]: BtSpan } = {
       [btSpanSymbol]: bt,
@@ -120,24 +136,24 @@ export class BraintrustTracer implements Tracer {
         buffer.error = err instanceof Error ? err.message : String(err);
       },
       end() {
-        try {
-          const payload: Record<string, unknown> = { metadata: buffer.metadata };
-          const evaluation = extractEvaluation(buffer.metadata);
-          if (buffer.input !== undefined) payload.input = buffer.input;
-          if (buffer.output !== undefined) payload.output = buffer.output;
-          if (buffer.error) payload.error = buffer.error;
-          if (evaluation) payload.scores = { [evaluation.key]: evaluation.score };
-          bt.log(payload);
-        } catch (err) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            `[observability:braintrust] log failed: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
+        const payload: Record<string, unknown> = { metadata: buffer.metadata };
+        const evaluation = extractEvaluation(buffer.metadata);
+        if (buffer.input !== undefined) payload.input = buffer.input;
+        if (buffer.output !== undefined) payload.output = buffer.output;
+        if (buffer.error) payload.error = buffer.error;
+        if (evaluation) payload.scores = { [evaluation.key]: evaluation.score };
+        tracer.track(
+          deliverWithRetryAndSpool({
+            adapter: 'braintrust',
+            operation: 'log',
+            payload,
+            run: async () => bt.log(payload),
+          })
+        );
         try {
           bt.end();
-        } catch {
-          // ignore
+        } catch (err) {
+          recordAdapterFailed('braintrust', err);
         }
       },
     };
@@ -146,17 +162,32 @@ export class BraintrustTracer implements Tracer {
 
   async flush(): Promise<void> {
     if (!this.logger) return;
+    const inFlight = Array.from(this.pending);
+    await Promise.allSettled(inFlight);
     try {
       // braintrust SDK exposes flush via the module-level function.
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const bt = require('braintrust') as { flush?: () => Promise<void> };
-      if (bt.flush) await bt.flush();
+      if (bt.flush) {
+        await deliverWithRetryAndSpool({
+          adapter: 'braintrust',
+          operation: 'flush',
+          payload: { pending: inFlight.length },
+          run: () => bt.flush!(),
+        });
+      }
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[observability:braintrust] flush failed: ${err instanceof Error ? err.message : String(err)}`
-      );
+      recordAdapterFailed('braintrust', err);
     }
+  }
+
+  private track(p: Promise<unknown>): void {
+    if (this.pending.size >= this.maxPending) {
+      recordAdapterDropped('braintrust', `pending queue exceeded max=${this.maxPending}`);
+      return;
+    }
+    this.pending.add(p);
+    p.finally(() => this.pending.delete(p)).catch(() => undefined);
   }
 
   private warnedInitFailure = false;

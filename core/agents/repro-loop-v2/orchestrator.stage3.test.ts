@@ -162,6 +162,7 @@ function makeOracleResult(args: {
       missingMarkers: [],
     },
     astReason: criteria.ast_preflight ? null : 'AST preflight failed',
+    sandboxResult: null,
     credentialsTerminal:
       args.verdict === 'credentials_required'
         ? {
@@ -170,6 +171,24 @@ function makeOracleResult(args: {
             stderrTail: 'missing credentials',
           }
         : null,
+  };
+}
+
+function makeCandidateRepro(path = 'tests/repro/test_issue_42_candidate_seed.py') {
+  return {
+    version: 1 as const,
+    source: 'direct_call' as const,
+    failureMode: 'unexpected_exception' as const,
+    expectedExceptionType: 'AssertionError',
+    candidateTestPath: path,
+    imports: ['from src.module import broken_symbol'],
+    setup: '',
+    exerciseCall: 'broken_symbol()',
+    sentinel: 'REPRO_BROKEN_SYMBOL_SEED_42',
+    pipInstalls: [],
+    requiresCredentials: [],
+    preconditionsSatisfied: [],
+    rationale: 'seeded deterministic candidate',
   };
 }
 
@@ -193,6 +212,7 @@ beforeEach(() => {
       openQuestions: [],
       summary: 'seed dossier',
       confidence: 'medium',
+      candidateRepro: makeCandidateRepro(),
       oracleSpec: {
         suspect_path_assertions: [{ kind: 'symbol', needle: 'broken_symbol', file: 'src/module.py' }],
         precondition_assertions: [],
@@ -244,6 +264,70 @@ describe('runReproV2 stage3 orchestration', () => {
     expect(runDeterministicOracleMock).not.toHaveBeenCalled();
   });
 
+  test('hard-stops as not_runnable when semantic-seeded analyst dossier omits candidateRepro', async () => {
+    runAnalystMock.mockImplementationOnce(async (args: RunAnalystArgs) => {
+      const snapshot = args.dossier.append({
+        issueNumber: args.issue.number,
+        attemptId: args.attemptId,
+        evidence: [
+          {
+            id: 'e1',
+            kind: 'file_excerpt',
+            source: 'src/module.py',
+            summary: 'suspect summary',
+            recordedAt: new Date('2024-01-01T00:00:00.000Z').toISOString(),
+          },
+        ],
+        suspectSymbols: [{ file: 'src/module.py', symbol: 'broken_symbol', reasoning: 'Issue stacktrace points here' }],
+        preconditions: [],
+        openQuestions: [],
+        summary: 'seed dossier without candidate',
+        confidence: 'medium',
+      });
+      return {
+        snapshot,
+        terminated: 'done',
+        toolCalls: 1,
+        transcriptSummary: 'ok',
+      };
+    });
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-not-runnable',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      semanticSuspectSeed: {
+        model: 'BAAI/bge-small-en-v1.5',
+        query: 'issue query',
+        cacheHit: true,
+        cacheKey: 'seed-cache',
+        indexedFileCount: 12,
+        instrumentationDirs: ['src'],
+        suspectFiles: ['src/module.py'],
+        suspectSymbols: [
+          {
+            file: 'src/module.py',
+            symbol: 'broken_symbol',
+            reasoning: 'semantic hit',
+          },
+        ],
+        semanticConfidence: {
+          top_score: 0.74,
+          low_confidence: false,
+          diagnostics: 'semantic top_score=0.740',
+        },
+      },
+    });
+
+    expect(outcome.status).toBe('not_runnable');
+    expect(outcome.message).toContain('candidateRepro');
+    expect(runReproBuilderMock).not.toHaveBeenCalled();
+    expect(runReproProberMock).not.toHaveBeenCalled();
+    expect(runDeterministicOracleMock).not.toHaveBeenCalled();
+  });
+
   test('defaults to builder + 3 prober samples and returns not_reproduced when none pass oracle', async () => {
     runReproBuilderMock.mockResolvedValue({
       ok: false,
@@ -277,6 +361,35 @@ describe('runReproV2 stage3 orchestration', () => {
     expect(outcome.candidates).toHaveLength(4);
   });
 
+  test('returns sandbox_failed when all candidates fail sandbox lifecycle before runnable repro evidence', async () => {
+    runReproBuilderMock.mockResolvedValue({
+      ok: true,
+      recipe: makeRecipe('builder'),
+      reason: 'Builder produced candidate',
+      runs: [],
+    });
+    runReproProberMock.mockResolvedValue(makeProberResult(makeRecipe('candidate-prober')));
+    runDeterministicOracleMock.mockResolvedValue(
+      makeOracleResult({
+        verdict: 'sandbox_failed',
+        message: 'Sandbox execution failed before runnable repro evidence: branch_push_unconfirmed',
+      })
+    );
+
+    const outcome = await runReproV2({
+      attemptId: 'attempt-stage3-sandbox-failed',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      proberSampleCount: 1,
+    });
+
+    expect(outcome.status).toBe('sandbox_failed');
+    expect(outcome.candidates.every((candidate) => candidate.status === 'sandbox_failed')).toBe(true);
+    expect(outcome.message).toContain('sandbox_failed');
+  });
+
   test('halts with sandbox_setup_failed before prober sampling when OpenInference preflight fails', async () => {
     runReproBuilderMock.mockResolvedValue({
       ok: false,
@@ -285,18 +398,18 @@ describe('runReproV2 stage3 orchestration', () => {
       runs: [],
     });
 
-    const pipInstall = jest.fn(async (spec: string) => ({
-      exitCode: spec === '-e python/openinference-semantic-conventions' ? 1 : 0,
+    const setupDependencies = jest.fn(async () => ({
+      ok: false as const,
+      phase: 'setup' as const,
+      reason: 'dependency_setup_failed',
+      failedStep: 1,
       stdout: '',
-      stderr: spec === '-e python/openinference-semantic-conventions' ? 'editable install failed' : '',
-      durationMs: 1,
+      stderr: 'editable install failed',
     }));
-    const runPython = jest.fn(async () => ({ exitCode: 0, stdout: '', stderr: '', durationMs: 1 }));
 
     const failingPreflightSandbox: SandboxHandle = {
       ...sandbox,
-      pipInstall,
-      runPython,
+      setupDependencies,
     };
 
     const outcome = await runReproV2({
@@ -312,8 +425,7 @@ describe('runReproV2 stage3 orchestration', () => {
     expect(outcome.message).toContain('sandbox_setup_failed');
     expect(runReproProberMock).not.toHaveBeenCalled();
     expect(runDeterministicOracleMock).not.toHaveBeenCalled();
-    expect(pipInstall).toHaveBeenCalledTimes(1);
-    expect(runPython).not.toHaveBeenCalled();
+    expect(setupDependencies).toHaveBeenCalledTimes(1);
     expect(outcome.candidates).toHaveLength(3);
     expect(outcome.candidates.filter((candidate) => candidate.source === 'prober')).toHaveLength(2);
     expect(
