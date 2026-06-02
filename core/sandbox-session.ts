@@ -623,7 +623,6 @@ export class SandboxSession {
       branch_name: this.branch,
       test_commands_b64: Buffer.from(JSON.stringify(commands), 'utf-8').toString('base64'),
       services_b64: Buffer.from('[]', 'utf-8').toString('base64'),
-      issue_number: String(this.issueNumber),
     };
   }
 
