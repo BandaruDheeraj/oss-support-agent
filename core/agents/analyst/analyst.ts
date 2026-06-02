@@ -122,7 +122,7 @@ EXACT field names (the Builder schema is strict):
 - \`exerciseCall\`: ONE Python expression that triggers the bug. Must reference at least one of the suspectSymbols you also recorded.
 - \`expectedExceptionType\` (for unexpected_exception) OR \`expectedValueExpression\` (for wrong_return) — exactly one of these.
 - \`pipInstalls\`: array of \`{package, editable?: boolean}\` for third-party deps the test needs.
-- \`preconditionsSatisfied\`: array of precondition condition strings (must match \`condition\` text of an entry in your preconditions list)
+- \`preconditionsSatisfied\`: array of precondition ids (must match the \`id\` field of entries in your preconditions list, e.g. ["pc-0"])
 - \`rationale\` (optional): 1-2 sentence justification.
 
 DO NOT emit a \`testSource\` or \`sentinelString\` field — the Builder renders the test source itself from the template + your fields.

@@ -63,7 +63,10 @@ function makeGitClient(overrides: Partial<GitClient> = {}): GitClient {
   };
 }
 
-function makeSession(): SandboxSession {
+function makeSession(
+  actionsOverrides: Partial<ActionsClient> = {},
+  gitOverrides: Partial<GitClient> = {}
+): SandboxSession {
   return new SandboxSession({
     manifest: makeManifest(),
     targetRepo: 'BandaruDheeraj/openinference',
@@ -72,8 +75,8 @@ function makeSession(): SandboxSession {
     branch: 'agent/scope-52',
     issueNumber: 52,
     timeoutMins: 15,
-    actionsClient: makeActionsClient(),
-    gitClient: makeGitClient(),
+    actionsClient: makeActionsClient(actionsOverrides),
+    gitClient: makeGitClient(gitOverrides),
   });
 }
 
@@ -261,5 +264,53 @@ describe('SandboxSession', () => {
     expect(result.phaseFailures).toHaveLength(1);
     expect(result.phaseFailures[0].reason).toBe('workflow_unreachable');
   });
-});
 
+  it('uses sandbox-output artifact as authoritative command output', async () => {
+    const session = makeSession({
+      waitForWorkflowRun: jest.fn().mockResolvedValue({
+        completed: true,
+        conclusion: 'failure',
+        timedOut: false,
+      }),
+      getWorkflowRunLogs: jest.fn().mockResolvedValue({
+        stdout: '(GHA log archive: 1234 bytes; run https://example.test/run/123)',
+        stderr: '',
+        exitCode: 1,
+      }),
+      downloadWorkflowRunArtifact: jest.fn().mockResolvedValue(
+        JSON.stringify([
+          {
+            command: 'pytest -q tests/repro.py',
+            exitCode: 1,
+            stdout: 'collected 1 item',
+            stderr: 'AssertionError: REPRO_SENTINEL in suspect_symbol',
+          },
+        ])
+      ),
+    });
+    (session as any).phaseResults.branch = { ok: true, phase: 'branch', sha: 'abc' };
+    (session as any).phaseResults.workflow = { ok: true, phase: 'workflow' };
+    (session as any).phaseResults.setup = { ok: true, phase: 'setup', installManifest: [] };
+
+    const dispatch = await session.dispatch({
+      commands: ['pytest -q tests/repro.py'],
+      sentinel: 'REPRO_SENTINEL',
+      suspectPathNeedles: ['suspect_symbol'],
+    });
+
+    expect(dispatch.ok).toBe(true);
+    if (!dispatch.ok) throw new Error('expected dispatch ok');
+    expect(dispatch.exitCode).toBe(1);
+    expect(dispatch.stderr).toContain('REPRO_SENTINEL');
+    expect(dispatch.rawLogs).toContain('suspect_symbol');
+    expect(dispatch.stepOutcomes).toEqual([
+      { command: 'pytest -q tests/repro.py', exitCode: 1 },
+    ]);
+
+    const result = session.result();
+    expect(result.reproStatus).toBe('failing');
+    expect(result.sentinelMatched).toBe(true);
+    expect(result.suspectPathHit).toBe(true);
+    expect(result.failureOutput).toContain('AssertionError');
+  });
+});

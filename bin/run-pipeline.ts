@@ -1932,6 +1932,13 @@ export async function runPipeline(args: {
 
   // ---------- Fork + branch ----------
   const ghClient = new GitHubRestClient(deps.token);
+  const upstreamOwner = repoFullName.split('/')[0];
+  if (upstreamOwner && upstreamOwner.toLowerCase() === deps.forkOrg.toLowerCase()) {
+    log(
+      `[config][warn] DEFAULT_FORK_ORG=${deps.forkOrg} matches upstream owner for ${repoFullName}; ` +
+        `safe production runs should use a separate bot fork/org.`
+    );
+  }
   const fork = await createForkAndBranch(ghClient, {
     upstream: repoFullName,
     forkOrg: deps.forkOrg,

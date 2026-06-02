@@ -36,6 +36,7 @@ import {
 import { FsManifestRegistry } from './clients/manifest-registry';
 import { runPipeline, defaultWorkspaceRoot } from './run-pipeline';
 import { buildLiveDeps, defaultStateRoot, type LiveDeps } from './clients/live-deps';
+import { FilePipelineRunStateStore } from './clients/state-stores';
 
 interface RequiredEnv {
   GITHUB_TOKEN: string;
@@ -97,7 +98,8 @@ async function processIssueEvent(
   eventType: string,
   registry: FsManifestRegistry,
   env: ReturnType<typeof loadEnv>,
-  live: LiveDeps | null
+  live: LiveDeps | null,
+  runStateStore: FilePipelineRunStateStore
 ): Promise<{ status: number; body: any }> {
   if (eventType !== 'issues') {
     return { status: 200, body: { status: 'ignored', reason: `event=${eventType}` } };
@@ -185,6 +187,34 @@ async function processIssueEvent(
     return { status: 500, body: { status: 'error', reason: 'manifest-missing-post-onboarding' } };
   }
 
+  const labelName = action === 'labeled' ? (payload as any).label?.name : undefined;
+  const runKey = `${repoFullName}#${payload.issue.number}`;
+  const acquired = runStateStore.acquireRun({
+    key: runKey,
+    repoFullName,
+    issueNumber: payload.issue.number,
+    action,
+    ...(labelName ? { labelName } : {}),
+    instanceId:
+      process.env.RENDER_INSTANCE_ID ||
+      process.env.RENDER_SERVICE_ID ||
+      process.env.HOSTNAME,
+  });
+  if (!acquired.acquired) {
+    log(
+      `[pipeline] duplicate trigger ignored for ${runKey}; existing run started at ${acquired.record.startedAt}`
+    );
+    return {
+      status: 202,
+      body: {
+        status: 'already-running',
+        message: 'pipeline already running for this issue',
+        runKey,
+        startedAt: acquired.record.startedAt,
+      },
+    };
+  }
+
   void runPipeline({
     payload,
     manifest: finalManifest,
@@ -200,9 +230,13 @@ async function processIssueEvent(
     },
   })
     .then((result) => {
+      runStateStore.completeRun(runKey, 'completed', { result });
       log(`[pipeline] complete: ${JSON.stringify(result)}`);
     })
     .catch((err: any) => {
+      runStateStore.completeRun(runKey, 'failed', {
+        error: err?.stack ?? err?.message ?? String(err),
+      });
       log(`[pipeline] FATAL: ${err?.message ?? err}`);
       if (err?.stack) log(err.stack);
     })
@@ -262,6 +296,7 @@ async function startServer(): Promise<void> {
     process.exit(1);
   }
   const registry = new FsManifestRegistry(env.REPO_ROOT);
+  const runStateStore = new FilePipelineRunStateStore(env.STATE_ROOT);
 
   const live = buildLiveDeps(process.env, {
     token: env.GITHUB_TOKEN,
@@ -348,7 +383,14 @@ async function startServer(): Promise<void> {
       }
 
       try {
-        const result = await processIssueEvent(payload, eventType, registry, env, live);
+        const result = await processIssueEvent(
+          payload,
+          eventType,
+          registry,
+          env,
+          live,
+          runStateStore
+        );
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.body));
       } catch (err: any) {

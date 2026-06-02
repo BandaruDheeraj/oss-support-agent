@@ -132,7 +132,7 @@ export function isProviderFailoverReason(reason: string | undefined): boolean {
 
 function shouldFailover(result: AgentLoopResult, routeIndex: number, routeCount: number): boolean {
   if (routeIndex >= routeCount - 1) return false;
-  return result.terminated === 'error' && result.toolCalls === 0 && isProviderFailoverReason(result.reason);
+  return result.terminated === 'error' && isProviderFailoverReason(result.reason);
 }
 
 async function runAgentLoopWithFailover(args: RunAgentLoopArgs): Promise<AgentLoopResult> {
@@ -140,10 +140,11 @@ async function runAgentLoopWithFailover(args: RunAgentLoopArgs): Promise<AgentLo
   let aggregateTurns = 0;
   let aggregateToolCalls = 0;
   let lastResult: AgentLoopResult | null = null;
+  let currentArgs = args;
 
   for (let i = 0; i < routes.length; i += 1) {
     const route = routes[i];
-    const result = await runAgentLoopOnce(args, route);
+    const result = await runAgentLoopOnce(currentArgs, route);
     aggregateTurns += result.turns;
     aggregateToolCalls += result.toolCalls;
     const merged: AgentLoopResult = {
@@ -158,6 +159,10 @@ async function runAgentLoopWithFailover(args: RunAgentLoopArgs): Promise<AgentLo
       `[agent-loop] attempt=${args.attemptId} agent=${args.agent} failover_from=${route.routeId}` +
         ` model=${route.modelId} reason=${JSON.stringify(result.reason ?? 'unknown')}`
     );
+    currentArgs = {
+      ...args,
+      user: buildFailoverResumePrompt(args.user, result, route),
+    };
   }
 
   return (
@@ -171,6 +176,28 @@ async function runAgentLoopWithFailover(args: RunAgentLoopArgs): Promise<AgentLo
       transcriptSummary: '(no tool calls)',
     }
   );
+}
+
+function buildFailoverResumePrompt(
+  originalUser: string,
+  result: AgentLoopResult,
+  route: ModelRoute
+): string {
+  const lines = [
+    originalUser,
+    '',
+    '[ORCHESTRATOR RESUME]',
+    `The previous provider route failed: route=${route.routeId} model=${route.modelId}.`,
+    `Failure: ${truncate(result.reason ?? 'unknown provider failure', 800)}`,
+  ];
+  if (result.toolCalls > 0) {
+    lines.push(
+      `Tool calls already completed before failover: ${result.toolCalls}.`,
+      `Transcript summary: ${truncate(result.transcriptSummary, 1200)}`,
+      'Continue from these observations. Do not repeat expensive sandbox or mutation steps unless a fresh observation is needed.'
+    );
+  }
+  return lines.join('\n');
 }
 
 async function runAgentLoopOnce(args: RunAgentLoopArgs, route: ModelRoute): Promise<AgentLoopResult> {

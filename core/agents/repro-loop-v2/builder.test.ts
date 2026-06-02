@@ -370,4 +370,33 @@ describe('runReproBuilder', () => {
     expect(out.recipe?.provenance.exerciseImports).toEqual(['import json', 'from collections import OrderedDict']);
     expect(out.recipe?.provenance.proberAttempts).toBe(0);
   });
+
+  it('accepts legacy precondition condition text and records canonical ids', async () => {
+    const d = snap(
+      {
+        preconditions: [
+          {
+            id: 'pc-0',
+            condition: 'no provider',
+            kind: 'config_absence',
+            evidenceRefs: [],
+            satisfactionModes: [],
+            threats: [],
+          },
+        ],
+      },
+      { preconditionsSatisfied: ['no provider'] }
+    );
+    const args = mkArgs(d, {
+      runRepro: [
+        mkRun({ exitCode: 1, stderr: SENTINEL }),
+        mkRun({ exitCode: 1, stderr: SENTINEL }),
+      ],
+    });
+
+    const out = await runReproBuilder(args);
+
+    expect(out.ok).toBe(true);
+    expect(out.recipe?.provenance.preconditionsSatisfied).toEqual(['pc-0']);
+  });
 });

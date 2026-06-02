@@ -108,3 +108,101 @@ export class FilePMEmailStateStore
     this.remove(runId);
   }
 }
+
+export type PipelineRunStatus = 'running' | 'completed' | 'failed';
+
+export interface PipelineRunRecord {
+  key: string;
+  repoFullName: string;
+  issueNumber: number;
+  status: PipelineRunStatus;
+  action: string;
+  labelName?: string;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  instanceId?: string;
+  result?: unknown;
+  error?: string;
+}
+
+export interface PipelineRunAcquireResult {
+  acquired: boolean;
+  record: PipelineRunRecord;
+  reason?: 'already-running';
+}
+
+export class FilePipelineRunStateStore extends FileStore<PipelineRunRecord> {
+  constructor(rootDir: string) {
+    super(path.join(rootDir, 'pipeline-runs'));
+  }
+
+  acquireRun(
+    input: {
+      key: string;
+      repoFullName: string;
+      issueNumber: number;
+      action: string;
+      labelName?: string;
+      instanceId?: string;
+    },
+    opts: { staleAfterMs?: number; now?: Date } = {}
+  ): PipelineRunAcquireResult {
+    const staleAfterMs = opts.staleAfterMs ?? 6 * 60 * 60 * 1000;
+    const now = opts.now ?? new Date();
+    const existing = this.load(input.key);
+    if (existing?.status === 'running') {
+      const updatedAt = Date.parse(existing.updatedAt);
+      const isFresh =
+        Number.isFinite(updatedAt) && now.getTime() - updatedAt < staleAfterMs;
+      if (isFresh) {
+        return { acquired: false, record: existing, reason: 'already-running' };
+      }
+    }
+
+    const ts = now.toISOString();
+    const record: PipelineRunRecord = {
+      key: input.key,
+      repoFullName: input.repoFullName,
+      issueNumber: input.issueNumber,
+      status: 'running',
+      action: input.action,
+      ...(input.labelName ? { labelName: input.labelName } : {}),
+      startedAt: ts,
+      updatedAt: ts,
+      ...(input.instanceId ? { instanceId: input.instanceId } : {}),
+    };
+    this.save(input.key, record);
+    return { acquired: true, record };
+  }
+
+  completeRun(
+    key: string,
+    status: Exclude<PipelineRunStatus, 'running'>,
+    details: { result?: unknown; error?: string; now?: Date } = {}
+  ): PipelineRunRecord {
+    const now = details.now ?? new Date();
+    const existing = this.load(key);
+    const ts = now.toISOString();
+    const record: PipelineRunRecord = {
+      ...(existing ?? {
+        key,
+        repoFullName: 'unknown',
+        issueNumber: 0,
+        action: 'unknown',
+        startedAt: ts,
+      }),
+      status,
+      updatedAt: ts,
+      completedAt: ts,
+      ...(details.result !== undefined ? { result: details.result } : {}),
+      ...(details.error ? { error: details.error } : {}),
+    };
+    this.save(key, record);
+    return record;
+  }
+
+  loadRun(key: string): PipelineRunRecord | null {
+    return this.load(key);
+  }
+}

@@ -1,6 +1,7 @@
 // Verified clean: triggerWorkflowDispatch, createSandboxConfig, verifyDispatchRefs
 // have no call sites outside SandboxSession as of 4cf4ecd.
 import type { Manifest } from './manifest/types';
+import type { SandboxCommandResult } from './adapter.interface';
 import {
   SANDBOX_WORKFLOW_FILE,
   type ActionsClient,
@@ -124,6 +125,7 @@ type CommandExecution =
       stdout: string;
       stderr: string;
       rawLogs: string;
+      commands?: SandboxCommandResult[];
     }
   | {
       ok: false;
@@ -133,6 +135,7 @@ type CommandExecution =
       stderr: string;
       rawLogs: string;
       exitCode: number | null;
+      commands?: SandboxCommandResult[];
     };
 
 export class SandboxSession {
@@ -490,15 +493,22 @@ export class SandboxSession {
       suspectPathHit,
     };
 
+    const stepOutcomes = run.commands
+      ? run.commands.map((command) => ({
+          command: command.command,
+          exitCode: command.exitCode,
+        }))
+      : commandBatch.map((command) => ({
+          command,
+          exitCode: run.exitCode,
+        }));
+
     return {
       ok: true,
       runId: run.runId,
       runUrl: `https://github.com/${this.sandboxWorkflowRepo}/actions/runs/${run.runId}`,
       conclusion: run.conclusion,
-      stepOutcomes: commandBatch.map((command) => ({
-        command,
-        exitCode: run.exitCode,
-      })),
+      stepOutcomes,
       stdout: run.stdout,
       stderr: run.stderr,
       rawLogs: run.rawLogs,
@@ -726,15 +736,23 @@ export class SandboxSession {
         this.sandboxWorkflowRepo,
         workflowRun.id
       );
-      const rawLogs = [logs.stdout, logs.stderr].filter((s) => s.length > 0).join('\n');
+      const artifactCommands = await this.downloadSandboxOutputCommands(workflowRun.id);
+      const commands = artifactCommands ?? logs.commands;
+      const stdout = commands ? formatCommandStream(commands, 'stdout') : logs.stdout;
+      const stderr = commands ? formatCommandStream(commands, 'stderr') : logs.stderr;
+      const exitCode = commands ? exitCodeFromCommands(commands, logs.exitCode) : logs.exitCode;
+      const rawLogs = commands
+        ? formatCommandRawLogs(commands, logs.stdout, logs.stderr)
+        : [logs.stdout, logs.stderr].filter((s) => s.length > 0).join('\n');
       return {
         ok: true,
         runId: workflowRun.id,
         conclusion: runStatus.conclusion,
-        exitCode: logs.exitCode,
-        stdout: logs.stdout,
-        stderr: logs.stderr,
+        exitCode,
+        stdout,
+        stderr,
         rawLogs,
+        ...(commands ? { commands } : {}),
       };
     } catch (err) {
       return {
@@ -787,6 +805,28 @@ export class SandboxSession {
     return null;
   }
 
+  private async downloadSandboxOutputCommands(runId: number): Promise<SandboxCommandResult[] | null> {
+    if (!this.actionsClient.downloadWorkflowRunArtifact) {
+      return null;
+    }
+
+    const attempts = 5;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const raw = await this.actionsClient.downloadWorkflowRunArtifact(
+        this.sandboxWorkflowRepo,
+        runId,
+        'sandbox-output'
+      );
+      if (raw) {
+        return parseSandboxOutputArtifact(raw);
+      }
+      if (attempt < attempts) {
+        await sleep(2_000);
+      }
+    }
+    return null;
+  }
+
   private async collectInstallManifest(spec: InstallSpec): Promise<PackageVersion[]> {
     const ordered = [
       {
@@ -830,6 +870,81 @@ export class SandboxSession {
       replaySpec: entry.replaySpec,
     }));
   }
+}
+
+function parseSandboxOutputArtifact(raw: string): SandboxCommandResult[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(
+      `sandbox-output artifact was not valid JSON: ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+
+  if (!Array.isArray(parsed)) {
+    throw new Error('sandbox-output artifact must be a JSON array');
+  }
+
+  return parsed.map((entry, index) => {
+    if (!entry || typeof entry !== 'object') {
+      throw new Error(`sandbox-output[${index}] must be an object`);
+    }
+    const row = entry as Record<string, unknown>;
+    if (typeof row.command !== 'string' || row.command.trim().length === 0) {
+      throw new Error(`sandbox-output[${index}].command must be a non-empty string`);
+    }
+    if (typeof row.exitCode !== 'number' || !Number.isFinite(row.exitCode)) {
+      throw new Error(`sandbox-output[${index}].exitCode must be a finite number`);
+    }
+    return {
+      command: row.command,
+      exitCode: Math.trunc(row.exitCode),
+      stdout: typeof row.stdout === 'string' ? row.stdout : '',
+      stderr: typeof row.stderr === 'string' ? row.stderr : '',
+    };
+  });
+}
+
+function exitCodeFromCommands(
+  commands: SandboxCommandResult[],
+  fallback: number | null
+): number | null {
+  if (commands.length === 0) return fallback;
+  const failed = commands.find((command) => command.exitCode !== 0);
+  return failed ? failed.exitCode : commands[commands.length - 1]!.exitCode;
+}
+
+function formatCommandStream(
+  commands: SandboxCommandResult[],
+  field: 'stdout' | 'stderr'
+): string {
+  return commands
+    .filter((command) => command[field].length > 0)
+    .map((command) => `[sandbox] $ ${command.command}\n${command[field]}`)
+    .join('\n');
+}
+
+function formatCommandRawLogs(
+  commands: SandboxCommandResult[],
+  workflowStdout: string,
+  workflowStderr: string
+): string {
+  const commandLogs = commands
+    .map((command) => {
+      const chunks = [
+        `[sandbox] $ ${command.command}`,
+        command.stdout ? `stdout:\n${command.stdout}` : '',
+        command.stderr ? `stderr:\n${command.stderr}` : '',
+        `exitCode=${command.exitCode}`,
+      ].filter((chunk) => chunk.length > 0);
+      return chunks.join('\n');
+    })
+    .join('\n\n');
+  const workflowLogs = [workflowStdout, workflowStderr]
+    .filter((chunk) => chunk.length > 0)
+    .join('\n');
+  return [commandLogs, workflowLogs].filter((chunk) => chunk.length > 0).join('\n\n');
 }
 
 function parsePipShowOutput(stdout: string): PackageVersion[] {

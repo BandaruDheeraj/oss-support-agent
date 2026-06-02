@@ -139,15 +139,25 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
   // (1) Validate against dossier (cheap, do BEFORE installs)
   // ---------------------------------------------------------------
 
-  const knownPreconditionIds = new Set(
-    args.dossierSnapshot.body.preconditions.map((p) => p.id)
-  );
-  for (const id of candidate.preconditionsSatisfied) {
-    if (!knownPreconditionIds.has(id)) {
+  const knownPreconditionIds = new Set<string>();
+  const preconditionConditionToId = new Map<string, string>();
+  for (const precondition of args.dossierSnapshot.body.preconditions) {
+    knownPreconditionIds.add(precondition.id);
+    preconditionConditionToId.set(precondition.condition, precondition.id);
+  }
+  const resolvedPreconditionsSatisfied: string[] = [];
+  for (const idOrCondition of candidate.preconditionsSatisfied) {
+    const resolved = knownPreconditionIds.has(idOrCondition)
+      ? idOrCondition
+      : preconditionConditionToId.get(idOrCondition);
+    if (!resolved) {
       return rej(
         'precondition_unknown',
-        `preconditionsSatisfied references unknown id "${id}". Known: ${Array.from(knownPreconditionIds).join(', ') || '(none)'}.`
+        `preconditionsSatisfied references unknown id or condition "${idOrCondition}". Known ids: ${Array.from(knownPreconditionIds).join(', ') || '(none)'}.`
       );
+    }
+    if (!resolvedPreconditionsSatisfied.includes(resolved)) {
+      resolvedPreconditionsSatisfied.push(resolved);
     }
   }
 
@@ -409,7 +419,7 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     approach: `builder:${candidate.failureMode}:${candidate.source}`,
     provenance: {
       exerciseImports: candidate.imports,
-      preconditionsSatisfied: candidate.preconditionsSatisfied,
+      preconditionsSatisfied: resolvedPreconditionsSatisfied,
       observedProbe: {
         sentinelObserved: lastFailing.sentinelObserved,
         signatureObserved: lastFailing.signatureObserved,

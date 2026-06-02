@@ -1,10 +1,12 @@
 import { generateText } from 'ai';
+import { z } from 'zod';
 import { runAgentLoop } from './agent-loop';
 import { ToolRegistry } from './tools/registry';
 import { getModelRoutes } from '../llm/v2/client';
 
 jest.mock('ai', () => ({
   generateText: jest.fn(),
+  tool: (opts: unknown) => opts,
 }));
 
 jest.mock('../llm/v2/client', () => ({
@@ -13,6 +15,7 @@ jest.mock('../llm/v2/client', () => ({
 
 jest.mock('../observability/spans', () => ({
   withAgentSpan: async (_agent: string, _attrs: Record<string, unknown>, fn: () => Promise<unknown>) => fn(),
+  withToolSpan: async (_name: string, _tier: string, _attrs: Record<string, unknown>, fn: (span: { setAttribute: () => void }) => Promise<unknown>) => fn({ setAttribute: () => {} }),
 }));
 
 function makeRegistry() {
@@ -31,6 +34,16 @@ function makeRegistry() {
       handles: {},
     },
   );
+}
+
+function makeRegistryWithReadTool() {
+  return makeRegistry().register({
+    name: 'read_note',
+    tier: 'read',
+    description: 'read a note',
+    parameters: z.object({}),
+    execute: async () => ({ ok: true, note: 'observed context' }),
+  });
 }
 
 describe('runAgentLoop provider failover', () => {
@@ -93,5 +106,30 @@ describe('runAgentLoop provider failover', () => {
     expect(mockedGenerateText.mock.calls[0]?.[0]?.model).toBe(mockedGenerateText.mock.calls[1]?.[0]?.model);
     expect(result.terminated).toBe('error');
     expect(result.reason).toContain('[invalid-request]');
+  });
+
+  test('fails over after provider errors even when tool calls already happened', async () => {
+    mockedGenerateText
+      .mockImplementationOnce(async (opts: any) => {
+        await opts.tools.read_note.execute({});
+        throw new Error('429 rate limit exceeded');
+      })
+      .mockResolvedValueOnce({ text: 'resumed', finishReason: 'stop' } as any);
+
+    const result = await runAgentLoop({
+      agent: 'ANALYST',
+      registry: makeRegistryWithReadTool(),
+      system: 'system',
+      user: 'user',
+      attemptId: 'attempt-1',
+      issueNumber: 48,
+    });
+
+    expect(mockedGenerateText).toHaveBeenCalledTimes(2);
+    expect(result.terminated).toBe('finished');
+    expect(result.text).toBe('resumed');
+    const secondCallMessages = mockedGenerateText.mock.calls[1]?.[0]?.messages as any[];
+    expect(secondCallMessages?.[0]?.content).toContain('[ORCHESTRATOR RESUME]');
+    expect(secondCallMessages?.[0]?.content).toContain('read_note');
   });
 });

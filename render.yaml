@@ -1,40 +1,37 @@
 services:
   - type: web
     name: oss-support-agent
-    runtime: docker
-    plan: free
+    runtime: node
+    plan: starter
     region: oregon
     branch: main
     autoDeploy: true
-
-    # Docker runtime: see ./Dockerfile. The custom image installs python3 +
-    # python3-venv + git, which Render's stock node runtime is missing and
-    # which the repro/fix sandbox needs to bootstrap `.agent-venv` per
-    # workspace. Without these the v2 Executor cannot run a single pip
-    # install and stalls every issue at "repro-not-runnable".
-    dockerfilePath: ./Dockerfile
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
 
     healthCheckPath: /healthz
 
-    # Single instance only. The Gmail watcher keeps an in-memory cursor and
-    # dual replicas would race / double-process replies.
+    # Single instance only. Pipeline idempotency is file-backed under the
+    # persistent disk; multiple replicas would need a shared transactional
+    # store such as Postgres.
     numInstances: 1
 
-    # NOTE: Free plan has no persistent disk and sleeps after 15 min idle.
-    # State will reset on restart and Gmail watcher pauses while asleep.
-    # Upgrade to "starter" + uncomment the disk block below for production.
-    # disk:
-    #   name: state
-    #   mountPath: /var/data
-    #   sizeGB: 1
+    disk:
+      name: state
+      mountPath: /var/data
+      sizeGB: 1
 
     envVars:
       - key: NODE_ENV
         value: production
       - key: STATE_ROOT
-        value: /tmp/oss-agent/state
+        value: /var/data/state
       - key: WORKSPACE_ROOT
         value: /tmp/oss-agent/workspaces
+      - key: HARNESS_REPO_FULL_NAME
+        value: BandaruDheeraj/oss-support-agent
+      - key: HARNESS_WORKFLOW_REF
+        value: main
 
       # Required — set these in the Render dashboard (mark as secret)
       - key: GITHUB_TOKEN
