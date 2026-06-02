@@ -734,8 +734,10 @@ async function runTriageEval(): Promise<void> {
     const triageStart = Date.now();
     let triageType: IssueType = 'bug_fix';
     let triageModule = '.';
+    let triageInputTokens = 0;
+    let triageOutputTokens = 0;
     try {
-      await tracedStage(
+      const triageResult = await tracedStage(
         ctx,
         'triage.classify',
         async () => {
@@ -748,11 +750,21 @@ async function runTriageEval(): Promise<void> {
           inputSummary: { title: g.title, body_preview: g.body.slice(0, 200) },
         }
       );
+      // Accumulate tokens if the result carries usage (e.g. when triage calls an LLM).
+      const r = triageResult as { input_tokens?: number; output_tokens?: number } | null;
+      if (r?.input_tokens) triageInputTokens = r.input_tokens;
+      if (r?.output_tokens) triageOutputTokens = r.output_tokens;
     } catch (err) {
       console.warn(`[eval] triage failed for #${g.issue_number}: ${(err as Error).message}`);
     }
     const triageLatency = Date.now() - triageStart;
     triageLatencies.push(triageLatency);
+    totalInputTokens += triageInputTokens;
+    totalOutputTokens += triageOutputTokens;
+    // Record fan-out latency for each platform (same span was sent to all in parallel).
+    for (const p of getRegisteredPlatforms()) {
+      perPlatform[p.name]?.latencies.push(triageLatency);
+    }
 
     const pmCtx: TelemetryContext = { ...ctx, agent_name: 'pm', stage: 'pm' };
     const pmStart = Date.now();
@@ -769,6 +781,8 @@ async function runTriageEval(): Promise<void> {
     };
     let pmDesignNeeded = false;
     let pmReasoning = '';
+    let pmInputTokens = 0;
+    let pmOutputTokens = 0;
     try {
       const pmResult = await tracedStage(
         pmCtx,
@@ -778,11 +792,20 @@ async function runTriageEval(): Promise<void> {
       );
       pmDesignNeeded = pmResult.designNeeded;
       pmReasoning = pmResult.reasoning;
+      // Accumulate tokens if PM ever calls an LLM.
+      const r = pmResult as unknown as { input_tokens?: number; output_tokens?: number };
+      if (r?.input_tokens) pmInputTokens = r.input_tokens;
+      if (r?.output_tokens) pmOutputTokens = r.output_tokens;
     } catch (err) {
       console.warn(`[eval] pm failed for #${g.issue_number}: ${(err as Error).message}`);
     }
     const pmLatency = Date.now() - pmStart;
     pmLatencies.push(pmLatency);
+    totalInputTokens += pmInputTokens;
+    totalOutputTokens += pmOutputTokens;
+    for (const p of getRegisteredPlatforms()) {
+      perPlatform[p.name]?.latencies.push(pmLatency);
+    }
 
     const triageScore = triageAccuracy({
       expected_module: g.expected_module,

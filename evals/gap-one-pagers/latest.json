@@ -1,5 +1,14 @@
 {
-  "latest_run_artifact": null,
-  "generated_at": null,
-  "gap_ids": []
+  "latest_run_artifact": "evals/gap-runs/2026-06-01T00-44-12-411Z.json",
+  "generated_at": "2026-06-02T17:07:34.257Z",
+  "gap_ids": [
+    "AX-001",
+    "AX-002",
+    "AX-003",
+    "AX-004",
+    "AX-005",
+    "OI-001",
+    "OI-002",
+    "OI-003"
+  ]
 }
