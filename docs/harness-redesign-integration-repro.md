@@ -329,8 +329,9 @@ Both runs use the same GHA sandbox, same install commands, same test. The only d
 | Branch base | Fork's main | Upstream's main | Fork main carries 17+ noise commits |
 | PR gating | Opens immediately | Email review + approval first | Maintainer signs off before upstream sees it |
 | CI failures | Not tracked | Watched; lint auto-fixed, rest emailed | Maintainer knows what needs fixing |
-| Lint tool version | Local install | Pinned version from tox.ini | ruff 0.9.2 vs 0.15.15 = different rules |
-| CI lint fixes | New commit ("fix: lint") | `git commit --amend` | Never show fix-the-fix commits in PR |
+| Lint tool version | Local install | Pinned version from tox.ini, run in venv | ruff 0.9.2 vs 0.15.15 = different rules; local "passes" but CI fails |
+| CI lint fixes | New commit ("fix: lint") | `git commit --amend --no-edit` | Never show fix-the-fix commits in PR |
+| Verify before push | No | Run pinned tool --no-fix before push | Without this, loop spins with wrong version indefinitely |
 | CLA | Not mentioned | Noted in review email upfront | First-time contributors always need it |
 
 ---
@@ -383,49 +384,91 @@ Reply "approved" to open the upstream PR, or "rejected: <reason>" to abort.
 
 ### Requirement 2: Watch PR For Failing CI Checks
 
-After the upstream PR is opened, the harness polls the PR's status checks and emails the maintainer when checks fail with enough detail to act on.
+After the upstream PR is opened, the harness polls the PR's status checks and auto-fixes what it can, emails the maintainer for what it can't.
 
-**What to watch:**
+**What happened on PR #3199 (the concrete case):**
 
-- Poll `GET /repos/{owner}/{repo}/commits/{sha}/check-runs` every 5 minutes
-- When all checks are `completed`:
-  - All pass → send success notification, done
-  - Any fail → triage and either auto-fix or email
+After the PR was opened, Python CI failed 3 separate times before all checks passed:
 
-**The version pinning problem (learned from #3198):**
+| Round | Failure | Root cause | Fix applied |
+|---|---|---|---|
+| 1 | `ruff format --diff` | Line too long (`async with ClaudeSDKClient...`) | `ruff format` with local version → still wrong |
+| 2 | `ruff check` I001 × 2 files | Import ordering — `opentelemetry` split by `openinference` import | `ruff check --fix` with local 0.15.15 → passed locally, still failed CI |
+| 3 | `ruff check` I001 × 2 files (again) | Same rule, different result: ruff 0.9.2 (CI) vs 0.15.15 (local) disagree on ordering | Install ruff 0.9.2 in a venv, run that exact version → passes CI |
 
-CI uses tool versions pinned in `tox.ini` or `pyproject.toml` — often different from whatever is installed locally. For #3198, CI used `ruff==0.9.2` while local had `ruff==0.15.15`. The two versions have different import ordering rules, so local checks passed but CI failed.
+**The version pinning problem — and why it requires a venv:**
 
-**Rule:** Before running any lint/format checks, read the tool versions from the repo's tox config and use those exact versions. Discoverable from `tox.ini` `deps =` or `pyproject.toml` `[tool.ruff]`.
+CI pins tool versions in `tox.ini` (visible in the job log: `ruff==0.9.2`). The local system install (`brew install ruff`) gives 0.15.15. These two versions produce different import ordering decisions for the same code. Running the local version produces "All checks passed" but CI still fails.
+
+The fix: install the pinned version in an isolated venv before running any auto-fix.
+
+```bash
+# Read pinned version from CI job log or tox.ini
+PINNED_RUFF="0.9.2"
+
+# Install in throwaway venv (system Python is managed, can't pip install globally)
+python3 -m venv /tmp/lint-venv
+/tmp/lint-venv/bin/pip install "ruff==${PINNED_RUFF}" --quiet
+
+# Run the exact CI version
+/tmp/lint-venv/bin/ruff check --fix .
+/tmp/lint-venv/bin/ruff format .
+
+# Verify with the same version before pushing
+/tmp/lint-venv/bin/ruff check --no-fix .   # must show "All checks passed!"
+```
+
+**How to find the pinned version:**
+
+1. Primary: Download the failing job log from `GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs` and grep for `ruff==` — CI prints the full installed package list.
+2. Secondary: Read `tox.ini` or `pyproject.toml` `[tool.tox]` section for the package under test.
+
+**What the CI job log actually looks like (for #3198):**
+
+```
+ruff==0.9.2                    ← pinned version printed in package list
+commands[2] ruff check --no-fix .
+src/.../_wrappers.py:3:1: I001 [*] Import block is un-sorted or un-formatted
+tests/test_instrumentor.py:7:1: I001 [*] Import block is un-sorted or un-formatted
+Found 2 errors.
+```
+
+This gives you everything: tool name, pinned version (from the package list above), file path, line number, rule code.
 
 **Failure triage:**
 
 | Check type | What it means | Auto-fix? | What to do |
 |---|---|---|---|
-| `ruff format` | Code style violation | Yes | Run `ruff format` with pinned version, amend commit, push |
-| `ruff check` (I001) | Import ordering | Yes | Run `ruff check --fix` with pinned version, amend commit, push |
+| `ruff format` | Code style violation | Yes | Install pinned ruff in venv, `ruff format`, amend, push |
+| `ruff check` (I001, E, F, W) | Lint violation | Yes | Install pinned ruff in venv, `ruff check --fix`, amend, push |
 | `mypy`/`pyright` | Type error | No | Email maintainer with exact error line and context |
-| Tests | Regression | No | Email maintainer with test name, failure output |
-| `CLAAssistant` | CLA not signed | No — human only | Email maintainer with sign link; note in review email too |
-| `zizmor` | Workflow security | No | Email maintainer with flagged line; usually pre-existing |
+| Test failures | Regression in existing tests | No | Email maintainer with test name and output |
+| `CLAAssistant` | CLA not signed | No — human only | Email maintainer with sign instructions; note it in the pre-PR review email too |
+| `zizmor` | Workflow security scanner | No | Email maintainer; often a pre-existing repo-level issue not caused by the PR |
 
-**Auto-fix loop for lint failures:**
+**The auto-fix loop (amend, never add new commits):**
 
 ```
-1. Download job log for failing check
-2. Parse: which tool failed, which file, which rule code
-3. Run: <tool>@<pinned-version> --fix <file>
-4. Amend the existing commit (git commit --amend --no-edit)
-5. Force-push (--force-with-lease)
-6. Wait 5 min, re-poll
-7. Repeat until all lint checks pass or a non-auto-fixable failure remains
+LOOP:
+  1. Poll check-runs → find failing checks
+  2. For each failing lint/format check:
+     a. Download job log → parse: tool name, pinned version, file, rule code
+     b. Install pinned version: python3 -m venv /tmp/lint-venv && pip install <tool>==<version>
+     c. Run: /tmp/lint-venv/bin/<tool> --fix <files>
+     d. Verify locally: /tmp/lint-venv/bin/<tool> --no-fix <files>  # must be clean
+     e. Stage only the changed files (git add -p, not git add -A)
+     f. Amend: git commit --amend --no-edit
+     g. Push: git push origin branch --force-with-lease
+  3. Wait 5 min → re-poll
+  4. If all lint checks pass → exit loop
+  5. If non-lint checks still fail → email maintainer
 ```
 
-The key: amend the commit rather than adding a new one. This keeps the 1-commit history clean. Upstream reviewers never see "fix: import ordering" commits.
+Critical: step (d) — verify locally with the pinned version before pushing. Without this check, the harness can loop indefinitely if the wrong tool version is being used.
 
-**CLA note:** CLA is always required for first-time contributors to a repo. The harness should mention this in the pre-PR review email so the maintainer signs it before the PR opens, not after.
+**CLA note:** CLA is always required for first-time contributors to a repo. Include sign instructions in the pre-PR review email. Once CLA is signed, it covers all future PRs to that repo, so only an issue for the first PR.
 
-**Implementation:** New `watchPrChecks` pipeline phase. Uses the existing GH Actions API client (`/repos/{owner}/{repo}/actions/jobs/{job_id}/logs`). Auto-fixes go through git amend + force-push. Non-fixable failures go through Resend email.
+**Implementation:** New `watchPrChecks` pipeline phase. Uses the existing GH Actions API client. Venv creation and tool installation run in the harness process (not in a GHA sandbox). Amend + force-push use the same git client used for branch creation. Non-fixable failures route through Resend email.
 
 ---
 
