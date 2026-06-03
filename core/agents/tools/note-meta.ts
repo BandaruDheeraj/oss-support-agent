@@ -62,15 +62,28 @@ export const stateHypothesis: ToolDef<z.infer<typeof StateHypothesisArgs>, unkno
   },
 };
 
-// LLMs (especially Anthropic) emit null for absent optional arrays instead of
-// omitting the field. Zod's .default([]) only fires on undefined, not null.
-// Preprocess at the schema boundary to coerce null → [] for all array fields.
+// Anthropic emits null for absent optional fields instead of omitting them.
+// Zod treats null and undefined differently: .optional()/.default() fire on
+// undefined but not on null. A single recursive null→undefined pass at the
+// schema boundary fixes all nested fields in one shot.
+function deepNullToUndefined(v: unknown): unknown {
+  if (v === null) return undefined;
+  if (Array.isArray(v)) return v.map(deepNullToUndefined);
+  if (v && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, deepNullToUndefined(val)])
+    );
+  }
+  return v;
+}
+
 function nullToArr<T>(v: unknown): T[] {
   return Array.isArray(v) ? (v as T[]) : [];
 }
 
-const RecordEvidence = z
-  .object({
+const RecordEvidence = z.preprocess(
+  deepNullToUndefined,
+  z.object({
     evidence: z.preprocess(nullToArr, z.array(EvidenceInputSchema)).default([]),
     suspectFiles: z.preprocess(nullToArr, z.array(z.string())).optional(),
     suspectSymbols: z.preprocess(nullToArr, z.array(SuspectSymbolSchema)).default([]),
@@ -106,7 +119,8 @@ const RecordEvidence = z
      */
     oracleSpec: ReproOracleSpecInputSchema.optional(),
   })
-  .passthrough();
+  .passthrough()
+);
 export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = {
   name: 'record_evidence',
   tier: 'note',
