@@ -120,9 +120,11 @@ OPTIONAL but recommended:
 - \`rationale\`: 1-2 sentence justification.
 - \`requiresCredentials\`: env var names needed at runtime (e.g. ["OPENAI_API_KEY"]).
 
+IMPORTANT — calling convention: internal functions often use \`getattr(msg, "content")\` (attribute access) rather than \`msg["content"]\` (dict access). When calling library internals directly, use \`types.SimpleNamespace\` instead of plain dicts so attribute access works:
+
 Example for a wrong-argument bug where result_content is passed to a mock:
 \`\`\`
-testSource: "from openinference.instrumentation.claude_agent_sdk._wrappers import _update_tool_spans_from_messages\\n\\ndef test_repro():\\n    captured = []\\n    class T:\\n        def start_tool_span(self, n, i, id, p=None): pass\\n        def end_tool_span(self, id, r): pass\\n        def end_tool_span_with_error(self, id, err): captured.append(err)\\n        def end_all_in_flight(self): pass\\n    msg = {'content': [{'type': 'tool_result', 'tool_use_id': 'tu1', 'is_error': True, 'content': 'real error'}]}\\n    _update_tool_spans_from_messages(msg, T())\\n    assert captured[0] == 'real error', f'REPRO_53: got {captured[0]!r}'"
+testSource: "import types\\nfrom openinference.instrumentation.claude_agent_sdk._wrappers import _update_tool_spans_from_messages\\n\\ndef test_repro():\\n    captured = []\\n    class T:\\n        def start_tool_span(self, n, i, id, p=None): pass\\n        def end_tool_span(self, id, r): pass\\n        def end_tool_span_with_error(self, id, err): captured.append(err)\\n        def end_all_in_flight(self): pass\\n    block = types.SimpleNamespace(type='tool_result', tool_use_id='tu1', is_error=True, content='real error')\\n    msg = types.SimpleNamespace(content=[block])\\n    _update_tool_spans_from_messages(msg, T())\\n    assert captured, 'REPRO: end_tool_span_with_error was never called'\\n    assert captured[0] == 'real error', f'REPRO: got {captured[0]!r}, expected real error'"
 \`\`\`
 
 Do NOT omit candidateRepro solely because of uncertainty. Write your best attempt and note caveats in \`rationale\`.
