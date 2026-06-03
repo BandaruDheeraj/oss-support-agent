@@ -145,7 +145,7 @@ export type PipelineResult =
     }
   | { status: 'pr-opened'; prUrl: string; prNumber: number };
 
-const DEFAULT_REPRO_STAGE_TIMEOUT_MS = 20 * 60 * 1000;
+const DEFAULT_REPRO_STAGE_TIMEOUT_MS = 60 * 60 * 1000; // 60 min; analyst alone takes 15-20 min
 const REPRO_STAGE_TIMEOUT_MS_ENV = 'OSA_REPRO_STAGE_TIMEOUT_MS';
 
 export class ReproStageTimeoutError extends Error {
