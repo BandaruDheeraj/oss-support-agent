@@ -27,6 +27,7 @@
     "typescript": "^5.4.0"
   },
   "dependencies": {
+    "@ai-sdk/anthropic": "^0.0.56",
     "@ai-sdk/openai": "^0.0.66",
     "@anthropic-ai/sdk": "^0.99.0",
     "@arizeai/openinference-core": "^2.1.1",

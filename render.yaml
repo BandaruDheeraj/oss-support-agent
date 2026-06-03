@@ -53,7 +53,10 @@ services:
       - key: RESEND_WEBHOOK_SECRET
         sync: false
 
-      # Optional — falls back to heuristic LLM if absent
+      # LLM — set ANTHROPIC_API_KEY to use Anthropic direct (preferred);
+      # set OPENROUTER_API_KEY to use OpenRouter (fallback).
+      - key: ANTHROPIC_API_KEY
+        sync: false
       - key: OPENROUTER_API_KEY
         sync: false
 

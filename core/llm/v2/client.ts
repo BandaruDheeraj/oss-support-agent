@@ -1,31 +1,44 @@
 /**
- * Phase E LLM provider — Vercel AI SDK pointed at OpenRouter.
+ * Phase E LLM provider — Vercel AI SDK.
+ *
+ * Provider priority:
+ *   1. Anthropic direct (ANTHROPIC_API_KEY) — uses claude-sonnet-4-5 by default
+ *   2. OpenRouter (OPENROUTER_API_KEY / OPENROUTER_API_KEYS)
+ *
+ * Set ANTHROPIC_API_KEY to bypass OpenRouter entirely. Both providers can
+ * coexist; Anthropic routes appear first in the failover chain.
  */
 
+import { createAnthropic, type AnthropicProvider } from '@ai-sdk/anthropic';
 import { createOpenAI, type OpenAIProvider } from '@ai-sdk/openai';
 import type { LanguageModelV1 } from 'ai';
 import { resolveModelFromEnv, type OpenRouterAgent } from '../client';
 
-const providerByKey = new Map<string, OpenAIProvider>();
+const openrouterByKey = new Map<string, OpenAIProvider>();
+let anthropicProvider: AnthropicProvider | undefined;
 
 export interface ModelRoute {
-  provider: 'openrouter';
+  provider: 'anthropic' | 'openrouter';
   routeId: string;
   modelId: string;
   model: LanguageModelV1;
 }
 
-export class MissingOpenRouterApiKeyError extends Error {
+export class MissingLlmApiKeyError extends Error {
   constructor() {
     super(
-      'Missing OpenRouter API key. Set OPENROUTER_API_KEY (or OPENROUTER_API_KEYS / OPENROUTER_API_KEY_FALLBACKS) to enable Phase E loops.'
+      'No LLM API key configured. Set ANTHROPIC_API_KEY, or OPENROUTER_API_KEY / OPENROUTER_API_KEYS to enable Phase E loops.'
     );
-    this.name = 'MissingOpenRouterApiKeyError';
+    this.name = 'MissingLlmApiKeyError';
   }
 }
 
+/** @deprecated Use MissingLlmApiKeyError */
+export class MissingOpenRouterApiKeyError extends MissingLlmApiKeyError {}
+
 export function resetProviderForTests(): void {
-  providerByKey.clear();
+  openrouterByKey.clear();
+  anthropicProvider = undefined;
 }
 
 function parseCsv(value: string | undefined): string[] {
@@ -69,8 +82,8 @@ function resolveModelIds(agent: PhaseEAgent, override?: string): string[] {
   ]);
 }
 
-function providerForApiKey(apiKey: string): OpenAIProvider {
-  const cached = providerByKey.get(apiKey);
+function openrouterProviderForKey(apiKey: string): OpenAIProvider {
+  const cached = openrouterByKey.get(apiKey);
   if (cached) return cached;
   const provider = createOpenAI({
     apiKey,
@@ -81,9 +94,18 @@ function providerForApiKey(apiKey: string): OpenAIProvider {
       'X-Title': process.env.OPENROUTER_X_TITLE || 'oss-support-agent',
     },
   });
-  providerByKey.set(apiKey, provider);
+  openrouterByKey.set(apiKey, provider);
   return provider;
 }
+
+function getAnthropicProvider(): AnthropicProvider {
+  if (!anthropicProvider) {
+    anthropicProvider = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  }
+  return anthropicProvider;
+}
+
+const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-5';
 
 export type PhaseEAgent =
   | OpenRouterAgent
@@ -104,24 +126,38 @@ export function getModel(agent: PhaseEAgent, override?: string): LanguageModelV1
 }
 
 export function getModelRoutes(agent: PhaseEAgent, override?: string): ModelRoute[] {
-  const apiKeys = resolveApiKeys();
-  if (apiKeys.length === 0) throw new MissingOpenRouterApiKeyError();
-
-  const modelIds = resolveModelIds(agent, override);
   const routes: ModelRoute[] = [];
-  for (let keyIndex = 0; keyIndex < apiKeys.length; keyIndex += 1) {
-    const key = apiKeys[keyIndex];
-    const provider = providerForApiKey(key);
-    for (let modelIndex = 0; modelIndex < modelIds.length; modelIndex += 1) {
-      const modelId = modelIds[modelIndex];
-      routes.push({
-        provider: 'openrouter',
-        routeId: `openrouter:k${keyIndex + 1}:m${modelIndex + 1}`,
-        modelId,
-        model: provider(modelId),
-      });
+
+  // Anthropic direct — highest priority when key is present.
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  if (anthropicKey) {
+    const modelId = override ?? DEFAULT_ANTHROPIC_MODEL;
+    routes.push({
+      provider: 'anthropic',
+      routeId: 'anthropic:k1:m1',
+      modelId,
+      model: getAnthropicProvider()(modelId as Parameters<AnthropicProvider>[0]),
+    });
+  }
+
+  // OpenRouter — fallback or primary when no Anthropic key.
+  const openrouterKeys = resolveApiKeys();
+  if (openrouterKeys.length > 0) {
+    const modelIds = resolveModelIds(agent, override);
+    for (let ki = 0; ki < openrouterKeys.length; ki += 1) {
+      const provider = openrouterProviderForKey(openrouterKeys[ki]);
+      for (let mi = 0; mi < modelIds.length; mi += 1) {
+        routes.push({
+          provider: 'openrouter',
+          routeId: `openrouter:k${ki + 1}:m${mi + 1}`,
+          modelId: modelIds[mi],
+          model: provider(modelIds[mi]),
+        });
+      }
     }
   }
+
+  if (routes.length === 0) throw new MissingLlmApiKeyError();
   return routes;
 }
 
