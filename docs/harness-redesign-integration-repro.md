@@ -325,9 +325,13 @@ Both runs use the same GHA sandbox, same install commands, same test. The only d
 | Base class | Hoped for | Enforced from profile | duck-typing crashes OTel SDK |
 | Cassette naming | Not addressed | Enforced from profile | conftest.py fails if name is wrong |
 | `assert`/`raise` | Post-hoc guard | Enforced + explained | if/print exits 0, pipeline is blind |
-| Commits | Every iteration pushed | Squashed to 1-2 clean commits | OSS repos expect clean history |
-| PR gating | Opens immediately | Email review first, then open | Maintainer signs off before upstream sees it |
-| CI failures | Not tracked | Watched and surfaced | Maintainer knows what needs fixing |
+| Commits | Every iteration pushed | Squashed to 1 clean commit | OSS repos expect clean history |
+| Branch base | Fork's main | Upstream's main | Fork main carries 17+ noise commits |
+| PR gating | Opens immediately | Email review + approval first | Maintainer signs off before upstream sees it |
+| CI failures | Not tracked | Watched; lint auto-fixed, rest emailed | Maintainer knows what needs fixing |
+| Lint tool version | Local install | Pinned version from tox.ini | ruff 0.9.2 vs 0.15.15 = different rules |
+| CI lint fixes | New commit ("fix: lint") | `git commit --amend` | Never show fix-the-fix commits in PR |
+| CLA | Not mentioned | Noted in review email upfront | First-time contributors always need it |
 
 ---
 
@@ -379,86 +383,130 @@ Reply "approved" to open the upstream PR, or "rejected: <reason>" to abort.
 
 ### Requirement 2: Watch PR For Failing CI Checks
 
-After the upstream PR is opened, the harness polls the PR's status checks and emails the maintainer when checks fail, with enough detail to fix them.
+After the upstream PR is opened, the harness polls the PR's status checks and emails the maintainer when checks fail with enough detail to act on.
 
 **What to watch:**
 
-- Parse `GET /repos/{owner}/{repo}/commits/{sha}/check-runs` every 5 minutes
+- Poll `GET /repos/{owner}/{repo}/commits/{sha}/check-runs` every 5 minutes
 - When all checks are `completed`:
-  - If all pass: send success notification, pipeline done
-  - If any fail: triage each failure and send fix-guidance email
+  - All pass → send success notification, done
+  - Any fail → triage and either auto-fix or email
+
+**The version pinning problem (learned from #3198):**
+
+CI uses tool versions pinned in `tox.ini` or `pyproject.toml` — often different from whatever is installed locally. For #3198, CI used `ruff==0.9.2` while local had `ruff==0.15.15`. The two versions have different import ordering rules, so local checks passed but CI failed.
+
+**Rule:** Before running any lint/format checks, read the tool versions from the repo's tox config and use those exact versions. Discoverable from `tox.ini` `deps =` or `pyproject.toml` `[tool.ruff]`.
 
 **Failure triage:**
 
-| Check type | What it means | What to include in email |
-|---|---|---|
-| Lint / format (`ruff`, `flake8`) | Code style violation | Show the diff ruff would produce |
-| Type check (`mypy`, `pyright`) | Type error | Show the exact error line |
-| Tests | Regression in unrelated tests | Show which test failed and the output |
-| CLA Assistant | CLA not signed | Direct link + sign instructions |
-| Security (`zizmor`) | Workflow security issue | Show the flagged line and suggested fix |
+| Check type | What it means | Auto-fix? | What to do |
+|---|---|---|---|
+| `ruff format` | Code style violation | Yes | Run `ruff format` with pinned version, amend commit, push |
+| `ruff check` (I001) | Import ordering | Yes | Run `ruff check --fix` with pinned version, amend commit, push |
+| `mypy`/`pyright` | Type error | No | Email maintainer with exact error line and context |
+| Tests | Regression | No | Email maintainer with test name, failure output |
+| `CLAAssistant` | CLA not signed | No — human only | Email maintainer with sign link; note in review email too |
+| `zizmor` | Workflow security | No | Email maintainer with flagged line; usually pre-existing |
 
-**Fixes the harness can apply automatically:**
-- `ruff format` violations — run ruff, commit, push
-- Import ordering — run `ruff check --fix`, commit, push
-- After auto-fix: re-watch for remaining failures
+**Auto-fix loop for lint failures:**
 
-**Fixes that require the maintainer:**
-- CLA — human must sign
-- Test regressions in unrelated code — may need manual investigation
-- Security findings — requires human judgment
+```
+1. Download job log for failing check
+2. Parse: which tool failed, which file, which rule code
+3. Run: <tool>@<pinned-version> --fix <file>
+4. Amend the existing commit (git commit --amend --no-edit)
+5. Force-push (--force-with-lease)
+6. Wait 5 min, re-poll
+7. Repeat until all lint checks pass or a non-auto-fixable failure remains
+```
 
-**Implementation:** New `watchPrChecks` pipeline phase. Uses the existing GH Actions client. Emails go through the same Resend transport.
+The key: amend the commit rather than adding a new one. This keeps the 1-commit history clean. Upstream reviewers never see "fix: import ordering" commits.
+
+**CLA note:** CLA is always required for first-time contributors to a repo. The harness should mention this in the pre-PR review email so the maintainer signs it before the PR opens, not after.
+
+**Implementation:** New `watchPrChecks` pipeline phase. Uses the existing GH Actions API client (`/repos/{owner}/{repo}/actions/jobs/{job_id}/logs`). Auto-fixes go through git amend + force-push. Non-fixable failures go through Resend email.
 
 ---
 
 ### Requirement 3: OSS-Standard Commit Practices
 
-The harness must follow the same commit hygiene expected by upstream OSS maintainers. PRs with noisy iterative commits ("fix lint", "fix lint 2", "actually fix lint") are harder to review and may be rejected on style grounds.
+The harness must follow the same commit hygiene expected by upstream OSS maintainers. PRs with noisy iterative commits are harder to review and will be rejected by many projects.
 
-**Rules:**
+**Rule 1: Branch from upstream, not the fork**
 
-**1. Squash all work to 1-2 commits before pushing the branch**
+This is the most important rule. The fork's `main` diverges from upstream (has merge commits, unrelated work, prior PRs). Creating a fix branch from the fork's `main` results in the PR showing all that history as "new commits."
 
-The branch that gets pushed to the fork (and PRed upstream) has exactly:
-- `test(pkg): <test description>` — the regression test and cassette
-- `fix(pkg): <fix description>` — the source code change
+**Wrong:**
+```bash
+git checkout fork/main
+git checkout -b fix/my-branch        # inherits 17 noise commits
+```
 
-If the fix and test are small, one combined commit is fine. No "fix: ruff" commits, no "wip" commits, no iterative history.
+**Correct:**
+```bash
+git fetch upstream main
+git checkout upstream/main -b fix/my-branch   # clean slate, 0 inherited commits
+git cherry-pick <our-squashed-commit>         # exactly 1 commit in the PR
+```
 
-**2. Commit messages follow Conventional Commits**
+Learned from #3198: the PR initially showed 21 commits because the branch was created from the fork's main, which had 17 upstream merge commits, 2 prior PRs (issue #53 work), and 2 reverts.
+
+**Rule 2: Squash all work to 1 clean commit before any push**
+
+All sandbox iteration work (5 dispatch-fail-fix cycles for #3198) stays local — never pushed. The branch gets one push: the clean squashed result.
+
+How to squash cleanly:
+```bash
+git reset --soft upstream/main     # unstage all changes, keep them staged
+git add <only our changed files>   # never git add -A
+git commit -m "fix(pkg): ..."      # one commit
+```
+
+**Rule 3: Commit messages follow Conventional Commits**
 
 ```
 fix(claude-agent-sdk): don't overwrite session.id when propagated via OTel baggage
 
-<body: what and why, not how>
+_extract_init_attributes and _extract_usage_and_cost_attributes both
+unconditionally set SESSION_ID from the Claude CLI's internal UUID.
+When callers propagate session.id via OTel baggage (e.g. Langfuse's
+propagate_attributes), a SpanProcessor sets it on span start, but the
+instrumentation then overwrites it mid-stream.
 
-Fixes: #<upstream issue number>
+Fix: check baggage before writing. If session.id is already in baggage,
+skip the write. For callers not using baggage, behaviour is unchanged.
+
+Fixes: #3198
 ```
 
-- Type: `fix` for bugs, `test` for test-only changes, `chore` for tooling
-- Scope: the affected package name (matches pyproject.toml `name` field)
-- Body: explain the problem and why this approach, not a line-by-line walkthrough
-- Footer: `Fixes: #<n>` linking to the upstream issue (not the fork issue)
+- **Type:** `fix` for bugs, `test` for test-only, `chore` for tooling
+- **Scope:** the package name from `pyproject.toml` `name =` field
+- **Body:** what the problem is and why this approach — not a line-by-line walkthrough of the code
+- **Footer:** `Fixes: #<upstream issue>`, not the fork issue
 
-**3. Never push the branch mid-process**
+**Rule 4: Post-PR CI fixes use git amend, not new commits**
 
-The branch is not pushed until the fix is verified. All sandbox work happens on the harness's local git state. Only two pushes ever happen:
-- Push 1: branch with test + fix (after fix verification passes)
-- Push 2: any CI fixes required after the PR is open (auto-applied by harness)
+When CI fails after the PR is open (lint, format, import ordering), fix and amend:
+```bash
+ruff check --fix .                  # fix the issue
+git add -p                          # stage only the lint fix
+git commit --amend --no-edit        # fold into the existing commit
+git push origin branch --force-with-lease
+```
 
-Each push is a force-push if it replaces prior state, with `--force-with-lease` for safety.
+The PR history stays at 1 commit. The maintainer never sees "fix: ruff" commits.
 
-**4. The PR description is written once, correctly**
+**Rule 5: PR description is written once from the dossier**
 
-The PR body is generated after fix verification and contains:
-- One-line summary of the bug
-- Root cause (2-3 sentences)
-- The fix approach and why alternatives were rejected
-- Test plan: what the regression test does and why no API key is needed
-- Link to the upstream issue
+Generated after fix verification, contains:
+- One-line bug summary
+- Root cause (2-3 sentences)  
+- Fix approach and why alternatives were rejected
+- Test plan: what the regression test does, why no API key is needed
+- Link to upstream issue
 
-No iterative PR description edits. The harness writes it once based on the dossier, fix hypothesis, and sandbox output.
+Never edited iteratively. The dossier + fix hypothesis + sandbox output contain everything needed to write it.
 
 ---
 
@@ -466,20 +514,39 @@ No iterative PR description edits. The harness writes it once based on the dossi
 
 ```
 Webhook
-  → Semantic Search
-  → Test Infra Fingerprint (reads conftest.py, pyproject.toml, existing tests)
-  → Analyst (produces reproFiles + fixHypothesis from profile)
-  → Repro Verification (sandbox: test fails + expected output present)
-  → Fix Application (patches code)
-  → Fix Verification (same sandbox: test now passes)
-  → [SQUASH] All sandbox work squashed to 1-2 clean commits on branch
-  → [EMAIL REVIEW] Send repro + fix to maintainer for approval
-  → [WAIT] Hold until maintainer approves
-  → PR Opened on upstream (1 commit, conventional message, full description)
-  → [WATCH] Poll PR checks every 5 minutes
-    → If lint/format fails: auto-fix + push + continue watching
-    → If CLA/security/tests fail: email maintainer with details
-    → If all pass: send success notification, done
+  ↓
+Semantic Search (GHA — finds suspect files/symbols)
+  ↓
+Test Infra Fingerprint (file reads only — no LLM, no sandbox)
+  reads: conftest.py, one existing test, pyproject.toml, cassettes/
+  produces: fixture names, cassette convention, install extras, tool versions
+  ↓
+Analyst (LLM — reads suspect code + test infra profile)
+  produces: reproFiles {test+cassette}, installSpec, thirdPartyStubs, fixHypothesis
+  ↓
+Repro Verification (sandbox — all reproFiles written first, then run)
+  must: exit non-zero + contain expectedFailureOutput
+  ↓
+Fix Application (LLM — patches source per fixHypothesis)
+  ↓
+Fix Verification (same sandbox — same test, same install)
+  must: exit zero
+  ↓
+SQUASH → cherry-pick onto upstream/main (NOT fork/main) → 1 clean commit
+  ↓
+EMAIL REVIEW → repro source + fix diff + both sandbox outputs → maintainer
+  mention CLA requirement if first-time contributor
+  ↓
+WAIT for approval (HITL inbox, same as PM email loop)
+  ↓
+PR OPENED on upstream
+  conventional commit message, full description, Fixes: #<n>
+  ↓
+WATCH CI (poll every 5 min)
+  ├─ lint/format fails → run <tool>@<pinned-version> --fix → amend → force-push → re-watch
+  ├─ CLA fails → email maintainer with sign link
+  ├─ tests fail → email maintainer with failure output
+  └─ all pass → success notification → DONE
 ```
 
 ---
