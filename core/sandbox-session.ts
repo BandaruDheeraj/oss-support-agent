@@ -375,6 +375,10 @@ export class SandboxSession {
   }
 
   async setupDependencies(spec: InstallSpec): Promise<SandboxPhaseResult> {
+    // All commands run in a SINGLE sandbox dispatch so each step sees the
+    // packages installed by the previous ones. Dispatching one-per-run was
+    // broken: every GHA run starts with a fresh container, so the import
+    // verification step never saw the pip-installed packages.
     const commands = [
       `pip install -e ${spec.semanticConventionsPath}`,
       `pip install -e ${spec.instrumentationCorePath}`,
@@ -383,41 +387,44 @@ export class SandboxSession {
       `python -c "from ${spec.importVerification.modulePath} import ${spec.importVerification.className}; print('import_ok')"`,
     ];
 
+    const run = await this.runCommandInSandbox(commands);
+    if (!run.ok) {
+      return this.recordPhaseResult({
+        ok: false,
+        phase: 'setup',
+        reason: 'dependency_setup_failed',
+        stdout: run.stdout,
+        stderr: run.stderr,
+        diagnostics: run.diagnostics,
+      });
+    }
+
+    // Find the first failed step from the per-command results in the artifact.
+    const cmdResults = run.commands ?? [];
     for (let i = 0; i < commands.length; i += 1) {
       const failedStep = i + 1;
-      const run = await this.runCommandInSandbox([commands[i]]);
-      if (!run.ok) {
-        return this.recordPhaseResult({
-          ok: false,
-          phase: 'setup',
-          reason: failedStep === 5 ? 'import_verification_failed' : 'dependency_setup_failed',
-          failedStep,
-          stdout: run.stdout,
-          stderr: run.stderr,
-          diagnostics: run.diagnostics,
-        });
-      }
-
-      const combinedOutput = `${run.stdout}\n${run.stderr}`;
+      const result = cmdResults[i];
+      if (!result) continue;
       if (failedStep === 5) {
-        if (!combinedOutput.includes('import_ok')) {
+        const combined = `${result.stdout}\n${result.stderr}`;
+        if (result.exitCode !== 0 || !combined.includes('import_ok')) {
           return this.recordPhaseResult({
             ok: false,
             phase: 'setup',
             reason: 'import_verification_failed',
             failedStep,
-            stdout: run.stdout,
-            stderr: run.stderr,
+            stdout: result.stdout,
+            stderr: result.stderr,
           });
         }
-      } else if (run.exitCode !== 0) {
+      } else if (result.exitCode !== 0) {
         return this.recordPhaseResult({
           ok: false,
           phase: 'setup',
           reason: 'dependency_setup_failed',
           failedStep,
-          stdout: run.stdout,
-          stderr: run.stderr,
+          stdout: result.stdout,
+          stderr: result.stderr,
         });
       }
     }

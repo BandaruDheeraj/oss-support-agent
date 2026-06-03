@@ -178,52 +178,24 @@ describe('SandboxSession', () => {
   it('setupDependencies returns import_verification_failed when step 5 output lacks import_ok', async () => {
     const session = makeSession();
     const runCommand = jest.spyOn<any, any>(session as any, 'runCommandInSandbox');
-    runCommand
-      .mockResolvedValueOnce({
-        ok: true,
-        runId: 1,
-        conclusion: 'success',
-        exitCode: 0,
-        stdout: 'step1',
-        stderr: '',
-        rawLogs: 'step1',
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        runId: 2,
-        conclusion: 'success',
-        exitCode: 0,
-        stdout: 'step2',
-        stderr: '',
-        rawLogs: 'step2',
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        runId: 3,
-        conclusion: 'success',
-        exitCode: 0,
-        stdout: 'step3',
-        stderr: '',
-        rawLogs: 'step3',
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        runId: 4,
-        conclusion: 'success',
-        exitCode: 0,
-        stdout: 'step4',
-        stderr: '',
-        rawLogs: 'step4',
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        runId: 5,
-        conclusion: 'success',
-        exitCode: 0,
-        stdout: 'import output missing sentinel',
-        stderr: '',
-        rawLogs: 'import output missing sentinel',
-      });
+    // All 5 commands run in a single sandbox dispatch; the artifact carries
+    // per-command results so we can pinpoint which step failed.
+    runCommand.mockResolvedValueOnce({
+      ok: true,
+      runId: 1,
+      conclusion: 'success',
+      exitCode: 0,
+      stdout: 'step1\nstep2\nstep3\nstep4\nimport output missing sentinel',
+      stderr: '',
+      rawLogs: '',
+      commands: [
+        { command: 'pip install -e python/openinference-semantic-conventions', exitCode: 0, stdout: 'step1', stderr: '' },
+        { command: 'pip install -e python/openinference-instrumentation', exitCode: 0, stdout: 'step2', stderr: '' },
+        { command: 'pip install -e python/instrumentation/openinference-instrumentation-smolagents', exitCode: 0, stdout: 'step3', stderr: '' },
+        { command: 'pip install smolagents', exitCode: 0, stdout: 'step4', stderr: '' },
+        { command: 'python -c "from openinference.instrumentation.smolagents import SmolagentsInstrumentor; print(\'import_ok\')"', exitCode: 0, stdout: 'import output missing sentinel', stderr: '' },
+      ],
+    });
 
     const spec: InstallSpec = {
       semanticConventionsPath: 'python/openinference-semantic-conventions',
