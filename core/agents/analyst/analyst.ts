@@ -112,8 +112,18 @@ When \`suspectSymbols\` is non-empty, you MUST include a \`candidateRepro\` fiel
 Write the full pytest test as a \`testSource\` string. You are not constrained to any template — write whatever Python test correctly exercises and exposes the bug. The test must FAIL on the buggy code and PASS once the fix is applied.
 
 REQUIRED fields in candidateRepro:
-- \`testSource\`: complete Python source of a pytest test file (imports + def test_...()). Write valid, runnable pytest. Any assertion style works — assert, pytest.raises, mock capture, etc.
+- \`testSource\`: complete Python source of a pytest test file (imports + def test_...()). Write valid, runnable pytest.
 - \`candidateTestPath\`: repo-relative path for the test file, e.g. "tests/repro/test_issue_53.py"
+
+CRITICAL — THE TEST MUST EXIT NON-ZERO WHEN THE BUG IS PRESENT:
+Use \`assert\` statements or \`raise AssertionError\`. Do NOT use if/print — printing "BUG CONFIRMED" exits 0 and the pipeline cannot detect the failure. The pipeline runs your test and checks the exit code: exit 0 = bug not present (or test is wrong), exit non-zero = bug confirmed.
+
+WRONG (exits 0 even when bug is present):
+  if captured[0] == "Tool execution error":
+      print("BUG CONFIRMED")  # ← pipeline sees exit 0, thinks bug is absent
+
+CORRECT (exits non-zero when bug is present):
+  assert captured[0] != "Tool execution error", f"BUG: got {captured[0]!r}"
 
 OPTIONAL but recommended:
 - \`pipInstalls\`: array of \`{package, editable?: boolean}\` for any third-party deps the test needs beyond the editable installs already performed.

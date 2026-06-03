@@ -269,6 +269,16 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
   let source: string;
   if (isTestSourcePath) {
     source = candidate.testSource!;
+    // Reject testSource that has no assertion — a test that only prints
+    // "BUG CONFIRMED" will exit 0 even when the bug is present, making
+    // the pipeline blind to the failure.
+    const hasAssertion = /\bassert\b/.test(source) || /\braise\b/.test(source) || /\bpytest\.raises\b/.test(source);
+    if (!hasAssertion) {
+      return rej(
+        'test_source_render_failed',
+        'testSource has no assert/raise statement. A test that only prints results exits 0 even when the bug is present — use assert or raise AssertionError to make the test fail when the bug fires.'
+      );
+    }
     if (source.length > REPRO_RECIPE_TEST_SOURCE_MAX) {
       return rej('test_source_render_failed', `testSource exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
     }
