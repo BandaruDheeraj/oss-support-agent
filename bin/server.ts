@@ -316,6 +316,10 @@ async function startServer(): Promise<void> {
         JSON.stringify({
           status: 'ok',
           live: !!live,
+          llm: {
+            anthropic: !!process.env.ANTHROPIC_API_KEY,
+            openrouter: !!process.env.OPENROUTER_API_KEY,
+          },
           observability: {
             backend: process.env.OBSERVABILITY_BACKEND ?? 'none',
             adapters: getObservabilityDiagnostics(),
