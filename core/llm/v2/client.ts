@@ -129,9 +129,14 @@ export function getModelRoutes(agent: PhaseEAgent, override?: string): ModelRout
   const routes: ModelRoute[] = [];
 
   // Anthropic direct — highest priority when key is present.
+  // Strip the "anthropic/" provider prefix if the override came from an
+  // OpenRouter-formatted env var (e.g. "anthropic/claude-sonnet-4.5").
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   if (anthropicKey) {
-    const modelId = override ?? DEFAULT_ANTHROPIC_MODEL;
+    const rawOverride = override ?? DEFAULT_ANTHROPIC_MODEL;
+    const modelId = rawOverride.startsWith('anthropic/')
+      ? rawOverride.slice('anthropic/'.length)
+      : rawOverride;
     routes.push({
       provider: 'anthropic',
       routeId: 'anthropic:k1:m1',
