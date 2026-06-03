@@ -24,6 +24,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: OSA_REPRO_STAGE_TIMEOUT_MS
+        value: "3600000"
       - key: STATE_ROOT
         value: /var/data/state
       - key: WORKSPACE_ROOT
