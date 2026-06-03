@@ -50,7 +50,14 @@ export type Evidence = z.infer<typeof EvidenceSchema>;
 export const EvidenceInputSchema = EvidenceSchema.extend({
   recordedAt: z.string().optional(),
   source: z.string().optional(),
-});
+  // LLMs (especially Anthropic) may emit null or unlisted kind values.
+  kind: z.string().nullable().optional().transform(v => {
+    const KNOWN_KINDS = ['observation', 'stack_frame', 'code_read', 'test_output', 'crash', 'note'];
+    const s = typeof v === 'string' ? v.toLowerCase().replace(/[\s-]+/g, '_') : '';
+    return (KNOWN_KINDS.includes(s) ? s : 'observation') as Evidence['kind'];
+  }),
+  summary: z.string().nullable().optional().transform(v => v ?? ''),
+}).passthrough();
 export type EvidenceInput = z.infer<typeof EvidenceInputSchema>;
 
 export const SuspectSymbolSchema = z.object({
@@ -358,7 +365,7 @@ export type Precondition = z.infer<typeof PreconditionSchema>;
 export const PreconditionInputSchema = z
   .object({
     id: z.string().optional(),
-    condition: z.string().min(1),
+    condition: z.string().nullable().optional().transform(v => v ?? '').pipe(z.string().min(1)),
     kind: z.string().optional(),
     appliesTo: z
       .object({ file: z.string().optional(), symbol: z.string().optional() })
