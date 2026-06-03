@@ -56,9 +56,17 @@ export type CandidateReproSource = z.infer<typeof CandidateReproSource>;
  * Strict schema. Used on round-trip (after normalization). All defaults
  * are explicit so the snapshot canonical-hash is stable.
  */
+export const CANDIDATE_REPRO_TEST_SOURCE_MAX_LEN = 16_000;
+
 export const CandidateReproSchema = z.object({
   version: z.literal(1),
   source: CandidateReproSource,
+  /**
+   * When present, the analyst wrote the full Python test source directly.
+   * The Builder writes it verbatim to candidateTestPath and runs it.
+   * failureMode / exerciseCall / sentinel are unused in this path.
+   */
+  testSource: z.string().min(1).max(CANDIDATE_REPRO_TEST_SOURCE_MAX_LEN).optional(),
   failureMode: CandidateReproFailureMode,
   /**
    * For failureMode==='unexpected_exception', the Python exception class
@@ -94,14 +102,14 @@ export const CandidateReproSchema = z.object({
    * the bug. For unexpected_exception: must raise. For wrong_return: must
    * return a value that compares != expectedValueExpression.
    */
-  exerciseCall: z.string().min(1).max(CANDIDATE_REPRO_EXERCISE_MAX_LEN),
+  exerciseCall: z.string().min(1).max(CANDIDATE_REPRO_EXERCISE_MAX_LEN).optional(),
   /**
    * Unique substring the Builder will look for in run_repro stderr to
    * confirm the rendered test was actually executed (not a different
    * pre-existing failure). Templates embed it inside an AssertionError
    * message that travels to pytest's output.
    */
-  sentinel: z.string().min(8).max(CANDIDATE_REPRO_SENTINEL_MAX_LEN),
+  sentinel: z.string().min(8).max(CANDIDATE_REPRO_SENTINEL_MAX_LEN).optional(),
   /** Optional human-readable failure signature for the Critic. */
   expectedFailureSignature: z.string().max(CANDIDATE_REPRO_SIGNATURE_MAX_LEN).optional(),
   /** Reuses the recipe schema verbatim — { package, editable }. */
@@ -130,6 +138,7 @@ export const CandidateReproInputSchema = z
   .object({
     version: z.literal(1).optional(),
     source: z.string().optional(),
+    testSource: z.string().optional(),
     failureMode: z.string().optional(),
     expectedExceptionType: z.string().optional(),
     expectedValueExpression: z.string().optional(),
@@ -174,6 +183,58 @@ export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | nul
     for (const a of aliases) if (r[a] !== undefined) return r[a];
     return undefined;
   };
+  const candidateTestPathRaw = pick('candidateTestPath', 'candidate_test_path', 'testPath', 'path');
+  const candidateTestPath = typeof candidateTestPathRaw === 'string' ? candidateTestPathRaw.trim() : '';
+  if (!candidateTestPath) return null;
+
+  // --- testSource path: analyst wrote the full test; no template needed ---
+  const testSourceRaw = pick('testSource', 'test_source', 'testfile', 'test_file', 'fullTestSource');
+  const testSource = typeof testSourceRaw === 'string' ? testSourceRaw.trim() : '';
+  if (testSource) {
+    const sourceRawTs = typeof r.source === 'string' ? r.source.toLowerCase().replace(/[\s-]+/g, '_') : '';
+    const sourceParsed: CandidateReproSource = (KNOWN_SOURCES as readonly string[]).includes(sourceRawTs)
+      ? (sourceRawTs as CandidateReproSource)
+      : 'direct_call';
+    const pipInstallsRawTs = pick('pipInstalls', 'pip_installs');
+    const pipInstallsTs: ReproRecipePipInstall[] = Array.isArray(pipInstallsRawTs)
+      ? pipInstallsRawTs
+          .map((p): ReproRecipePipInstall | null => {
+            if (!p || typeof p !== 'object') return null;
+            const pp = p as Record<string, unknown>;
+            const pkg = typeof pp.package === 'string' ? pp.package.trim() : '';
+            if (!pkg || /^\s*-e\s/.test(pkg)) return null;
+            return { package: pkg, editable: pp.editable === true };
+          })
+          .filter((p): p is ReproRecipePipInstall => p !== null)
+      : [];
+    const requiresCredRaw = pick('requiresCredentials', 'requires_credentials');
+    const requiresCredentials = Array.isArray(requiresCredRaw)
+      ? requiresCredRaw.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+      : [];
+    const precondRaw = pick('preconditionsSatisfied', 'preconditions_satisfied');
+    const preconditionsSatisfied = Array.isArray(precondRaw)
+      ? precondRaw.filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+      : [];
+    const rationaleTs = typeof r.rationale === 'string' ? r.rationale.slice(0, CANDIDATE_REPRO_RATIONALE_MAX_LEN) : '';
+    const sentinelRawTs = pick('sentinel', 'sentinelString', 'sentinel_string');
+    const sentinelTs = typeof sentinelRawTs === 'string' ? sentinelRawTs.trim() : '';
+    return {
+      version: 1 as const,
+      source: sourceParsed,
+      testSource,
+      failureMode: 'wrong_return' as CandidateReproFailureMode, // placeholder; unused in testSource path
+      candidateTestPath,
+      imports: [],
+      setup: '',
+      sentinel: sentinelTs.length >= 8 ? sentinelTs : undefined,
+      pipInstalls: pipInstallsTs,
+      requiresCredentials,
+      preconditionsSatisfied,
+      rationale: rationaleTs,
+    };
+  }
+
+  // --- template path (legacy): failureMode + exerciseCall + sentinel ---
   const failureModeRaw = pick('failureMode', 'failure_mode', 'mode');
   const failureMode = typeof failureModeRaw === 'string' ? failureModeRaw.toLowerCase().replace(/[\s-]+/g, '_') : '';
   if (!(KNOWN_FAILURE_MODES as readonly string[]).includes(failureMode)) return null;
@@ -184,9 +245,6 @@ export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | nul
   const sentinelRaw = pick('sentinel', 'sentinelString', 'sentinel_string');
   const sentinel = typeof sentinelRaw === 'string' ? sentinelRaw.trim() : '';
   if (sentinel.length < 8) return null;
-  const candidateTestPathRaw = pick('candidateTestPath', 'candidate_test_path', 'testPath', 'path');
-  const candidateTestPath = typeof candidateTestPathRaw === 'string' ? candidateTestPathRaw.trim() : '';
-  if (!candidateTestPath) return null;
 
   const sourceRaw = typeof r.source === 'string' ? r.source.toLowerCase().replace(/[\s-]+/g, '_') : '';
   const source: CandidateReproSource = (KNOWN_SOURCES as readonly string[]).includes(sourceRaw)
@@ -329,7 +387,7 @@ export function renderTestSource(candidate: CandidateRepro): RenderTestSourceRes
   }
   // Sentinels are inlined into a Python string literal. Reject quotes and
   // newlines defensively; they would break the rendered source.
-  if (/["'\n\r\\]/.test(candidate.sentinel)) {
+  if (/["'\n\r\\]/.test(candidate.sentinel ?? "")) {
     return { ok: false, reason: 'sentinel_unsafe' };
   }
 

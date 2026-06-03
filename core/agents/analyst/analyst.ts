@@ -107,27 +107,25 @@ LOW-CONFIDENCE semantic seed handling:
 When \`semanticConfidence.low_confidence\` is true, you MUST explicitly state in your dossier summary that semantic suspects are low-confidence. You MUST carry that uncertainty into \`oracleSpec\`: only include suspect_path_assertions you can justify from direct file reads / concrete evidence, and avoid claiming suspect-path evidence you cannot verify.
 
 CANDIDATE REPRO (REQUIRED when suspect symbols are present):
-When \`suspectSymbols\` is non-empty, you MUST include a \`candidateRepro\` field on record_evidence (even if confidence is only low/medium). A downstream deterministic Builder uses this to author the failing test without another LLM round-trip.
+When \`suspectSymbols\` is non-empty, you MUST include a \`candidateRepro\` field on record_evidence (even if confidence is only low/medium).
 
-Two supported failureMode templates:
-1. \`unexpected_exception\` — the exercise call raises an exception when it shouldn't (or a different exception type than expected). Set \`expectedExceptionType\` to the FQN or short name of the exception type that the BUGGY code raises (e.g. "AttributeError"). The Builder will assert that calling \`exerciseCall\` raises an exception of that type; if no exception is raised, the test passes (meaning the bug is fixed) — DO NOT emit candidateRepro when you've established the bug is already fixed.
-2. \`wrong_return\` — the exercise call returns the wrong value. Set \`expectedValueExpression\` to a Python expression the actual return must equal (e.g. "True", "42", "'ok'"). The Builder asserts \`actual == <expectedValueExpression>\`; if the bug is present, the assert fails.
+Write the full pytest test as a \`testSource\` string. You are not constrained to any template — write whatever Python test correctly exercises and exposes the bug. The test must FAIL on the buggy code and PASS once the fix is applied.
 
-EXACT field names (the Builder schema is strict):
-- \`failureMode\`: "unexpected_exception" | "wrong_return"
-- \`candidateTestPath\`: relative path under tests/ (e.g. "tests/repro/test_issue_<N>.py")
-- \`sentinel\`: a short distinctive string (8-80 chars, no quotes / newlines / backslashes), e.g. "REPRO_46_NONRECORDINGSPAN_SENTINEL"
-- \`imports\`: ARRAY OF STRINGS — each entry is a full Python import line, e.g. ["from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags", "from openinference.instrumentation.smolagents._wrappers import _finalize_step_span"]
-- \`setup\`: optional Python preamble (string, may contain newlines). Used for variable assignments and helper objects before the exercise call.
-- \`exerciseCall\`: ONE Python expression that triggers the bug. Must reference at least one of the suspectSymbols you also recorded.
-- \`expectedExceptionType\` (for unexpected_exception) OR \`expectedValueExpression\` (for wrong_return) — exactly one of these.
-- \`pipInstalls\`: array of \`{package, editable?: boolean}\` for third-party deps the test needs.
-- \`preconditionsSatisfied\`: array of precondition ids (must match the \`id\` field of entries in your preconditions list, e.g. ["pc-0"])
-- \`rationale\` (optional): 1-2 sentence justification.
+REQUIRED fields in candidateRepro:
+- \`testSource\`: complete Python source of a pytest test file (imports + def test_...()). Write valid, runnable pytest. Any assertion style works — assert, pytest.raises, mock capture, etc.
+- \`candidateTestPath\`: repo-relative path for the test file, e.g. "tests/repro/test_issue_53.py"
 
-DO NOT emit a \`testSource\` or \`sentinelString\` field — the Builder renders the test source itself from the template + your fields.
+OPTIONAL but recommended:
+- \`pipInstalls\`: array of \`{package, editable?: boolean}\` for any third-party deps the test needs beyond the editable installs already performed.
+- \`rationale\`: 1-2 sentence justification.
+- \`requiresCredentials\`: env var names needed at runtime (e.g. ["OPENAI_API_KEY"]).
 
-Do NOT omit candidateRepro solely because of uncertainty. If call shape is imperfect, emit your best deterministic single-call candidate and capture caveats in \`rationale\`.
+Example for a wrong-argument bug where result_content is passed to a mock:
+\`\`\`
+testSource: "from openinference.instrumentation.claude_agent_sdk._wrappers import _update_tool_spans_from_messages\\n\\ndef test_repro():\\n    captured = []\\n    class T:\\n        def start_tool_span(self, n, i, id, p=None): pass\\n        def end_tool_span(self, id, r): pass\\n        def end_tool_span_with_error(self, id, err): captured.append(err)\\n        def end_all_in_flight(self): pass\\n    msg = {'content': [{'type': 'tool_result', 'tool_use_id': 'tu1', 'is_error': True, 'content': 'real error'}]}\\n    _update_tool_spans_from_messages(msg, T())\\n    assert captured[0] == 'real error', f'REPRO_53: got {captured[0]!r}'"
+\`\`\`
+
+Do NOT omit candidateRepro solely because of uncertainty. Write your best attempt and note caveats in \`rationale\`.
 
 REPRO TARGETS (optional, low-cost):
 Independent of candidateRepro, you SHOULD include a \`reproTargets\` field on record_evidence when you've identified the structural setup the repro needs:
@@ -317,7 +315,7 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
       ? `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous terminal tool call failed JSON parsing:\n` +
         `${result.reason ?? '(unknown parse failure)'}\n\n` +
         `Re-emit ONE valid JSON object for record_evidence. No XML envelope tokens, no prose before/after the JSON, no trailing text. ` +
-        `Keep it minimal, but include candidateRepro when suspect symbols are present (semantic-seeded runs require it).\n\n` +
+        `Keep it minimal, but include candidateRepro.testSource (a full pytest test string) when suspect symbols are present.\n\n` +
         `Use this exact minimal shape if needed:\n` +
         `record_evidence({\n` +
         `  "summary": "<one-paragraph summary of what you found>",\n` +
@@ -327,7 +325,7 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
         `  "preconditions": [],\n` +
         `  "openQuestions": []\n` +
         `})\n\n` +
-        `If semantic suspect files/symbols were provided, include candidateRepro in this retry; it is required for downstream repro execution.\n\n` +
+        `If semantic suspect files/symbols were provided, include candidateRepro with testSource (a full pytest test string) in this retry; it is required for repro execution.\n\n` +
         `Do NOT call abandon — just emit a valid record_evidence tool call with what you have.`
       : `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous attempt ended with a plain-text reply (no tool call). Plain-text replies are DISCARDED. You MUST call record_evidence NOW. Use this minimal template if you are stuck — fill in summary and confidence from what you have already investigated, and set every array to [] if you don't have specific entries:\n\n` +
         `record_evidence({\n` +
@@ -338,7 +336,7 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
         `  preconditions: [],\n` +
         `  openQuestions: []\n` +
         `})\n\n` +
-        `If semantic suspect files/symbols were provided, include candidateRepro in this retry; it is required for downstream repro execution.\n\n` +
+        `If semantic suspect files/symbols were provided, include candidateRepro with testSource (a full pytest test string) in this retry; it is required for repro execution.\n\n` +
         `Do NOT call abandon — abandon is reserved for contradictory or empty issues, not incomplete investigations. Just call record_evidence with whatever you have.`;
     const retry = await runAgentLoop({
       agent: 'ANALYST',

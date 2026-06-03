@@ -161,13 +161,18 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     }
   }
 
+  // When the analyst wrote the full test source, skip template validation
+  // checks that only apply to the exerciseCall/sentinel schema path.
+  const isTestSourcePath = !!candidate.testSource;
+
   // exerciseCall must reference at least one suspect symbol — keeps the
   // Builder honest (no Builder-authored tests that exercise unrelated code).
-  // Vacuously true when the dossier has no suspect symbols.
+  // Skip for testSource path: the analyst wrote the full test and is
+  // responsible for relevance.
   const suspectSymbols = args.dossierSnapshot.body.suspectSymbols.map((s) => s.symbol);
-  if (suspectSymbols.length > 0) {
+  if (!isTestSourcePath && suspectSymbols.length > 0) {
     const referencesOne = suspectSymbols.some((sym) =>
-      new RegExp(`\\b${escapeRegExp(sym)}\\b`).test(`${candidate.setup}\n${candidate.exerciseCall}`)
+      new RegExp(`\\b${escapeRegExp(sym)}\\b`).test(`${candidate.setup ?? ''}\n${candidate.exerciseCall ?? ''}`)
     );
     if (!referencesOne) {
       return rej(
@@ -188,10 +193,13 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     return rej('path_invalid', err instanceof Error ? err.message : String(err));
   }
 
-  // Static import shape (fast, no sandbox round-trip).
-  for (const imp of candidate.imports) {
-    if (!looksLikeSafeImport(imp)) {
-      return rej('import_unsafe_static', `Import statement failed static safety check: ${JSON.stringify(imp)}`);
+  // Static import shape check — only for template path (testSource path has
+  // no separate imports array; safety checked via ast.parse of the full source).
+  if (!isTestSourcePath) {
+    for (const imp of candidate.imports) {
+      if (!looksLikeSafeImport(imp)) {
+        return rej('import_unsafe_static', `Import statement failed static safety check: ${JSON.stringify(imp)}`);
+      }
     }
   }
 
@@ -221,50 +229,58 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
   }
 
   // ---------------------------------------------------------------
-  // (3) Probe import safety via ast.parse in the sandbox
+  // (3) Import validation — skipped for testSource path
   // ---------------------------------------------------------------
 
-  if (candidate.imports.length > 0) {
-    const probe = buildImportSafetyProbe(candidate.imports);
-    const probeRun = await safeSandbox(args.sandbox.runPython(probe));
-    if (!probeRun.ok) {
-      return rej('sandbox_error', `runPython(import probe) threw: ${probeRun.error}`);
+  if (!isTestSourcePath) {
+    if (candidate.imports.length > 0) {
+      const probe = buildImportSafetyProbe(candidate.imports);
+      const probeRun = await safeSandbox(args.sandbox.runPython(probe));
+      if (!probeRun.ok) {
+        return rej('sandbox_error', `runPython(import probe) threw: ${probeRun.error}`);
+      }
+      if (probeRun.value.exitCode !== 0) {
+        return rej(
+          'import_ast_parse_failed',
+          `Import safety probe failed (exit ${probeRun.value.exitCode}): ${tail(probeRun.value.stderr, 400)}`
+        );
+      }
     }
-    if (probeRun.value.exitCode !== 0) {
-      return rej(
-        'import_ast_parse_failed',
-        `Import safety probe failed (exit ${probeRun.value.exitCode}): ${tail(probeRun.value.stderr, 400)}`
-      );
+
+    if (candidate.imports.length > 0) {
+      const importExecutable = candidate.imports.join('\n');
+      const exec = await safeSandbox(args.sandbox.runPython(importExecutable));
+      if (!exec.ok) {
+        return rej('sandbox_error', `runPython(imports) threw: ${exec.error}`);
+      }
+      if (exec.value.exitCode !== 0) {
+        return rej(
+          'import_ast_parse_failed',
+          `Imports execute non-zero (exit ${exec.value.exitCode}): ${tail(exec.value.stderr, 400)}`
+        );
+      }
     }
   }
 
-  // Probe that the imports themselves actually resolve at runtime (catches
-  // missing transitive deps that pip didn't surface).
-  if (candidate.imports.length > 0) {
-    const importExecutable = candidate.imports.join('\n');
-    const exec = await safeSandbox(args.sandbox.runPython(importExecutable));
-    if (!exec.ok) {
-      return rej('sandbox_error', `runPython(imports) threw: ${exec.error}`);
-    }
-    if (exec.value.exitCode !== 0) {
-      return rej(
-        'import_ast_parse_failed',
-        `Imports execute non-zero (exit ${exec.value.exitCode}): ${tail(exec.value.stderr, 400)}`
-      );
-    }
-  }
-
   // ---------------------------------------------------------------
-  // (4) Render the test source
+  // (4) Get test source — written by analyst OR rendered from template
   // ---------------------------------------------------------------
 
-  const render = renderTestSource(candidate);
-  if (!render.ok) {
-    return rej('test_source_render_failed', `Template render rejected: ${render.reason}`);
-  }
-  const source = render.source;
-  if (source.length > REPRO_RECIPE_TEST_SOURCE_MAX) {
-    return rej('test_source_render_failed', `Rendered source exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
+  let source: string;
+  if (isTestSourcePath) {
+    source = candidate.testSource!;
+    if (source.length > REPRO_RECIPE_TEST_SOURCE_MAX) {
+      return rej('test_source_render_failed', `testSource exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
+    }
+  } else {
+    const render = renderTestSource(candidate);
+    if (!render.ok) {
+      return rej('test_source_render_failed', `Template render rejected: ${render.reason}`);
+    }
+    source = render.source;
+    if (source.length > REPRO_RECIPE_TEST_SOURCE_MAX) {
+      return rej('test_source_render_failed', `Rendered source exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
+    }
   }
 
   // ---------------------------------------------------------------
@@ -332,7 +348,7 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
       };
     }
     runs.push(
-      observe(r.value, candidate.sentinel, candidate.expectedFailureSignature ?? '')
+      observe(r.value, candidate.sentinel ?? "", candidate.expectedFailureSignature ?? '')
     );
   }
 
@@ -353,7 +369,7 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
         candidateTestPath,
       };
     }
-    runs.push(observe(tie.value, candidate.sentinel, candidate.expectedFailureSignature ?? ''));
+    runs.push(observe(tie.value, candidate.sentinel ?? "", candidate.expectedFailureSignature ?? ''));
   }
 
   // ---------------------------------------------------------------
@@ -363,8 +379,14 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
   const failingWithSentinel = runs.filter(
     (r) => r.exitCode !== 0 && r.sentinelObserved
   ).length;
+  const failingAny = runs.filter((r) => r.exitCode !== 0).length;
   const allPassed = runs.every((r) => r.exitCode === 0);
   const allFailedNoSentinel = runs.every((r) => r.exitCode !== 0 && !r.sentinelObserved);
+
+  // For the testSource path the analyst wrote the full test; we don't require
+  // a sentinel string in the output — exit-code alone confirms the bug fires.
+  const hasSentinel = !!candidate.sentinel;
+  const verdictOk = hasSentinel ? failingWithSentinel >= 2 : failingAny >= 2;
 
   if (allPassed) {
     await safeRevert(args.workspace, candidateTestPath);
@@ -377,8 +399,8 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     };
   }
 
-  if (failingWithSentinel < 2) {
-    if (allFailedNoSentinel) {
+  if (!verdictOk) {
+    if (hasSentinel && allFailedNoSentinel) {
       await safeRevert(args.workspace, candidateTestPath);
       return {
         ok: false,
@@ -409,14 +431,16 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     version: 1,
     candidateTestPath,
     testSource: source,
-    sentinelString: candidate.sentinel,
+    sentinelString: candidate.sentinel ?? '',
     ...(candidate.expectedFailureSignature
       ? { expectedFailureSignature: candidate.expectedFailureSignature }
       : {}),
     pipInstalls: candidate.pipInstalls,
     requiresCredentials: candidate.requiresCredentials,
     verbatimSnippetIncompatible: false,
-    approach: `builder:${candidate.failureMode}:${candidate.source}`,
+    approach: isTestSourcePath
+      ? `builder:test_source:${candidate.source}`
+      : `builder:${candidate.failureMode}:${candidate.source}`,
     provenance: {
       exerciseImports: candidate.imports,
       preconditionsSatisfied: resolvedPreconditionsSatisfied,
