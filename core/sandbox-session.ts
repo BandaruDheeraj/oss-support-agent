@@ -375,17 +375,31 @@ export class SandboxSession {
   }
 
   async setupDependencies(spec: InstallSpec): Promise<SandboxPhaseResult> {
-    // All commands run in a SINGLE sandbox dispatch so each step sees the
-    // packages installed by the previous ones. Dispatching one-per-run was
-    // broken: every GHA run starts with a fresh container, so the import
-    // verification step never saw the pip-installed packages.
-    const commands = [
+    // All commands — installs, import verification, AND pip show — run in a
+    // SINGLE sandbox dispatch. Each GHA run starts with a fresh container, so
+    // splitting across multiple dispatches means later commands never see
+    // packages installed earlier. Append pip show at the end of the same batch
+    // so collectInstallManifest doesn't need a separate round-trip.
+    const showTargets = Array.from(
+      new Set(
+        [
+          derivePackageName(spec.semanticConventionsPath),
+          derivePackageName(spec.instrumentationCorePath),
+          derivePackageName(spec.instrumentationPackagePath),
+          ...spec.thirdPartyDeps,
+        ].filter((n) => n.length > 0)
+      )
+    );
+
+    const setupCommands = [
       `pip install -e ${spec.semanticConventionsPath}`,
       `pip install -e ${spec.instrumentationCorePath}`,
       `pip install -e ${spec.instrumentationPackagePath}`,
       `pip install ${spec.thirdPartyDeps.join(' ')}`.trim(),
       `python -c "from ${spec.importVerification.modulePath} import ${spec.importVerification.className}; print('import_ok')"`,
     ];
+    const pipShowCmd = showTargets.length > 0 ? `pip show ${showTargets.join(' ')}` : null;
+    const commands = pipShowCmd ? [...setupCommands, pipShowCmd] : setupCommands;
 
     const run = await this.runCommandInSandbox(commands);
     if (!run.ok) {
@@ -399,9 +413,9 @@ export class SandboxSession {
       });
     }
 
-    // Find the first failed step from the per-command results in the artifact.
+    // Check each setup step for failures (indices 0-4).
     const cmdResults = run.commands ?? [];
-    for (let i = 0; i < commands.length; i += 1) {
+    for (let i = 0; i < setupCommands.length; i += 1) {
       const failedStep = i + 1;
       const result = cmdResults[i];
       if (!result) continue;
@@ -429,7 +443,30 @@ export class SandboxSession {
       }
     }
 
-    const installManifest = await this.collectInstallManifest(spec);
+    // Parse pip show output from the last command in the batch (index 5).
+    const pipShowResult = pipShowCmd ? cmdResults[setupCommands.length] : undefined;
+    const versions: Map<string, string> =
+      pipShowResult && pipShowResult.exitCode === 0
+        ? new Map(
+            parsePipShowOutput(pipShowResult.stdout).map((pkg) => [
+              pkg.name.toLowerCase(),
+              pkg.version,
+            ])
+          )
+        : new Map();
+
+    const ordered = [
+      { name: derivePackageName(spec.semanticConventionsPath), replaySpec: `-e ${spec.semanticConventionsPath}` },
+      { name: derivePackageName(spec.instrumentationCorePath), replaySpec: `-e ${spec.instrumentationCorePath}` },
+      { name: derivePackageName(spec.instrumentationPackagePath), replaySpec: `-e ${spec.instrumentationPackagePath}` },
+      ...spec.thirdPartyDeps.map((dep) => ({ name: dep, replaySpec: dep })),
+    ];
+    const installManifest: PackageVersion[] = ordered.map((entry) => ({
+      name: entry.name,
+      version: versions.get(entry.name.toLowerCase()) ?? 'unknown',
+      replaySpec: entry.replaySpec,
+    }));
+
     return this.recordPhaseResult({
       ok: true,
       phase: 'setup',
