@@ -56,7 +56,7 @@ export type EvidenceInput = z.infer<typeof EvidenceInputSchema>;
 export const SuspectSymbolSchema = z.object({
   file: z.string(),
   symbol: z.string(),
-  reasoning: z.string(),
+  reasoning: z.string().optional().default(''),
 });
 
 export type SuspectSymbol = z.infer<typeof SuspectSymbolSchema>;

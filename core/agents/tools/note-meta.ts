@@ -62,13 +62,20 @@ export const stateHypothesis: ToolDef<z.infer<typeof StateHypothesisArgs>, unkno
   },
 };
 
+// LLMs (especially Anthropic) emit null for absent optional arrays instead of
+// omitting the field. Zod's .default([]) only fires on undefined, not null.
+// Preprocess at the schema boundary to coerce null → [] for all array fields.
+function nullToArr<T>(v: unknown): T[] {
+  return Array.isArray(v) ? (v as T[]) : [];
+}
+
 const RecordEvidence = z
   .object({
-    evidence: z.array(EvidenceInputSchema).default([]),
-    suspectFiles: z.array(z.string()).optional(),
-    suspectSymbols: z.array(SuspectSymbolSchema).default([]),
-    preconditions: z.array(PreconditionInputSchema).default([]),
-    openQuestions: z.array(z.string()).default([]),
+    evidence: z.preprocess(nullToArr, z.array(EvidenceInputSchema)).default([]),
+    suspectFiles: z.preprocess(nullToArr, z.array(z.string())).optional(),
+    suspectSymbols: z.preprocess(nullToArr, z.array(SuspectSymbolSchema)).default([]),
+    preconditions: z.preprocess(nullToArr, z.array(PreconditionInputSchema)).default([]),
+    openQuestions: z.preprocess(nullToArr, z.array(z.string())).default([]),
     summary: z.string().min(1).optional(),
     confidence: z.enum(['low', 'medium', 'high']).optional(),
     /**
