@@ -51,10 +51,23 @@ export const EvidenceInputSchema = EvidenceSchema.extend({
   recordedAt: z.string().optional(),
   source: z.string().optional(),
   // LLMs (especially Anthropic) may emit null or unlisted kind values.
+  // Accept any string and map to the nearest valid enum value; default 'note'.
   kind: z.string().nullable().optional().transform(v => {
-    const KNOWN_KINDS = ['observation', 'stack_frame', 'code_read', 'test_output', 'crash', 'note'];
+    const VALID: Evidence['kind'][] = [
+      'issue_excerpt', 'file_excerpt', 'symbol_definition', 'symbol_caller',
+      'recent_commit', 'web_reference', 'tool_observation', 'human_input',
+      'critic_finding', 'note',
+    ];
+    const MAP: Record<string, Evidence['kind']> = {
+      observation: 'tool_observation',
+      stack_frame: 'symbol_definition',
+      code_read: 'file_excerpt',
+      test_output: 'tool_observation',
+      crash: 'tool_observation',
+    };
     const s = typeof v === 'string' ? v.toLowerCase().replace(/[\s-]+/g, '_') : '';
-    return (KNOWN_KINDS.includes(s) ? s : 'observation') as Evidence['kind'];
+    if ((VALID as string[]).includes(s)) return s as Evidence['kind'];
+    return MAP[s] ?? 'note';
   }),
   summary: z.string().nullable().optional().transform(v => v ?? ''),
 }).passthrough();
