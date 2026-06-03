@@ -9,7 +9,7 @@ function tempRoot(): string {
 }
 
 describe('FilePipelineRunStateStore', () => {
-  it('blocks duplicate running issue runs', () => {
+  it('blocks duplicate running issue runs from the same instance', () => {
     const store = new FilePipelineRunStateStore(tempRoot());
     const first = store.acquireRun({
       key: 'owner/repo#42',
@@ -25,13 +25,35 @@ describe('FilePipelineRunStateStore', () => {
       issueNumber: 42,
       action: 'labeled',
       labelName: 'agent-fix',
-      instanceId: 'instance-b',
+      instanceId: 'instance-a',
     });
 
     expect(first.acquired).toBe(true);
     expect(second.acquired).toBe(false);
     expect(second.reason).toBe('already-running');
     expect(second.record.instanceId).toBe('instance-a');
+  });
+
+  it('allows a new instance to reacquire a run left running by a dead instance', () => {
+    const store = new FilePipelineRunStateStore(tempRoot());
+    store.acquireRun({
+      key: 'owner/repo#42',
+      repoFullName: 'owner/repo',
+      issueNumber: 42,
+      action: 'labeled',
+      instanceId: 'instance-old',
+    });
+
+    // New deploy creates instance-new; instance-old was killed and its run is dead.
+    const reacquired = store.acquireRun({
+      key: 'owner/repo#42',
+      repoFullName: 'owner/repo',
+      issueNumber: 42,
+      action: 'labeled',
+      instanceId: 'instance-new',
+    });
+
+    expect(reacquired.acquired).toBe(true);
   });
 
   it('allows a stale running issue run to be reacquired', () => {

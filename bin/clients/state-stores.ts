@@ -152,9 +152,18 @@ export class FilePipelineRunStateStore extends FileStore<PipelineRunRecord> {
     const now = opts.now ?? new Date();
     const existing = this.load(input.key);
     if (existing?.status === 'running') {
+      // A run owned by a different instance is dead — the process was killed
+      // by a deploy or restart. Release it immediately rather than waiting
+      // for the stale TTL (which defaults to 6 hours).
+      const sameInstance =
+        !input.instanceId ||
+        !existing.instanceId ||
+        existing.instanceId === input.instanceId;
       const updatedAt = Date.parse(existing.updatedAt);
       const isFresh =
-        Number.isFinite(updatedAt) && now.getTime() - updatedAt < staleAfterMs;
+        sameInstance &&
+        Number.isFinite(updatedAt) &&
+        now.getTime() - updatedAt < staleAfterMs;
       if (isFresh) {
         return { acquired: false, record: existing, reason: 'already-running' };
       }
