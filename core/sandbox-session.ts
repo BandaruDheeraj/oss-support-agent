@@ -163,6 +163,8 @@ export class SandboxSession {
       }
     | null = null;
 
+  private readonly runLabel: string;
+
   constructor(params: {
     manifest: Manifest;
     targetRepo: string;
@@ -173,6 +175,8 @@ export class SandboxSession {
     timeoutMins: number;
     actionsClient: ActionsClient;
     gitClient: GitClient;
+    /** Optional human-readable label shown in the GHA run title, e.g. "issue#53 repro" */
+    runLabel?: string;
   }) {
     const errors: Array<{ field: string; received: unknown }> = [];
 
@@ -216,6 +220,7 @@ export class SandboxSession {
     this.issueNumber = params.issueNumber;
     this.timeoutMins = params.timeoutMins;
     this.actionsClient = params.actionsClient;
+    this.runLabel = params.runLabel ?? `${params.targetRepo}#${params.issueNumber}`;
     this.gitClient = params.gitClient;
   }
 
@@ -401,7 +406,7 @@ export class SandboxSession {
     const pipShowCmd = showTargets.length > 0 ? `pip show ${showTargets.join(' ')}` : null;
     const commands = pipShowCmd ? [...setupCommands, pipShowCmd] : setupCommands;
 
-    const run = await this.runCommandInSandbox(commands);
+    const run = await this.runCommandInSandbox(commands, 'setup');
     if (!run.ok) {
       return this.recordPhaseResult({
         ok: false,
@@ -495,7 +500,7 @@ export class SandboxSession {
 
     const replayCommands = this.buildInstallReplayCommands();
     const commandBatch = [...replayCommands, ...recipe.commands];
-    const run = await this.runCommandInSandbox(commandBatch);
+    const run = await this.runCommandInSandbox(commandBatch, 'repro');
     if (!run.ok) {
       this.lastDispatch = {
         ok: false,
@@ -660,13 +665,14 @@ export class SandboxSession {
     return commands;
   }
 
-  private buildWorkflowInputs(commands: string[]): Record<string, string> {
+  private buildWorkflowInputs(commands: string[], label?: string): Record<string, string> {
     return {
       repo_full_name: this.targetRepo,
       fork_clone_url: `https://github.com/${this.targetRepo}.git`,
       branch_name: this.branch,
       test_commands_b64: Buffer.from(JSON.stringify(commands), 'utf-8').toString('base64'),
       services_b64: Buffer.from('[]', 'utf-8').toString('base64'),
+      run_label: label ?? this.runLabel,
     };
   }
 
@@ -816,8 +822,8 @@ export class SandboxSession {
     }
   }
 
-  private async runCommandInSandbox(commands: string[]): Promise<CommandExecution> {
-    const inputs = this.buildWorkflowInputs(commands);
+  private async runCommandInSandbox(commands: string[], phaseLabel?: string): Promise<CommandExecution> {
+    const inputs = this.buildWorkflowInputs(commands, phaseLabel ? `${this.runLabel} [${phaseLabel}]` : undefined);
     return this.executeWorkflowDispatch(
       SANDBOX_WORKFLOW_FILE,
       inputs,

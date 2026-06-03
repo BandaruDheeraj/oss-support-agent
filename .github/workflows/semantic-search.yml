@@ -1,4 +1,5 @@
 name: semantic-search
+run-name: "semantic-search — ${{ inputs.run_label || inputs.repo_full_name }}"
 
 on:
   workflow_dispatch:

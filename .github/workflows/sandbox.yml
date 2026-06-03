@@ -1,4 +1,5 @@
 name: sandbox
+run-name: "sandbox — ${{ inputs.run_label || inputs.repo_full_name }}@${{ inputs.branch_name }}"
 
 on:
   workflow_dispatch:
@@ -22,6 +23,10 @@ on:
       services_b64:
         description: Base64-encoded JSON ServiceConfig[] of docker services to start
         required: true
+        type: string
+      run_label:
+        description: "Human-readable label for this run (e.g. 'issue#53 repro', 'issue#53 fix-verify')"
+        required: false
         type: string
 
 jobs:
