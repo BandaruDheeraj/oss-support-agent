@@ -325,15 +325,174 @@ Both runs use the same GHA sandbox, same install commands, same test. The only d
 | Base class | Hoped for | Enforced from profile | duck-typing crashes OTel SDK |
 | Cassette naming | Not addressed | Enforced from profile | conftest.py fails if name is wrong |
 | `assert`/`raise` | Post-hoc guard | Enforced + explained | if/print exits 0, pipeline is blind |
+| Commits | Every iteration pushed | Squashed to 1-2 clean commits | OSS repos expect clean history |
+| PR gating | Opens immediately | Email review first, then open | Maintainer signs off before upstream sees it |
+| CI failures | Not tracked | Watched and surfaced | Maintainer knows what needs fixing |
+
+---
+
+## Three Additional Requirements (Post Walk-Through)
+
+### Requirement 1: Human Review Email Before Upstream PR
+
+The harness MUST NOT open a PR on the upstream repo without the maintainer reviewing the repro and fix first. This is both an OSS courtesy (don't spam upstream with unreviewed work) and a quality gate (the maintainer can catch errors before they're public).
+
+**Flow:**
+
+1. Fix verification passes (test exits 0 on fixed code) → harness sends review email
+2. Email contains:
+   - Link to the branch in the fork
+   - The repro test source (inline, readable)
+   - The fix diff (inline, readable)
+   - Sandbox run output showing: test fails before fix, passes after
+   - One-click approve / reject links (same HITL mechanism as PM email loop)
+3. Maintainer replies "approved" or clicks the approve link
+4. Only then: harness opens the PR on the upstream repo
+
+**Email format:**
+```
+Subject: [agent-fix] Arize-ai/openinference#3198 — ready for upstream PR
+
+Bug: session.id overwritten by Claude internal UUID (#3198)
+Branch: BandaruDheeraj:fix/claude-agent-sdk-session-id-overwrite
+
+REPRO TEST (confirms bug before fix):
+─────────────────────────────────────
+[test source]
+
+Exit code: 1
+Output: "session.id was overwritten by Claude's internal UUID.
+         Expected: dedf7759-... Got: 63cfe7fe-..."
+
+FIX (two lines in _wrappers.py):
+─────────────────────────────────
+[diff]
+
+EXIT CODE AFTER FIX: 0 — test passes
+
+Reply "approved" to open the upstream PR, or "rejected: <reason>" to abort.
+```
+
+**Implementation:** Use the existing Resend + HITL inbox mechanism. The harness already has `runIntrospection` and PM email flows — this is the same pattern applied to the pre-PR gate.
+
+---
+
+### Requirement 2: Watch PR For Failing CI Checks
+
+After the upstream PR is opened, the harness polls the PR's status checks and emails the maintainer when checks fail, with enough detail to fix them.
+
+**What to watch:**
+
+- Parse `GET /repos/{owner}/{repo}/commits/{sha}/check-runs` every 5 minutes
+- When all checks are `completed`:
+  - If all pass: send success notification, pipeline done
+  - If any fail: triage each failure and send fix-guidance email
+
+**Failure triage:**
+
+| Check type | What it means | What to include in email |
+|---|---|---|
+| Lint / format (`ruff`, `flake8`) | Code style violation | Show the diff ruff would produce |
+| Type check (`mypy`, `pyright`) | Type error | Show the exact error line |
+| Tests | Regression in unrelated tests | Show which test failed and the output |
+| CLA Assistant | CLA not signed | Direct link + sign instructions |
+| Security (`zizmor`) | Workflow security issue | Show the flagged line and suggested fix |
+
+**Fixes the harness can apply automatically:**
+- `ruff format` violations — run ruff, commit, push
+- Import ordering — run `ruff check --fix`, commit, push
+- After auto-fix: re-watch for remaining failures
+
+**Fixes that require the maintainer:**
+- CLA — human must sign
+- Test regressions in unrelated code — may need manual investigation
+- Security findings — requires human judgment
+
+**Implementation:** New `watchPrChecks` pipeline phase. Uses the existing GH Actions client. Emails go through the same Resend transport.
+
+---
+
+### Requirement 3: OSS-Standard Commit Practices
+
+The harness must follow the same commit hygiene expected by upstream OSS maintainers. PRs with noisy iterative commits ("fix lint", "fix lint 2", "actually fix lint") are harder to review and may be rejected on style grounds.
+
+**Rules:**
+
+**1. Squash all work to 1-2 commits before pushing the branch**
+
+The branch that gets pushed to the fork (and PRed upstream) has exactly:
+- `test(pkg): <test description>` — the regression test and cassette
+- `fix(pkg): <fix description>` — the source code change
+
+If the fix and test are small, one combined commit is fine. No "fix: ruff" commits, no "wip" commits, no iterative history.
+
+**2. Commit messages follow Conventional Commits**
+
+```
+fix(claude-agent-sdk): don't overwrite session.id when propagated via OTel baggage
+
+<body: what and why, not how>
+
+Fixes: #<upstream issue number>
+```
+
+- Type: `fix` for bugs, `test` for test-only changes, `chore` for tooling
+- Scope: the affected package name (matches pyproject.toml `name` field)
+- Body: explain the problem and why this approach, not a line-by-line walkthrough
+- Footer: `Fixes: #<n>` linking to the upstream issue (not the fork issue)
+
+**3. Never push the branch mid-process**
+
+The branch is not pushed until the fix is verified. All sandbox work happens on the harness's local git state. Only two pushes ever happen:
+- Push 1: branch with test + fix (after fix verification passes)
+- Push 2: any CI fixes required after the PR is open (auto-applied by harness)
+
+Each push is a force-push if it replaces prior state, with `--force-with-lease` for safety.
+
+**4. The PR description is written once, correctly**
+
+The PR body is generated after fix verification and contains:
+- One-line summary of the bug
+- Root cause (2-3 sentences)
+- The fix approach and why alternatives were rejected
+- Test plan: what the regression test does and why no API key is needed
+- Link to the upstream issue
+
+No iterative PR description edits. The harness writes it once based on the dossier, fix hypothesis, and sandbox output.
+
+---
+
+## Updated Full Flow
+
+```
+Webhook
+  → Semantic Search
+  → Test Infra Fingerprint (reads conftest.py, pyproject.toml, existing tests)
+  → Analyst (produces reproFiles + fixHypothesis from profile)
+  → Repro Verification (sandbox: test fails + expected output present)
+  → Fix Application (patches code)
+  → Fix Verification (same sandbox: test now passes)
+  → [SQUASH] All sandbox work squashed to 1-2 clean commits on branch
+  → [EMAIL REVIEW] Send repro + fix to maintainer for approval
+  → [WAIT] Hold until maintainer approves
+  → PR Opened on upstream (1 commit, conventional message, full description)
+  → [WATCH] Poll PR checks every 5 minutes
+    → If lint/format fails: auto-fix + push + continue watching
+    → If CLA/security/tests fail: email maintainer with details
+    → If all pass: send success notification, done
+```
 
 ---
 
 ## What Still Requires A Human
 
-- **Live credentials** — bug only manifests with real API keys, no cassette exists and can't be recorded in sandbox
+- **Live credentials** — bug only manifests with real API keys, no cassette exists
 - **Concurrency / timing bugs** — not reproducible in a single sequential run
-- **Architecture-level fixes** — fix spans many files, no single `fixHypothesis` file
-- **Proprietary dependencies** — library under test can't be cloned or pip-installed
-- **First-ever cassette recording** — existing tests have cassettes to copy; truly new test patterns need a real API key to record
+- **Architecture-level fixes** — fix spans many files
+- **Proprietary dependencies** — library can't be cloned or pip-installed
+- **First-ever cassette recording** — truly new test patterns need a real API key
+- **CLA signing** — must be done by a human GitHub account
+- **Security findings** — requires human judgment, not auto-fixed
+- **Upstream maintainer review** — harness only opens the PR; merging is always human
 
-The goal is to handle the majority class: single-library instrumentation bugs where a cassette exists, the third-party can be stubbed, and the fix is localized to one or two functions.
+The goal is to handle the majority class: single-library instrumentation bugs where a cassette exists, the third-party can be stubbed, the fix is localized, and the PR can be reviewed and merged by the upstream maintainer without back-and-forth.
