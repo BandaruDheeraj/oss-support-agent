@@ -149,6 +149,12 @@ export interface ReproV2Outcome {
     | 'sandbox_failed'
     | 'api_unavailable';
   dossier: DossierStore;
+  /**
+   * When status==='sandbox_failed', the raw error message from the sandbox.
+   * Surfaces to the pipeline driver so it can be fed back to the analyst as
+   * a corrective hint on the next attempt.
+   */
+  sandboxError?: string;
   /** The recipe authored by the selected candidate (when reproduced). */
   recipe?: ReproRecipe;
   /**
@@ -362,14 +368,24 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       installSpec: resolveInstallSpec(snapshot),
     });
     if (!preflight.ok) {
+      // Surface the sandbox error as a corrective hint so the caller can feed it
+      // back to the analyst on the next attempt. This implements the feedback loop:
+      // sandbox error → orchestrator surfaces it → pipeline re-runs analyst with
+      // the error as context → analyst corrects its reproFiles/installSpec output.
+      // eslint-disable-next-line no-console
+      console.log(
+        `[v2-orchestrator] attempt=${args.attemptId} sandbox_setup_failed — ` +
+        `surfacing for corrective retry: ${preflight.message.slice(0, 300)}`
+      );
       candidates.push(...buildBlockedProberCandidates(proberSampleCount, preflight.message));
       return {
-        status: 'not_reproduced',
+        status: 'sandbox_failed',
         dossier,
         ...(builder ? { builder } : {}),
         ...(builderRejectStage ? { builderRejectStage } : {}),
         candidates,
         message: preflight.message,
+        sandboxError: preflight.message,
       };
     }
   }

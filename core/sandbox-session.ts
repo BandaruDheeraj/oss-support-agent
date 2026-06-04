@@ -400,7 +400,9 @@ export class SandboxSession {
       `pip install -e ${spec.semanticConventionsPath}`,
       `pip install -e ${spec.instrumentationCorePath}`,
       `pip install -e ${spec.instrumentationPackagePath}`,
-      `pip install ${spec.thirdPartyDeps.join(' ')}`.trim(),
+      // Only include the thirdPartyDeps step when there are deps — an empty
+      // `pip install ` (no args) fails with "You must give at least one requirement".
+      ...(spec.thirdPartyDeps.length > 0 ? [`pip install ${spec.thirdPartyDeps.join(' ')}`] : []),
       `python -c "from ${spec.importVerification.modulePath} import ${spec.importVerification.className}; print('import_ok')"`,
     ];
     const pipShowCmd = showTargets.length > 0 ? `pip show ${showTargets.join(' ')}` : null;
