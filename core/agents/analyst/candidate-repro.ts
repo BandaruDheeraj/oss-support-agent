@@ -125,6 +125,8 @@ export const CandidateReproSchema = z.object({
   preconditionsSatisfied: z.array(z.string().min(1)).default([]),
   /** Free-form 1-2 sentence justification surfaced in telemetry. */
   rationale: z.string().max(CANDIDATE_REPRO_RATIONALE_MAX_LEN).default(''),
+  /** Integration-first multi-file repro candidate (optional). */
+  reproFilesCandidate: z.custom<ReproFilesCandidate>().optional(),
 });
 export type CandidateRepro = z.infer<typeof CandidateReproSchema>;
 
@@ -158,6 +160,21 @@ export const CandidateReproInputSchema = z
     requiresCredentials: z.array(z.string()).optional(),
     preconditionsSatisfied: z.array(z.string()).optional(),
     rationale: z.string().optional(),
+    reproFiles: z.array(z.object({
+      path: z.string().min(1),
+      content: z.string(),
+      append: z.boolean().optional(),
+    })).optional(),
+    testEntryPoint: z.string().optional(),
+    installSpec: z.object({
+      editableInstall: z.array(z.string()).optional(),
+      additionalPackages: z.array(z.string()).optional(),
+    }).optional(),
+    expectedFailureOutput: z.string().optional(),
+    fixHypothesis: z.object({
+      file: z.string(),
+      description: z.string(),
+    }).optional(),
   })
   .passthrough();
 export type CandidateReproInput = z.infer<typeof CandidateReproInputSchema>;
@@ -174,6 +191,13 @@ const KNOWN_SOURCES = ['direct_call', 'issue_snippet', 'derived'] as const;
 export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
+
+  // --- reproFiles path: integration-first multi-file repro ---
+  // Check before testSource/template paths. If reproFiles is present and
+  // normalizes successfully, store the result in reproFilesCandidate and
+  // still proceed to build a minimal CandidateRepro shell around it so the
+  // existing Builder machinery can gate on candidateTestPath.
+  const reproFilesNormalized = Array.isArray(r.reproFiles) ? normalizeReproFilesInput(r) : null;
 
   // Accept common LLM-emitted alias field names. These are intentionally
   // narrow — the prompt asks for the canonical names; aliases are a
@@ -231,6 +255,7 @@ export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | nul
       requiresCredentials,
       preconditionsSatisfied,
       rationale: rationaleTs,
+      ...(reproFilesNormalized ? { reproFilesCandidate: reproFilesNormalized } : {}),
     };
   }
 
@@ -355,6 +380,7 @@ export function normalizeCandidateReproInput(raw: unknown): CandidateRepro | nul
     requiresCredentials,
     preconditionsSatisfied,
     rationale,
+    ...(reproFilesNormalized ? { reproFilesCandidate: reproFilesNormalized } : {}),
   };
 }
 
@@ -495,4 +521,83 @@ export function buildImportSafetyProbe(imports: string[]): string {
     `        sys.exit(2)`,
     `print("BUILDER_IMPORT_OK")`,
   ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Integration-first multi-file repro schema (ReproFiles redesign)
+// ---------------------------------------------------------------------------
+
+export interface ReproFile {
+  path: string;       // repo-relative path
+  content: string;    // file content
+  append?: boolean;   // if true, append to existing file rather than create
+}
+
+export const REPRO_FILES_INSTALL_SPEC_MAX = 20;
+
+export interface ReproInstallSpec {
+  editableInstall: string[];      // repo-relative dirs with pyproject.toml, installed with -e
+  additionalPackages: string[];   // pip package names/specs without -e
+}
+
+export interface ReproFilesCandidate {
+  reproFiles: ReproFile[];
+  testEntryPoint: string;         // pytest path e.g. "tests/test_x.py::test_fn"
+  installSpec: ReproInstallSpec;
+  expectedFailureOutput: string;  // substring that must appear in stderr/stdout when bug present
+  fixHypothesis: {
+    file: string;                 // repo-relative path of the file to fix
+    description: string;          // what to change and why
+  };
+  rationale?: string;
+}
+
+export function normalizeReproFilesInput(raw: unknown): ReproFilesCandidate | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+
+  const reproFiles = Array.isArray(r.reproFiles)
+    ? r.reproFiles
+        .map((f): ReproFile | null => {
+          if (!f || typeof f !== 'object') return null;
+          const ff = f as Record<string, unknown>;
+          const path = typeof ff.path === 'string' ? ff.path.trim() : '';
+          const content = typeof ff.content === 'string' ? ff.content : '';
+          if (!path) return null;
+          return { path, content, append: ff.append === true };
+        })
+        .filter((f): f is ReproFile => f !== null)
+    : [];
+  if (reproFiles.length === 0) return null;
+
+  const testEntryPoint = typeof r.testEntryPoint === 'string' ? r.testEntryPoint.trim() : '';
+  if (!testEntryPoint) return null;
+
+  const rawInstall = r.installSpec && typeof r.installSpec === 'object' ? r.installSpec as Record<string, unknown> : {};
+  const installSpec: ReproInstallSpec = {
+    editableInstall: Array.isArray(rawInstall.editableInstall)
+      ? rawInstall.editableInstall.filter((s): s is string => typeof s === 'string')
+      : [],
+    additionalPackages: Array.isArray(rawInstall.additionalPackages)
+      ? rawInstall.additionalPackages.filter((s): s is string => typeof s === 'string')
+      : [],
+  };
+
+  const expectedFailureOutput = typeof r.expectedFailureOutput === 'string' ? r.expectedFailureOutput.trim() : '';
+
+  const fixHypRaw = r.fixHypothesis && typeof r.fixHypothesis === 'object' ? r.fixHypothesis as Record<string, unknown> : {};
+  const fixHypothesis = {
+    file: typeof fixHypRaw.file === 'string' ? fixHypRaw.file.trim() : '',
+    description: typeof fixHypRaw.description === 'string' ? fixHypRaw.description.trim() : '',
+  };
+  if (!fixHypothesis.file) return null;
+
+  return {
+    reproFiles,
+    testEntryPoint,
+    installSpec,
+    expectedFailureOutput,
+    fixHypothesis,
+    rationale: typeof r.rationale === 'string' ? r.rationale.slice(0, 2000) : '',
+  };
 }

@@ -43,6 +43,7 @@ import {
   renderTestSource,
   looksLikeSafeImport,
   buildImportSafetyProbe,
+  type ReproFilesCandidate,
 } from '../analyst/candidate-repro';
 import type {
   RepoHandle,
@@ -75,7 +76,8 @@ export type BuilderRejectStage =
   | 'run_repro_pass'
   | 'run_repro_timeout'
   | 'sentinel_absent'
-  | 'run_repro_flaky';
+  | 'run_repro_flaky'
+  | 'expected_output_absent';
 
 export interface BuilderRunObservation {
   exitCode: number;
@@ -201,6 +203,17 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
         return rej('import_unsafe_static', `Import statement failed static safety check: ${JSON.stringify(imp)}`);
       }
     }
+  }
+
+  // ---------------------------------------------------------------
+  // (reproFiles path) Multi-file repro — short-circuits before the
+  // existing pip / import / template pipeline when candidate carries a
+  // reproFilesCandidate block. The existing paths below remain 100%
+  // unchanged and are only reached when reproFilesCandidate is absent.
+  // ---------------------------------------------------------------
+
+  if (candidate.reproFilesCandidate) {
+    return runReproFilesPath(args, candidate.reproFilesCandidate, candidate, resolvedPreconditionsSatisfied);
   }
 
   // ---------------------------------------------------------------
@@ -480,6 +493,228 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     reason: 'Builder produced a recipe; runs reproduced reliably with sentinel.',
     runs,
     candidateTestPath,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// reproFiles path — multi-file repro execution
+// ---------------------------------------------------------------------------
+
+async function runReproFilesPath(
+  args: ReproBuilderArgs,
+  reproFilesCandidate: ReproFilesCandidate,
+  candidate: CandidateRepro,
+  resolvedPreconditionsSatisfied: string[]
+): Promise<ReproBuilderResult> {
+  // (a) Write all files; track paths for cleanup on rejection.
+  const writtenPaths: string[] = [];
+  for (const file of reproFilesCandidate.reproFiles) {
+    try {
+      let content = file.content;
+      if (file.append) {
+        const existing = await args.workspace.readFile(file.path);
+        content = (existing ?? '') + file.content;
+      }
+      await args.workspace.writeTest(file.path, content);
+      writtenPaths.push(file.path);
+    } catch (err) {
+      // Revert already-written files before returning.
+      for (const p of writtenPaths) {
+        await safeRevert(args.workspace, p);
+      }
+      return rej(
+        'write_test_failed',
+        `workspace.writeTest threw for ${file.path}: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  }
+
+  // (b) Test entry point from reproFilesCandidate.
+  const testEntryPoint = reproFilesCandidate.testEntryPoint;
+
+  // (c) Install packages from installSpec (skip candidate.pipInstalls).
+  const { installSpec } = reproFilesCandidate;
+  for (const editablePath of installSpec.editableInstall) {
+    const spec = `-e ${editablePath}`;
+    const run = await safeSandbox(args.sandbox.pipInstall(spec));
+    if (!run.ok) {
+      for (const p of writtenPaths) await safeRevert(args.workspace, p);
+      return rej('sandbox_error', `pip install (editable) threw for ${editablePath}: ${run.error}`);
+    }
+    if (run.value.exitCode !== 0) {
+      for (const p of writtenPaths) await safeRevert(args.workspace, p);
+      return {
+        ok: false,
+        rejectStage: 'pip_install_failed',
+        reason: `pip install -e ${editablePath} failed (exit ${run.value.exitCode})`,
+        runs: [],
+        pipInstallFailure: {
+          spec,
+          exitCode: run.value.exitCode,
+          stderrTail: tail(run.value.stderr, STDERR_TAIL),
+        },
+      };
+    }
+  }
+  for (const pkg of installSpec.additionalPackages) {
+    const run = await safeSandbox(args.sandbox.pipInstall(pkg));
+    if (!run.ok) {
+      for (const p of writtenPaths) await safeRevert(args.workspace, p);
+      return rej('sandbox_error', `pip install threw for ${pkg}: ${run.error}`);
+    }
+    if (run.value.exitCode !== 0) {
+      for (const p of writtenPaths) await safeRevert(args.workspace, p);
+      return {
+        ok: false,
+        rejectStage: 'pip_install_failed',
+        reason: `pip install ${pkg} failed (exit ${run.value.exitCode})`,
+        runs: [],
+        pipInstallFailure: {
+          spec: pkg,
+          exitCode: run.value.exitCode,
+          stderrTail: tail(run.value.stderr, STDERR_TAIL),
+        },
+      };
+    }
+  }
+
+  // (d) Run the test.
+  args.sandbox.setReproTestPath(testEntryPoint);
+
+  const runs: BuilderRunObservation[] = [];
+  for (let i = 0; i < 2; i++) {
+    const r = await safeSandbox(args.sandbox.runRepro());
+    if (!r.ok) {
+      for (const p of writtenPaths) await safeRevert(args.workspace, p);
+      return {
+        ok: false,
+        rejectStage: 'sandbox_error',
+        reason: `runRepro #${i + 1} threw: ${r.error}`,
+        runs,
+        candidateTestPath: testEntryPoint,
+      };
+    }
+    // No sentinel for reproFiles path — observe with empty sentinel.
+    runs.push(observe(r.value, '', ''));
+  }
+
+  // Tiebreak on disagreement.
+  const agree = (a: BuilderRunObservation, b: BuilderRunObservation) =>
+    (a.exitCode === 0) === (b.exitCode === 0);
+
+  if (!agree(runs[0], runs[1])) {
+    const tie = await safeSandbox(args.sandbox.runRepro());
+    if (!tie.ok) {
+      for (const p of writtenPaths) await safeRevert(args.workspace, p);
+      return {
+        ok: false,
+        rejectStage: 'sandbox_error',
+        reason: `runRepro tiebreak threw: ${tie.error}`,
+        runs,
+        candidateTestPath: testEntryPoint,
+      };
+    }
+    runs.push(observe(tie.value, '', ''));
+  }
+
+  // (e) Verdict: need 2 failing runs.
+  const failingAny = runs.filter((r) => r.exitCode !== 0).length;
+  const allPassed = runs.every((r) => r.exitCode === 0);
+
+  if (allPassed) {
+    for (const p of writtenPaths) await safeRevert(args.workspace, p);
+    return {
+      ok: false,
+      rejectStage: 'run_repro_pass',
+      reason: 'Candidate reproFiles test passed on every run; bug not triggered.',
+      runs,
+      candidateTestPath: testEntryPoint,
+    };
+  }
+
+  if (failingAny < 2) {
+    for (const p of writtenPaths) await safeRevert(args.workspace, p);
+    return {
+      ok: false,
+      rejectStage: 'run_repro_flaky',
+      reason: `Runs disagreed (reproFiles path): ${runs.map((r) => `${r.exitCode}`).join('|')}`,
+      runs,
+      candidateTestPath: testEntryPoint,
+    };
+  }
+
+  // Validate expectedFailureOutput if set.
+  const expectedOut = reproFilesCandidate.expectedFailureOutput;
+  if (expectedOut) {
+    const anyRunContainsOutput = runs.some((r) => {
+      const combined = `${r.stderrTail}\n${r.stdoutTail}`;
+      return combined.includes(expectedOut);
+    });
+    if (!anyRunContainsOutput) {
+      for (const p of writtenPaths) await safeRevert(args.workspace, p);
+      return {
+        ok: false,
+        rejectStage: 'expected_output_absent',
+        reason: `expectedFailureOutput "${expectedOut.slice(0, 120)}" not found in any failing run's output.`,
+        runs,
+        candidateTestPath: testEntryPoint,
+      };
+    }
+  }
+
+  // (g) Build recipe using reproFilesCandidate data.
+  const lastFailing = runs.filter((r) => r.exitCode !== 0).slice(-1)[0] ?? runs[runs.length - 1];
+
+  // Use the first repro file's content as testSource in the recipe
+  // (the recipe schema requires a testSource string; we record the entry-point file content).
+  const entryFile = reproFilesCandidate.reproFiles.find(
+    (f) => testEntryPoint.startsWith(f.path)
+  ) ?? reproFilesCandidate.reproFiles[0];
+  const recipeTestSource = entryFile
+    ? entryFile.content.slice(0, REPRO_RECIPE_TEST_SOURCE_MAX)
+    : testEntryPoint;
+
+  const recipe: ReproRecipe = {
+    version: 1,
+    candidateTestPath: testEntryPoint,
+    testSource: recipeTestSource,
+    sentinelString: expectedOut || testEntryPoint,
+    pipInstalls: [
+      ...installSpec.editableInstall.map((p) => ({ package: p, editable: true })),
+      ...installSpec.additionalPackages.map((p) => ({ package: p, editable: false })),
+    ],
+    requiresCredentials: candidate.requiresCredentials,
+    verbatimSnippetIncompatible: false,
+    approach: `reproFiles:${candidate.source}`,
+    provenance: {
+      exerciseImports: [],
+      preconditionsSatisfied: resolvedPreconditionsSatisfied,
+      observedProbe: {
+        sentinelObserved: false,
+        signatureObserved: false,
+        exitCode: lastFailing.exitCode,
+        durationMs: lastFailing.durationMs,
+        stderrTail: lastFailing.stderrTail,
+        stdoutTail: lastFailing.stdoutTail,
+      },
+      proberAttempts: 0,
+      recordedAt: new Date().toISOString(),
+    },
+  };
+
+  // eslint-disable-next-line no-console
+  console.log(
+    `[v2-builder] attempt=${args.attemptId} ok=true path=reproFiles ranRepro=${runs.length}` +
+      ` failingAny=${failingAny} source=${candidate.source}` +
+      ` reproFiles=${reproFilesCandidate.reproFiles.length}`
+  );
+
+  return {
+    ok: true,
+    recipe,
+    reason: 'Builder (reproFiles path) produced a recipe; runs reproduced reliably.',
+    runs,
+    candidateTestPath: testEntryPoint,
   };
 }
 

@@ -67,7 +67,12 @@ import type { RetryLoopConfig } from '../core/retry-loop-types';
 
 import { GitHubRestClient, GitHubIssueCommenter } from './clients/github-rest';
 import type { IssueCommenter } from '../core/agents/triage-types';
-import { LocalWorkspace } from './clients/local-workspace';
+import {
+  LocalWorkspace,
+  execCommand,
+  buildConventionalCommitMessage,
+  readPyprojectScope,
+} from './clients/local-workspace';
 import { LocalForkCommitter, LocalRepoFileReader } from './clients/local-fork-deps';
 import { runLocalSandbox } from './clients/local-sandbox';
 import type { LiveDeps } from './clients/live-deps';
@@ -1494,6 +1499,193 @@ function resolveRecordedBackend(): string {
 }
 
 /**
+ * Gather the git diff of the last commit in the workspace directory.
+ * Returns the diff string (capped at 20KB), or an error description on failure.
+ */
+async function gatherFixDiff(workspaceDir: string, log: (msg: string) => void): Promise<string> {
+  try {
+    const result = await execCommand('git', ['diff', 'HEAD~1', 'HEAD'], workspaceDir, {
+      timeoutMs: 15_000,
+    });
+    if (result.exitCode !== 0) {
+      log(`[pre-pr-review] git diff failed (exit ${result.exitCode}): ${result.stderr.slice(0, 200)}`);
+      return result.stderr.slice(0, 500) || '(git diff returned no output)';
+    }
+    const diff = result.stdout.trim();
+    return diff.slice(0, 20_000) || '(empty diff)';
+  } catch (err: any) {
+    log(`[pre-pr-review] git diff threw: ${err?.message ?? err}`);
+    return '(diff unavailable)';
+  }
+}
+
+interface PrePrReviewGate {
+  /** true if approved (including when the gate is skipped due to missing deps). */
+  approved: boolean;
+  skipped: boolean;
+  skipReason?: string;
+}
+
+/**
+ * Send a pre-PR review email to PM_EMAIL and wait for an approval reply
+ * before opening the PR on the upstream repo.
+ *
+ * The gate is bypassed (returns approved=true, skipped=true) when:
+ *   - live deps (Gmail/HITL) are not configured
+ *   - email send fails
+ *   - reply waiter throws
+ *
+ * This is a fail-safe design: missing or broken infra never blocks the PR.
+ * Email subject always carries the "[upstream-pr-review]" prefix for easy filtering.
+ */
+async function sendPrePrReviewEmail(args: {
+  issueTitle: string;
+  issueNumber: number;
+  issueUrl: string;
+  repoFullName: string;
+  reproTestPath: string | undefined;
+  reproTestContent: string | undefined;
+  fixDiff: string;
+  sandbox1ExitCode: number | null;
+  sandbox1Output: string;
+  sandbox2ExitCode: number | null;
+  sandbox2Output: string;
+  changedFiles: string[];
+  forkFullName: string;
+  branchName: string;
+  pmEmail: string;
+  approvalKeywords: string[];
+  live: import('./clients/live-deps').LiveDeps;
+  runId: string;
+  log: (msg: string) => void;
+}): Promise<PrePrReviewGate> {
+  const {
+    issueTitle,
+    issueNumber,
+    issueUrl,
+    repoFullName,
+    reproTestPath,
+    reproTestContent,
+    fixDiff,
+    sandbox1ExitCode,
+    sandbox1Output,
+    sandbox2ExitCode,
+    sandbox2Output,
+    changedFiles,
+    forkFullName,
+    branchName,
+    pmEmail,
+    approvalKeywords,
+    live,
+    runId,
+    log,
+  } = args;
+
+  const prReviewRunId = `${runId}-pr-review`;
+
+  const reproSection = reproTestPath
+    ? [
+        `**Repro test path:** \`${reproTestPath}\``,
+        reproTestContent
+          ? `\`\`\`python\n${reproTestContent.slice(0, 3_000)}${reproTestContent.length > 3_000 ? '\n... (truncated)' : ''}\n\`\`\``
+          : '(content unavailable)',
+      ].join('\n')
+    : '(repro test path not available)';
+
+  const run1Section = [
+    `**Sandbox run 1 (bug present):** exit code \`${sandbox1ExitCode ?? 'n/a'}\``,
+    `\`\`\`\n${sandbox1Output.slice(0, 500)}${sandbox1Output.length > 500 ? '\n...' : ''}\n\`\`\``,
+  ].join('\n');
+
+  const run2Section = [
+    `**Sandbox run 2 (fix applied):** exit code \`${sandbox2ExitCode ?? 'n/a'}\``,
+    `\`\`\`\n${sandbox2Output.slice(0, 500)}${sandbox2Output.length > 500 ? '\n...' : ''}\n\`\`\``,
+  ].join('\n');
+
+  const diffSection = [
+    `**Fix diff:**`,
+    `\`\`\`diff\n${fixDiff.slice(0, 6_000)}${fixDiff.length > 6_000 ? '\n...(truncated)' : ''}\n\`\`\``,
+  ].join('\n');
+
+  const changedFilesSection =
+    changedFiles.length > 0
+      ? `**Changed files:**\n${changedFiles.map((f) => `- \`${f}\``).join('\n')}`
+      : '**Changed files:** (none recorded)';
+
+  const claNote = `> **Note:** If this is the first PR from this agent to \`${repoFullName}\`, please check whether the upstream repo requires a CLA signature before merging. The agent will open the PR as a draft.`;
+
+  const branchUrl = `https://github.com/${forkFullName}/tree/${branchName}`;
+
+  const emailBody = [
+    `## [upstream-pr-review] Pre-PR Review: ${issueTitle}`,
+    ``,
+    `**Issue:** [${repoFullName}#${issueNumber}](${issueUrl})`,
+    `**Fork branch:** [${forkFullName}@${branchName}](${branchUrl})`,
+    ``,
+    `The oss-support-agent has completed repro + fix validation and is ready to open a pull request on the upstream repo. Please review the evidence below and reply with an approval keyword to proceed.`,
+    ``,
+    `---`,
+    ``,
+    `### Repro Test`,
+    reproSection,
+    ``,
+    `### Sandbox Evidence`,
+    run1Section,
+    ``,
+    run2Section,
+    ``,
+    `### Fix Diff`,
+    diffSection,
+    ``,
+    changedFilesSection,
+    ``,
+    `---`,
+    ``,
+    claNote,
+    ``,
+    `---`,
+    `To approve and open the PR, reply with one of: ${approvalKeywords.join(', ')}`,
+    `To block/reject, reply with anything else (e.g. "reject", "hold", "no").`,
+    ``,
+    `Run: ${runId}`,
+  ].join('\n');
+
+  const subject = `[upstream-pr-review] ${repoFullName}#${issueNumber}: ${issueTitle}`;
+  const replyToAddress = live.replyToFor(prReviewRunId);
+
+  log(`[pre-pr-review] sending pre-PR review email to ${pmEmail} (runId=${prReviewRunId})`);
+
+  try {
+    await live.failureNotifier.sendEmail(pmEmail, subject, emailBody, replyToAddress);
+  } catch (err: any) {
+    log(`[pre-pr-review] failed to send email (fail-safe: opening PR directly): ${err?.message ?? err}`);
+    return { approved: true, skipped: true, skipReason: `email-send-failed: ${err?.message ?? err}` };
+  }
+
+  log(`[pre-pr-review] waiting for reply (runId=${prReviewRunId})`);
+
+  let reply: import('../core/gmail-types').GmailReply;
+  try {
+    const result = await live.replyWaiter.waitForEmailReply(prReviewRunId);
+    reply = result.reply;
+  } catch (err: any) {
+    log(`[pre-pr-review] waitForEmailReply threw (fail-safe: opening PR directly): ${err?.message ?? err}`);
+    return { approved: true, skipped: true, skipReason: `reply-wait-failed: ${err?.message ?? err}` };
+  }
+
+  log(`[pre-pr-review] received reply (${reply.body.length} chars) from ${reply.from}`);
+
+  const approval = detectApproval(reply.body, approvalKeywords);
+  if (approval.approved) {
+    log(`[pre-pr-review] approved (keyword: ${approval.matchedKeyword})`);
+    return { approved: true, skipped: false };
+  }
+
+  log(`[pre-pr-review] reply did not contain approval keyword — gate rejected`);
+  return { approved: false, skipped: false };
+}
+
+/**
  * Run the issue-sweep / scope-confirmation flow over Gmail.
  *
  * After PM design approval, sweep all open issues in the repo and find ones
@@ -2819,6 +3011,35 @@ export async function runPipeline(args: {
     agentInvestigationSection = buildAgentInvestigationSection(fixOutcome.v2);
   }
 
+  // ---------- Squash + rebase onto upstream/main (OSS-standard commit hygiene) ----------
+  // When the PR target is an upstream repo that differs from our fork origin we
+  // must rebase our work onto upstream/main so the PR shows exactly 1 clean
+  // commit (no fork-history noise).  The fork will always differ from upstream,
+  // so this step always runs when we are about to open a cross-fork PR.
+  const upstreamUrl = `https://github.com/${repoFullName}.git`;
+  const isUpstreamPr = fork.forkFullName.toLowerCase() !== repoFullName.toLowerCase();
+  if (isUpstreamPr) {
+    try {
+      log(`[pr/squash] PR target (${repoFullName}) differs from fork (${fork.forkFullName}); squashing onto upstream/main`);
+      const scope = readPyprojectScope(workspace.dir, routing.result.affectedModule);
+      const shortDescription = prSummary.slice(0, 72); // keep header line short
+      const bodyText =
+        `Problem: ${confirmedIssues[0]?.title ?? prSummary}\n\n` +
+        `Approach: ${prSummary}`;
+      const conventionalMsg = buildConventionalCommitMessage(
+        scope,
+        shortDescription,
+        bodyText,
+        issueNumber
+      );
+      await workspace.squashAndRebaseOntoUpstream(upstreamUrl, conventionalMsg);
+      log(`[pr/squash] squash-rebase complete; branch ${fork.branchName} now 1 commit above upstream/main`);
+    } catch (squashErr: any) {
+      // Non-fatal: log and continue. A PR with more commits is still valid.
+      log(`[pr/squash] squash-rebase failed (non-blocking): ${squashErr?.message ?? squashErr}`);
+    }
+  }
+
   // ---------- Draft PR ----------
   const prMeta = await adapter.getPRMetadata(
     confirmedIssues.map((i) => ({
@@ -2853,6 +3074,73 @@ export async function runPipeline(args: {
       : []),
     ...(prMeta.extraBodySections ?? []),
   ].join('\n');
+
+  // ---------- Pre-PR review gate ----------
+  // If live deps (Gmail/HITL) are configured and PM_EMAIL is set, send a
+  // review email to the PM before opening the PR. The email includes the repro
+  // test source, fix diff, and both sandbox run outputs so the reviewer can
+  // assess correctness without opening the branch. Gate is fail-safe: any
+  // infra error skips the gate and proceeds to open the PR directly.
+  if (deps.live && manifest.pm_email) {
+    const issueUrl = `https://github.com/${repoFullName}/issues/${issueNumber}`;
+    const fixDiff = await gatherFixDiff(workspace.dir, log);
+
+    // Extract sandbox evidence from the fix outcome (v2 path only).
+    let sb1ExitCode: number | null = null;
+    let sb1Output = '(not available)';
+    let sb2ExitCode: number | null = null;
+    let sb2Output = '(not available)';
+    if (v2FixOutcomeForEmail?.v2.executor) {
+      const ev = v2FixOutcomeForEmail.v2.executor.greenEvidence;
+      if (ev.lastReproRun) {
+        // lastReproRun is the run AFTER the fix is applied — shows bug is gone.
+        // We label it "run 2" (fix applied). For "run 1" (bug present) we use
+        // the repro baseline from the repro outcome if available.
+        sb2ExitCode = ev.lastReproRun.exitCode;
+        sb2Output = (ev.lastReproRun.stdout + ev.lastReproRun.stderr).trim() || '(no output)';
+      }
+      if (ev.lastTestsRun) {
+        sb2Output = (ev.lastTestsRun.stdout + ev.lastTestsRun.stderr).trim() || sb2Output;
+      }
+    }
+    // Baseline (bug-present) run: best-effort from repro outcome
+    if (v2ReproOutcomeForEmail?.v2) {
+      const reproVerdict = v2ReproOutcomeForEmail.v2.criticVerdict;
+      if (reproVerdict) {
+        sb1ExitCode = reproVerdict.reproducedReliably ? 1 : null;
+        sb1Output = reproVerdict.reason ?? '(repro confirmed)';
+      }
+    }
+
+    const prGate = await sendPrePrReviewEmail({
+      issueTitle: payload.issue.title ?? '',
+      issueNumber,
+      issueUrl,
+      repoFullName,
+      reproTestPath: v2ReproOutcomeForEmail?.candidateTestPath,
+      reproTestContent: v2ReproOutcomeForEmail?.candidateTestContent,
+      fixDiff,
+      sandbox1ExitCode: sb1ExitCode,
+      sandbox1Output: sb1Output,
+      sandbox2ExitCode: sb2ExitCode,
+      sandbox2Output: sb2Output,
+      changedFiles: v2FixOutcomeForEmail?.changedFiles ?? [],
+      forkFullName: fork.forkFullName,
+      branchName: fork.branchName,
+      pmEmail: manifest.pm_email,
+      approvalKeywords: manifest.approval_keywords,
+      live: deps.live,
+      runId,
+      log,
+    });
+
+    if (prGate.skipped) {
+      log(`[pre-pr-review] gate skipped (${prGate.skipReason ?? 'unknown'}); opening PR directly`);
+    } else if (!prGate.approved) {
+      log('[pre-pr-review] gate rejected — PR NOT opened');
+      return finish({ status: 'fix-failed', reason: 'pre-pr-review gate rejected by PM' });
+    }
+  }
 
   const pr = await ghClient.createPullRequest({
     upstream: repoFullName,

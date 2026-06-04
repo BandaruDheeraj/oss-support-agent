@@ -108,6 +108,75 @@ function cloneUrl(token: string, fullName: string): string {
   return `https://x-access-token:${token}@github.com/${fullName}.git`;
 }
 
+/**
+ * Extract the package `name` from the nearest `pyproject.toml` file at or
+ * above `affectedModulePath` within the workspace.
+ *
+ * Returns the name from the `[project]` or `[tool.poetry]` section if
+ * present, falling back to the last path component of `affectedModulePath`.
+ *
+ * @param workspaceDir  Absolute path to the workspace root (LocalWorkspace.dir).
+ * @param affectedModulePath  Repo-relative path to the affected module/package.
+ */
+export function readPyprojectScope(workspaceDir: string, affectedModulePath: string): string {
+  // Normalize: remove leading/trailing slashes, split into parts.
+  const rel = affectedModulePath.replace(/^\/+|\/+$/g, '');
+  const parts = rel.split('/').filter(Boolean);
+
+  // Walk from the module directory up to the workspace root looking for pyproject.toml.
+  for (let depth = parts.length; depth >= 0; depth--) {
+    const candidateDir = path.join(workspaceDir, ...parts.slice(0, depth));
+    const pyprojectPath = path.join(candidateDir, 'pyproject.toml');
+    if (fs.existsSync(pyprojectPath)) {
+      try {
+        const content = fs.readFileSync(pyprojectPath, 'utf-8');
+        // [project] name = "..."  (PEP 517 / setuptools)
+        const projectMatch = /\[project\][^\[]*?^name\s*=\s*["']([^"']+)["']/ms.exec(content);
+        if (projectMatch) return projectMatch[1];
+        // [tool.poetry] name = "..."
+        const poetryMatch = /\[tool\.poetry\][^\[]*?^name\s*=\s*["']([^"']+)["']/ms.exec(content);
+        if (poetryMatch) return poetryMatch[1];
+      } catch {
+        /* ignore read errors */
+      }
+    }
+  }
+
+  // Fallback: last non-empty path component.
+  return parts[parts.length - 1] ?? (rel || 'unknown');
+}
+
+/**
+ * Build a Conventional Commits-formatted message.
+ *
+ * Format:
+ *   fix({scope}): {description}
+ *
+ *   {body}
+ *
+ *   Fixes: #{fixesIssue}
+ *
+ * The `scope` should come from the affected package's pyproject.toml `name`
+ * field (or a short module name as a fallback). `body` explains what the
+ * problem is and why this approach was taken. `fixesIssue` is the upstream
+ * issue number.
+ */
+export function buildConventionalCommitMessage(
+  scope: string,
+  description: string,
+  body: string,
+  fixesIssue: number
+): string {
+  const header = `fix(${scope}): ${description}`;
+  const footer = `Fixes: #${fixesIssue}`;
+  const parts = [header];
+  if (body.trim()) {
+    parts.push('', body.trim());
+  }
+  parts.push('', footer);
+  return parts.join('\n');
+}
+
 export class LocalWorkspace {
   public readonly dir: string;
 
@@ -360,6 +429,72 @@ export class LocalWorkspace {
   async resetToShaAndForcePush(sha: string): Promise<void> {
     await git(this.dir, ['reset', '--hard', sha]);
     await git(this.dir, ['clean', '-fd', '-e', '.agent-venv']);
+    await git(this.dir, ['push', '--force-with-lease', 'origin', this.branch]);
+  }
+
+  /**
+   * Squash all commits that are not in upstream/main into a single commit
+   * rebased cleanly onto upstream/main, then force-push with --force-with-lease.
+   *
+   * This ensures that a PR opened against an upstream repo shows ONLY our 1
+   * clean commit rather than the full fork history.
+   *
+   * Steps:
+   *   1. Add an "upstream" git remote pointing to upstreamUrl (idempotent).
+   *   2. Fetch upstream/main.
+   *   3. Identify our commits via `git log HEAD ^upstream/main`.
+   *   4. Soft-reset to upstream/main (all our changes become staged).
+   *   5. Re-commit with commitMessage.
+   *   6. Force-push with --force-with-lease.
+   *
+   * @param upstreamUrl  HTTPS clone URL of the original upstream repo
+   *                     (e.g. "https://github.com/Arize-ai/openinference.git").
+   * @param commitMessage  The final single-commit message (use
+   *                       buildConventionalCommitMessage to build it).
+   */
+  async squashAndRebaseOntoUpstream(
+    upstreamUrl: string,
+    commitMessage: string
+  ): Promise<void> {
+    // 1. Add upstream remote (idempotent — ignore error if it already exists).
+    const remoteList = await execCommand('git', ['remote'], this.dir);
+    const remotes = remoteList.stdout.split('\n').map((r) => r.trim()).filter(Boolean);
+    if (!remotes.includes('upstream')) {
+      await git(this.dir, ['remote', 'add', 'upstream', upstreamUrl]);
+    } else {
+      // Update the URL in case it changed.
+      await git(this.dir, ['remote', 'set-url', 'upstream', upstreamUrl]);
+    }
+
+    // 2. Fetch upstream/main (shallow to avoid downloading the full history).
+    await git(this.dir, ['fetch', '--depth=1', 'upstream', 'main']);
+
+    // 3. Identify our commits (diagnostic only — used for logging).
+    const ourCommitsResult = await execCommand(
+      'git',
+      ['log', '--oneline', 'HEAD', '^upstream/main'],
+      this.dir
+    );
+    const ourCommitLines = ourCommitsResult.stdout.trim().split('\n').filter(Boolean);
+
+    if (ourCommitLines.length === 0) {
+      // Nothing to squash — branch is already at upstream/main or behind it.
+      return;
+    }
+
+    // 4. Soft-reset to upstream/main — keeps all our changes staged.
+    await git(this.dir, ['reset', '--soft', 'upstream/main']);
+
+    // 5. Re-commit with the final message.
+    // Use GIT_AUTHOR_NAME/EMAIL env vars to keep the configured identity.
+    await git(this.dir, ['commit', '-m', commitMessage], {
+      GIT_AUTHOR_NAME: this.opts.authorName,
+      GIT_AUTHOR_EMAIL: this.opts.authorEmail,
+      GIT_COMMITTER_NAME: this.opts.authorName,
+      GIT_COMMITTER_EMAIL: this.opts.authorEmail,
+    });
+
+    // 6. Force-push with lease.
     await git(this.dir, ['push', '--force-with-lease', 'origin', this.branch]);
   }
 }

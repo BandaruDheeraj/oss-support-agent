@@ -73,6 +73,18 @@ export interface SandboxArtifact {
 }
 
 /**
+ * A single check run attached to a commit ref.
+ */
+export interface CheckRun {
+  id: number;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  detailsUrl: string | null;
+  appSlug: string | null;
+}
+
+/**
  * Interface for GitHub Actions API interactions (for testability).
  */
 export interface ActionsClient {
@@ -136,6 +148,18 @@ export interface ActionsClient {
     name: string,
     content: string
   ): Promise<string>;
+
+  /**
+   * Fetch all check runs for a given commit ref (SHA or branch name).
+   * Optional so minimal clients and test fakes don't need to implement it.
+   */
+  getCheckRuns?(repoFullName: string, ref: string): Promise<CheckRun[]>;
+
+  /**
+   * Download the raw log text for a single Actions job by job ID.
+   * Optional so minimal clients and test fakes don't need to implement it.
+   */
+  downloadJobLog?(repoFullName: string, jobId: number): Promise<string>;
 }
 
 /**

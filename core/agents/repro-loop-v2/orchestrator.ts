@@ -23,6 +23,7 @@ import type { IssueCodeSnippet } from './repro-hints';
 import { deriveEditableInstallsFromSuspectPaths, mergeEditableInstallCandidates } from './repro-hints';
 import type { SemanticSuspectSeed } from '../analyst/semantic-search';
 import type { InstallSpec } from '../../sandbox-session';
+import type { TestInfraProfile } from './test-infra-fingerprint';
 
 const DEFAULT_PROBER_SAMPLE_COUNT = 3;
 const DEFAULT_PROBER_TEMPERATURE = 0.7;
@@ -30,7 +31,7 @@ const PROBER_SAMPLE_COUNT_ENV = 'OSA_REPRO_PROBER_SAMPLES';
 const PROBER_TEMPERATURE_ENV = 'OSA_REPRO_PROBER_TEMPERATURE';
 const OPENINFERENCE_REPO_SUFFIX = '/openinference';
 
-const OPENINFERENCE_PROBER_INSTALL_SPEC: InstallSpec = {
+const OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT: InstallSpec = {
   semanticConventionsPath: 'python/openinference-semantic-conventions',
   instrumentationCorePath: 'python/openinference-instrumentation',
   instrumentationPackagePath: 'python/instrumentation/openinference-instrumentation-smolagents',
@@ -95,6 +96,8 @@ export interface RunReproV2Args {
   proberSampleCount?: number;
   /** Sampling temperature for Prober best-of-N generation. */
   proberTemperature?: number;
+  /** Optional test infrastructure fingerprint for the affected package. */
+  testInfraProfile?: TestInfraProfile | null;
 }
 
 export interface ReproCandidateEvaluation {
@@ -207,6 +210,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       dossier,
       carryforwardSummary: args.carryforwardSummary,
       semanticSuspectSeed: args.semanticSuspectSeed ?? null,
+      testInfraProfile: args.testInfraProfile,
     });
     if (!analyst.snapshot) {
       if (analyst.terminated === 'api_unavailable') {
@@ -336,9 +340,19 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   const requiresOpenInferencePreflight =
     proberSampleCount > 0 && shouldRunOpenInferencePreflight(args.repo.fullName);
   if (requiresOpenInferencePreflight) {
+    const installSpec = snapshot.body.candidateRepro?.reproFilesCandidate?.installSpec
+      ? {
+          semanticConventionsPath: snapshot.body.candidateRepro.reproFilesCandidate.installSpec.editableInstall[0] ?? OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT.semanticConventionsPath,
+          instrumentationCorePath: snapshot.body.candidateRepro.reproFilesCandidate.installSpec.editableInstall[1] ?? OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT.instrumentationCorePath,
+          instrumentationPackagePath: snapshot.body.candidateRepro.reproFilesCandidate.installSpec.editableInstall[2] ?? OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT.instrumentationPackagePath,
+          thirdPartyDeps: snapshot.body.candidateRepro.reproFilesCandidate.installSpec.additionalPackages,
+          importVerification: OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT.importVerification,
+        }
+      : OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT;
     const preflight = await runOpenInferenceProberPreflight({
       sandbox: args.sandbox,
       attemptId: args.attemptId,
+      installSpec,
     });
     if (!preflight.ok) {
       candidates.push(...buildBlockedProberCandidates(proberSampleCount, preflight.message));
@@ -535,6 +549,7 @@ function buildBlockedProberCandidates(sampleCount: number, message: string): Rep
 async function runOpenInferenceProberPreflight(args: {
   sandbox: SandboxHandle;
   attemptId: string;
+  installSpec: InstallSpec;
 }): Promise<{ ok: true } | { ok: false; message: string }> {
   if (!args.sandbox.setupDependencies) {
     const message =
@@ -545,7 +560,7 @@ async function runOpenInferenceProberPreflight(args: {
   }
 
   try {
-    const setup = await args.sandbox.setupDependencies(OPENINFERENCE_PROBER_INSTALL_SPEC);
+    const setup = await args.sandbox.setupDependencies(args.installSpec);
     if (!setup.ok) {
       const tail = collapseWhitespace(setup.stderr || setup.stdout || '').slice(-600);
       const message =

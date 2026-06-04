@@ -22,6 +22,8 @@ export interface RunAnalystArgs {
   carryforwardSummary?: string;
   /** Optional semantic retrieval seed computed pre-Analyst. */
   semanticSuspectSeed?: SemanticSuspectSeed | null;
+  /** Optional test infrastructure fingerprint for the affected package. */
+  testInfraProfile?: import('../repro-loop-v2/test-infra-fingerprint').TestInfraProfile | null;
 }
 
 export interface AnalystResult {
@@ -107,35 +109,52 @@ LOW-CONFIDENCE semantic seed handling:
 When \`semanticConfidence.low_confidence\` is true, you MUST explicitly state in your dossier summary that semantic suspects are low-confidence. You MUST carry that uncertainty into \`oracleSpec\`: only include suspect_path_assertions you can justify from direct file reads / concrete evidence, and avoid claiming suspect-path evidence you cannot verify.
 
 CANDIDATE REPRO (REQUIRED when suspect symbols are present):
-When \`suspectSymbols\` is non-empty, you MUST include a \`candidateRepro\` field on record_evidence (even if confidence is only low/medium).
+When \`suspectSymbols\` is non-empty, you MUST include a \`candidateRepro\` field on record_evidence.
 
-Write the full pytest test as a \`testSource\` string. You are not constrained to any template — write whatever Python test correctly exercises and exposes the bug. The test must FAIL on the buggy code and PASS once the fix is applied.
+PREFERRED: reproFiles path (integration test, not unit test)
+─────────────────────────────────────────────────────────────
+Write an integration test that runs the real stack the way the user described.
+Do NOT call internal functions in isolation. Wire up the real library, real OTel stack, and a stub of any third-party.
 
-REQUIRED fields in candidateRepro:
-- \`testSource\`: complete Python source of a pytest test file (imports + def test_...()). Write valid, runnable pytest.
-- \`candidateTestPath\`: repo-relative path for the test file, e.g. "tests/repro/test_issue_53.py"
+Use the TEST INFRASTRUCTURE PROFILE (provided in your context) to:
+- Match the cassette naming convention exactly (e.g. test function name → tests/cassettes/{module}/{name}.yaml)
+- Copy an existing cassette rather than recording a new one
+- Use available fixtures (cassette_transport, in_memory_span_exporter, etc.)
+- Install correct extras (e.g. [instruments,test] not just [test])
+- Inherit from base classes listed in sdkBaseClasses (not duck-typed)
+- Use asyncTestMarker if the test is async
 
-CRITICAL — THE TEST MUST EXIT NON-ZERO WHEN THE BUG IS PRESENT:
-Use \`assert\` statements or \`raise AssertionError\`. Do NOT use if/print — printing "BUG CONFIRMED" exits 0 and the pipeline cannot detect the failure. The pipeline runs your test and checks the exit code: exit 0 = bug not present (or test is wrong), exit non-zero = bug confirmed.
+Use these installSpec extras and additionalPackages from the profile.
 
-WRONG (exits 0 even when bug is present):
-  if captured[0] == "Tool execution error":
-      print("BUG CONFIRMED")  # ← pipeline sees exit 0, thinks bug is absent
+INSTALL what the instrumentation PATCHES (the library being wrapped), NOT what uses the instrumentation.
+STUB the third-party's interface contract (4 lines), NOT the third-party itself.
 
-CORRECT (exits non-zero when bug is present):
-  assert captured[0] != "Tool execution error", f"BUG: got {captured[0]!r}"
+reproFiles field:
+- path: repo-relative path of the file
+- content: complete file content as a string
+- append: true to append to an existing file (e.g. adding a test to test_instrumentor.py)
 
-OPTIONAL but recommended:
-- \`pipInstalls\`: array of \`{package, editable?: boolean}\` for any third-party deps the test needs beyond the editable installs already performed.
-- \`rationale\`: 1-2 sentence justification.
-- \`requiresCredentials\`: env var names needed at runtime (e.g. ["OPENAI_API_KEY"]).
+testEntryPoint: e.g. "tests/test_instrumentor.py::test_session_id_not_overwritten"
 
-IMPORTANT — calling convention: internal functions often use \`getattr(msg, "content")\` (attribute access) rather than \`msg["content"]\` (dict access). When calling library internals directly, use \`types.SimpleNamespace\` instead of plain dicts so attribute access works:
+installSpec:
+- editableInstall: repo-relative dirs to pip install -e (from profile.testExtras + affected package)
+- additionalPackages: extra pip packages (pytest, pytest-asyncio, pyyaml as needed)
 
-Example for a wrong-argument bug where result_content is passed to a mock:
-\`\`\`
-testSource: "import types\\nfrom openinference.instrumentation.claude_agent_sdk._wrappers import _update_tool_spans_from_messages\\n\\ndef test_repro():\\n    captured = []\\n    class T:\\n        def start_tool_span(self, n, i, id, p=None): pass\\n        def end_tool_span(self, id, r): pass\\n        def end_tool_span_with_error(self, id, err): captured.append(err)\\n        def end_all_in_flight(self): pass\\n    block = types.SimpleNamespace(type='tool_result', tool_use_id='tu1', is_error=True, content='real error')\\n    msg = types.SimpleNamespace(content=[block])\\n    _update_tool_spans_from_messages(msg, T())\\n    assert captured, 'REPRO: end_tool_span_with_error was never called'\\n    assert captured[0] == 'real error', f'REPRO: got {captured[0]!r}, expected real error'"
-\`\`\`
+expectedFailureOutput: a substring that MUST appear in stdout/stderr when the bug is present.
+If you include this, the Builder will validate the failure output, not just the exit code.
+
+fixHypothesis:
+- file: the source file to modify
+- description: what to change and why (the Builder/fix-agent uses this)
+
+CRITICAL: The test MUST exit non-zero when the bug is present. Use assert or raise.
+Do NOT use if/print — that exits 0 and the pipeline sees no failure.
+
+ALSO critical: include the cassette as a reproFile with the correct name per the naming convention.
+Without the cassette, the test will fail with "cassette not found" before it even runs.
+
+LEGACY: testSource path (simple pytest string) still accepted for simple unit-test-style bugs.
+Use reproFiles for any bug involving SDK lifecycle, OTel context, or third-party integration.
 
 Do NOT omit candidateRepro solely because of uncertainty. Write your best attempt and note caveats in \`rationale\`.
 
@@ -268,7 +287,11 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
       `If semanticConfidence.low_confidence is true, explicitly state that uncertainty in your dossier summary and avoid unverified suspect_path assertions.`
     : '';
 
-  const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\n${args.issue.body}\n\nRepo: ${args.repo.fullName} (affected module: ${args.repo.affectedModule}, language: ${args.repo.language})${carry}${semanticSeed}\n\nInvestigate and produce an EvidenceDossier via record_evidence.`;
+  const testInfraSection = args.testInfraProfile
+    ? `\n\n=== TEST INFRASTRUCTURE PROFILE ===\n${JSON.stringify(args.testInfraProfile, null, 2)}`
+    : '';
+
+  const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\n${args.issue.body}\n\nRepo: ${args.repo.fullName} (affected module: ${args.repo.affectedModule}, language: ${args.repo.language})${carry}${semanticSeed}${testInfraSection}\n\nInvestigate and produce an EvidenceDossier via record_evidence.`;
 
   // Pin Analyst to a strong tool-calling model unless explicitly overridden.
   // We bypass OPENROUTER_MODEL_DEFAULT here because some defaults (e.g.

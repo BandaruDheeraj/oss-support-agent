@@ -559,9 +559,9 @@ describe('runReproPipelineWithTimeout', () => {
 
 describe('resolveReproStageTimeoutMs', () => {
   test('returns default timeout when env value is missing or invalid', () => {
-    expect(resolveReproStageTimeoutMs({})).toBe(20 * 60 * 1000);
-    expect(resolveReproStageTimeoutMs({ OSA_REPRO_STAGE_TIMEOUT_MS: 'invalid' })).toBe(20 * 60 * 1000);
-    expect(resolveReproStageTimeoutMs({ OSA_REPRO_STAGE_TIMEOUT_MS: '0' })).toBe(20 * 60 * 1000);
+    expect(resolveReproStageTimeoutMs({})).toBe(60 * 60 * 1000);
+    expect(resolveReproStageTimeoutMs({ OSA_REPRO_STAGE_TIMEOUT_MS: 'invalid' })).toBe(60 * 60 * 1000);
+    expect(resolveReproStageTimeoutMs({ OSA_REPRO_STAGE_TIMEOUT_MS: '0' })).toBe(60 * 60 * 1000);
   });
 
   test('returns configured timeout from env', () => {
