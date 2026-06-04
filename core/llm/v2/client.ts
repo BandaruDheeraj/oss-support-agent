@@ -152,19 +152,25 @@ export function getModelRoutes(agent: PhaseEAgent, override?: string): ModelRout
     });
   }
 
-  // OpenRouter — fallback or primary when no Anthropic key.
-  const openrouterKeys = resolveApiKeys();
-  if (openrouterKeys.length > 0) {
-    const modelIds = resolveModelIds(agent, override);
-    for (let ki = 0; ki < openrouterKeys.length; ki += 1) {
-      const provider = openrouterProviderForKey(openrouterKeys[ki]);
-      for (let mi = 0; mi < modelIds.length; mi += 1) {
-        routes.push({
-          provider: 'openrouter',
-          routeId: `openrouter:k${ki + 1}:m${mi + 1}`,
-          modelId: modelIds[mi],
-          model: provider(modelIds[mi]),
-        });
+  // OpenRouter — only used when NO Anthropic key is configured.
+  // When ANTHROPIC_API_KEY is set, we use Anthropic exclusively and never
+  // fall back to OpenRouter. This prevents the pattern where Anthropic fails
+  // silently (e.g. unsupported model ID) and OpenRouter's spend-limit error
+  // becomes the visible failure.
+  if (!anthropicKey) {
+    const openrouterKeys = resolveApiKeys();
+    if (openrouterKeys.length > 0) {
+      const modelIds = resolveModelIds(agent, override);
+      for (let ki = 0; ki < openrouterKeys.length; ki += 1) {
+        const provider = openrouterProviderForKey(openrouterKeys[ki]);
+        for (let mi = 0; mi < modelIds.length; mi += 1) {
+          routes.push({
+            provider: 'openrouter',
+            routeId: `openrouter:k${ki + 1}:m${mi + 1}`,
+            modelId: modelIds[mi],
+            model: provider(modelIds[mi]),
+          });
+        }
       }
     }
   }
