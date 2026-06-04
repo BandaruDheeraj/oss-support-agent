@@ -322,23 +322,86 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
       return rej('test_source_render_failed', `testSource exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
     }
   } else if (isReproFilesPath) {
-    const rf = (candidate as any).reproFiles as Array<{path: string, content: string, append?: boolean}>;
-    const writtenPaths: string[] = [];
-    for (const rfile of rf) {
-      try {
-        await args.workspace.writeTest(rfile.path, rfile.content);
-        writtenPaths.push(rfile.path);
-      } catch (err) {
-        for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
-        return rej('write_test_failed', "Failed to write " + rfile.path + ": " + (err instanceof Error ? err.message : String(err)));
-      }
-    }
+    // For reproFiles, run the test INLINE via sandbox.runPython() rather than
+    // writing files to the workspace. This avoids the git commit/push cycle:
+    // workspace.writeTest() only writes locally — for GHA sandboxes, the file
+    // would need to be committed and pushed before the sandbox clones the branch,
+    // which doesn't happen between writeTest and dispatch. Running inline is simpler.
+    const rf = (candidate as any).reproFiles as Array<{path: string, content: string}>;
     const testFile = rf.find(f => !f.path.endsWith('.yaml') && !f.path.endsWith('.yml'));
     source = testFile ? testFile.content : rf[0].content;
+    // Synthesize a fake candidateTestPath so downstream steps have something to revert
     const testEntryPoint = (candidate as any).testEntryPoint;
     if (testEntryPoint && typeof testEntryPoint === 'string') {
       (candidate as any).candidateTestPath = testEntryPoint.split('::')[0];
+    } else {
+      (candidate as any).candidateTestPath = 'tests/repro/test_inline.py';
     }
+    // Run the test inline — skip AST parse and template rendering steps below,
+    // go directly to executing the source via runPython.
+    const inlineResult = await safeSandbox(args.sandbox.runPython(source));
+    if (!inlineResult.ok) {
+      return rej('sandbox_error', `runPython(reproFiles inline test) threw: ${inlineResult.error}`);
+    }
+    const exitCode = inlineResult.value.exitCode ?? 0;
+    const allOutput = inlineResult.value.stdout + inlineResult.value.stderr;
+    const expectedOut = (candidate as any).expectedFailureOutput;
+    const run1: BuilderRunObservation = {
+      exitCode,
+      sentinelObserved: expectedOut ? allOutput.includes(expectedOut) : exitCode !== 0,
+      signatureObserved: false,
+      stdoutTail: tail(inlineResult.value.stdout, STDERR_TAIL),
+      stderrTail: tail(inlineResult.value.stderr, STDERR_TAIL),
+      durationMs: 0,
+    };
+    // Run twice (required for verdict)
+    const inlineResult2 = await safeSandbox(args.sandbox.runPython(source));
+    const exitCode2 = inlineResult2.ok ? (inlineResult2.value.exitCode ?? 0) : 1;
+    const allOutput2 = inlineResult2.ok ? inlineResult2.value.stdout + inlineResult2.value.stderr : '';
+    const run2: BuilderRunObservation = {
+      exitCode: exitCode2,
+      sentinelObserved: expectedOut ? allOutput2.includes(expectedOut) : exitCode2 !== 0,
+      signatureObserved: false,
+      stdoutTail: inlineResult2.ok ? tail(inlineResult2.value.stdout, STDERR_TAIL) : '',
+      stderrTail: inlineResult2.ok ? tail(inlineResult2.value.stderr, STDERR_TAIL) : '',
+      durationMs: 0,
+    };
+    const runs = [run1, run2];
+    const failingAny = runs.filter(r => r.exitCode !== 0).length;
+    const allPassed = runs.every(r => r.exitCode === 0);
+    if (allPassed) {
+      return rej('run_repro_pass', 'Inline reproFiles test passed on every run; bug not triggered.');
+    }
+    if (failingAny < 2) {
+      return rej('run_repro_flaky', `Inline reproFiles runs disagreed: ${runs.map(r => r.exitCode).join('/')}`);
+    }
+    // Bug confirmed — build recipe with inline source
+    const candidateTestPath = (candidate as any).candidateTestPath ?? 'tests/repro/test_inline.py';
+    const recipe: ReproRecipe = {
+      version: 1,
+      candidateTestPath,
+      testSource: source,
+      sentinelString: '',
+      pipInstalls: candidate.pipInstalls ?? [],
+      requiresCredentials: candidate.requiresCredentials ?? [],
+      verbatimSnippetIncompatible: false,
+      approach: 'builder:repro_files:inline',
+      provenance: {
+        exerciseImports: [],
+        preconditionsSatisfied: [],
+        observedProbe: {
+          sentinelObserved: false,
+          signatureObserved: false,
+          exitCode: run1.exitCode,
+          durationMs: 0,
+          stderrTail: run1.stderrTail,
+          stdoutTail: run1.stdoutTail,
+        },
+        proberAttempts: 0,
+        recordedAt: new Date().toISOString(),
+      },
+    };
+    return { ok: true, reason: '', recipe, runs, rejectStage: undefined, candidateTestPath };
   } else {
     const render = renderTestSource(candidate);
     if (!render.ok) {
