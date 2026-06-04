@@ -113,11 +113,26 @@ When suspectSymbols is non-empty, you MUST include reproFiles on record_evidence
 
 You receive a testInfraProfile in your context (when available) with cassette naming convention, available fixtures, install extras, existing cassette names, and pinned tool versions. Use it.
 
-WRITE A COMPLETE INTEGRATION TEST — not a unit test calling internals. Exercise the real library stack the way the issue reporter described. Use the cassette transport fixture to replay API calls (no credentials needed).
+CHOOSE THE RIGHT TEST APPROACH based on the bug type:
+
+A) FUNCTION-LEVEL BUG (wrong argument, wrong return value, wrong attribute set):
+   Write a targeted unit test that calls the buggy function directly.
+   Use types.SimpleNamespace for any object the function reads via getattr.
+   No cassette needed — the function is tested in isolation.
+   Example for _update_tool_spans_from_messages:
+     block = types.SimpleNamespace(type='tool_result', tool_use_id='tu1', is_error=True, content='real error')
+     msg = types.SimpleNamespace(content=[block])
+     _update_tool_spans_from_messages(msg, tracker)
+     assert tracker.captured[0] != 'Tool execution error', f'BUG: got {tracker.captured[0]!r}'
+
+B) LIFECYCLE BUG (context propagation, span lifecycle, on_start/on_end ordering):
+   Write a cassette-based integration test that exercises the real library stack.
+   Use the cassette transport fixture from the testInfraProfile to replay API calls.
+   Copy an existing cassette, rename to match the test function name per cassetteNamingConvention.
 
 reproFiles is an array of {path, content, append?}:
 1. Test file: append existing test_*.py (append: true) rather than creating a new file
-2. Cassette file: copy content from an existing cassette, rename to match the test function name exactly per cassetteNamingConvention in the profile
+2. Cassette file (type B only): copy content from an existing cassette, rename to match the test function name exactly per cassetteNamingConvention in the profile
 
 testEntryPoint: repo-relative pytest path e.g. "tests/test_foo.py::test_my_function"
 

@@ -111,6 +111,7 @@ import { emitOnlineEvaluation } from '../core/observability/evaluator';
 import { activeBackend } from '../core/observability';
 import { getEvalRecorder } from '../core/observability/eval-recorder';
 import { fingerprintTestInfra } from '../core/agents/repro-loop-v2/test-infra-fingerprint';
+import { watchAndFixPrChecks } from '../core/ci-check-watcher';
 
 /** Module-level sweep state store. Keyed by per-run sweep runId; no cross-run conflicts. */
 const sweepStateStore = new InMemorySweepStateStore();
@@ -3237,6 +3238,31 @@ export async function runPipeline(args: {
     draft: true,
   });
   log(`[pr] opened ${pr.url}`);
+
+  // Watch PR CI checks and auto-fix lint/format failures with the exact
+  // pinned tool version from CI. This is a background-style loop: it runs
+  // for up to 60 minutes, automatically amending commits for fixable failures
+  // (ruff format, import ordering) and emailing the maintainer for anything
+  // that requires human action (CLA, type errors, test regressions).
+  const [prOwner, prRepo] = repoFullName.split('/');
+  if (prOwner && prRepo && pr.number) {
+    watchAndFixPrChecks({
+      prNumber: pr.number,
+      owner: prOwner,
+      repo: prRepo,
+      branchDir: workspace.dir,
+      githubToken: deps.token,
+      maxWaitMs: 60 * 60 * 1000,
+      log,
+    })
+      .then((result) => {
+        log(`[ci-watch] done: passed=${result.allPassed} autoFixed=${result.autoFixed.join(',')} requiresHuman=${result.requiresHuman.length}`);
+      })
+      .catch((err: any) => {
+        log(`[ci-watch] error (non-fatal): ${err?.message ?? err}`);
+      });
+    log(`[ci-watch] watching PR #${pr.number} for CI failures`);
+  }
 
   const allLabels = [...(prMeta.extraLabels ?? []), ...regressionLabels, ...usabilityLabels];
   if (allLabels.length) {
