@@ -50,6 +50,8 @@ export interface TestInfraProfile {
   pinnedToolVersions: Record<string, string>;
   /** Path to the closest existing test file (first one that was successfully read) */
   closestExistingTest: string | null;
+  /** Content of up to 3 existing cassettes (name → raw YAML, capped at 8KB each) */
+  existingCassetteContent: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +99,7 @@ export async function fingerprintTestInfra(args: {
     asyncTestMarker: null,
     pinnedToolVersions: {},
     closestExistingTest: null,
+    existingCassetteContent: {},
   };
 
   // Run all reads concurrently; each is independently try/caught.
@@ -106,6 +109,18 @@ export async function fingerprintTestInfra(args: {
     parseToxIni(gitClient, repoFullName, ref, pkg, profile),
     readOneTestFile(gitClient, repoFullName, ref, pkg, profile),
   ]);
+
+  // Fetch content of up to 3 existing cassettes (8KB cap each) so the analyst
+  // can copy a real cassette structure when writing integration repro tests.
+  profile.existingCassetteContent = {};
+  const cassetteDir = affectedPackagePath + '/tests/cassettes/test_instrumentor';
+  for (const name of profile.existingCassettes.slice(0, 3)) {
+    const cassettePath = cassetteDir + '/' + name + '.yaml';
+    const content = await gitClient.getFileContents(repoFullName, cassettePath, ref);
+    if (content.ok && content.content) {
+      profile.existingCassetteContent[name] = content.content.slice(0, 8000);
+    }
+  }
 
   return profile;
 }

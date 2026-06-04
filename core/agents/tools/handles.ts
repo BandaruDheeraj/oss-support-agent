@@ -91,6 +91,12 @@ export interface SandboxHandle {
   setupDependencies?(spec: InstallSpec): Promise<SandboxPhaseResult>;
   /** Latest lifecycle result when sandbox operations are owned by SandboxSession. */
   getSandboxResult?(): SandboxSessionResult | null;
+  /**
+   * Commit all pending workspace changes and push to git branch. Call AFTER
+   * writing test files and BEFORE dispatching a GHA sandbox so files exist on
+   * GitHub when the sandbox clones. No-op in local mode.
+   */
+  flushWorkspaceToBranch?(): Promise<void>;
 }
 
 export interface SandboxRun {

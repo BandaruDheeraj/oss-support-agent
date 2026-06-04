@@ -149,6 +149,9 @@ CRITICAL RULES — all learned from real failures:
 - Inherit from SDK base classes (e.g. opentelemetry.sdk.trace.SpanProcessor). Duck typing crashes the SDK.
 - Cassette file MUST be named after the test function. conftest.py will pytest.fail if name is wrong.
 - Install the host library (SDK being instrumented), stub the third party (Langfuse = 10-line SpanProcessor, not pip install).
+- Test file MUST work as a standalone pytest file: top-level test_*() function, all imports at module level, no if-name-main guards.
+- testEntryPoint must be a valid pytest path: "tests/repro/test_issue_N.py::test_function_name"
+- The test will be COMMITTED to the branch as a permanent regression test — write it as production test code.
 
 WRONG (exits 0 even when bug present):
   if captured[0] == "Tool execution error":

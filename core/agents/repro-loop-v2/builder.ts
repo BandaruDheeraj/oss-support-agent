@@ -322,64 +322,102 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
       return rej('test_source_render_failed', `testSource exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
     }
   } else if (isReproFilesPath) {
-    // For reproFiles, run the test INLINE via sandbox.runPython() rather than
-    // writing files to the workspace. This avoids the git commit/push cycle:
-    // workspace.writeTest() only writes locally — for GHA sandboxes, the file
-    // would need to be committed and pushed before the sandbox clones the branch,
-    // which doesn't happen between writeTest and dispatch. Running inline is simpler.
-    const rf = (candidate as any).reproFiles as Array<{path: string, content: string}>;
-    const testFile = rf.find(f => !f.path.endsWith('.yaml') && !f.path.endsWith('.yml'));
+    const rf = (candidate as any).reproFiles as Array<{path: string, content: string, append?: boolean}>;
+    const testFile = rf.find((f: {path: string}) => !f.path.endsWith('.yaml') && !f.path.endsWith('.yml'));
     source = testFile ? testFile.content : rf[0].content;
-    // Synthesize a fake candidateTestPath so downstream steps have something to revert
-    const testEntryPoint = (candidate as any).testEntryPoint;
-    if (testEntryPoint && typeof testEntryPoint === 'string') {
-      (candidate as any).candidateTestPath = testEntryPoint.split('::')[0];
-    } else {
-      (candidate as any).candidateTestPath = 'tests/repro/test_inline.py';
+    const rawTestEntryPoint = (candidate as any).testEntryPoint;
+    const testEntryPoint: string = typeof rawTestEntryPoint === 'string' ? rawTestEntryPoint : (testFile?.path ?? 'tests/repro/test_repro.py');
+    const testPath = testEntryPoint.split('::')[0];
+
+    // Step A — fast gate: does the test actually detect the bug?
+    const gateResult = await safeSandbox(args.sandbox.runPython(source));
+    if (!gateResult.ok) {
+      return rej('sandbox_error', 'runPython gate threw: ' + gateResult.error);
     }
-    // Run the test inline — skip AST parse and template rendering steps below,
-    // go directly to executing the source via runPython.
-    const inlineResult = await safeSandbox(args.sandbox.runPython(source));
-    if (!inlineResult.ok) {
-      return rej('sandbox_error', `runPython(reproFiles inline test) threw: ${inlineResult.error}`);
+    if (gateResult.value.exitCode === 0) {
+      return rej('run_repro_pass', 'reproFiles inline gate exited 0 on buggy code — test does not detect the bug.');
     }
-    const exitCode = inlineResult.value.exitCode ?? 0;
-    const allOutput = inlineResult.value.stdout + inlineResult.value.stderr;
-    const expectedOut = (candidate as any).expectedFailureOutput;
-    const run1: BuilderRunObservation = {
-      exitCode,
-      sentinelObserved: expectedOut ? allOutput.includes(expectedOut) : exitCode !== 0,
-      signatureObserved: false,
-      stdoutTail: tail(inlineResult.value.stdout, STDERR_TAIL),
-      stderrTail: tail(inlineResult.value.stderr, STDERR_TAIL),
-      durationMs: 0,
-    };
-    // Run twice (required for verdict)
-    const inlineResult2 = await safeSandbox(args.sandbox.runPython(source));
-    const exitCode2 = inlineResult2.ok ? (inlineResult2.value.exitCode ?? 0) : 1;
-    const allOutput2 = inlineResult2.ok ? inlineResult2.value.stdout + inlineResult2.value.stderr : '';
-    const run2: BuilderRunObservation = {
-      exitCode: exitCode2,
-      sentinelObserved: expectedOut ? allOutput2.includes(expectedOut) : exitCode2 !== 0,
-      signatureObserved: false,
-      stdoutTail: inlineResult2.ok ? tail(inlineResult2.value.stdout, STDERR_TAIL) : '',
-      stderrTail: inlineResult2.ok ? tail(inlineResult2.value.stderr, STDERR_TAIL) : '',
-      durationMs: 0,
-    };
-    const runs = [run1, run2];
-    const failingAny = runs.filter(r => r.exitCode !== 0).length;
-    const allPassed = runs.every(r => r.exitCode === 0);
-    if (allPassed) {
-      return rej('run_repro_pass', 'Inline reproFiles test passed on every run; bug not triggered.');
+
+    // Step B — write all files to workspace
+    const writtenPaths: string[] = [];
+    for (const rfile of rf) {
+      try {
+        await args.workspace.writeTest(rfile.path, rfile.content);
+        writtenPaths.push(rfile.path);
+      } catch (err) {
+        for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
+        return rej('write_test_failed', 'Failed to write ' + rfile.path + ': ' + (err instanceof Error ? err.message : String(err)));
+      }
     }
-    if (failingAny < 2) {
-      return rej('run_repro_flaky', `Inline reproFiles runs disagreed: ${runs.map(r => r.exitCode).join('/')}`);
+
+    // Step C — flush workspace to git branch
+    let flushedToBranch = false;
+    if (typeof (args.sandbox as any).flushWorkspaceToBranch === 'function') {
+      try {
+        await (args.sandbox as any).flushWorkspaceToBranch();
+        flushedToBranch = true;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.log('[v2-builder] flushWorkspaceToBranch failed, falling back to inline: ' + (err instanceof Error ? err.message : String(err)));
+      }
     }
-    // Bug confirmed — build recipe with inline source
-    const candidateTestPath = (candidate as any).candidateTestPath ?? 'tests/repro/test_inline.py';
-    const recipe: ReproRecipe = {
+
+    if (flushedToBranch) {
+      // Step D — GHA sandbox runs pytest on the real branch clone
+      args.sandbox.setReproTestPath(testPath);
+      const expectedOut = (candidate as any).expectedFailureOutput as string | undefined;
+      const runs: BuilderRunObservation[] = [];
+      for (let i = 0; i < 2; i++) {
+        const r = await safeSandbox(args.sandbox.runRepro());
+        if (!r.ok) {
+          for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
+          return { ok: false, rejectStage: 'sandbox_error' as BuilderRejectStage, reason: 'runRepro #' + (i + 1) + ' threw: ' + r.error, runs, candidateTestPath: testPath };
+        }
+        runs.push(observe(r.value, '', expectedOut ?? ''));
+      }
+      const allPassed = runs.every((r) => r.exitCode === 0);
+      const failingAny = runs.filter((r) => r.exitCode !== 0).length;
+      if (allPassed) {
+        for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
+        return rej('run_repro_pass', 'pytest on branch passed on every run — bug not triggered.');
+      }
+      if (failingAny < 2) {
+        for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
+        return rej('run_repro_flaky', 'pytest on branch: runs disagreed: ' + runs.map((r) => r.exitCode).join('/'));
+      }
+      (candidate as any).candidateTestPath = testPath;
+      const lastFailing = runs.filter((r) => r.exitCode !== 0).slice(-1)[0] ?? runs[runs.length - 1];
+      const recipe: ReproRecipe = {
+        version: 1,
+        candidateTestPath: testPath,
+        testSource: source,
+        sentinelString: '',
+        pipInstalls: candidate.pipInstalls ?? [],
+        requiresCredentials: candidate.requiresCredentials ?? [],
+        verbatimSnippetIncompatible: false,
+        approach: 'builder:repro_files:committed',
+        provenance: {
+          exerciseImports: [],
+          preconditionsSatisfied: [],
+          observedProbe: { sentinelObserved: false, signatureObserved: false, exitCode: lastFailing.exitCode, durationMs: lastFailing.durationMs, stderrTail: lastFailing.stderrTail, stdoutTail: lastFailing.stdoutTail },
+          proberAttempts: 0,
+          recordedAt: '(stamped-after-workflow)',
+        },
+      };
+      return { ok: true, reason: '', recipe, runs, rejectStage: undefined, candidateTestPath: testPath };
+    }
+
+    // Fallback: flush not available — use inline confirmation
+    const gate2 = await safeSandbox(args.sandbox.runPython(source));
+    const ec2 = gate2.ok ? gate2.value.exitCode ?? 1 : 1;
+    const inlineRuns: BuilderRunObservation[] = [
+      { exitCode: gateResult.value.exitCode ?? 1, sentinelObserved: true, signatureObserved: false, stdoutTail: tail(gateResult.value.stdout, STDERR_TAIL), stderrTail: tail(gateResult.value.stderr, STDERR_TAIL), durationMs: 0 },
+      { exitCode: ec2, sentinelObserved: ec2 !== 0, signatureObserved: false, stdoutTail: gate2.ok ? tail(gate2.value.stdout, STDERR_TAIL) : '', stderrTail: gate2.ok ? tail(gate2.value.stderr, STDERR_TAIL) : '', durationMs: 0 },
+    ];
+    (candidate as any).candidateTestPath = testPath;
+    const inlineRecipe: ReproRecipe = {
       version: 1,
-      candidateTestPath,
+      candidateTestPath: testPath,
       testSource: source,
       sentinelString: '',
       pipInstalls: candidate.pipInstalls ?? [],
@@ -389,19 +427,12 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
       provenance: {
         exerciseImports: [],
         preconditionsSatisfied: [],
-        observedProbe: {
-          sentinelObserved: false,
-          signatureObserved: false,
-          exitCode: run1.exitCode,
-          durationMs: 0,
-          stderrTail: run1.stderrTail,
-          stdoutTail: run1.stdoutTail,
-        },
+        observedProbe: { sentinelObserved: true, signatureObserved: false, exitCode: gateResult.value.exitCode ?? 1, durationMs: 0, stderrTail: tail(gateResult.value.stderr, STDERR_TAIL), stdoutTail: tail(gateResult.value.stdout, STDERR_TAIL) },
         proberAttempts: 0,
-        recordedAt: new Date().toISOString(),
+        recordedAt: '(stamped-after-workflow)',
       },
     };
-    return { ok: true, reason: '', recipe, runs, rejectStage: undefined, candidateTestPath };
+    return { ok: true, reason: '', recipe: inlineRecipe, runs: inlineRuns, rejectStage: undefined, candidateTestPath: testPath };
   } else {
     const render = renderTestSource(candidate);
     if (!render.ok) {

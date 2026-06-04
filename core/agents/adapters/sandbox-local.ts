@@ -110,6 +110,9 @@ export function createLocalSandboxAdapter(
     setReproTestPath(p: string) {
       opts.reproTestPath = p;
     },
+    async flushWorkspaceToBranch() {
+      // local sandbox reads from filesystem; no push needed
+    },
     async runRepro(_options?: { suspectPathNeedles?: string[] }) {
       const reproPath = opts.reproTestPath;
       if (!reproPath) {

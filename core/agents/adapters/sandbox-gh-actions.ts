@@ -109,6 +109,13 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
     setReproTestPath(p: string) {
       opts.reproTestPath = p;
     },
+    async flushWorkspaceToBranch() {
+      preDispatchReady = false;
+      const branch = await session.verifyAndPushBranch();
+      if (!branch.ok) {
+        throw new Error('flushWorkspaceToBranch failed: ' + branch.reason);
+      }
+    },
     async runRepro(options?: { suspectPathNeedles?: string[] }) {
       const reproPath = opts.reproTestPath;
       if (!reproPath) {

@@ -112,7 +112,7 @@ export async function runDeterministicReproOracle(
   // the Builder already ran the test twice and confirmed the bug via runPython().
   // Skip re-running — there is no file on the branch for pytest to find, and the
   // Builder's runs are already authoritative.
-  if (args.recipe.approach?.includes('repro_files:inline')) {
+  if (args.recipe.approach === 'builder:repro_files:inline') {
     const passedCriteria: DeterministicReproOracleCriteria = {
       baseline_head_fails: true,
       reliable_failures: true,
