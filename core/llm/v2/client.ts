@@ -2,7 +2,7 @@
  * Phase E LLM provider — Vercel AI SDK.
  *
  * Provider priority:
- *   1. Anthropic direct (ANTHROPIC_API_KEY) — uses claude-sonnet-4-5 by default
+ *   1. Anthropic direct (ANTHROPIC_API_KEY) — uses claude-3-5-sonnet-20241022 by default
  *   2. OpenRouter (OPENROUTER_API_KEY / OPENROUTER_API_KEYS)
  *
  * Set ANTHROPIC_API_KEY to bypass OpenRouter entirely. Both providers can
@@ -105,7 +105,10 @@ function getAnthropicProvider(): AnthropicProvider {
   return anthropicProvider;
 }
 
-const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-5';
+// Use a model known to work with @ai-sdk/anthropic@0.0.56.
+// claude-sonnet-4-5 (Claude 4 series) is NOT in this SDK version's API surface
+// and causes a silent failure that falls through to OpenRouter.
+const DEFAULT_ANTHROPIC_MODEL = 'claude-3-5-sonnet-20241022';
 
 export type PhaseEAgent =
   | OpenRouterAgent
