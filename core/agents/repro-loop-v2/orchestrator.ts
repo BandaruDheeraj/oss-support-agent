@@ -51,23 +51,13 @@ function resolveInstallSpec(snapshot: DossierSnapshot): InstallSpec {
       instrumentationCorePath: editable[1] || editable[0],
       instrumentationPackagePath: editable[2] || editable[0],
       thirdPartyDeps: (rf.installSpec.additionalPackages || []).filter((p: string) => !p.startsWith('pytest') && p !== 'pyyaml'),
-      // Use the instrumentation package itself for import verification.
-      // Derive the module from the package path: the last path segment
-      // typically maps to the dotted module name (e.g.
-      // "openinference-instrumentation-claude-agent-sdk" →
-      // "openinference.instrumentation.claude_agent_sdk").
-      // Fall back to the semconv package which always exists.
-      importVerification: (() => {
-        const pkgPath = editable[2] || editable[0];
-        const pkgName = pkgPath.split('/').pop() ?? '';
-        const suffix = pkgName.replace(/^openinference-instrumentation-/, '').replace(/-/g, '_');
-        const modulePath = suffix ? `openinference.instrumentation.${suffix}` : 'openinference.semantic_conventions';
-        // Use a real symbol: every openinference instrumentor exposes its class name
-        const className = suffix
-          ? suffix.split('_').map((p: string) => p.charAt(0).toUpperCase() + p.slice(1)).join('') + 'Instrumentor'
-          : 'SpanAttributes';
-        return { modulePath, className };
-      })(),
+      // Use the semantic conventions package for import verification — it is
+      // always installed as the first editable dep and its exports are stable.
+      // Avoids fragile class-name derivation from package path segments.
+      importVerification: {
+        modulePath: 'openinference.semconv.trace',
+        className: 'SpanAttributes',
+      },
     };
   }
   return OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT;
