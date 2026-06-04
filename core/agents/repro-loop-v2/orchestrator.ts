@@ -260,7 +260,8 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     ((args.semanticSuspectSeed.suspectFiles?.length ?? 0) > 0 ||
       (args.semanticSuspectSeed.suspectSymbols?.length ?? 0) > 0);
   const suspectSymbols = snapshot.body.suspectSymbols ?? [];
-  if (analystRanThisAttempt && hasSemanticSeedScope && suspectSymbols.length > 0 && !snapshot.body.candidateRepro) {
+  const hasReproSpec = !!(snapshot.body.candidateRepro || (snapshot.body as any).reproFiles);
+  if (analystRanThisAttempt && hasSemanticSeedScope && suspectSymbols.length > 0 && !hasReproSpec) {
     return {
       status: 'not_runnable',
       dossier,

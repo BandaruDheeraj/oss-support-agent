@@ -117,9 +117,33 @@ export interface ReproBuilderResult {
 
 /** Build a single recipe from a candidate. No retries. */
 export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuilderResult> {
-  const candidate = args.dossierSnapshot.body.candidateRepro;
+  // Support both candidateRepro (legacy) and reproFiles (new integration-test schema).
+  // If reproFiles is present in the dossier, synthesize a minimal candidateRepro from it
+  // so the rest of the Builder pipeline can proceed unchanged.
+  const rawReproFiles = (args.dossierSnapshot.body as any).reproFiles;
+  let candidate = args.dossierSnapshot.body.candidateRepro;
+  if (!candidate && rawReproFiles) {
+    // Promote reproFiles to candidateRepro shape understood by the testSource path
+    candidate = {
+      version: 1 as const,
+      source: 'direct_call' as const,
+      failureMode: 'wrong_return' as const,
+      testSource: rawReproFiles.reproFiles?.[0]?.content ?? '',
+      candidateTestPath: rawReproFiles.testEntryPoint?.split('::')[0] ?? 'tests/repro/test_repro.py',
+      imports: [],
+      setup: '',
+      pipInstalls: rawReproFiles.installSpec?.additionalPackages?.map((p: string) => ({ package: p, editable: false })) ?? [],
+      requiresCredentials: [],
+      preconditionsSatisfied: [],
+      rationale: rawReproFiles.rationale ?? '',
+      reproFiles: rawReproFiles.reproFiles,
+      testEntryPoint: rawReproFiles.testEntryPoint,
+      installSpec: rawReproFiles.installSpec,
+      expectedFailureOutput: rawReproFiles.expectedFailureOutput,
+    } as any;
+  }
   if (!candidate) {
-    return rej('no_candidate', 'Dossier carries no candidateRepro; Builder bypassed.');
+    return rej('no_candidate', 'Dossier carries no candidateRepro or reproFiles; Builder bypassed.');
   }
 
   // (Pre-pip) — short-circuit on missing required credentials.
