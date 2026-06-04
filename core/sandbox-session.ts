@@ -905,7 +905,7 @@ export class SandboxSession {
     );
     let versions = new Map<string, string>();
     if (showTargets.length > 0) {
-      const run = await this.runCommandInSandbox([`pip show ${showTargets.join(' ')}`]);
+      const run = await this.runCommandInSandbox([`pip show ${showTargets.join(' ')}`], 'pkg-versions');
       if (run.ok && run.exitCode === 0) {
         versions = new Map(
           parsePipShowOutput(run.stdout).map((pkg) => [pkg.name.toLowerCase(), pkg.version])

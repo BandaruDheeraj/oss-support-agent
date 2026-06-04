@@ -1331,6 +1331,7 @@ async function runVerification(args: {
       timeoutMins: manifest.sandbox_timeout_mins ?? 15,
       actionsClient,
       gitClient,
+      runLabel: `${forkFullName}#${issueNumber} verify`,
     });
     const branchPhase = await verificationSandboxSession.verifyAndPushBranch();
     if (!branchPhase.ok) {
@@ -2737,6 +2738,7 @@ export async function runPipeline(args: {
               timeoutMins: manifest.sandbox_timeout_mins,
               actionsClient,
               gitClient,
+              runLabel: `${fork.forkFullName}#${issueNumber} repro`,
             });
 
             return {
