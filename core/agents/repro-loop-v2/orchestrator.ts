@@ -42,6 +42,21 @@ const OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT: InstallSpec = {
   },
 };
 
+function resolveInstallSpec(snapshot: DossierSnapshot): InstallSpec {
+  const rf = (snapshot.body as any).reproFiles;
+  if (rf && rf.installSpec && Array.isArray(rf.installSpec.editableInstall) && rf.installSpec.editableInstall.length > 0) {
+    const editable = rf.installSpec.editableInstall;
+    return {
+      semanticConventionsPath: editable[0],
+      instrumentationCorePath: editable[1] || editable[0],
+      instrumentationPackagePath: editable[2] || editable[0],
+      thirdPartyDeps: (rf.installSpec.additionalPackages || []).filter((p: string) => !p.startsWith('pytest') && p !== 'pyyaml'),
+      importVerification: { modulePath: 'openinference.instrumentation', className: 'BaseInstrumentor' },
+    };
+  }
+  return OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT;
+}
+
 type CandidateSource = 'builder' | 'prober';
 type CandidateStatus =
   | 'generation_failed'
@@ -340,19 +355,10 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   const requiresOpenInferencePreflight =
     proberSampleCount > 0 && shouldRunOpenInferencePreflight(args.repo.fullName);
   if (requiresOpenInferencePreflight) {
-    const installSpec = snapshot.body.candidateRepro?.reproFilesCandidate?.installSpec
-      ? {
-          semanticConventionsPath: snapshot.body.candidateRepro.reproFilesCandidate.installSpec.editableInstall[0] ?? OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT.semanticConventionsPath,
-          instrumentationCorePath: snapshot.body.candidateRepro.reproFilesCandidate.installSpec.editableInstall[1] ?? OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT.instrumentationCorePath,
-          instrumentationPackagePath: snapshot.body.candidateRepro.reproFilesCandidate.installSpec.editableInstall[2] ?? OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT.instrumentationPackagePath,
-          thirdPartyDeps: snapshot.body.candidateRepro.reproFilesCandidate.installSpec.additionalPackages,
-          importVerification: OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT.importVerification,
-        }
-      : OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT;
     const preflight = await runOpenInferenceProberPreflight({
       sandbox: args.sandbox,
       attemptId: args.attemptId,
-      installSpec,
+      installSpec: resolveInstallSpec(snapshot),
     });
     if (!preflight.ok) {
       candidates.push(...buildBlockedProberCandidates(proberSampleCount, preflight.message));

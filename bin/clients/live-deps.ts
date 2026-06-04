@@ -74,6 +74,11 @@ export interface LiveDeps {
   replyToBase: string;
   /** Build a per-runId reply-to using plus-addressing. */
   replyToFor: (runId: string) => string;
+  /**
+   * Simple one-shot mail sender. Useful for lightweight notification emails
+   * that don't require a reply-waiter gate (e.g. pre-PR simple notifications).
+   */
+  sendMail: (args: { to: string; subject: string; body: string }) => Promise<void>;
   /** HTTP /inbound dispatcher: caller passes raw body + svix headers. */
   dispatchInbound: (
     rawBody: string,
@@ -181,6 +186,10 @@ export function buildLiveDeps(
   const dispatchInbound: LiveDeps['dispatchInbound'] = (rawBody, headers) =>
     resendDeps.dispatchInbound(rawBody, headers, replyWaiter, options.log);
 
+  const sendMail: LiveDeps['sendMail'] = async ({ to, subject, body }) => {
+    await resendDeps.client.sendEmail({ to, subject, body, replyTo: replyToBase });
+  };
+
   return {
     gmail: resendDeps.client,
     watcher,
@@ -200,6 +209,7 @@ export function buildLiveDeps(
     monitoredEmail,
     replyToBase,
     replyToFor,
+    sendMail,
     dispatchInbound,
     runIntrospection,
   };

@@ -527,6 +527,38 @@ export function buildImportSafetyProbe(imports: string[]): string {
 // Integration-first multi-file repro schema (ReproFiles redesign)
 // ---------------------------------------------------------------------------
 
+export const REPRO_FILE_CONTENT_MAX = 32000;
+
+export const ReproFileSchema = z.object({
+  path: z.string().min(1).max(300),
+  content: z.string().min(1).max(REPRO_FILE_CONTENT_MAX),
+  append: z.boolean().default(false),
+});
+
+export const ReproFilesInputSchema = z.object({
+  reproFiles: z.array(ReproFileSchema).min(1).max(20),
+  testEntryPoint: z.string().min(1).max(400),
+  installSpec: z.object({
+    editableInstall: z.array(z.string()).default([]),
+    additionalPackages: z.array(z.string()).default([]),
+  }).optional(),
+  expectedFailureOutput: z.string().max(500).optional(),
+  fixHypothesis: z.object({
+    file: z.string().min(1).max(300),
+    description: z.string().min(1).max(2000),
+  }).optional(),
+  rationale: z.string().max(2000).optional(),
+}).passthrough();
+
+export function normalizeReproFilesInputStrict(raw: unknown): z.infer<typeof ReproFilesInputSchema> | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+  if (!Array.isArray(r.reproFiles) || r.reproFiles.length === 0) return null;
+  if (typeof r.testEntryPoint !== 'string' || !r.testEntryPoint.trim()) return null;
+  const result = ReproFilesInputSchema.safeParse(raw);
+  return result.success ? result.data : null;
+}
+
 export interface ReproFile {
   path: string;       // repo-relative path
   content: string;    // file content

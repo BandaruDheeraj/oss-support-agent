@@ -44,20 +44,37 @@ function ensureScoped(path: string, roots: string[]): void {
 }
 
 const WriteTest = z
-  .object({ path: z.string().min(1), content: z.string().min(1) })
+  .object({
+    path: z.string().min(1),
+    content: z.string().min(1),
+    append: z.boolean().optional(),
+  })
   .strict();
 export const writeTest: ToolDef<z.infer<typeof WriteTest>, unknown> = {
   name: 'write_test',
   tier: 'write-test',
   description:
-    'Write a test file under one of the configured test roots. Used by the Repro Executor to commit the repro test, and by the Fix Executor to extend coverage.',
+    'Write a test file under one of the configured test roots. Used by the Repro Executor to commit the repro test, and by the Fix Executor to extend coverage. Set append=true to append to an existing file instead of overwriting it.',
   parameters: WriteTest,
-  async execute({ path, content }, ctx) {
+  async execute({ path, content, append }, ctx) {
     const ws = asHandles(ctx.handles).workspace;
     ensureScoped(path, ws.testRoots());
-    await ws.writeTest(path, content);
+    let finalContent = content;
+    if (append) {
+      let existing: string | null = null;
+      try {
+        existing = await ws.readFile(path);
+      } catch {
+        // file does not exist yet — treat as empty
+        existing = null;
+      }
+      if (existing !== null) {
+        finalContent = existing + '\n' + content;
+      }
+    }
+    await ws.writeTest(path, finalContent);
     maybeAutoSetReproTestPath(ctx, path);
-    return { written: path, bytes: Buffer.byteLength(content, 'utf8') };
+    return { written: path, bytes: Buffer.byteLength(finalContent, 'utf8'), appended: append };
   },
 };
 

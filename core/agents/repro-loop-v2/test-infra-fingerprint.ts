@@ -22,72 +22,81 @@
 // ---------------------------------------------------------------------------
 
 export interface TestInfraProfile {
-  /** e.g. "tests/cassettes/{module}/{name}.yaml" */
-  cassetteDir: string | null;
   /** Human description of the naming rule inferred from conftest.py */
   cassetteNamingConvention: string | null;
   /** e.g. "cassette_transport" – the fixture name that injects the transport */
   cassetteTransportFixture: string | null;
-  /** Existing cassette names without extension, e.g. ["test_chat", "test_stream"] */
-  existingCassettes: string[];
-
   /** All @pytest.fixture names found in conftest.py */
   availableFixtures: string[];
-
-  /** pip extras from [project.optional-dependencies], e.g. ["test", "instruments"] */
-  testExtras: string[];
-  /** Packages inferred from conftest.py top-level imports */
-  additionalTestPackages: string[];
-
+  /** Top-level import lines from one existing test file */
+  existingTestImports: string[];
   /**
    * Map of class-name → import-path for SDK base classes seen in conftest or
    * test imports, e.g. { SpanProcessor: "opentelemetry.sdk.trace.SpanProcessor" }
    */
   sdkBaseClasses: Record<string, string>;
+  /**
+   * Map of extra-name → package list for optional-dependency extras from
+   * pyproject.toml, e.g. { test: ["pytest", "pytest-asyncio"] }
+   */
+  installExtras: Record<string, string>;
+  /** Packages inferred from conftest.py and test top-level imports */
+  additionalPackages: string[];
+  /** Existing cassette names without extension, e.g. ["test_chat", "test_stream"] */
+  existingCassettes: string[];
   /** e.g. "@pytest.mark.asyncio" */
   asyncTestMarker: string | null;
-
-  /** Top-level import lines from one existing test file */
-  existingTestImports: string[];
-
   /** e.g. { ruff: "0.9.2" } from tox.ini or pyproject.toml */
-  lintToolVersions: Record<string, string>;
+  pinnedToolVersions: Record<string, string>;
+  /** Path to the closest existing test file (first one that was successfully read) */
+  closestExistingTest: string | null;
 }
 
-export interface FingerprintArgs {
-  gitClient: {
-    getFileContents(
-      repoFullName: string,
-      path: string,
-      ref: string
-    ): Promise<{ ok: boolean; content?: string }>;
-  };
-  repoFullName: string;
-  ref: string;
-  /** e.g. "python/instrumentation/openinference-instrumentation-claude-agent-sdk" */
-  affectedPackagePath: string;
+// ---------------------------------------------------------------------------
+// GitClient interface (inline, matches core/sandbox-session.ts GitClient shape)
+// ---------------------------------------------------------------------------
+
+interface GitClientLike {
+  getFileContents(
+    repo: string,
+    path: string,
+    ref: string
+  ): Promise<{ ok: boolean; content?: string }>;
+  getDefaultBranch(repo: string): Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
-export async function fingerPrintTestInfra(args: FingerprintArgs): Promise<TestInfraProfile> {
-  const { gitClient, repoFullName, ref, affectedPackagePath } = args;
+export async function fingerprintTestInfra(args: {
+  repoFullName: string;
+  affectedPackagePath: string;
+  gitClient: GitClientLike;
+}): Promise<TestInfraProfile> {
+  const { gitClient, repoFullName, affectedPackagePath } = args;
   const pkg = affectedPackagePath.replace(/\/$/, '');
 
+  // Resolve the default branch to use as ref
+  let ref: string;
+  try {
+    ref = await gitClient.getDefaultBranch(repoFullName);
+  } catch {
+    ref = 'main';
+  }
+
   const profile: TestInfraProfile = {
-    cassetteDir: null,
     cassetteNamingConvention: null,
     cassetteTransportFixture: null,
-    existingCassettes: [],
     availableFixtures: [],
-    testExtras: [],
-    additionalTestPackages: [],
-    sdkBaseClasses: {},
-    asyncTestMarker: null,
     existingTestImports: [],
-    lintToolVersions: {},
+    sdkBaseClasses: {},
+    installExtras: {},
+    additionalPackages: [],
+    existingCassettes: [],
+    asyncTestMarker: null,
+    pinnedToolVersions: {},
+    closestExistingTest: null,
   };
 
   // Run all reads concurrently; each is independently try/caught.
@@ -95,7 +104,6 @@ export async function fingerPrintTestInfra(args: FingerprintArgs): Promise<TestI
     parseConftest(gitClient, repoFullName, ref, pkg, profile),
     parsePyproject(gitClient, repoFullName, ref, pkg, profile),
     parseToxIni(gitClient, repoFullName, ref, pkg, profile),
-    listCassettes(gitClient, repoFullName, ref, pkg, profile),
     readOneTestFile(gitClient, repoFullName, ref, pkg, profile),
   ]);
 
@@ -107,7 +115,7 @@ export async function fingerPrintTestInfra(args: FingerprintArgs): Promise<TestI
 // ---------------------------------------------------------------------------
 
 async function parseConftest(
-  gitClient: FingerprintArgs['gitClient'],
+  gitClient: GitClientLike,
   repoFullName: string,
   ref: string,
   pkg: string,
@@ -135,12 +143,11 @@ async function parseConftest(
 
     // --- Cassette transport fixture ------------------------------------------
     // Look for a fixture that yields or returns a ReplayTransport / transport
-    // object. Heuristic: fixture whose body mentions "ReplayTransport",
-    // "VCR", "cassette", or "transport" and is not a path function.
+    // object. Heuristic: fixture whose name contains "transport", "cassette",
+    // "vcr", or "replay".
     const cassetteFxRe =
       /^@pytest\.fixture(?:\([^)]*\))?\s*\ndef\s+(\w*(?:transport|cassette|vcr|replay)\w*)\b/gim;
     while ((m = cassetteFxRe.exec(src)) !== null) {
-      // Prefer the first match — there's usually only one.
       if (!profile.cassetteTransportFixture) {
         profile.cassetteTransportFixture = m[1];
       }
@@ -158,52 +165,28 @@ async function parseConftest(
       }
     }
 
-    // --- Cassette path / naming convention -----------------------------------
+    // --- Cassette naming convention ------------------------------------------
     // Look for a function like `_cassette_path`, `cassette_path`, etc.
     const cassettePathFnRe =
-      /def\s+(\w*cassette_path\w*)\s*\([^)]*\)[\s\S]*?(?=\ndef |\nclass |\Z)/gi;
-    const cassettePathFnAlt =
-      /def\s+(get_cassette_path|cassette_name|_cassette_name)\s*\([^)]*\)/gi;
+      /def\s+(\w*cassette_path\w*|get_cassette_path|cassette_name|_cassette_name)\s*\([^)]*\)/gi;
 
-    let cassetteDirRaw: string | null = null;
-    let cassetteConvention: string | null = null;
-
-    for (const re of [cassettePathFnRe, cassettePathFnAlt]) {
-      m = re.exec(src);
-      if (m) {
-        // Extract the body of the function (crude: up to 20 lines)
-        const startIdx = m.index;
-        const snippet = src.slice(startIdx, startIdx + 1200);
-        // Try to extract the cassette dir from path joins / f-strings
-        const dirMatch =
-          snippet.match(/['"](tests\/cassettes[^'"]*)['"]/i) ??
-          snippet.match(/os\.path\.join\(([^)]+)\)/i) ??
-          snippet.match(/Path\(([^)]+)\)/i);
-        if (dirMatch) {
-          cassetteDirRaw = dirMatch[1].replace(/\s+/g, '');
-        }
-        cassetteConvention = inferNamingConvention(snippet);
-        break;
+    m = cassettePathFnRe.exec(src);
+    if (m) {
+      const startIdx = m.index;
+      const snippet = src.slice(startIdx, startIdx + 1200);
+      const convention = inferNamingConvention(snippet);
+      if (convention) {
+        profile.cassetteNamingConvention = convention;
       }
     }
 
-    // Fallback: scan src for any string that looks like a cassette directory.
-    if (!cassetteDirRaw) {
-      const pathLiteralRe = /['"]([^'"]*cassettes[^'"]*)['"]/gi;
-      while ((m = pathLiteralRe.exec(src)) !== null) {
-        const candidate = m[1];
-        if (candidate.includes('/') && !candidate.startsWith('http')) {
-          cassetteDirRaw = candidate;
-          break;
-        }
+    // Fallback: scan for f-strings or path patterns containing "cassette".
+    if (!profile.cassetteNamingConvention) {
+      const fstringRe = /f["']([^"']*cassette[^'"]*)['"]/i;
+      const fm = src.match(fstringRe);
+      if (fm) {
+        profile.cassetteNamingConvention = inferNamingConvention(fm[0]) ?? `Path template: ${fm[1]}`;
       }
-    }
-
-    if (cassetteDirRaw) {
-      profile.cassetteDir = cassetteDirRaw;
-    }
-    if (cassetteConvention) {
-      profile.cassetteNamingConvention = cassetteConvention;
     }
 
     // --- Async test marker ---------------------------------------------------
@@ -218,9 +201,9 @@ async function parseConftest(
 
     // --- Additional test packages from imports -------------------------------
     const importedPackages = extractTopLevelPackages(src);
-    for (const pkg of importedPackages) {
-      if (!profile.additionalTestPackages.includes(pkg)) {
-        profile.additionalTestPackages.push(pkg);
+    for (const p of importedPackages) {
+      if (!profile.additionalPackages.includes(p)) {
+        profile.additionalPackages.push(p);
       }
     }
   } catch {
@@ -233,7 +216,7 @@ async function parseConftest(
 // ---------------------------------------------------------------------------
 
 async function parsePyproject(
-  gitClient: FingerprintArgs['gitClient'],
+  gitClient: GitClientLike,
   repoFullName: string,
   ref: string,
   pkg: string,
@@ -249,25 +232,27 @@ async function parsePyproject(
     const src = result.content;
 
     // --- [project.optional-dependencies] -------------------------------------
-    // Match the section header and collect the keys (extras names).
-    const optDepsSectionRe =
-      /\[project\.optional-dependencies\]([\s\S]*?)(?=^\[|\z)/m;
+    // Match the section header and collect the extras with their package lists.
+    const optDepsSectionRe = /\[project\.optional-dependencies\]([\s\S]*?)(?=^\[|\z)/m;
     const sectionMatch = src.match(optDepsSectionRe);
     if (sectionMatch) {
       const sectionBody = sectionMatch[1];
-      // Each extra is a key = [ ... ] block
-      const extraKeyRe = /^(\w[\w-]*)\s*=/gm;
+      // Each extra: key = [\n  "pkg1",\n  "pkg2",\n]
+      const extraBlockRe = /^([\w][\w-]*)\s*=\s*\[([\s\S]*?)\]/gm;
       let m: RegExpExecArray | null;
-      while ((m = extraKeyRe.exec(sectionBody)) !== null) {
+      while ((m = extraBlockRe.exec(sectionBody)) !== null) {
         const extraName = m[1];
-        if (!profile.testExtras.includes(extraName)) {
-          profile.testExtras.push(extraName);
-        }
+        // Extract individual package specs from the bracket content
+        const pkgList = m[2]
+          .split(/[\n,]/)
+          .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+          .filter((s) => s.length > 0);
+        profile.installExtras[extraName] = pkgList.join(', ');
       }
     }
 
-    // --- Ruff / lint tool versions from [tool.ruff] -------------------------
-    mergeRuffVersionFromPyproject(src, profile.lintToolVersions);
+    // --- Pinned tool versions from dev/lint dependency entries ---------------
+    mergePinnedVersionsFromPyproject(src, profile.pinnedToolVersions);
 
     // --- Async marker from tool.pytest.ini_options --------------------------
     if (!profile.asyncTestMarker) {
@@ -281,11 +266,11 @@ async function parsePyproject(
 }
 
 // ---------------------------------------------------------------------------
-// Step 3: Parse tox.ini for lint tool versions
+// Step 3: Parse tox.ini for pinned tool versions
 // ---------------------------------------------------------------------------
 
 async function parseToxIni(
-  gitClient: FingerprintArgs['gitClient'],
+  gitClient: GitClientLike,
   repoFullName: string,
   ref: string,
   pkg: string,
@@ -299,102 +284,18 @@ async function parseToxIni(
     );
     if (!result.ok || !result.content) return;
     const src = result.content;
-    mergeLintVersionsFromToxIni(src, profile.lintToolVersions);
+    mergePinnedVersionsFromToxIni(src, profile.pinnedToolVersions);
   } catch {
     // best effort
   }
 }
 
 // ---------------------------------------------------------------------------
-// Step 4: List existing cassettes using GitHub contents API (tree walk)
-// ---------------------------------------------------------------------------
-
-async function listCassettes(
-  gitClient: FingerprintArgs['gitClient'],
-  repoFullName: string,
-  ref: string,
-  pkg: string,
-  profile: TestInfraProfile
-): Promise<void> {
-  // We use getFileContents on candidate directory paths to enumerate cassettes.
-  // GitHub's contents API returns an array when the path is a directory.
-  // Our gitClient.getFileContents interface returns {ok, content?} where content
-  // is a decoded string. For directories the response from getFileContents will
-  // typically not be ok (404 or the client returns ok:false for directories).
-  //
-  // Strategy: attempt to GET the cassettes directory as a directory listing.
-  // Since FingerprintArgs.gitClient only exposes getFileContents (single file),
-  // we need to list cassette YAML files by fetching the GitHub contents API
-  // directly. However, we only have the gitClient interface — so we try a few
-  // well-known cassette sub-paths from the profile (or defaults) and record
-  // names from successful reads.
-  //
-  // More robustly: extend the gitClient interface inline to call GitHub
-  // /repos/:owner/:repo/contents/:path?ref= and parse the JSON array.
-  // But since we only have getFileContents, we'll use a supplementary fetch
-  // call if the environment has GITHUB_TOKEN, falling back to an empty list.
-
-  try {
-    const cassetteBasePaths = profile.cassetteDir
-      ? [profile.cassetteDir]
-      : [
-          `${pkg}/tests/cassettes`,
-          `${pkg}/tests/cassettes/integration`,
-          `${pkg}/tests/fixtures/cassettes`,
-        ];
-
-    const names: string[] = [];
-
-    for (const basePath of cassetteBasePaths) {
-      const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? '';
-      if (!token) continue;
-
-      // Call GitHub contents API with Accept: application/json to get a dir listing.
-      const cleanPath = basePath.replace(/^\/+|\/+$/g, '');
-      const url = `https://api.github.com/repos/${repoFullName}/contents/${cleanPath}?ref=${encodeURIComponent(ref)}`;
-      try {
-        const res = await fetch(url, {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            Accept: 'application/vnd.github+json',
-            'X-GitHub-Api-Version': '2022-11-28',
-            'User-Agent': 'oss-support-agent',
-          },
-        });
-        if (!res.ok) continue;
-        const data = (await res.json()) as unknown;
-        if (!Array.isArray(data)) continue;
-
-        for (const entry of data as Array<{ name?: string; type?: string }>) {
-          if (entry.type === 'file' && typeof entry.name === 'string') {
-            const n = entry.name.replace(/\.(yaml|yml|json|json\.gz)$/i, '');
-            if (!names.includes(n)) names.push(n);
-          }
-        }
-        if (names.length > 0) break; // found cassettes — stop iterating paths
-      } catch {
-        // network failure or JSON parse error — skip this path
-        continue;
-      }
-    }
-
-    profile.existingCassettes = names;
-
-    // Update cassetteDir if we found cassettes at a path we didn't know before.
-    if (names.length > 0 && !profile.cassetteDir) {
-      profile.cassetteDir = `${pkg}/tests/cassettes`;
-    }
-  } catch {
-    // best effort
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Step 5: Read one existing integration test file
+// Step 4: Read one existing integration test file for imports + base classes
 // ---------------------------------------------------------------------------
 
 async function readOneTestFile(
-  gitClient: FingerprintArgs['gitClient'],
+  gitClient: GitClientLike,
   repoFullName: string,
   ref: string,
   pkg: string,
@@ -416,6 +317,9 @@ async function readOneTestFile(
       const result = await gitClient.getFileContents(repoFullName, filePath, ref);
       if (!result.ok || !result.content) continue;
       const src = result.content;
+
+      // Record the path of the closest existing test
+      profile.closestExistingTest = filePath;
 
       // Extract top-level import lines (lines starting with 'import' or 'from').
       const importLines = src
@@ -440,8 +344,8 @@ async function readOneTestFile(
       // Additional packages
       const pkgs = extractTopLevelPackages(src);
       for (const p of pkgs) {
-        if (!profile.additionalTestPackages.includes(p)) {
-          profile.additionalTestPackages.push(p);
+        if (!profile.additionalPackages.includes(p)) {
+          profile.additionalPackages.push(p);
         }
       }
 
@@ -469,14 +373,13 @@ function extractFixtureBlocks(src: string): Array<[string, string]> {
   let baseIndent = -1;
 
   for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+    const line = lines[i]!;
 
     if (/^@pytest\.fixture/.test(line)) {
-      // Next def is a fixture
-      inFixture = true;
       if (fixtureName && bodyLines.length > 0) {
         results.push([fixtureName, bodyLines.join('\n')]);
       }
+      inFixture = true;
       fixtureName = '';
       bodyLines = [];
       baseIndent = -1;
@@ -485,9 +388,9 @@ function extractFixtureBlocks(src: string): Array<[string, string]> {
 
     if (inFixture && /^def\s+(\w+)/.test(line)) {
       const match = line.match(/^def\s+(\w+)/);
-      fixtureName = match ? match[1] : '';
-      baseIndent = line.search(/\S/); // indentation of the def line (should be 0 for top-level)
-      inFixture = false; // reset so we don't catch the next @pytest.fixture
+      fixtureName = match ? match[1]! : '';
+      baseIndent = line.search(/\S/);
+      inFixture = false;
       continue;
     }
 
@@ -497,7 +400,6 @@ function extractFixtureBlocks(src: string): Array<[string, string]> {
         bodyLines.push(line);
         continue;
       }
-      // If we encounter a line at or less indentation than the def, the fixture body is over.
       if (indent <= baseIndent && bodyLines.length > 0) {
         results.push([fixtureName, bodyLines.join('\n')]);
         fixtureName = '';
@@ -522,8 +424,7 @@ function inferNamingConvention(snippet: string): string | null {
   const fstringRe = /f["']([^"']*cassette[^"']*)['"]/i;
   const m = snippet.match(fstringRe);
   if (m) {
-    // Normalise Python f-string variables to {variable} style
-    const template = m[1].replace(/\{([^}]+)\}/g, (_, v) => `{${v.trim()}}`);
+    const template = m[1]!.replace(/\{([^}]+)\}/g, (_, v) => `{${(v as string).trim()}}`);
     return `Path template: ${template}`;
   }
 
@@ -531,7 +432,7 @@ function inferNamingConvention(snippet: string): string | null {
   const joinRe = /os\.path\.join\(([^)]+)\)/;
   const jm = snippet.match(joinRe);
   if (jm) {
-    return `os.path.join-based: ${jm[1].replace(/\s+/g, ' ').trim()}`;
+    return `os.path.join-based: ${jm[1]!.replace(/\s+/g, ' ').trim()}`;
   }
 
   // Generic: looks like it uses the test function name
@@ -546,20 +447,23 @@ function inferNamingConvention(snippet: string): string | null {
  * Merge SDK base classes from an import section into the profile map.
  * Looks for commonly-used OTel / OpenInference SDK classes.
  */
-const SDK_BASE_CLASS_PATTERNS: Array<[RegExp, string, string]> = [
-  [/from\s+(opentelemetry\.sdk\.trace)\s+import\s+([^#\n]+)/, 'opentelemetry.sdk.trace', ''],
-  [/from\s+(opentelemetry\.sdk\.trace\.export)\s+import\s+([^#\n]+)/, 'opentelemetry.sdk.trace.export', ''],
-  [/from\s+(opentelemetry\.sdk\.trace\.export\.in_memory_span_exporter)\s+import\s+([^#\n]+)/, 'opentelemetry.sdk.trace.export.in_memory_span_exporter', ''],
-  [/from\s+(openinference\.instrumentation)\s+import\s+([^#\n]+)/, 'openinference.instrumentation', ''],
-  [/from\s+(opentelemetry\.trace)\s+import\s+([^#\n]+)/, 'opentelemetry.trace', ''],
+const SDK_BASE_CLASS_PATTERNS: Array<[RegExp, string]> = [
+  [/from\s+(opentelemetry\.sdk\.trace)\s+import\s+([^#\n]+)/, 'opentelemetry.sdk.trace'],
+  [/from\s+(opentelemetry\.sdk\.trace\.export)\s+import\s+([^#\n]+)/, 'opentelemetry.sdk.trace.export'],
+  [
+    /from\s+(opentelemetry\.sdk\.trace\.export\.in_memory_span_exporter)\s+import\s+([^#\n]+)/,
+    'opentelemetry.sdk.trace.export.in_memory_span_exporter',
+  ],
+  [/from\s+(openinference\.instrumentation)\s+import\s+([^#\n]+)/, 'openinference.instrumentation'],
+  [/from\s+(opentelemetry\.trace)\s+import\s+([^#\n]+)/, 'opentelemetry.trace'],
 ];
 
 function mergeBaseClasses(src: string, into: Record<string, string>): void {
   for (const [re, modulePath] of SDK_BASE_CLASS_PATTERNS) {
-    let m: RegExpExecArray | null;
     const localRe = new RegExp(re.source, 'gm');
+    let m: RegExpExecArray | null;
     while ((m = localRe.exec(src)) !== null) {
-      const importedNames = m[2]
+      const importedNames = m[2]!
         .split(',')
         .map((n) => n.trim().replace(/\s+as\s+\w+/, '').trim())
         .filter((n) => /^[A-Z][A-Za-z0-9_]*$/.test(n)); // class names (PascalCase)
@@ -582,7 +486,7 @@ function extractTopLevelPackages(src: string): string[] {
   const importRe = /^(?:import|from)\s+([\w.]+)/gm;
   let m: RegExpExecArray | null;
   while ((m = importRe.exec(src)) !== null) {
-    const top = m[1].split('.')[0];
+    const top = m[1]!.split('.')[0];
     if (top && top !== 'typing' && top !== '__future__' && top !== 'builtins') {
       pkgs.add(top);
     }
@@ -591,33 +495,32 @@ function extractTopLevelPackages(src: string): string[] {
 }
 
 /**
- * Merge ruff/mypy/black version pins found in pyproject.toml into lintToolVersions.
- * Handles [tool.ruff], [[tool.mypy]], etc.
+ * Merge pinned tool versions found in pyproject.toml into pinnedToolVersions.
+ * Handles entries like `ruff==X.Y.Z` or `ruff>=X.Y.Z` in optional-dependencies
+ * or dev dependency groups.
  */
-function mergeRuffVersionFromPyproject(src: string, into: Record<string, string>): void {
-  // Look for `ruff>=X.Y.Z` or `ruff==X.Y.Z` in optional-dependencies or
-  // dev dependencies.
-  const pinRe = /\b(ruff|mypy|black|isort|flake8|pylint)\s*[=><!]+\s*([\d.]+)/gi;
+function mergePinnedVersionsFromPyproject(src: string, into: Record<string, string>): void {
+  const pinRe = /\b(ruff|mypy|black|isort|flake8|pylint|pytest|coverage)\s*[=><!]+\s*([\d.]+)/gi;
   let m: RegExpExecArray | null;
   while ((m = pinRe.exec(src)) !== null) {
-    const tool = m[1].toLowerCase();
+    const tool = m[1]!.toLowerCase();
     if (!into[tool]) {
-      into[tool] = m[2];
+      into[tool] = m[2]!;
     }
   }
 }
 
 /**
- * Parse tox.ini for lint tool version pins in deps lines.
+ * Parse tox.ini for pinned tool version entries in deps lines.
  * Handles lines like: `    ruff==0.9.2` or `    ruff>=0.9.0`
  */
-function mergeLintVersionsFromToxIni(src: string, into: Record<string, string>): void {
-  const lineRe = /^\s*(ruff|mypy|black|isort|flake8|pylint)\s*[=><!]+\s*([\d.]+)/gim;
+function mergePinnedVersionsFromToxIni(src: string, into: Record<string, string>): void {
+  const lineRe = /^\s*(ruff|mypy|black|isort|flake8|pylint|pytest|coverage)\s*[=><!]+\s*([\d.]+)/gim;
   let m: RegExpExecArray | null;
   while ((m = lineRe.exec(src)) !== null) {
-    const tool = m[1].toLowerCase();
+    const tool = m[1]!.toLowerCase();
     if (!into[tool]) {
-      into[tool] = m[2];
+      into[tool] = m[2]!;
     }
   }
 }

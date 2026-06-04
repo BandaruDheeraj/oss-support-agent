@@ -160,6 +160,15 @@ export interface ActionsClient {
    * Optional so minimal clients and test fakes don't need to implement it.
    */
   downloadJobLog?(repoFullName: string, jobId: number): Promise<string>;
+
+  /**
+   * List check runs for a PR commit SHA.
+   * Optional so minimal clients and test fakes don't need to implement it.
+   */
+  listPrCheckRuns?(
+    repoFullName: string,
+    prSha: string
+  ): Promise<Array<{ name: string; status: string; conclusion: string | null; detailsUrl: string }>>;
 }
 
 /**

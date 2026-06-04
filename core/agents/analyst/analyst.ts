@@ -109,54 +109,40 @@ LOW-CONFIDENCE semantic seed handling:
 When \`semanticConfidence.low_confidence\` is true, you MUST explicitly state in your dossier summary that semantic suspects are low-confidence. You MUST carry that uncertainty into \`oracleSpec\`: only include suspect_path_assertions you can justify from direct file reads / concrete evidence, and avoid claiming suspect-path evidence you cannot verify.
 
 CANDIDATE REPRO (REQUIRED when suspect symbols are present):
-When \`suspectSymbols\` is non-empty, you MUST include a \`candidateRepro\` field on record_evidence.
+When suspectSymbols is non-empty, you MUST include reproFiles on record_evidence (even at low/medium confidence).
 
-PREFERRED: reproFiles path (integration test, not unit test)
-─────────────────────────────────────────────────────────────
-Write an integration test that runs the real stack the way the user described.
-Do NOT call internal functions in isolation. Wire up the real library, real OTel stack, and a stub of any third-party.
+You receive a testInfraProfile in your context (when available) with cassette naming convention, available fixtures, install extras, existing cassette names, and pinned tool versions. Use it.
 
-Use the TEST INFRASTRUCTURE PROFILE (provided in your context) to:
-- Match the cassette naming convention exactly (e.g. test function name → tests/cassettes/{module}/{name}.yaml)
-- Copy an existing cassette rather than recording a new one
-- Use available fixtures (cassette_transport, in_memory_span_exporter, etc.)
-- Install correct extras (e.g. [instruments,test] not just [test])
-- Inherit from base classes listed in sdkBaseClasses (not duck-typed)
-- Use asyncTestMarker if the test is async
+WRITE A COMPLETE INTEGRATION TEST — not a unit test calling internals. Exercise the real library stack the way the issue reporter described. Use the cassette transport fixture to replay API calls (no credentials needed).
 
-Use these installSpec extras and additionalPackages from the profile.
+reproFiles is an array of {path, content, append?}:
+1. Test file: append existing test_*.py (append: true) rather than creating a new file
+2. Cassette file: copy content from an existing cassette, rename to match the test function name exactly per cassetteNamingConvention in the profile
 
-INSTALL what the instrumentation PATCHES (the library being wrapped), NOT what uses the instrumentation.
-STUB the third-party's interface contract (4 lines), NOT the third-party itself.
+testEntryPoint: repo-relative pytest path e.g. "tests/test_foo.py::test_my_function"
 
-reproFiles field:
-- path: repo-relative path of the file
-- content: complete file content as a string
-- append: true to append to an existing file (e.g. adding a test to test_instrumentor.py)
+installSpec.editableInstall: install the library the instrumentation PATCHES (the SDK), not third-party consumers. Use extras from profile (e.g. [instruments,test]).
+installSpec.additionalPackages: from profile.additionalPackages
 
-testEntryPoint: e.g. "tests/test_instrumentor.py::test_session_id_not_overwritten"
+expectedFailureOutput: substring that MUST appear in stdout/stderr when the bug is present. Used to distinguish real repro from import errors.
 
-installSpec:
-- editableInstall: repo-relative dirs to pip install -e (from profile.testExtras + affected package)
-- additionalPackages: extra pip packages (pytest, pytest-asyncio, pyyaml as needed)
+fixHypothesis: {file: "src/path/to/file.py", description: "one sentence: what to change and why"}
 
-expectedFailureOutput: a substring that MUST appear in stdout/stderr when the bug is present.
-If you include this, the Builder will validate the failure output, not just the exit code.
+CRITICAL RULES — all learned from real failures:
+- Test MUST use assert or raise. if/print exits 0 even when bug present — pipeline cannot detect it.
+- Use types.SimpleNamespace(field=value) NOT plain dicts when calling library internals. Internal functions use getattr not dict access.
+- Inherit from SDK base classes (e.g. opentelemetry.sdk.trace.SpanProcessor). Duck typing crashes the SDK.
+- Cassette file MUST be named after the test function. conftest.py will pytest.fail if name is wrong.
+- Install the host library (SDK being instrumented), stub the third party (Langfuse = 10-line SpanProcessor, not pip install).
 
-fixHypothesis:
-- file: the source file to modify
-- description: what to change and why (the Builder/fix-agent uses this)
+WRONG (exits 0 even when bug present):
+  if captured[0] == "Tool execution error":
+      print("BUG CONFIRMED")  # exits 0 — pipeline blind
 
-CRITICAL: The test MUST exit non-zero when the bug is present. Use assert or raise.
-Do NOT use if/print — that exits 0 and the pipeline sees no failure.
+CORRECT:
+  assert captured[0] != "Tool execution error", f"BUG: got {captured[0]!r}"
 
-ALSO critical: include the cassette as a reproFile with the correct name per the naming convention.
-Without the cassette, the test will fail with "cassette not found" before it even runs.
-
-LEGACY: testSource path (simple pytest string) still accepted for simple unit-test-style bugs.
-Use reproFiles for any bug involving SDK lifecycle, OTel context, or third-party integration.
-
-Do NOT omit candidateRepro solely because of uncertainty. Write your best attempt and note caveats in \`rationale\`.
+Do NOT omit reproFiles solely because of uncertainty. Write your best attempt and note caveats in rationale.
 
 REPRO TARGETS (optional, low-cost):
 Independent of candidateRepro, you SHOULD include a \`reproTargets\` field on record_evidence when you've identified the structural setup the repro needs:
@@ -360,7 +346,7 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
         `  "preconditions": [],\n` +
         `  "openQuestions": []\n` +
         `})\n\n` +
-        `If semantic suspect files/symbols were provided, include candidateRepro with testSource (a full pytest test string) in this retry; it is required for repro execution.\n\n` +
+        `If semantic suspect files/symbols were provided, include reproFiles with testEntryPoint and reproFiles array in this retry; it is required for repro execution.\n\n` +
         `Do NOT call abandon — just emit a valid record_evidence tool call with what you have.`
       : `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous attempt ended with a plain-text reply (no tool call). Plain-text replies are DISCARDED. You MUST call record_evidence NOW. Use this minimal template if you are stuck — fill in summary and confidence from what you have already investigated, and set every array to [] if you don't have specific entries:\n\n` +
         `record_evidence({\n` +
@@ -371,7 +357,7 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
         `  preconditions: [],\n` +
         `  openQuestions: []\n` +
         `})\n\n` +
-        `If semantic suspect files/symbols were provided, include candidateRepro with testSource (a full pytest test string) in this retry; it is required for repro execution.\n\n` +
+        `If semantic suspect files/symbols were provided, include reproFiles with testEntryPoint and reproFiles array in this retry; it is required for repro execution.\n\n` +
         `Do NOT call abandon — abandon is reserved for contradictory or empty issues, not incomplete investigations. Just call record_evidence with whatever you have.`;
     const retry = await runAgentLoop({
       agent: 'ANALYST',

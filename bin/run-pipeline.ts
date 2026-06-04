@@ -1519,6 +1519,47 @@ async function gatherFixDiff(workspaceDir: string, log: (msg: string) => void): 
   }
 }
 
+/**
+ * Send a lightweight pre-PR notification email via live.sendMail (no reply
+ * gate). Used as a simple notification step before the full HITL gate runs,
+ * or as a standalone notification when the full gate is not applicable.
+ *
+ * Safe to call with a null/undefined live argument — logs and returns without
+ * throwing when mail is not configured.
+ */
+async function sendPrePrNotificationEmail(args: {
+  issueUrl: string;
+  branchUrl: string;
+  log: (msg: string) => void;
+  live: import('./clients/live-deps').LiveDeps | null | undefined;
+}): Promise<void> {
+  const { issueUrl, branchUrl, log, live } = args;
+  if (!live || !live.sendMail) {
+    log('[pre-pr-review] mail not configured, skipping review gate');
+    return;
+  }
+  const subject = '[agent-fix] Ready for upstream PR review — ' + issueUrl;
+  const body = [
+    'Branch ready for upstream PR: ' + branchUrl,
+    '',
+    'The repro test fails on the buggy code and passes after the fix.',
+    'Review the branch diff before replying.',
+    '',
+    'NOTE: If this is your first PR to this repo, you will need to sign the CLA.',
+    '',
+    "Reply 'approved' to open the upstream PR, or 'rejected: <reason>' to abort.",
+  ].join('\n');
+  try {
+    await live.sendMail({ to: live.monitoredEmail, subject, body });
+    log('[pre-pr-review] review email sent to ' + live.monitoredEmail);
+  } catch (err) {
+    log(
+      '[pre-pr-review] failed to send review email: ' +
+        (err instanceof Error ? err.message : String(err))
+    );
+  }
+}
+
 interface PrePrReviewGate {
   /** true if approved (including when the gate is skipped due to missing deps). */
   approved: boolean;
@@ -3074,6 +3115,17 @@ export async function runPipeline(args: {
       : []),
     ...(prMeta.extraBodySections ?? []),
   ].join('\n');
+
+  // ---------- Pre-PR notification (simple, no gate) ----------
+  // Send a lightweight notification email via live.sendMail so the operator is
+  // aware the agent is about to open a PR. This runs unconditionally when mail
+  // is configured — the full HITL gate below may add an approval wait on top.
+  await sendPrePrNotificationEmail({
+    issueUrl: 'https://github.com/' + repoFullName + '/issues/' + issueNumber,
+    branchUrl: 'https://github.com/' + fork.forkFullName + '/tree/' + fork.branchName,
+    log,
+    live: deps.live || null,
+  });
 
   // ---------- Pre-PR review gate ----------
   // If live deps (Gmail/HITL) are configured and PM_EMAIL is set, send a

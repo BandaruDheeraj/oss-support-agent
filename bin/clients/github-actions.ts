@@ -13,11 +13,12 @@ import JSZip from 'jszip';
 
 import type {
   ActionsClient,
-  CheckRun,
   WorkflowRun,
   WorkflowRunStatus,
   WorkflowRunLogs,
 } from '../../core/sandbox-types';
+
+export type { ActionsClient } from '../../core/sandbox-types';
 
 const GITHUB_API = 'https://api.github.com';
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
@@ -302,60 +303,27 @@ export class GitHubActionsClient implements ActionsClient {
     return `https://github.com/${forkFullName}/actions/runs/${runId}`;
   }
 
-  /**
-   * Fetch all check runs for a given commit ref (SHA or branch name).
-   * Handles pagination automatically via the Link header.
-   */
-  async getCheckRuns(repoFullName: string, ref: string): Promise<CheckRun[]> {
-    const [owner, repo] = repoFullName.split('/');
-    const results: CheckRun[] = [];
-    let url: string | null =
-      `${GITHUB_API}/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}/check-runs?per_page=100`;
-
-    while (url) {
-      const res = await this.request(url);
-      if (!res.ok) {
-        throw new Error(
-          `GitHub getCheckRuns failed (${res.status}) for ${repoFullName}@${ref}: ${await res.text()}`
-        );
-      }
-      const data: any = await res.json();
-      const runs: any[] = data.check_runs ?? [];
-      for (const r of runs) {
-        results.push({
-          id: r.id,
-          name: r.name,
-          status: r.status,
-          conclusion: r.conclusion ?? null,
-          detailsUrl: r.details_url ?? null,
-          appSlug: r.app?.slug ?? null,
-        });
-      }
-      // Follow the next-page link if present.
-      const link = res.headers.get('link') ?? '';
-      const nextMatch = link.match(/<([^>]+)>;\s*rel="next"/);
-      url = nextMatch ? nextMatch[1] : null;
-    }
-
-    return results;
+  async downloadJobLog(repoFullName: string, jobId: number): Promise<string> {
+    const url = GITHUB_API + '/repos/' + repoFullName + '/actions/jobs/' + jobId + '/logs';
+    const res = await this.request(url);
+    if (!res.ok) return '';
+    return res.text();
   }
 
-  /**
-   * Download raw log text for a single Actions job by job ID.
-   * GitHub responds with a 302 redirect to a signed S3/CDN URL; we follow it.
-   * Returns an empty string on any non-fatal error (e.g. 404, expired log).
-   */
-  async downloadJobLog(repoFullName: string, jobId: number): Promise<string> {
-    const [owner, repo] = repoFullName.split('/');
-    const url = `${GITHUB_API}/repos/${owner}/${repo}/actions/jobs/${jobId}/logs`;
-    try {
-      const res = await this.request(url, { redirect: 'follow' });
-      if (!res.ok) {
-        return '';
-      }
-      return res.text();
-    } catch {
-      return '';
-    }
+  async listPrCheckRuns(
+    repoFullName: string,
+    prSha: string
+  ): Promise<Array<{ name: string; status: string; conclusion: string | null; detailsUrl: string }>> {
+    const url =
+      GITHUB_API + '/repos/' + repoFullName + '/commits/' + prSha + '/check-runs?per_page=100';
+    const res = await this.request(url);
+    if (!res.ok) return [];
+    const data: any = await res.json();
+    return (data.check_runs || []).map((c: any) => ({
+      name: c.name,
+      status: c.status,
+      conclusion: c.conclusion || null,
+      detailsUrl: c.details_url || '',
+    }));
   }
 }

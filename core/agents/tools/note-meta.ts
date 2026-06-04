@@ -19,12 +19,14 @@ import {
   ReproRecipeInputSchema,
   ReproTargetsInputSchema,
   ReproOracleSpecInputSchema,
+  ReproFilesInputSchema,
   type SuspectSymbol,
   SuspectSymbolSchema,
   normalizePreconditionInput,
   normalizeReproRecipeInput,
   normalizeReproTargetsInput,
   normalizeReproOracleSpecInput,
+  normalizeReproFilesInput,
   buildReproOracleSpec,
   CandidateReproInputSchema,
   normalizeCandidateReproInput,
@@ -113,6 +115,11 @@ const RecordEvidence = z.preprocess(
      */
     reproTargets: ReproTargetsInputSchema.optional(),
     /**
+     * Multi-file repro input under the ReproFiles redesign. Optional;
+     * when present the Builder uses these files instead of the template path.
+     */
+    reproFiles: ReproFilesInputSchema.optional(),
+    /**
      * Structured repro oracle assertions consumed by deterministic repro/fix
      * gates. Optional on input; when omitted we derive defaults from
      * suspectSymbols + preconditions.
@@ -192,6 +199,12 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
         candidateRepro = undefined;
       }
     }
+    // Normalize reproFiles via the strict schema coercer. Returns null when
+    // reproFiles array is absent/empty or testEntryPoint is missing — in that
+    // case omit the field so the snapshot hash matches a legacy body lacking it.
+    const reproFiles = args.reproFiles
+      ? normalizeReproFilesInput(args.reproFiles) ?? undefined
+      : undefined;
     // Normalize reproTargets via the loose-input coercer. Returns null when
     // both arrays are empty after cleaning — in that case omit the field so
     // the snapshot hash matches a legacy body literally lacking it.
@@ -217,12 +230,14 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       ...(reproRecipe ? { reproRecipe } : {}),
       ...(candidateRepro ? { candidateRepro } : {}),
       ...(reproTargets ? { reproTargets } : {}),
+      ...(reproFiles ? { reproFiles } : {}),
     });
     return {
       snapshot_id: snap.snapshotId,
       recipe_recorded: reproRecipe ? true : false,
       candidate_recorded: candidateRepro ? true : false,
       repro_targets_recorded: reproTargets ? true : false,
+      repro_files_recorded: reproFiles ? true : false,
       oracle_spec_recorded: oracleSpec ? true : false,
       suspect_files_count: suspectFiles.length,
       suspect_symbols_count: suspectSymbols.length,

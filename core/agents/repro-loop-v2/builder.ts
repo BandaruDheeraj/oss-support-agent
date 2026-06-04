@@ -167,6 +167,8 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
   // checks that only apply to the exerciseCall/sentinel schema path.
   const isTestSourcePath = !!candidate.testSource;
 
+  const isReproFilesPath = !!(candidate as any).reproFiles && Array.isArray((candidate as any).reproFiles) && (candidate as any).reproFiles.length > 0;
+
   // exerciseCall must reference at least one suspect symbol — keeps the
   // Builder honest (no Builder-authored tests that exercise unrelated code).
   // Skip for testSource path: the analyst wrote the full test and is
@@ -294,6 +296,24 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     }
     if (source.length > REPRO_RECIPE_TEST_SOURCE_MAX) {
       return rej('test_source_render_failed', `testSource exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
+    }
+  } else if (isReproFilesPath) {
+    const rf = (candidate as any).reproFiles as Array<{path: string, content: string, append?: boolean}>;
+    const writtenPaths: string[] = [];
+    for (const rfile of rf) {
+      try {
+        await args.workspace.writeTest(rfile.path, rfile.content);
+        writtenPaths.push(rfile.path);
+      } catch (err) {
+        for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
+        return rej('write_test_failed', "Failed to write " + rfile.path + ": " + (err instanceof Error ? err.message : String(err)));
+      }
+    }
+    const testFile = rf.find(f => !f.path.endsWith('.yaml') && !f.path.endsWith('.yml'));
+    source = testFile ? testFile.content : rf[0].content;
+    const testEntryPoint = (candidate as any).testEntryPoint;
+    if (testEntryPoint && typeof testEntryPoint === 'string') {
+      (candidate as any).candidateTestPath = testEntryPoint.split('::')[0];
     }
   } else {
     const render = renderTestSource(candidate);
@@ -441,6 +461,15 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
       runs,
       candidateTestPath,
     };
+  }
+
+  const expectedOut = (candidate as any).expectedFailureOutput;
+  if (expectedOut && typeof expectedOut === 'string') {
+    const allOutput = runs.map(r => (r as any).stdout + (r as any).stderr).join('\n');
+    if (!allOutput.includes(expectedOut)) {
+      await safeRevert(args.workspace, candidateTestPath);
+      return rej('sentinel_absent', 'expectedFailureOutput "' + expectedOut + '" not found — likely unrelated failure');
+    }
   }
 
   // ---------------------------------------------------------------

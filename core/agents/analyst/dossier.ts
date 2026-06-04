@@ -12,8 +12,9 @@
 import { createHash } from 'crypto';
 import { z } from 'zod';
 import { CandidateReproSchema, type CandidateRepro } from './candidate-repro';
-export { CandidateReproSchema, CandidateReproInputSchema, normalizeCandidateReproInput, renderTestSource } from './candidate-repro';
+export { CandidateReproSchema, CandidateReproInputSchema, normalizeCandidateReproInput, renderTestSource, ReproFilesInputSchema, normalizeReproFilesInputStrict as normalizeReproFilesInput } from './candidate-repro';
 export type { CandidateRepro, CandidateReproInput, CandidateReproFailureMode, CandidateReproSource } from './candidate-repro';
+import { ReproFilesInputSchema } from './candidate-repro';
 
 export const EvidenceSchema = z.object({
   id: z.string(),                          // stable id within the dossier
@@ -771,6 +772,13 @@ export const DossierBodySchema = z.object({
    * remain stable.
    */
   reproTargets: ReproTargetsSchema.optional(),
+  /**
+   * Multi-file repro input authored by the Analyst under the ReproFiles
+   * redesign. OPTIONAL: snapshots predating this field deserialize without
+   * it; `snapshotIdFor` strips it from the canonical hash when absent so
+   * legacy snapshot ids remain stable.
+   */
+  reproFiles: ReproFilesInputSchema.optional(),
 });
 
 export type DossierBody = z.infer<typeof DossierBodySchema>;
@@ -917,6 +925,7 @@ export class DossierStore {
       | 'reproRecipe'
       | 'candidateRepro'
       | 'reproTargets'
+      | 'reproFiles'
     > & {
       parentSnapshotId?: string | null;
       suspectFiles?: SuspectFile[];
@@ -926,6 +935,7 @@ export class DossierStore {
       reproRecipe?: ReproRecipe;
       candidateRepro?: CandidateRepro;
       reproTargets?: ReproTargets;
+      reproFiles?: z.infer<typeof ReproFilesInputSchema>;
     }
   ): DossierSnapshot {
     const parent = input.parentSnapshotId ?? this.latest()?.snapshotId ?? null;
