@@ -83,9 +83,11 @@ function nullToArr<T>(v: unknown): T[] {
   return Array.isArray(v) ? (v as T[]) : [];
 }
 
-const RecordEvidence = z.preprocess(
-  deepNullToUndefined,
-  z.object({
+// Note: we intentionally do NOT wrap RecordEvidence in z.preprocess() at the
+// top level. The Vercel AI SDK uses zodToJsonSchema() on the parameters schema
+// and ZodEffects (the output of z.preprocess) produces an empty JSON Schema,
+// breaking LLM tool-call generation. Null handling is done per-field instead.
+const RecordEvidence = z.object({
     evidence: z.preprocess(nullToArr, z.array(EvidenceInputSchema)).default([]),
     suspectFiles: z.preprocess(nullToArr, z.array(z.string())).optional(),
     suspectSymbols: z.preprocess(nullToArr, z.array(SuspectSymbolSchema)).default([]),
@@ -126,15 +128,17 @@ const RecordEvidence = z.preprocess(
      */
     oracleSpec: ReproOracleSpecInputSchema.optional(),
   })
-  .passthrough()
-);
+  .passthrough();
 export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = {
   name: 'record_evidence',
   tier: 'note',
   description:
     'Analyst- and Prober-only: append a new EvidenceDossier snapshot summarising everything you have read so far. Include suspectFiles/suspectSymbols when known. Call this to terminate the loop. Prober additionally supplies `reproRecipe` carrying the executable test + observed probe results.',
   parameters: RecordEvidence,
-  async execute(args, ctx) {
+  async execute(rawArgs, ctx) {
+    // Apply deepNullToUndefined here (not in schema) to avoid converting the
+    // schema to ZodEffects which breaks the AI SDK's JSON Schema generation.
+    const args = deepNullToUndefined(rawArgs) as typeof rawArgs;
     const handles = asHandles(ctx.handles);
     const dossier = handles.dossier;
     if (!dossier) return { error: 'dossier writer not available — caller is not the Analyst' };
