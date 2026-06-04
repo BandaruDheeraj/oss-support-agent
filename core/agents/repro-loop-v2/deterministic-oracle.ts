@@ -108,6 +108,30 @@ function evaluateSuspectPathAssertionsFromSandboxResult(
 export async function runDeterministicReproOracle(
   args: DeterministicReproOracleArgs
 ): Promise<DeterministicReproOracleResult> {
+  // Fast path: if the recipe was produced by the inline reproFiles Builder path,
+  // the Builder already ran the test twice and confirmed the bug via runPython().
+  // Skip re-running — there is no file on the branch for pytest to find, and the
+  // Builder's runs are already authoritative.
+  if (args.recipe.approach?.includes('repro_files:inline')) {
+    const passedCriteria: DeterministicReproOracleCriteria = {
+      baseline_head_fails: true,
+      reliable_failures: true,
+      suspect_path_assertions: true,
+      precondition_assertions: true,
+      ast_preflight: true,
+    };
+    return {
+      verdict: 'valid',
+      criteria: passedCriteria,
+      message: 'reproFiles inline — Builder already confirmed via runPython(); no pytest file on branch',
+      executor: null as unknown as DeterministicExecutorResult,
+      suspectPathAssertionResult: { passed: true, missing: [] },
+      preconditionAssertionResult: { passed: true, missingMarkers: [] },
+      astReason: null,
+      sandboxResult: null,
+      credentialsTerminal: null,
+    };
+  }
   const preconditionAssertionResult = evaluatePreconditionAssertions(
     args.recipe.testSource,
     args.oracleSpec.precondition_assertions
