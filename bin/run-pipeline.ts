@@ -110,6 +110,7 @@ import { inferUsabilityIntrospection } from './clients/usability-introspect';
 import { emitOnlineEvaluation } from '../core/observability/evaluator';
 import { activeBackend } from '../core/observability';
 import { getEvalRecorder } from '../core/observability/eval-recorder';
+import { fingerprintTestInfra } from '../core/agents/repro-loop-v2/test-infra-fingerprint';
 
 /** Module-level sweep state store. Keyed by per-run sweep runId; no cross-run conflicts. */
 const sweepStateStore = new InMemorySweepStateStore();
@@ -2765,6 +2766,35 @@ export async function runPipeline(args: {
 
     const reproAttemptId = runId + "-repro";
     const reproStageTimeoutMs = resolveReproStageTimeoutMs(process.env);
+
+    // Phase 0: Test Infrastructure Fingerprinting
+    // Reads conftest.py, pyproject.toml, cassettes/, existing tests from the
+    // target repo before the analyst writes any code. Eliminates the common
+    // "5 dispatch-fail-fix cycles" caused by unknown base classes, wrong extras,
+    // wrong cassette naming, wrong import scope, wrong pinned tool version.
+    let testInfraProfile = null;
+    try {
+      const ghClientForFingerprint = new GitHubActionsClient(deps.token);
+      const ghRestForFingerprint = new GitHubRestClient(deps.token);
+      testInfraProfile = await fingerprintTestInfra({
+        repoFullName: fork.forkFullName,
+        affectedPackagePath: routing.result.affectedModule ?? '',
+        gitClient: {
+          getDefaultBranch: (repo) => ghRestForFingerprint.getDefaultBranch(repo).catch(() => 'main'),
+          getFileContents: (repo, filePath, ref) =>
+            ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
+        },
+      });
+      if (testInfraProfile) {
+        log(`[v2-driver] test-infra fingerprint: cassette_convention=${testInfraProfile.cassetteNamingConvention ?? 'unknown'} ` +
+            `fixtures=${testInfraProfile.availableFixtures.length} ` +
+            `cassettes=${testInfraProfile.existingCassettes.length} ` +
+            `pinned_tools=${JSON.stringify(testInfraProfile.pinnedToolVersions)}`);
+      }
+    } catch (err: any) {
+      log(`[v2-driver] test-infra fingerprint failed (non-fatal): ${err?.message ?? err}`);
+    }
+
     let reproOutcome: ReproPipelineOutcome;
     try {
       reproOutcome = await runReproPipelineWithTimeout({
@@ -2783,6 +2813,7 @@ export async function runPipeline(args: {
             language: 'python',
             sandboxDriver: v2SandboxDriver,
             ghActionsSandboxOptions: v2GhActionsSandboxOptions,
+            testInfraProfile,
             log,
           }),
       });

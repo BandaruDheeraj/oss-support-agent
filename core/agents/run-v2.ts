@@ -89,6 +89,8 @@ export interface ReproPipelineInput {
   };
 
   carryforwardSummary?: string;
+  /** Test infrastructure fingerprint produced by Phase 0 (pre-analyst). */
+  testInfraProfile?: import('./repro-loop-v2/test-infra-fingerprint').TestInfraProfile | null;
   log?: (msg: string) => void;
 }
 
@@ -237,6 +239,7 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     issueSnippets,
     issueBody: input.payload.issue.body ?? undefined,
     workspaceDir: input.workspace.dir,
+    testInfraProfile: input.testInfraProfile ?? null,
     ...(semanticSuspectSeed ? { semanticSuspectSeed } : {}),
   });
 
