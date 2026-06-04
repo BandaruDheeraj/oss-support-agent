@@ -135,10 +135,7 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
   description:
     'Analyst- and Prober-only: append a new EvidenceDossier snapshot summarising everything you have read so far. Include suspectFiles/suspectSymbols when known. Call this to terminate the loop. Prober additionally supplies `reproRecipe` carrying the executable test + observed probe results.',
   parameters: RecordEvidence,
-  async execute(rawArgs, ctx) {
-    // Apply deepNullToUndefined here (not in schema) to avoid converting the
-    // schema to ZodEffects which breaks the AI SDK's JSON Schema generation.
-    const args = deepNullToUndefined(rawArgs) as typeof rawArgs;
+  async execute(args, ctx) {
     const handles = asHandles(ctx.handles);
     const dossier = handles.dossier;
     if (!dossier) return { error: 'dossier writer not available — caller is not the Analyst' };

@@ -3,6 +3,18 @@
  */
 
 import { tool as aiTool, type CoreTool } from 'ai';
+
+/** Recursively convert null → undefined so Zod .optional()/.default() fire correctly. */
+function nullToUndefinedDeep(v: unknown): unknown {
+  if (v === null) return undefined;
+  if (Array.isArray(v)) return v.map(nullToUndefinedDeep);
+  if (v && typeof v === 'object') {
+    return Object.fromEntries(
+      Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, nullToUndefinedDeep(val)])
+    );
+  }
+  return v;
+}
 import { z } from 'zod';
 import { withToolSpan } from '../../observability/spans';
 import { redactValue } from '../../observability/redact';
@@ -115,7 +127,12 @@ export class ToolRegistry {
     def: ToolDef<TArgs, TResult>,
     rawArgs: unknown
   ): Promise<TResult | { __toolError: string; __kind: string }> {
-    const parsed = def.parameters.safeParse(rawArgs);
+    // Convert null → undefined before Zod validates: LLMs (especially Anthropic)
+    // emit null for absent optional fields. Zod's .optional()/.default() fire on
+    // undefined but not null. This is safe for all tools since null is never
+    // semantically distinct from undefined in our tool parameter schemas.
+    const sanitizedArgs = nullToUndefinedDeep(rawArgs);
+    const parsed = def.parameters.safeParse(sanitizedArgs);
     if (!parsed.success) {
       return errorReturn(
         new ToolGuardError('invalid_args', `Invalid args for ${def.name}: ${parsed.error.message}`, def.name)
