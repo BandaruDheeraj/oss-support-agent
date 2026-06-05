@@ -229,7 +229,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   const hasReproSpec = !!(snapshot.body.candidateRepro || (snapshot.body as any).reproFiles);
   // The assembler (Stage A, below) provides the candidateRepro when gitClient is present —
   // only block if BOTH the analyst AND the assembler have nothing to offer.
-  const assemblerCanRun = !!(args.gitClient && args.testInfraProfile && suspectSymbols.length > 0);
+  const assemblerCanRun = !!(args.gitClient && suspectSymbols.length > 0);
   if (analystRanThisAttempt && hasSemanticSeedScope && suspectSymbols.length > 0 && !hasReproSpec && !assemblerCanRun) {
     return {
       status: 'not_runnable',
@@ -254,14 +254,15 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   // function source, finds the tracker base class, and builds a working test
   // from known-good patterns — no LLM creativity needed.
   let assembledTest: import('./test-assembler').AssembledTest | null = null;
-  if (args.testInfraProfile && args.gitClient) {
+  if (args.gitClient) {
     try {
       assembledTest = await assembleReproTest({
         dossierSnapshot: snapshot,
-        testInfraProfile: args.testInfraProfile,
+        testInfraProfile: args.testInfraProfile ?? null,
         gitClient: args.gitClient,
-        repoFullName: args.repo.fullName,
-        ref: 'main',
+        repoFullName: args.repo.forkFullName,
+        ref: args.repo.branch,
+        editableInstallCandidates: args.editableInstallCandidates,
       });
       if (assembledTest) {
         log('[v2-orchestrator] assembled test: type=' + assembledTest.bugType + ' path=' + assembledTest.testEntryPoint);

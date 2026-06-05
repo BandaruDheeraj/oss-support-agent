@@ -39,6 +39,9 @@ export interface TestAssemblerArgs {
   };
   repoFullName: string;
   ref: string;
+  /** Pre-discovered editable-install paths from workspace BFS scan. When provided,
+   *  these replace the file-path heuristic in buildInstallSpec. */
+  editableInstallCandidates?: string[];
 }
 
 export interface AssembledTest {
@@ -107,7 +110,11 @@ export async function assembleReproTest(
   // -------------------------------------------------------------------------
   // 4. Build install spec from fingerprint profile extras and suspect file.
   // -------------------------------------------------------------------------
-  const installSpec = buildInstallSpec(primarySuspect.file, testInfraProfile);
+  const installSpec = buildInstallSpec(
+    primarySuspect.file,
+    testInfraProfile,
+    args.editableInstallCandidates ?? []
+  );
 
   // -------------------------------------------------------------------------
   // 5a. TYPE 2 — Lifecycle (span_attribute oracle): cassette-based test.
@@ -428,17 +435,31 @@ function extractWrongValue(description: string): string {
  */
 function buildInstallSpec(
   suspectFilePath: string,
-  profile: TestInfraProfile | null
+  profile: TestInfraProfile | null,
+  editableInstallCandidates: string[] = []
 ): AssembledTest['installSpec'] {
-  const editableInstall: string[] = [];
   const additionalPackages: string[] = [];
 
-  // Derive the package root from the suspect file path.
-  // Walk up segments until we hit a known root or depth=3.
-  const parts = suspectFilePath.replace(/\\/g, '/').split('/');
-  if (parts.length > 1) {
-    // Use the top-level directory as the editable install path.
-    editableInstall.push(parts[0]!);
+  // Prefer pre-discovered editable candidates (produced by workspace BFS scan of
+  // pyproject.toml files). Filter to those that are a prefix of the suspect file,
+  // then fall back to ALL candidates. If none exist, derive from the file path.
+  let editableInstall: string[] = [];
+  if (editableInstallCandidates.length > 0) {
+    const normalizedSuspect = suspectFilePath.replace(/\\/g, '/');
+    const matched = editableInstallCandidates.filter((c) =>
+      normalizedSuspect.startsWith(c.replace(/\\/g, '/').replace(/\/?$/, '/'))
+    );
+    editableInstall = matched.length > 0 ? matched : editableInstallCandidates;
+  } else {
+    // Fallback: derive from the suspect file path — take the first two segments
+    // (e.g. "python/openinference-instrumentation-anthropic") to avoid
+    // accidentally pointing at a bare "python/" monorepo root.
+    const parts = suspectFilePath.replace(/\\/g, '/').split('/');
+    if (parts.length >= 2) {
+      editableInstall.push(parts.slice(0, 2).join('/'));
+    } else if (parts.length === 1) {
+      editableInstall.push(parts[0]!);
+    }
   }
 
   // Add packages from profile extras (test / instrumentation extras).
