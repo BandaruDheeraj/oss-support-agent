@@ -312,7 +312,20 @@ function deriveModulePath(filePath: string): string {
   // Normalise to forward slashes.
   const p = filePath.replace(/\\/g, '/');
 
-  // Strip a leading packaging prefix if present.
+  // Strategy 1: if the path contains a "/src/" segment, take everything after it.
+  // This handles both flat-src layout (python/pkg/src/openinference/...) and
+  // deep-nested layouts (python/instrumentation/pkg/src/openinference/...).
+  // e.g. "python/instrumentation/openinference-instrumentation-claude-agent-sdk/src/openinference/instrumentation/claude_agent_sdk/_wrappers.py"
+  //   -> "openinference/instrumentation/claude_agent_sdk/_wrappers.py"
+  const srcIdx = p.indexOf('/src/');
+  if (srcIdx !== -1) {
+    let rel = p.slice(srcIdx + 5); // skip "/src/"
+    if (rel.endsWith('.py')) rel = rel.slice(0, -3);
+    if (rel.endsWith('/__init__')) rel = rel.slice(0, -9);
+    return rel.replace(/\//g, '.');
+  }
+
+  // Strategy 2: strip a leading packaging prefix then convert.
   const strippedLeaders = [
     /^python\//,
     /^src\//,
