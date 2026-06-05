@@ -117,7 +117,7 @@ describe('runAnalyst parse-recovery', () => {
     mockedGenerateText.mockResolvedValue({ text: 'ok' } as Awaited<ReturnType<typeof generateText>>);
   });
 
-  it('includes strong candidateRepro emission guidance in the system prompt', async () => {
+  it('includes oracleSpec and reproTargets guidance in the system prompt', async () => {
     mockedRunAgentLoop.mockResolvedValue(makeLoopResult());
 
     await runAnalyst({
@@ -130,8 +130,8 @@ describe('runAnalyst parse-recovery', () => {
     });
 
     const systemPrompt = mockedRunAgentLoop.mock.calls[0][0].system;
-    expect(systemPrompt).toContain('you MUST include a `candidateRepro` field on record_evidence');
-    expect(systemPrompt).toContain('Do NOT omit candidateRepro solely because of uncertainty');
+    expect(systemPrompt).toContain('oracleSpec');
+    expect(systemPrompt).toContain('reproTargets');
     expect(systemPrompt).toContain('semanticConfidence.low_confidence');
   });
 

@@ -91,6 +91,12 @@ export interface ReproPipelineInput {
   carryforwardSummary?: string;
   /** Test infrastructure fingerprint produced by Phase 0 (pre-analyst). */
   testInfraProfile?: import('./repro-loop-v2/test-infra-fingerprint').TestInfraProfile | null;
+  /**
+   * Optional git client used by the deterministic Test Assembler (Stage A).
+   * When provided alongside testInfraProfile, the assembler can read suspect
+   * function source from the repo and build a working test without an LLM loop.
+   */
+  gitClient?: { getFileContents(repo: string, path: string, ref: string): Promise<{ok: boolean, content?: string}> };
   log?: (msg: string) => void;
 }
 
@@ -240,6 +246,7 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     issueBody: input.payload.issue.body ?? undefined,
     workspaceDir: input.workspace.dir,
     testInfraProfile: input.testInfraProfile ?? null,
+    ...(input.gitClient ? { gitClient: input.gitClient } : {}),
     ...(semanticSuspectSeed ? { semanticSuspectSeed } : {}),
   });
 

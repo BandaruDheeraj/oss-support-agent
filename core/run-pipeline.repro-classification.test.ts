@@ -97,16 +97,16 @@ describe('classifyAlreadyFixedOnMain', () => {
     expect(result.reason).toContain('passed on every run');
   });
 
-  test('does not flag unrelated prober failure', () => {
+  test('does not flag unrelated builder generation failure', () => {
     const outcome = makeOutcome({
       status: 'not_reproduced',
       candidates: [
         {
-          candidateId: 'candidate-1',
-          source: 'prober',
-          sampleIndex: 1,
+          candidateId: 'candidate-0',
+          source: 'builder',
+          sampleIndex: 0,
           status: 'generation_failed',
-          message: 'Prober could not draft a valid recipe.',
+          message: 'Builder could not draft a valid recipe.',
         },
       ],
     });

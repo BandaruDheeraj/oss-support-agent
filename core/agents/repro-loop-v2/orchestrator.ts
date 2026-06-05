@@ -1,6 +1,5 @@
 /**
- * Repro orchestrator: Analyst → Builder + best-of-N Prober sampling →
- * Deterministic Repro Oracle.
+ * Repro orchestrator: Analyst → Builder → Deterministic Repro Oracle.
  *
  * One authoritative deterministic gate decides candidate validity. LLMs are
  * only advisory rankers over already-valid candidates.
@@ -8,7 +7,6 @@
 
 import { runAnalyst } from '../analyst/analyst';
 import { DossierStore, buildReproOracleSpec, type DossierSnapshot, type ReproRecipe } from '../analyst/dossier';
-import { runReproProber, type ReproProberResult } from './prober';
 import { runReproBuilder, type ReproBuilderResult, type BuilderRejectStage } from './builder';
 import { rankValidReproCandidates, type ReproAdvisoryRankResult } from './advisory-ranker';
 import type { DeterministicExecutorResult } from './executor';
@@ -18,55 +16,15 @@ import {
   type DeterministicReproOracleResult,
 } from './deterministic-oracle';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
-import { detectCredentialError } from '../../credentials-check';
-import type { IssueCodeSnippet } from './repro-hints';
 import { deriveEditableInstallsFromSuspectPaths, mergeEditableInstallCandidates } from './repro-hints';
+import type { IssueCodeSnippet } from './repro-hints';
 import type { SemanticSuspectSeed } from '../analyst/semantic-search';
-import type { InstallSpec } from '../../sandbox-session';
 import type { TestInfraProfile } from './test-infra-fingerprint';
+import { assembleReproTest } from './test-assembler';
 
-const DEFAULT_PROBER_SAMPLE_COUNT = 3;
-const DEFAULT_PROBER_TEMPERATURE = 0.7;
-const PROBER_SAMPLE_COUNT_ENV = 'OSA_REPRO_PROBER_SAMPLES';
-const PROBER_TEMPERATURE_ENV = 'OSA_REPRO_PROBER_TEMPERATURE';
-const OPENINFERENCE_REPO_SUFFIX = '/openinference';
-
-const OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT: InstallSpec = {
-  semanticConventionsPath: 'python/openinference-semantic-conventions',
-  instrumentationCorePath: 'python/openinference-instrumentation',
-  instrumentationPackagePath: 'python/instrumentation/openinference-instrumentation-smolagents',
-  thirdPartyDeps: ['smolagents'],
-  importVerification: {
-    modulePath: 'openinference.instrumentation.smolagents',
-    className: 'SmolagentsInstrumentor',
-  },
-};
-
-function resolveInstallSpec(snapshot: DossierSnapshot): InstallSpec {
-  const rf = (snapshot.body as any).reproFiles;
-  if (rf && rf.installSpec && Array.isArray(rf.installSpec.editableInstall) && rf.installSpec.editableInstall.length > 0) {
-    const editable = rf.installSpec.editableInstall;
-    return {
-      semanticConventionsPath: editable[0],
-      instrumentationCorePath: editable[1] || editable[0],
-      instrumentationPackagePath: editable[2] || editable[0],
-      thirdPartyDeps: (rf.installSpec.additionalPackages || []).filter((p: string) => !p.startsWith('pytest') && p !== 'pyyaml'),
-      // Use the semantic conventions package for import verification — it is
-      // always installed as the first editable dep and its exports are stable.
-      // Avoids fragile class-name derivation from package path segments.
-      importVerification: {
-        modulePath: 'openinference.semconv.trace',
-        className: 'SpanAttributes',
-      },
-    };
-  }
-  return OPENINFERENCE_PROBER_INSTALL_SPEC_DEFAULT;
-}
-
-type CandidateSource = 'builder' | 'prober';
+type CandidateSource = 'builder';
 type CandidateStatus =
   | 'generation_failed'
-  | 'setup_failed'
   | 'sandbox_failed'
   | 'invalid'
   | 'valid'
@@ -89,15 +47,11 @@ export interface RunReproV2Args {
    */
   editableInstallCandidates?: string[];
   /**
-   * Verbatim fenced code blocks lifted from the issue body, surfaced to the
-   * Prober so the first repro draft can mirror the snippet exactly rather
-   * than paraphrasing it.
+   * Verbatim fenced code blocks lifted from the issue body.
    */
   issueSnippets?: IssueCodeSnippet[];
   /**
-   * Raw issue body. Used by the deterministic heavy-framework detector to
-   * surface a hint about prose-only issues that name a heavy 3rd-party
-   * framework in their reproduction steps.
+   * Raw issue body.
    */
   issueBody?: string;
   /**
@@ -113,12 +67,14 @@ export interface RunReproV2Args {
    * and suspect-symbol starting point.
    */
   semanticSuspectSeed?: SemanticSuspectSeed | null;
-  /** Number of Prober samples to run in parallel. */
-  proberSampleCount?: number;
-  /** Sampling temperature for Prober best-of-N generation. */
-  proberTemperature?: number;
   /** Optional test infrastructure fingerprint for the affected package. */
   testInfraProfile?: TestInfraProfile | null;
+  /**
+   * Optional git client for reading repo file contents. When provided together
+   * with testInfraProfile, enables the deterministic Test Assembler (Stage A)
+   * which builds a working test from known-good patterns without an LLM loop.
+   */
+  gitClient?: { getFileContents(repo: string, path: string, ref: string): Promise<{ok: boolean, content?: string}> };
 }
 
 export interface ReproCandidateEvaluation {
@@ -134,7 +90,6 @@ export interface ReproCandidateEvaluation {
     expectedFailureSignature: string;
     approach: string;
   };
-  prober?: ReproProberResult;
   builder?: ReproBuilderResult;
   builderRejectStage?: BuilderRejectStage;
   executor?: DeterministicExecutorResult;
@@ -173,7 +128,6 @@ export interface ReproV2Outcome {
     expectedFailureSignature: string;
     approach: string;
   };
-  prober?: ReproProberResult;
   /** Populated when the Builder ran (success or reject). */
   builder?: ReproBuilderResult;
   /**
@@ -188,10 +142,9 @@ export interface ReproV2Outcome {
   selectedCandidateId?: string;
   candidates: ReproCandidateEvaluation[];
   /**
-   * Populated when status === 'credentials_required'. Either lifted from
+   * Populated when status === 'credentials_required'. Lifted from
    * the recipe's `requiresCredentials` (static check before Executor) or
-   * from any Prober run_repro transcript entry whose stderr matched a
-   * known credential-error pattern (dynamic post-failure detection).
+   * from run_repro stderr that matched a known credential-error pattern.
    */
   credentialsTerminal?: {
     inferredEnvVars: string[];
@@ -214,7 +167,8 @@ interface ValidCandidate extends ReproCandidateEvaluation {
   oracle: DeterministicReproOracleResult;
 }
 
-type AsyncLock = <T>(task: () => Promise<T>) => Promise<T>;
+// eslint-disable-next-line no-console
+const log = (msg: string) => console.log(msg);
 
 export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> {
   const dossier = args.dossier ?? new DossierStore();
@@ -292,6 +246,66 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       precondition_assertions: [],
     };
 
+  // Stage A: Deterministic Test Assembly
+  // Replaces the LLM-based Prober entirely. The assembler reads the suspect
+  // function source, finds the tracker base class, and builds a working test
+  // from known-good patterns — no LLM creativity needed.
+  let assembledTest: import('./test-assembler').AssembledTest | null = null;
+  if (args.testInfraProfile && args.gitClient) {
+    try {
+      assembledTest = await assembleReproTest({
+        dossierSnapshot: snapshot,
+        testInfraProfile: args.testInfraProfile,
+        gitClient: args.gitClient,
+        repoFullName: args.repo.fullName,
+        ref: 'main',
+      });
+      if (assembledTest) {
+        log('[v2-orchestrator] assembled test: type=' + assembledTest.bugType + ' path=' + assembledTest.testEntryPoint);
+      }
+    } catch (err: any) {
+      log('[v2-orchestrator] test assembly failed (continuing): ' + (err?.message ?? err));
+    }
+  }
+
+  // Stage B0: Inject assembled test into the snapshot so the Builder uses it
+  if (assembledTest) {
+    // Build a reproFilesCandidate block so the Builder's committed path is taken.
+    const reproFilesCandidate = {
+      reproFiles: assembledTest.reproFiles,
+      testEntryPoint: assembledTest.testEntryPoint,
+      installSpec: assembledTest.installSpec,
+      expectedFailureOutput: '',
+      fixHypothesis: { file: '', description: assembledTest.rationale },
+      rationale: assembledTest.rationale,
+    };
+
+    // Synthetic candidateRepro with reproFilesCandidate wired in — Builder will
+    // route directly to runReproFilesPath (write to branch, push, GHA pytest).
+    const syntheticCandidate = {
+      version: 1 as const,
+      source: 'derived' as const,
+      failureMode: 'wrong_return' as const,
+      testSource: assembledTest.reproFiles[0]?.content ?? '',
+      candidateTestPath: assembledTest.testEntryPoint.split('::')[0],
+      imports: [],
+      setup: '',
+      pipInstalls: [],
+      requiresCredentials: [],
+      preconditionsSatisfied: [],
+      rationale: assembledTest.rationale,
+      reproFilesCandidate,
+    } as any;
+
+    // Update snapshot body with the assembled test
+    (snapshot.body as any).reproFiles = {
+      reproFiles: assembledTest.reproFiles,
+      testEntryPoint: assembledTest.testEntryPoint,
+      installSpec: assembledTest.installSpec,
+    };
+    (snapshot.body as any).candidateRepro = syntheticCandidate;
+  }
+
   // Editable-install candidates: prefer the Analyst's structured
   // reproTargets.editableInstall when present (and non-empty). Falls back
   // to the BFS+walk-up heuristic in repro-hints.ts when the Analyst did
@@ -331,13 +345,6 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       }`
   );
 
-  const proberSampleCount = resolveProberSampleCount(args.proberSampleCount, runtimeEnv);
-  const proberTemperature = resolveProberTemperature(args.proberTemperature, runtimeEnv);
-  // eslint-disable-next-line no-console
-  console.log(
-    `[v2-orchestrator] attempt=${args.attemptId} prober_samples=${proberSampleCount} prober_temperature=${proberTemperature}`
-  );
-
   // Stage B0: Deterministic Builder as candidate 0.
   let builder: ReproBuilderResult | undefined;
   let builderRejectStage: BuilderRejectStage | undefined;
@@ -364,54 +371,6 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   });
   builderRejectStage = builderCandidate.builderRejectStage;
   candidates.push(builderCandidate);
-
-  const requiresOpenInferencePreflight =
-    proberSampleCount > 0 && shouldRunOpenInferencePreflight(args.repo.fullName);
-  if (requiresOpenInferencePreflight) {
-    const preflight = await runOpenInferenceProberPreflight({
-      sandbox: args.sandbox,
-      attemptId: args.attemptId,
-      installSpec: resolveInstallSpec(snapshot),
-    });
-    if (!preflight.ok) {
-      // Surface the sandbox error as a corrective hint so the caller can feed it
-      // back to the analyst on the next attempt. This implements the feedback loop:
-      // sandbox error → orchestrator surfaces it → pipeline re-runs analyst with
-      // the error as context → analyst corrects its reproFiles/installSpec output.
-      // eslint-disable-next-line no-console
-      console.log(
-        `[v2-orchestrator] attempt=${args.attemptId} sandbox_setup_failed — ` +
-        `surfacing for corrective retry: ${preflight.message.slice(0, 300)}`
-      );
-      candidates.push(...buildBlockedProberCandidates(proberSampleCount, preflight.message));
-      return {
-        status: 'sandbox_failed',
-        dossier,
-        ...(builder ? { builder } : {}),
-        ...(builderRejectStage ? { builderRejectStage } : {}),
-        candidates,
-        message: preflight.message,
-        sandboxError: preflight.message,
-      };
-    }
-  }
-
-  // Stage B1: K Prober samples at temperature in parallel.
-  const lock = createAsyncLock();
-  const proberRuns = Array.from({ length: proberSampleCount }, (_, idx) => {
-    const sampleIndex = idx + 1;
-    return runProberSample({
-      args,
-      snapshot,
-      sampleIndex,
-      temperature: proberTemperature,
-      editableInstallCandidates: effectiveEditableInstalls,
-      runtimeEnv,
-      sandbox: createSerializedSandboxView(args.sandbox, lock),
-    });
-  });
-  const proberCandidates = await Promise.all(proberRuns);
-  candidates.push(...proberCandidates);
 
   // Stage C: deterministic oracle over every candidate with a recipe.
   for (const candidate of candidates) {
@@ -451,15 +410,6 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     }
 
     candidate.status = 'invalid';
-    if (candidate.prober) {
-      // Keep transcript-based credential detection unchanged.
-      const credResult = detectCredentialsFromTranscript(candidate.prober.transcript, runtimeEnv);
-      if (credResult) {
-        candidate.status = 'credentials_required';
-        candidate.credentialsTerminal = credResult;
-        candidate.message = `Prober transcript indicates missing credentials: ${credResult.inferredEnvVars.join(', ')}`;
-      }
-    }
   }
 
   const validCandidates = candidates.filter(isValidCandidate);
@@ -485,22 +435,11 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       }
     }
 
-    if (selected.source === 'prober') {
-      appendRecipeSnapshot({
-        dossier,
-        baseSnapshot: snapshot,
-        issueNumber: args.issue.number,
-        attemptId: args.attemptId,
-        recipe: selected.recipe,
-      });
-    }
-
     return {
       status: 'reproduced',
       dossier,
       recipe: selected.recipe,
       plan: selected.plan,
-      ...(selected.prober ? { prober: selected.prober } : {}),
       ...(builder ? { builder } : {}),
       ...(builderRejectStage ? { builderRejectStage } : {}),
       executor: selected.executor,
@@ -522,7 +461,6 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       dossier,
       ...(credentialCandidate.recipe ? { recipe: credentialCandidate.recipe } : {}),
       ...(credentialCandidate.plan ? { plan: credentialCandidate.plan } : {}),
-      ...(credentialCandidate.prober ? { prober: credentialCandidate.prober } : {}),
       ...(builder ? { builder } : {}),
       ...(builderRejectStage ? { builderRejectStage } : {}),
       ...(credentialCandidate.executor ? { executor: credentialCandidate.executor } : {}),
@@ -556,59 +494,6 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
     candidates,
     message: buildNoReproMessage(candidates),
   };
-}
-
-function shouldRunOpenInferencePreflight(repoFullName: string): boolean {
-  return repoFullName.toLowerCase().endsWith(OPENINFERENCE_REPO_SUFFIX);
-}
-
-function buildBlockedProberCandidates(sampleCount: number, message: string): ReproCandidateEvaluation[] {
-  return Array.from({ length: sampleCount }, (_, idx) => {
-    const sampleIndex = idx + 1;
-    return {
-      candidateId: `candidate-${sampleIndex}`,
-      source: 'prober',
-      sampleIndex,
-      status: 'setup_failed',
-      message,
-    };
-  });
-}
-
-async function runOpenInferenceProberPreflight(args: {
-  sandbox: SandboxHandle;
-  attemptId: string;
-  installSpec: InstallSpec;
-}): Promise<{ ok: true } | { ok: false; message: string }> {
-  if (!args.sandbox.setupDependencies) {
-    const message =
-      'sandbox_setup_failed: sandbox adapter does not implement setupDependencies required for openinference preflight.';
-    // eslint-disable-next-line no-console
-    console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
-    return { ok: false, message };
-  }
-
-  try {
-    const setup = await args.sandbox.setupDependencies(args.installSpec);
-    if (!setup.ok) {
-      const tail = collapseWhitespace(setup.stderr || setup.stdout || '').slice(-600);
-      const message =
-        `sandbox_setup_failed: openinference setup phase=${setup.phase} reason=${setup.reason}` +
-        (setup.failedStep ? ` failedStep=${setup.failedStep}` : '') +
-        (tail ? ` output_tail=${tail}` : '') +
-        (setup.diagnostics ? ` diagnostics=${JSON.stringify(setup.diagnostics)}` : '');
-      // eslint-disable-next-line no-console
-      console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
-      return { ok: false, message };
-    }
-  } catch (err) {
-    const detail = collapseWhitespace(err instanceof Error ? err.message : String(err));
-    const message = `sandbox_setup_failed: openinference setup threw: ${detail}`;
-    // eslint-disable-next-line no-console
-    console.log(`[v2-orchestrator] attempt=${args.attemptId} ${message}`);
-    return { ok: false, message };
-  }
-  return { ok: true };
 }
 
 function buildBuilderCandidate(args: {
@@ -669,111 +554,6 @@ function buildBuilderCandidate(args: {
   };
 }
 
-async function runProberSample(args: {
-  args: RunReproV2Args;
-  snapshot: DossierSnapshot;
-  sampleIndex: number;
-  temperature: number;
-  editableInstallCandidates: string[];
-  runtimeEnv: NodeJS.ProcessEnv;
-  sandbox: SandboxHandle;
-}): Promise<ReproCandidateEvaluation> {
-  const candidateId = `candidate-${args.sampleIndex}`;
-  const forcedPath = buildProberCandidatePath(args.args.issue.number, args.sampleIndex);
-  const sampleAttemptId = `${args.args.attemptId}:prober:${args.sampleIndex}`;
-  const sampleDossier = cloneDossier(args.snapshot);
-  const sampleSnapshot = sampleDossier.latest()!;
-
-  let prober: ReproProberResult;
-  try {
-    prober = await runReproProber({
-      attemptId: sampleAttemptId,
-      dossier: sampleDossier,
-      dossierSnapshot: sampleSnapshot,
-      issue: args.args.issue,
-      repo: args.args.repo,
-      workspace: args.args.workspace,
-      sandbox: args.sandbox,
-      editableInstallCandidates: args.editableInstallCandidates,
-      issueSnippets: args.args.issueSnippets,
-      issueBody: args.args.issueBody,
-      temperature: args.temperature,
-      forcedCandidateTestPath: forcedPath,
-    });
-  } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    return {
-      candidateId,
-      source: 'prober',
-      sampleIndex: args.sampleIndex,
-      status: isSandboxSetupFailure(detail) ? 'setup_failed' : 'generation_failed',
-      message: `Prober sample failed to run: ${detail}`,
-    };
-  }
-
-  const proberAuthoritative = prober.terminated === 'done' && !!prober.recipe;
-  if (!proberAuthoritative) {
-    const credResult = detectCredentialsFromTranscript(prober.transcript, args.runtimeEnv);
-    if (credResult) {
-      return {
-        candidateId,
-        source: 'prober',
-        sampleIndex: args.sampleIndex,
-        status: 'credentials_required',
-        message: `Prober sample requires credentials: ${credResult.inferredEnvVars.join(', ')}`,
-        prober,
-        credentialsTerminal: credResult,
-      };
-    }
-    if (!prober.recipe) {
-      const setupFailureDetail = inferProberSetupFailureDetail(prober);
-      if (setupFailureDetail) {
-        return {
-          candidateId,
-          source: 'prober',
-          sampleIndex: args.sampleIndex,
-          status: 'setup_failed',
-          message: `Prober sample failed sandbox setup before recipe generation: ${setupFailureDetail}`,
-          prober,
-        };
-      }
-      return {
-        candidateId,
-        source: 'prober',
-        sampleIndex: args.sampleIndex,
-        status: 'generation_failed',
-        message: `Prober sample terminated without recipe (${prober.terminated}${prober.reason ? `: ${prober.reason}` : ''})`,
-        prober,
-      };
-    }
-    return {
-      candidateId,
-      source: 'prober',
-      sampleIndex: args.sampleIndex,
-      status: 'generation_failed',
-      message:
-        `Prober sample produced a recipe but did not self-verify it ` +
-        `(terminated=${prober.terminated}${prober.reason ? `, reason="${prober.reason}"` : ''}). ` +
-        `verifiedState=[${prober.verifiedSummary}].`,
-      recipe: prober.recipe,
-      plan: toPlanProjection(prober.recipe),
-      prober,
-    };
-  }
-
-  const recipe = prober.recipe as ReproRecipe;
-  return {
-    candidateId,
-    source: 'prober',
-    sampleIndex: args.sampleIndex,
-    status: 'generation_failed',
-    message: 'Prober sample produced candidate recipe.',
-    recipe,
-    plan: toPlanProjection(recipe),
-    prober,
-  };
-}
-
 function toPlanProjection(recipe: ReproRecipe): ReproV2Outcome['plan'] {
   return {
     candidateTestPath: recipe.candidateTestPath,
@@ -790,31 +570,6 @@ function isValidCandidate(candidate: ReproCandidateEvaluation): candidate is Val
     !!candidate.oracle &&
     !!candidate.executor
   );
-}
-
-function buildProberCandidatePath(issueNumber: number, sampleIndex: number): string {
-  return `tests/repro/test_issue_${issueNumber}_candidate_${sampleIndex}.py`;
-}
-
-function cloneDossier(snapshot: DossierSnapshot): DossierStore {
-  const cloned = new DossierStore();
-  cloned.append({ ...snapshot.body });
-  return cloned;
-}
-
-function appendRecipeSnapshot(args: {
-  dossier: DossierStore;
-  baseSnapshot: DossierSnapshot;
-  issueNumber: number;
-  attemptId: string;
-  recipe: ReproRecipe;
-}): void {
-  args.dossier.append({
-    ...args.baseSnapshot.body,
-    issueNumber: args.issueNumber,
-    attemptId: args.attemptId,
-    reproRecipe: args.recipe,
-  });
 }
 
 function createAnalystSemanticScopedWorkspace(
@@ -916,120 +671,14 @@ function clampPathsToAllowedFiles(paths: string[] | undefined, allowedFiles: str
   return scoped.length > 0 ? scoped : allowedFiles;
 }
 
-function createAsyncLock(): AsyncLock {
-  let queue = Promise.resolve();
-  return async function withLock<T>(task: () => Promise<T>): Promise<T> {
-    const run = queue.then(task, task);
-    queue = run.then(
-      () => undefined,
-      () => undefined
-    );
-    return run;
-  };
-}
-
-function createSerializedSandboxView(base: SandboxHandle, lock: AsyncLock): SandboxHandle {
-  let reproTestPath: string | undefined;
-  return {
-    runPython: (snippet, env) => lock(() => base.runPython(snippet, env)),
-    pipInstall: (spec) => lock(() => base.pipInstall(spec)),
-    runRepro: () =>
-      lock(async () => {
-        if (reproTestPath) {
-          base.setReproTestPath(reproTestPath);
-        }
-        return base.runRepro();
-      }),
-    runTests: (command) => lock(() => base.runTests(command)),
-    pythonModuleCheck: (name) => lock(() => base.pythonModuleCheck(name)),
-    listPackages: () => lock(() => base.listPackages()),
-    getSandboxResult: () => base.getSandboxResult?.() ?? null,
-    setReproTestPath: (path) => {
-      reproTestPath = path;
-    },
-  };
-}
-
-function resolveProberSampleCount(explicit: number | undefined, env: NodeJS.ProcessEnv): number {
-  const raw = explicit ?? parseNumberEnv(env[PROBER_SAMPLE_COUNT_ENV]);
-  if (raw === undefined || !Number.isFinite(raw)) return DEFAULT_PROBER_SAMPLE_COUNT;
-  return Math.max(0, Math.floor(raw));
-}
-
-function resolveProberTemperature(explicit: number | undefined, env: NodeJS.ProcessEnv): number {
-  const raw = explicit ?? parseNumberEnv(env[PROBER_TEMPERATURE_ENV]);
-  if (raw === undefined || !Number.isFinite(raw)) return DEFAULT_PROBER_TEMPERATURE;
-  return Math.min(2, Math.max(0, raw));
-}
-
-function parseNumberEnv(value: string | undefined): number | undefined {
-  if (!value) return undefined;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : undefined;
-}
-
-function collapseWhitespace(value: string): string {
-  return value.replace(/\s+/g, ' ').trim();
-}
-
-function inferProberSetupFailureDetail(prober: ReproProberResult): string | null {
-  const candidates: string[] = [];
-  if (prober.reason) candidates.push(prober.reason);
-  for (const entry of prober.transcript) {
-    if (entry.result && typeof entry.result === 'object') {
-      const result = entry.result as Record<string, unknown>;
-      const message = result.message;
-      if (typeof message === 'string') candidates.push(message);
-      const stderr = result.stderr;
-      if (typeof stderr === 'string') candidates.push(stderr);
-      const error = result.error;
-      if (typeof error === 'string') candidates.push(error);
-    } else if (typeof entry.result === 'string') {
-      candidates.push(entry.result);
-    }
-  }
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    if (isSandboxSetupFailure(candidate)) return collapseWhitespace(candidate).slice(0, 320);
-  }
-  return null;
-}
-
-function isSandboxSetupFailure(message: string): boolean {
-  const normalized = message.toLowerCase();
-  return (
-    normalized.includes('sandbox_setup_failed') ||
-    normalized.includes('wait_for_run') ||
-    normalized.includes('workflow run did not appear within') ||
-    normalized.includes('no ref found for') ||
-    normalized.includes('missing fork repro ref') ||
-    normalized.includes('missing workflow dispatch ref') ||
-    normalized.includes('pre_dispatch_ref')
-  );
-}
-
 function buildNoReproMessage(candidates: ReproCandidateEvaluation[]): string {
-  const setupFailures = candidates.filter((candidate) => candidate.status === 'setup_failed').length;
-  const proberCandidates = candidates.filter((candidate) => candidate.source === 'prober');
-  const builderCandidates = candidates.filter((candidate) => candidate.source === 'builder');
-  const allProberSetupFailed =
-    proberCandidates.length > 0 && proberCandidates.every((candidate) => candidate.status === 'setup_failed');
   const builderUnavailable =
-    builderCandidates.length === 0 ||
-    builderCandidates.every(
+    candidates.length === 0 ||
+    candidates.every(
       (candidate) => candidate.status === 'generation_failed' && candidate.builderRejectStage === 'no_candidate'
     );
-  if (allProberSetupFailed && builderUnavailable) {
-    return (
-      `sandbox_setup_failed: no candidate passed deterministic repro oracle after evaluating ${candidates.length} candidates; ` +
-      `${setupFailures} candidate(s) failed sandbox setup before oracle validation.`
-    );
-  }
-  if (setupFailures > 0) {
-    return (
-      `No candidate passed deterministic repro oracle after evaluating ${candidates.length} candidates; ` +
-      `${setupFailures} candidate(s) failed sandbox setup before oracle validation.`
-    );
+  if (builderUnavailable) {
+    return `Builder had no candidate repro to evaluate.`;
   }
   return `Deterministic repro oracle rejected all ${candidates.length} candidates.`;
 }
@@ -1044,30 +693,3 @@ function buildSandboxFailedMessage(candidates: ReproCandidateEvaluation[]): stri
   );
 }
 
-/**
- * Walk a tool transcript. If any run_repro entry's stderr/stdout matches a
- * known credential-error pattern AND the inferred env vars are missing from
- * the process environment, return a structured signal.
- */
-function detectCredentialsFromTranscript(
-  transcript: Array<{ tool: string; result: unknown; ok: boolean }>,
-  env: NodeJS.ProcessEnv
-): ReproV2Outcome['credentialsTerminal'] | null {
-  for (const e of transcript) {
-    if (e.tool !== 'run_repro') continue;
-    const r = e.result as any;
-    if (!r || typeof r !== 'object') continue;
-    const stdout = String(r.stdout ?? '');
-    const stderr = String(r.stderr ?? '');
-    const detected = detectCredentialError(stdout, stderr);
-    if (!detected.isCredentialError) continue;
-    const missing = detected.inferredEnvVars.filter((v) => !env[v] || env[v]?.length === 0);
-    if (missing.length === 0) continue;
-    return {
-      inferredEnvVars: missing,
-      matchedPattern: detected.matchedPattern ?? null,
-      stderrTail: stderr.slice(-2000),
-    };
-  }
-  return null;
-}

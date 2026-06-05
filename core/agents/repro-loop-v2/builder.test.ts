@@ -2,6 +2,7 @@ import { runReproBuilder } from './builder';
 import type { ReproBuilderArgs } from './builder';
 import type { DossierSnapshot } from '../analyst/dossier';
 import type { CandidateRepro } from '../analyst/candidate-repro';
+import type { ReproFilesCandidate } from '../analyst/candidate-repro';
 import type {
   RepoHandle,
   SandboxHandle,
@@ -12,7 +13,31 @@ import type {
 
 const SENTINEL = 'BUILDER_TEST_SENTINEL_42';
 
-function snap(overrides: Partial<DossierSnapshot['body']> = {}, candidate?: Partial<CandidateRepro>): DossierSnapshot {
+function makeReproFilesCandidate(overrides: Partial<ReproFilesCandidate> = {}): ReproFilesCandidate {
+  return {
+    reproFiles: [
+      {
+        path: 'tests/test_repro_46.py',
+        content: `def test_repro():\n    raise AssertionError("${SENTINEL}")\n`,
+        append: false,
+      },
+    ],
+    testEntryPoint: 'tests/test_repro_46.py',
+    installSpec: {
+      editableInstall: [],
+      additionalPackages: [],
+    },
+    expectedFailureOutput: SENTINEL,
+    fixHypothesis: {
+      file: 'src/foo.py',
+      description: 'Fix the finalize function',
+    },
+    rationale: '',
+    ...overrides,
+  };
+}
+
+function snap(overrides: Partial<DossierSnapshot['body']> = {}, candidateOverrides: Partial<CandidateRepro> = {}): DossierSnapshot {
   const baseCandidate: CandidateRepro = {
     version: 1,
     source: 'direct_call',
@@ -26,6 +51,7 @@ function snap(overrides: Partial<DossierSnapshot['body']> = {}, candidate?: Part
     requiresCredentials: [],
     preconditionsSatisfied: [],
     rationale: '',
+    reproFilesCandidate: makeReproFilesCandidate(),
   };
   return {
     snapshotId: 'snap-1',
@@ -40,7 +66,7 @@ function snap(overrides: Partial<DossierSnapshot['body']> = {}, candidate?: Part
       openQuestions: [],
       summary: 's',
       confidence: 'medium',
-      candidateRepro: { ...baseCandidate, ...(candidate ?? {}) },
+      candidateRepro: { ...baseCandidate, ...candidateOverrides },
       ...overrides,
     },
   };
@@ -187,6 +213,17 @@ describe('runReproBuilder', () => {
     expect(out.rejectStage).toBe('no_candidate');
   });
 
+  it('returns no_candidate when candidateRepro has no reproFilesCandidate', async () => {
+    const d = snap();
+    // Remove the reproFilesCandidate block so builder cannot proceed
+    const candidate = d.body.candidateRepro!;
+    delete (candidate as any).reproFilesCandidate;
+    const args = mkArgs(d);
+    const out = await runReproBuilder(args);
+    expect(out.ok).toBe(false);
+    expect(out.rejectStage).toBe('no_candidate');
+  });
+
   it('rejects on missing credentials', async () => {
     const d = snap({}, { requiresCredentials: ['OPENAI_API_KEY'] });
     const args = mkArgs(d, {}, {});
@@ -202,29 +239,14 @@ describe('runReproBuilder', () => {
     expect(out.rejectStage).toBe('precondition_unknown');
   });
 
-  it('rejects when no suspect symbol referenced', async () => {
-    const d = snap({}, { setup: 'x = 1', exerciseCall: 'x.attr()' });
-    const args = mkArgs(d);
-    const out = await runReproBuilder(args);
-    expect(out.rejectStage).toBe('symbol_not_referenced');
-  });
-
-  it('rejects on path outside test roots', async () => {
-    const d = snap({}, { candidateTestPath: '../escape.py' });
-    const args = mkArgs(d);
-    const out = await runReproBuilder(args);
-    expect(out.rejectStage).toBe('path_invalid');
-  });
-
-  it('rejects on unsafe import (static check)', async () => {
-    const d = snap({}, { imports: ['import os; os.system("rm -rf /")'] });
-    const args = mkArgs(d);
-    const out = await runReproBuilder(args);
-    expect(out.rejectStage).toBe('import_unsafe_static');
-  });
-
-  it('rejects on pip install failure', async () => {
-    const d = snap({}, { pipInstalls: [{ package: 'badpkg==99', editable: false }] });
+  it('rejects on pip install failure (additionalPackages)', async () => {
+    const reproFiles = makeReproFilesCandidate({
+      installSpec: {
+        editableInstall: [],
+        additionalPackages: ['badpkg==99'],
+      },
+    });
+    const d = snap({}, { reproFilesCandidate: reproFiles });
     const args = mkArgs(d, { pipInstall: [mkRun({ exitCode: 1, stderr: 'no match' })] });
     const out = await runReproBuilder(args);
     expect(out.rejectStage).toBe('pip_install_failed');
@@ -233,7 +255,13 @@ describe('runReproBuilder', () => {
   });
 
   it('renders -e prefix for editable installs', async () => {
-    const d = snap({}, { pipInstalls: [{ package: 'python/openinference-instrumentation-smolagents', editable: true }] });
+    const reproFiles = makeReproFilesCandidate({
+      installSpec: {
+        editableInstall: ['python/openinference-instrumentation-smolagents'],
+        additionalPackages: [],
+      },
+    });
+    const d = snap({}, { reproFilesCandidate: reproFiles });
     const args = mkArgs(d, {
       pipInstall: [mkRun({ exitCode: 0 })],
       runRepro: [
@@ -245,17 +273,7 @@ describe('runReproBuilder', () => {
     expect(args.sandbox.pipCalls).toEqual(['-e python/openinference-instrumentation-smolagents']);
   });
 
-  it('rejects when import probe fails in sandbox', async () => {
-    const d = snap({}, { imports: ['from x import y'] });
-    // first runPython is the import probe — make it fail
-    const args = mkArgs(d, {
-      runPython: [mkRun({ exitCode: 1, stderr: 'SyntaxError' })],
-    });
-    const out = await runReproBuilder(args);
-    expect(out.rejectStage).toBe('import_ast_parse_failed');
-  });
-
-  it('builds a recipe on a successful 2/2 sentinel run', async () => {
+  it('builds a recipe on a successful 2/2 failing run', async () => {
     const d = snap();
     const args = mkArgs(d, {
       runRepro: [
@@ -267,9 +285,9 @@ describe('runReproBuilder', () => {
     expect(out.ok).toBe(true);
     expect(out.recipe).toBeDefined();
     expect(out.recipe?.sentinelString).toBe(SENTINEL);
-    expect(out.recipe?.testSource).toContain(SENTINEL);
-    expect(out.recipe?.approach).toMatch(/^builder:unexpected_exception:direct_call$/);
-    expect(out.recipe?.provenance.observedProbe?.sentinelObserved).toBe(true);
+    expect(out.recipe?.testSource).toContain('test_repro');
+    expect(out.recipe?.approach).toMatch(/^reproFiles:/);
+    expect(out.recipe?.provenance.observedProbe?.sentinelObserved).toBe(false);
     expect(args.workspace.writes).toHaveLength(1);
     expect(args.workspace.writes[0].path).toBe('tests/test_repro_46.py');
     expect(args.sandbox.reproPath).toBe('tests/test_repro_46.py');
@@ -286,8 +304,11 @@ describe('runReproBuilder', () => {
     expect(args.workspace.reverts).toEqual(['tests/test_repro_46.py']);
   });
 
-  it('rejects when runs fail without sentinel and reverts', async () => {
-    const d = snap();
+  it('rejects when runs fail but expectedFailureOutput absent and reverts', async () => {
+    const reproFiles = makeReproFilesCandidate({
+      expectedFailureOutput: 'SPECIFIC_EXPECTED_STRING',
+    });
+    const d = snap({}, { reproFilesCandidate: reproFiles });
     const args = mkArgs(d, {
       runRepro: [
         mkRun({ exitCode: 1, stderr: 'pre-existing ImportError' }),
@@ -295,11 +316,11 @@ describe('runReproBuilder', () => {
       ],
     });
     const out = await runReproBuilder(args);
-    expect(out.rejectStage).toBe('sentinel_absent');
+    expect(out.rejectStage).toBe('expected_output_absent');
     expect(args.workspace.reverts).toEqual(['tests/test_repro_46.py']);
   });
 
-  it('tiebreaks on disagreement: 2/3 fail-w-sentinel passes', async () => {
+  it('tiebreaks on disagreement: 2/3 fail passes', async () => {
     const d = snap();
     const args = mkArgs(d, {
       runRepro: [
@@ -313,7 +334,7 @@ describe('runReproBuilder', () => {
     expect(out.runs).toHaveLength(3);
   });
 
-  it('tiebreaks on disagreement: 1/3 fail-w-sentinel rejected as flaky', async () => {
+  it('tiebreaks on disagreement: 1/3 fail rejected as flaky', async () => {
     const d = snap();
     const args = mkArgs(d, {
       runRepro: [
@@ -327,7 +348,7 @@ describe('runReproBuilder', () => {
     expect(args.workspace.reverts).toEqual(['tests/test_repro_46.py']);
   });
 
-  it('reverts and surfaces sandbox_error if writeTest throws', async () => {
+  it('reverts and surfaces write_test_failed if writeTest throws', async () => {
     const d = snap();
     const args = mkArgs(d, {
       runRepro: [
@@ -342,7 +363,7 @@ describe('runReproBuilder', () => {
     expect(args.workspace.reverts).toEqual([]);
   });
 
-  it('records preconditionsSatisfied + imports in provenance', async () => {
+  it('records preconditionsSatisfied in provenance', async () => {
     const d = snap(
       {
         preconditions: [
@@ -356,7 +377,7 @@ describe('runReproBuilder', () => {
           },
         ],
       },
-      { preconditionsSatisfied: ['pc-0'], imports: ['import json', 'from collections import OrderedDict'] }
+      { preconditionsSatisfied: ['pc-0'] }
     );
     const args = mkArgs(d, {
       runRepro: [
@@ -367,7 +388,6 @@ describe('runReproBuilder', () => {
     const out = await runReproBuilder(args);
     expect(out.ok).toBe(true);
     expect(out.recipe?.provenance.preconditionsSatisfied).toEqual(['pc-0']);
-    expect(out.recipe?.provenance.exerciseImports).toEqual(['import json', 'from collections import OrderedDict']);
     expect(out.recipe?.provenance.proberAttempts).toBe(0);
   });
 

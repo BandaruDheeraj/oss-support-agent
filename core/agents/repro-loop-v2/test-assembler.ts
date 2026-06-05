@@ -1,0 +1,478 @@
+/**
+ * Deterministic Test Assembler.
+ *
+ * Takes a dossier snapshot (suspect function, oracle spec, fixHypothesis) and
+ * the test infrastructure fingerprint profile, reads the suspect function's
+ * source from the repo, and produces a working test deterministically — no
+ * LLM loop.
+ *
+ * Supports two bug types:
+ *
+ *   TYPE 1 — Function-level bug (oracle has symbol assertion, bug is wrong
+ *             argument / return): imports the suspect function, derives the
+ *             tracker base class from the source file, generates a mock tracker
+ *             that captures calls, calls the function with a constructed
+ *             SimpleNamespace message, and asserts the captured argument does
+ *             NOT equal the wrong hardcoded value from fixHypothesis.
+ *
+ *   TYPE 2 — Lifecycle bug (oracle has span_attribute assertion, involves OTel
+ *             span lifecycle): uses an existing cassette from the fingerprint
+ *             profile and generates a test using the cassette_transport fixture.
+ */
+
+import type { DossierSnapshot } from '../analyst/dossier';
+import type { TestInfraProfile } from './test-infra-fingerprint';
+
+// ---------------------------------------------------------------------------
+// Public interface
+// ---------------------------------------------------------------------------
+
+export interface TestAssemblerArgs {
+  dossierSnapshot: DossierSnapshot;
+  testInfraProfile: TestInfraProfile | null;
+  gitClient: {
+    getFileContents(
+      repo: string,
+      path: string,
+      ref: string
+    ): Promise<{ ok: boolean; content?: string }>;
+  };
+  repoFullName: string;
+  ref: string;
+}
+
+export interface AssembledTest {
+  reproFiles: Array<{ path: string; content: string; append: boolean }>;
+  testEntryPoint: string;
+  installSpec: {
+    editableInstall: string[];
+    additionalPackages: string[];
+  };
+  bugType: 'function-level' | 'lifecycle' | 'unknown';
+  rationale: string;
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+
+export async function assembleReproTest(
+  args: TestAssemblerArgs
+): Promise<AssembledTest | null> {
+  const { dossierSnapshot, testInfraProfile, gitClient, repoFullName, ref } =
+    args;
+  const body = dossierSnapshot.body;
+
+  // -------------------------------------------------------------------------
+  // 1. Determine bug type from the oracle spec.
+  // -------------------------------------------------------------------------
+  const oracleSpec = body.oracleSpec;
+  const hasSpanAttributeAssertion =
+    Array.isArray(oracleSpec?.suspect_path_assertions) &&
+    oracleSpec.suspect_path_assertions.some((a) => a.kind === 'span_attribute');
+
+  const hasSymbolAssertion =
+    Array.isArray(oracleSpec?.suspect_path_assertions) &&
+    oracleSpec.suspect_path_assertions.some(
+      (a) => a.kind === 'symbol' || a.kind === 'stack_frame'
+    );
+
+  // -------------------------------------------------------------------------
+  // 2. Find the primary suspect symbol + file from the dossier.
+  // -------------------------------------------------------------------------
+  const suspectSymbols = body.suspectSymbols ?? [];
+  const primarySuspect = suspectSymbols[0];
+
+  if (!primarySuspect) {
+    // Cannot proceed without a suspect symbol to drive the test.
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
+  // 3. Extract fixHypothesis from the dossier body (may live on reproFiles or
+  //    directly on candidateRepro if available).
+  // -------------------------------------------------------------------------
+  const reproFiles = (body as Record<string, unknown>).reproFiles as
+    | { fixHypothesis?: { file: string; description: string } }
+    | undefined;
+  const candidateRepro = (body as Record<string, unknown>).candidateRepro as
+    | Record<string, unknown>
+    | undefined;
+  const fixHypothesis: { file: string; description: string } | undefined =
+    reproFiles?.fixHypothesis ??
+    (candidateRepro?.fixHypothesis as
+      | { file: string; description: string }
+      | undefined);
+
+  // -------------------------------------------------------------------------
+  // 4. Build install spec from fingerprint profile extras and suspect file.
+  // -------------------------------------------------------------------------
+  const installSpec = buildInstallSpec(primarySuspect.file, testInfraProfile);
+
+  // -------------------------------------------------------------------------
+  // 5a. TYPE 2 — Lifecycle (span_attribute oracle): cassette-based test.
+  // -------------------------------------------------------------------------
+  if (hasSpanAttributeAssertion) {
+    const cassette = pickCassette(testInfraProfile);
+    if (cassette) {
+      const lifecycleTest = buildLifecycleTest(
+        cassette,
+        oracleSpec?.suspect_path_assertions.find(
+          (a) => a.kind === 'span_attribute'
+        ) ?? null,
+        testInfraProfile
+      );
+      return {
+        reproFiles: [
+          {
+            path: 'tests/repro/test_repro_lifecycle.py',
+            content: lifecycleTest,
+            append: false,
+          },
+        ],
+        testEntryPoint:
+          'tests/repro/test_repro_lifecycle.py::test_repro_lifecycle',
+        installSpec,
+        bugType: 'lifecycle',
+        rationale:
+          'Oracle has span_attribute assertion; using cassette-transport fixture to test span lifecycle.',
+      };
+    }
+    // Fall through to function-level if no cassette available.
+  }
+
+  // -------------------------------------------------------------------------
+  // 5b. TYPE 1 — Function-level (symbol oracle): mock-tracker test.
+  // -------------------------------------------------------------------------
+  if (hasSymbolAssertion || !hasSpanAttributeAssertion) {
+    // Read the suspect source file to find the tracker base class.
+    const suspectFilePath = primarySuspect.file;
+    const suspectFunction = primarySuspect.symbol;
+
+    // Derive the Python module import path from the file path:
+    //   e.g.  "python/openinference/instrumentation/anthropic/_wrappers.py"
+    //      -> "openinference.instrumentation.anthropic._wrappers"
+    const suspectModule = deriveModulePath(suspectFilePath);
+
+    // Attempt to read the source file to find the tracker base class.
+    let trackerBase: string | null = null;
+    try {
+      const result = await gitClient.getFileContents(
+        repoFullName,
+        suspectFilePath,
+        ref
+      );
+      if (result.ok && result.content) {
+        trackerBase = findTrackerBaseClass(result.content);
+      }
+    } catch {
+      // best-effort; proceed without a base class
+    }
+
+    // Extract the wrong value from fixHypothesis.description.
+    const wrongValue = extractWrongValue(fixHypothesis?.description ?? body.summary ?? '');
+
+    if (!suspectFunction) return null;
+
+    const testContent = buildFunctionLevelTest(
+      suspectModule,
+      suspectFunction,
+      trackerBase ?? 'object',
+      wrongValue
+    );
+
+    return {
+      reproFiles: [
+        {
+          path: 'tests/repro/test_repro.py',
+          content: testContent,
+          append: false,
+        },
+      ],
+      testEntryPoint: 'tests/repro/test_repro.py::test_repro',
+      installSpec,
+      bugType: 'function-level',
+      rationale: `Function-level bug in ${suspectFunction} (${suspectFilePath}): assembling mock-tracker test to capture wrong argument.`,
+    };
+  }
+
+  // Could not determine bug type.
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Template builders
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a function-level test for `_update_tool_spans_from_messages`-style
+ * bugs where the wrong argument is passed to a tracker method.
+ */
+function buildFunctionLevelTest(
+  suspectModule: string,
+  suspectFunction: string,
+  trackerBase: string,
+  wrongValue: string
+): string {
+  const baseImport =
+    trackerBase !== 'object'
+      ? `from ${suspectModule} import ${trackerBase}`
+      : '# No tracker base class found; using object';
+  const classBase = trackerBase !== 'object' ? trackerBase : 'object';
+
+  return [
+    'import types',
+    `from ${suspectModule} import ${suspectFunction}`,
+    baseImport,
+    '',
+    `class _CaptureTracker(${classBase}):`,
+    '    def __init__(self):',
+    '        self.error_calls = []',
+    '        self.end_calls = []',
+    '    def start_tool_span(self, name, input, id, parent=None): pass',
+    '    def end_tool_span(self, id, response): self.end_calls.append(response)',
+    `    def end_tool_span_with_error(self, id, error): self.error_calls.append(error)`,
+    '    def end_all_in_flight(self): pass',
+    '',
+    'def test_repro():',
+    '    tracker = _CaptureTracker()',
+    "    block = types.SimpleNamespace(type='tool_result', tool_use_id='tu1', is_error=True, content='actual error text')",
+    '    msg = types.SimpleNamespace(content=[block])',
+    `    ${suspectFunction}(msg, tracker)`,
+    "    assert tracker.error_calls, 'REPRO: end_tool_span_with_error was never called'",
+    `    assert tracker.error_calls[0] != ${JSON.stringify(wrongValue)}, f'REPRO: bug confirmed, got {tracker.error_calls[0]!r}'`,
+  ].join('\n');
+}
+
+/**
+ * Build a lifecycle test using the cassette_transport fixture pattern.
+ */
+function buildLifecycleTest(
+  cassetteName: string,
+  spanAttrAssertion: { kind: string; needle: string; file?: string } | null,
+  profile: TestInfraProfile | null
+): string {
+  const transportFixture =
+    profile?.cassetteTransportFixture ?? 'cassette_transport';
+  const attributeNeedle = spanAttrAssertion?.needle ?? '';
+
+  return [
+    'import pytest',
+    'from opentelemetry.sdk.trace import TracerProvider',
+    'from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter',
+    'from opentelemetry.sdk.trace.export import SimpleSpanProcessor',
+    '',
+    '',
+    `@pytest.mark.usefixtures("${transportFixture}")`,
+    'def test_repro_lifecycle(cassette_transport):',
+    '    exporter = InMemorySpanExporter()',
+    '    provider = TracerProvider()',
+    '    provider.add_span_processor(SimpleSpanProcessor(exporter))',
+    '',
+    `    # Cassette: ${cassetteName}`,
+    '    # Set up the condition that triggers the bug and exercise the instrumented call.',
+    '    # (Fill in with the actual client call that exercises the instrumented code path.)',
+    '    # client = ... # configure instrumented client with provider',
+    '    # client.some_call()',
+    '',
+    '    spans = exporter.get_finished_spans()',
+    "    assert spans, 'REPRO: no spans recorded'",
+    '    span = spans[0]',
+    `    needle = ${JSON.stringify(attributeNeedle)}`,
+    "    found = any(needle in str(v) for v in span.attributes.values()) if span.attributes else False",
+    "    assert found, f'REPRO: span_attribute {needle!r} not found in span attributes: {dict(span.attributes or {})}'",
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Source analysis helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive a Python module import path from a repo-relative file path.
+ *
+ * Examples:
+ *   "python/openinference/instrumentation/anthropic/_wrappers.py"
+ *     -> "openinference.instrumentation.anthropic._wrappers"
+ *   "src/my_pkg/utils.py"
+ *     -> "my_pkg.utils"
+ *
+ * Strategy: strip the leading path segment that is a known packaging prefix
+ * (e.g. "python/", "src/", "lib/"), then replace "/" with "." and strip ".py".
+ * Falls back to converting the entire path.
+ */
+function deriveModulePath(filePath: string): string {
+  // Normalise to forward slashes.
+  const p = filePath.replace(/\\/g, '/');
+
+  // Strip a leading packaging prefix if present.
+  const strippedLeaders = [
+    /^python\//,
+    /^src\//,
+    /^lib\//,
+    /^packages\//,
+    /^opentelemetry-instrumentation-[^/]+\//,
+  ];
+  let rel = p;
+  for (const re of strippedLeaders) {
+    if (re.test(rel)) {
+      rel = rel.replace(re, '');
+      break;
+    }
+  }
+
+  // Strip ".py" extension.
+  if (rel.endsWith('.py')) {
+    rel = rel.slice(0, -3);
+  }
+  // Strip "__init__" suffix — importing a package is done by its directory name.
+  if (rel.endsWith('/__init__')) {
+    rel = rel.slice(0, -9);
+  }
+
+  // Replace path separators with dots.
+  return rel.replace(/\//g, '.');
+}
+
+/**
+ * Scan the Python source file for a class definition whose body contains
+ * `end_tool_span_with_error` (or more generally, tracker-like methods).
+ * Returns the class name, or null if none found.
+ */
+function findTrackerBaseClass(source: string): string | null {
+  // Look for a class that defines end_tool_span_with_error.
+  // Pattern: `class Foo...:\n  ... def end_tool_span_with_error ...`
+  const classRe = /^class\s+(\w+)[^:]*:/gm;
+  let classMatch: RegExpExecArray | null;
+
+  // Collect all class names with their start positions.
+  const classes: Array<{ name: string; start: number }> = [];
+  while ((classMatch = classRe.exec(source)) !== null) {
+    classes.push({ name: classMatch[1]!, start: classMatch.index });
+  }
+
+  // For each class, check if the slice until the next class (or EOF) contains
+  // the tracker method signatures.
+  for (let i = 0; i < classes.length; i++) {
+    const cls = classes[i]!;
+    const end = i + 1 < classes.length ? classes[i + 1]!.start : source.length;
+    const body = source.slice(cls.start, end);
+    if (
+      /def\s+end_tool_span_with_error/.test(body) ||
+      (/def\s+start_tool_span/.test(body) && /def\s+end_tool_span/.test(body))
+    ) {
+      return cls.name;
+    }
+  }
+
+  // Fallback: look for any class with start_/end_ pattern (generic tracker).
+  for (let i = 0; i < classes.length; i++) {
+    const cls = classes[i]!;
+    const end = i + 1 < classes.length ? classes[i + 1]!.start : source.length;
+    const body = source.slice(cls.start, end);
+    if (/def\s+start_\w+/.test(body) && /def\s+end_\w+/.test(body)) {
+      return cls.name;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Extract the wrong hardcoded value from a fixHypothesis description or
+ * dossier summary. Looks for quoted strings, specific keywords, or falls
+ * back to a generic placeholder.
+ *
+ * Common patterns in descriptions:
+ *   "... passes `content` instead of `error` ..."
+ *   "... hardcoded to \"some value\" ..."
+ *   "... wrong argument: 'foo' ..."
+ */
+function extractWrongValue(description: string): string {
+  if (!description) return '';
+
+  // Pattern 1: backtick-quoted identifiers — take the first one mentioned
+  // after "instead of", "wrong", "hardcoded", "passes", "sends", "uses".
+  const backtickRe =
+    /(?:instead of|wrong|hardcoded|passes?|sends?|uses?)\s+[`'"]([^`'"]{1,80})[`'"]/i;
+  const m1 = description.match(backtickRe);
+  if (m1) return m1[1]!;
+
+  // Pattern 2: any backtick-quoted expression (first one).
+  const backtickAny = description.match(/`([^`]{1,80})`/);
+  if (backtickAny) return backtickAny[1]!;
+
+  // Pattern 3: double-quoted string literal.
+  const dquote = description.match(/"([^"]{1,80})"/);
+  if (dquote) return dquote[1]!;
+
+  // Pattern 4: single-quoted string literal.
+  const squote = description.match(/'([^']{1,80})'/);
+  if (squote) return squote[1]!;
+
+  return '';
+}
+
+// ---------------------------------------------------------------------------
+// Install spec builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive install spec from the fingerprint profile and the suspect file path.
+ *
+ * Heuristic:
+ *   - If the fingerprint profile has an "instrumentation" extra or "test"
+ *     extra, add the packages from there as additionalPackages.
+ *   - Derive the editable-install path from the suspect file's top-level
+ *     directory (the directory that contains a pyproject.toml / setup.py).
+ */
+function buildInstallSpec(
+  suspectFilePath: string,
+  profile: TestInfraProfile | null
+): AssembledTest['installSpec'] {
+  const editableInstall: string[] = [];
+  const additionalPackages: string[] = [];
+
+  // Derive the package root from the suspect file path.
+  // Walk up segments until we hit a known root or depth=3.
+  const parts = suspectFilePath.replace(/\\/g, '/').split('/');
+  if (parts.length > 1) {
+    // Use the top-level directory as the editable install path.
+    editableInstall.push(parts[0]!);
+  }
+
+  // Add packages from profile extras (test / instrumentation extras).
+  if (profile?.installExtras) {
+    const testPkgs =
+      profile.installExtras['test'] ?? profile.installExtras['tests'] ?? '';
+    if (testPkgs) {
+      for (const p of testPkgs.split(',').map((s) => s.trim()).filter(Boolean)) {
+        if (!additionalPackages.includes(p)) {
+          additionalPackages.push(p);
+        }
+      }
+    }
+  }
+
+  return { editableInstall, additionalPackages };
+}
+
+// ---------------------------------------------------------------------------
+// Cassette picker
+// ---------------------------------------------------------------------------
+
+/**
+ * Return the name of the first available cassette from the fingerprint profile,
+ * or null if none are available.
+ */
+function pickCassette(profile: TestInfraProfile | null): string | null {
+  if (!profile) return null;
+  if (profile.existingCassettes.length > 0) {
+    return profile.existingCassettes[0]!;
+  }
+  const keys = Object.keys(profile.existingCassetteContent ?? {});
+  if (keys.length > 0) {
+    return keys[0]!;
+  }
+  return null;
+}

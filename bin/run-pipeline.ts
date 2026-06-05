@@ -996,10 +996,10 @@ function detectLlmQuotaFailure(v2: ReproV2Outcome): NotReproducedRunDiagnostics[
     };
   }
   for (const candidate of v2.candidates) {
-    const candidateReason = candidate.prober?.reason ?? candidate.message;
+    const candidateReason = candidate.message;
     if (!isLlmQuotaFailure(candidateReason)) continue;
     return {
-      stage: candidate.source === 'prober' ? 'prober' : candidate.source === 'builder' ? 'builder' : 'orchestrator',
+      stage: 'builder' as const,
       candidate_id: candidate.candidateId,
       reason: candidateReason,
     };
@@ -1018,12 +1018,11 @@ export function buildNotReproducedRunDiagnostics(
 
   const runReproByCandidate = outcome.v2.candidates.map((candidate) => {
     const deterministicCalls = candidate.executor?.runs.length ?? 0;
-    const proberCalls = candidate.prober?.ranReproCount ?? 0;
     return {
       candidate_id: candidate.candidateId,
       source: candidate.source,
       status: candidate.status,
-      calls: deterministicCalls + proberCalls,
+      calls: deterministicCalls,
       message: candidate.message,
     };
   });

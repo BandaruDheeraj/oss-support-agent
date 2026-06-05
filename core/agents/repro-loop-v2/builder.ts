@@ -1,48 +1,26 @@
 /**
  * Deterministic Repro Builder.
  *
- * Replaces the LLM Prober when the Analyst supplies a structured
- * `candidateRepro` block. The Builder:
+ * Consumes the Analyst's reproFiles block:
+ *   1. validates credentials and pip installs.
+ *   2. writes all reproFiles to workspace.
+ *   3. flushes workspace to branch.
+ *   4. runs GHA pytest via sandbox.runRepro() twice; tiebreak on disagreement.
+ *   5. emits a fully-formed ReproRecipe on success.
  *
- *   1. validates the candidate against the dossier (preconditions exist,
- *      suspect symbols referenced, path under testRoots).
- *   2. installs declared pip packages; ANY failure → reject.
- *   3. validates each import statement is a single ast.Import/ast.ImportFrom
- *      via `sandbox.runPython('ast.parse(...)')`; smuggled side effects
- *      reject.
- *   4. renders test source from the failureMode-keyed template
- *      (try/except sentinel for unexpected_exception; equality assertion
- *      for wrong_return).
- *   5. runs the orchestrator's `reproAstPreflight` on the rendered source.
- *   6. writes the test (path-scoped through ensureTestRootScoped).
- *   7. setReproTestPath + runRepro() twice; if disagreement, tiebreak with
- *      a third run.
- *   8. on success, emits a fully-formed `ReproRecipe` (with
- *      provenance.synthesizedBy === 'builder') that the existing executor
- *      can re-apply.
- *   9. on any rejection AFTER writeTest, calls `workspace.revertFile` so
- *      the Prober fallback inherits a clean tree.
- *
- * NO LLM tool loops. The Builder uses the sandbox + workspace handles
- * exactly the same way the deterministic Executor does — this means once
- * the recipe is emitted, the Executor's re-application is logically a
- * no-op (idempotent pip + same writeTest + same runRepro semantics).
+ * NO LLM tool loops.
  */
 
 import type {
   CandidateRepro,
   DossierSnapshot,
   ReproRecipe,
-  ReproRecipePipInstall,
 } from '../analyst/dossier';
 import {
   REPRO_RECIPE_OBSERVED_TAIL_MAX,
   REPRO_RECIPE_TEST_SOURCE_MAX,
 } from '../analyst/dossier';
 import {
-  renderTestSource,
-  looksLikeSafeImport,
-  buildImportSafetyProbe,
   type ReproFilesCandidate,
 } from '../analyst/candidate-repro';
 import type {
@@ -52,8 +30,6 @@ import type {
   WorkspaceReader,
   WorkspaceWriter,
 } from '../tools/handles';
-import { ensureTestRootScoped } from '../tools/write-test';
-import { reproAstPreflight } from './executor';
 
 const STDOUT_TAIL = REPRO_RECIPE_OBSERVED_TAIL_MAX;
 const STDERR_TAIL = REPRO_RECIPE_OBSERVED_TAIL_MAX;
@@ -61,21 +37,11 @@ const STDERR_TAIL = REPRO_RECIPE_OBSERVED_TAIL_MAX;
 /** Granular reject stages — every reject path gets its own histogram bucket. */
 export type BuilderRejectStage =
   | 'no_candidate'
-  | 'schema_invalid'
-  | 'path_invalid'
   | 'precondition_unknown'
-  | 'symbol_not_referenced'
   | 'pip_install_failed'
-  | 'import_unsafe_static'
-  | 'import_ast_parse_failed'
-  | 'test_source_render_failed'
-  | 'test_source_syntax_invalid'
-  | 'ast_preflight_failed'
   | 'write_test_failed'
   | 'sandbox_error'
   | 'run_repro_pass'
-  | 'run_repro_timeout'
-  | 'sentinel_absent'
   | 'run_repro_flaky'
   | 'expected_output_absent';
 
@@ -123,23 +89,29 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
   const rawReproFiles = (args.dossierSnapshot.body as any).reproFiles;
   let candidate = args.dossierSnapshot.body.candidateRepro;
   if (!candidate && rawReproFiles) {
-    // Promote reproFiles to candidateRepro shape understood by the testSource path
+    // Promote reproFiles block to a candidateRepro with an inline reproFilesCandidate
+    // so the committed path (runReproFilesPath) is used directly.
+    const promotedReproFilesCandidate: import('../analyst/candidate-repro').ReproFilesCandidate = {
+      reproFiles: rawReproFiles.reproFiles ?? [],
+      testEntryPoint: rawReproFiles.testEntryPoint ?? 'tests/repro/test_repro.py',
+      installSpec: rawReproFiles.installSpec ?? { editableInstall: [], additionalPackages: [] },
+      expectedFailureOutput: rawReproFiles.expectedFailureOutput ?? '',
+      fixHypothesis: rawReproFiles.fixHypothesis ?? { file: '', description: '' },
+      rationale: rawReproFiles.rationale ?? '',
+    };
     candidate = {
       version: 1 as const,
       source: 'direct_call' as const,
       failureMode: 'wrong_return' as const,
       testSource: rawReproFiles.reproFiles?.[0]?.content ?? '',
-      candidateTestPath: rawReproFiles.testEntryPoint?.split('::')[0] ?? 'tests/repro/test_repro.py',
+      candidateTestPath: (rawReproFiles.testEntryPoint ?? 'tests/repro/test_repro.py').split('::')[0],
       imports: [],
       setup: '',
-      pipInstalls: rawReproFiles.installSpec?.additionalPackages?.map((p: string) => ({ package: p, editable: false })) ?? [],
+      pipInstalls: [],
       requiresCredentials: [],
       preconditionsSatisfied: [],
       rationale: rawReproFiles.rationale ?? '',
-      reproFiles: rawReproFiles.reproFiles,
-      testEntryPoint: rawReproFiles.testEntryPoint,
-      installSpec: rawReproFiles.installSpec,
-      expectedFailureOutput: rawReproFiles.expectedFailureOutput,
+      reproFilesCandidate: promotedReproFilesCandidate,
     } as any;
   }
   if (!candidate) {
@@ -162,7 +134,7 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
   }
 
   // ---------------------------------------------------------------
-  // (1) Validate against dossier (cheap, do BEFORE installs)
+  // (1) Validate preconditions against dossier
   // ---------------------------------------------------------------
 
   const knownPreconditionIds = new Set<string>();
@@ -187,460 +159,16 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     }
   }
 
-  // When the analyst wrote the full test source, skip template validation
-  // checks that only apply to the exerciseCall/sentinel schema path.
-  const isTestSourcePath = !!candidate.testSource;
-
-  const isReproFilesPath = !!(candidate as any).reproFiles && Array.isArray((candidate as any).reproFiles) && (candidate as any).reproFiles.length > 0;
-
-  // exerciseCall must reference at least one suspect symbol — keeps the
-  // Builder honest (no Builder-authored tests that exercise unrelated code).
-  // Skip for testSource path: the analyst wrote the full test and is
-  // responsible for relevance.
-  const suspectSymbols = args.dossierSnapshot.body.suspectSymbols.map((s) => s.symbol);
-  if (!isTestSourcePath && suspectSymbols.length > 0) {
-    const referencesOne = suspectSymbols.some((sym) =>
-      new RegExp(`\\b${escapeRegExp(sym)}\\b`).test(`${candidate.setup ?? ''}\n${candidate.exerciseCall ?? ''}`)
-    );
-    if (!referencesOne) {
-      return rej(
-        'symbol_not_referenced',
-        `setup+exerciseCall references none of the dossier's suspect symbols: ${suspectSymbols.join(', ')}.`
-      );
-    }
-  }
-
-  // Path scope.
-  try {
-    ensureTestRootScoped(
-      candidate.candidateTestPath,
-      args.workspace.testRoots(),
-      'candidateRepro.candidateTestPath'
-    );
-  } catch (err) {
-    return rej('path_invalid', err instanceof Error ? err.message : String(err));
-  }
-
-  // Static import shape check — only for template path (testSource path has
-  // no separate imports array; safety checked via ast.parse of the full source).
-  if (!isTestSourcePath) {
-    for (const imp of candidate.imports) {
-      if (!looksLikeSafeImport(imp)) {
-        return rej('import_unsafe_static', `Import statement failed static safety check: ${JSON.stringify(imp)}`);
-      }
-    }
-  }
-
   // ---------------------------------------------------------------
-  // (reproFiles path) Multi-file repro — short-circuits before the
-  // existing pip / import / template pipeline when candidate carries a
-  // reproFilesCandidate block. The existing paths below remain 100%
-  // unchanged and are only reached when reproFilesCandidate is absent.
+  // (2) Route to reproFilesCandidate path (the only supported path)
   // ---------------------------------------------------------------
 
   if (candidate.reproFilesCandidate) {
     return runReproFilesPath(args, candidate.reproFilesCandidate, candidate, resolvedPreconditionsSatisfied);
   }
 
-  // ---------------------------------------------------------------
-  // (2) pip installs (any failure → reject)
-  // ---------------------------------------------------------------
-
-  for (const inst of candidate.pipInstalls) {
-    const spec = renderPipSpec(inst);
-    const run = await safeSandbox(args.sandbox.pipInstall(spec));
-    if (!run.ok) {
-      return rej('sandbox_error', `pip install threw: ${run.error}`);
-    }
-    if (run.value.exitCode !== 0) {
-      return {
-        ok: false,
-        rejectStage: 'pip_install_failed',
-        reason: `pip install failed for ${spec} (exit ${run.value.exitCode})`,
-        runs: [],
-        pipInstallFailure: {
-          spec,
-          exitCode: run.value.exitCode,
-          stderrTail: tail(run.value.stderr, STDERR_TAIL),
-        },
-      };
-    }
-  }
-
-  // ---------------------------------------------------------------
-  // (3) Import validation — skipped for testSource path
-  // ---------------------------------------------------------------
-
-  if (!isTestSourcePath) {
-    if (candidate.imports.length > 0) {
-      const probe = buildImportSafetyProbe(candidate.imports);
-      const probeRun = await safeSandbox(args.sandbox.runPython(probe));
-      if (!probeRun.ok) {
-        return rej('sandbox_error', `runPython(import probe) threw: ${probeRun.error}`);
-      }
-      if (probeRun.value.exitCode !== 0) {
-        return rej(
-          'import_ast_parse_failed',
-          `Import safety probe failed (exit ${probeRun.value.exitCode}): ${tail(probeRun.value.stderr, 400)}`
-        );
-      }
-    }
-
-    if (candidate.imports.length > 0) {
-      const importExecutable = candidate.imports.join('\n');
-      const exec = await safeSandbox(args.sandbox.runPython(importExecutable));
-      if (!exec.ok) {
-        return rej('sandbox_error', `runPython(imports) threw: ${exec.error}`);
-      }
-      if (exec.value.exitCode !== 0) {
-        return rej(
-          'import_ast_parse_failed',
-          `Imports execute non-zero (exit ${exec.value.exitCode}): ${tail(exec.value.stderr, 400)}`
-        );
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------
-  // (4) Get test source — written by analyst OR rendered from template
-  // ---------------------------------------------------------------
-
-  let source: string;
-  if (isTestSourcePath) {
-    source = candidate.testSource!;
-    // Reject testSource that has no assertion — a test that only prints
-    // "BUG CONFIRMED" will exit 0 even when the bug is present, making
-    // the pipeline blind to the failure.
-    const hasAssertion = /\bassert\b/.test(source) || /\braise\b/.test(source) || /\bpytest\.raises\b/.test(source);
-    if (!hasAssertion) {
-      return rej(
-        'test_source_render_failed',
-        'testSource has no assert/raise statement. A test that only prints results exits 0 even when the bug is present — use assert or raise AssertionError to make the test fail when the bug fires.'
-      );
-    }
-    if (source.length > REPRO_RECIPE_TEST_SOURCE_MAX) {
-      return rej('test_source_render_failed', `testSource exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
-    }
-  } else if (isReproFilesPath) {
-    const rf = (candidate as any).reproFiles as Array<{path: string, content: string, append?: boolean}>;
-    const testFile = rf.find((f: {path: string}) => !f.path.endsWith('.yaml') && !f.path.endsWith('.yml'));
-    source = testFile ? testFile.content : rf[0].content;
-    const rawTestEntryPoint = (candidate as any).testEntryPoint;
-    const testEntryPoint: string = typeof rawTestEntryPoint === 'string' ? rawTestEntryPoint : (testFile?.path ?? 'tests/repro/test_repro.py');
-    const testPath = testEntryPoint.split('::')[0];
-
-    // Step A — fast gate: does the test actually detect the bug?
-    const gateResult = await safeSandbox(args.sandbox.runPython(source));
-    if (!gateResult.ok) {
-      return rej('sandbox_error', 'runPython gate threw: ' + gateResult.error);
-    }
-    if (gateResult.value.exitCode === 0) {
-      return rej('run_repro_pass', 'reproFiles inline gate exited 0 on buggy code — test does not detect the bug.');
-    }
-
-    // Step B — write all files to workspace
-    const writtenPaths: string[] = [];
-    for (const rfile of rf) {
-      try {
-        await args.workspace.writeTest(rfile.path, rfile.content);
-        writtenPaths.push(rfile.path);
-      } catch (err) {
-        for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
-        return rej('write_test_failed', 'Failed to write ' + rfile.path + ': ' + (err instanceof Error ? err.message : String(err)));
-      }
-    }
-
-    // Step C — flush workspace to git branch
-    let flushedToBranch = false;
-    if (typeof (args.sandbox as any).flushWorkspaceToBranch === 'function') {
-      try {
-        await (args.sandbox as any).flushWorkspaceToBranch();
-        flushedToBranch = true;
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.log('[v2-builder] flushWorkspaceToBranch failed, falling back to inline: ' + (err instanceof Error ? err.message : String(err)));
-      }
-    }
-
-    if (flushedToBranch) {
-      // Step D — GHA sandbox runs pytest on the real branch clone
-      args.sandbox.setReproTestPath(testPath);
-      const expectedOut = (candidate as any).expectedFailureOutput as string | undefined;
-      const runs: BuilderRunObservation[] = [];
-      for (let i = 0; i < 2; i++) {
-        const r = await safeSandbox(args.sandbox.runRepro());
-        if (!r.ok) {
-          for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
-          return { ok: false, rejectStage: 'sandbox_error' as BuilderRejectStage, reason: 'runRepro #' + (i + 1) + ' threw: ' + r.error, runs, candidateTestPath: testPath };
-        }
-        runs.push(observe(r.value, '', expectedOut ?? ''));
-      }
-      const allPassed = runs.every((r) => r.exitCode === 0);
-      const failingAny = runs.filter((r) => r.exitCode !== 0).length;
-      if (allPassed) {
-        for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
-        return rej('run_repro_pass', 'pytest on branch passed on every run — bug not triggered.');
-      }
-      if (failingAny < 2) {
-        for (const p of writtenPaths) { await safeRevert(args.workspace, p); }
-        return rej('run_repro_flaky', 'pytest on branch: runs disagreed: ' + runs.map((r) => r.exitCode).join('/'));
-      }
-      (candidate as any).candidateTestPath = testPath;
-      const lastFailing = runs.filter((r) => r.exitCode !== 0).slice(-1)[0] ?? runs[runs.length - 1];
-      const recipe: ReproRecipe = {
-        version: 1,
-        candidateTestPath: testPath,
-        testSource: source,
-        sentinelString: '',
-        pipInstalls: candidate.pipInstalls ?? [],
-        requiresCredentials: candidate.requiresCredentials ?? [],
-        verbatimSnippetIncompatible: false,
-        approach: 'builder:repro_files:committed',
-        provenance: {
-          exerciseImports: [],
-          preconditionsSatisfied: [],
-          observedProbe: { sentinelObserved: false, signatureObserved: false, exitCode: lastFailing.exitCode, durationMs: lastFailing.durationMs, stderrTail: lastFailing.stderrTail, stdoutTail: lastFailing.stdoutTail },
-          proberAttempts: 0,
-          recordedAt: '(stamped-after-workflow)',
-        },
-      };
-      return { ok: true, reason: '', recipe, runs, rejectStage: undefined, candidateTestPath: testPath };
-    }
-
-    // Fallback: flush not available — use inline confirmation
-    const gate2 = await safeSandbox(args.sandbox.runPython(source));
-    const ec2 = gate2.ok ? gate2.value.exitCode ?? 1 : 1;
-    const inlineRuns: BuilderRunObservation[] = [
-      { exitCode: gateResult.value.exitCode ?? 1, sentinelObserved: true, signatureObserved: false, stdoutTail: tail(gateResult.value.stdout, STDERR_TAIL), stderrTail: tail(gateResult.value.stderr, STDERR_TAIL), durationMs: 0 },
-      { exitCode: ec2, sentinelObserved: ec2 !== 0, signatureObserved: false, stdoutTail: gate2.ok ? tail(gate2.value.stdout, STDERR_TAIL) : '', stderrTail: gate2.ok ? tail(gate2.value.stderr, STDERR_TAIL) : '', durationMs: 0 },
-    ];
-    (candidate as any).candidateTestPath = testPath;
-    const inlineRecipe: ReproRecipe = {
-      version: 1,
-      candidateTestPath: testPath,
-      testSource: source,
-      sentinelString: '',
-      pipInstalls: candidate.pipInstalls ?? [],
-      requiresCredentials: candidate.requiresCredentials ?? [],
-      verbatimSnippetIncompatible: false,
-      approach: 'builder:repro_files:inline',
-      provenance: {
-        exerciseImports: [],
-        preconditionsSatisfied: [],
-        observedProbe: { sentinelObserved: true, signatureObserved: false, exitCode: gateResult.value.exitCode ?? 1, durationMs: 0, stderrTail: tail(gateResult.value.stderr, STDERR_TAIL), stdoutTail: tail(gateResult.value.stdout, STDERR_TAIL) },
-        proberAttempts: 0,
-        recordedAt: '(stamped-after-workflow)',
-      },
-    };
-    return { ok: true, reason: '', recipe: inlineRecipe, runs: inlineRuns, rejectStage: undefined, candidateTestPath: testPath };
-  } else {
-    const render = renderTestSource(candidate);
-    if (!render.ok) {
-      return rej('test_source_render_failed', `Template render rejected: ${render.reason}`);
-    }
-    source = render.source;
-    if (source.length > REPRO_RECIPE_TEST_SOURCE_MAX) {
-      return rej('test_source_render_failed', `Rendered source exceeded cap (${source.length} > ${REPRO_RECIPE_TEST_SOURCE_MAX}).`);
-    }
-  }
-
-  // ---------------------------------------------------------------
-  // (5) AST parse the rendered source (full Python syntax check)
-  // ---------------------------------------------------------------
-
-  const astParse = await safeSandbox(
-    args.sandbox.runPython(`import ast, sys; ast.parse(${JSON.stringify(source)}); print("OK")`)
-  );
-  if (!astParse.ok) {
-    return rej('sandbox_error', `ast.parse probe threw: ${astParse.error}`);
-  }
-  if (astParse.value.exitCode !== 0) {
-    return rej(
-      'test_source_syntax_invalid',
-      `Rendered source failed ast.parse: ${tail(astParse.value.stderr, 400)}`
-    );
-  }
-
-  // ---------------------------------------------------------------
-  // (6) Run the orchestrator's reproAstPreflight (referential alignment
-  // with the post-Executor check — Builder never emits a recipe that the
-  // orchestrator would reject downstream).
-  // ---------------------------------------------------------------
-
-  const suspectFiles = args.dossierSnapshot.body.suspectSymbols.map((s) => s.file);
-  const pre = reproAstPreflight(args.repo.language, source, suspectFiles, suspectSymbols);
-  if (!pre.ok) {
-    return rej('ast_preflight_failed', `reproAstPreflight rejected rendered source: ${pre.reason ?? '(no reason)'}`);
-  }
-
-  // ---------------------------------------------------------------
-  // (7) Write the candidate test
-  // ---------------------------------------------------------------
-
-  try {
-    await args.workspace.writeTest(candidate.candidateTestPath, source);
-  } catch (err) {
-    return rej(
-      'write_test_failed',
-      `workspace.writeTest threw: ${err instanceof Error ? err.message : String(err)}`
-    );
-  }
-
-  // Any rejection from here on must revert the file.
-  const candidateTestPath = candidate.candidateTestPath;
-
-  // ---------------------------------------------------------------
-  // (8) Run repro × 2; tiebreak on disagreement
-  // ---------------------------------------------------------------
-
-  args.sandbox.setReproTestPath(candidateTestPath);
-
-  const runs: BuilderRunObservation[] = [];
-  for (let i = 0; i < 2; i++) {
-    const r = await safeSandbox(args.sandbox.runRepro());
-    if (!r.ok) {
-      await safeRevert(args.workspace, candidateTestPath);
-      return {
-        ok: false,
-        rejectStage: 'sandbox_error',
-        reason: `runRepro #${i + 1} threw: ${r.error}`,
-        runs,
-        candidateTestPath,
-      };
-    }
-    runs.push(
-      observe(r.value, candidate.sentinel ?? "", candidate.expectedFailureSignature ?? '')
-    );
-  }
-
-  // Tiebreak on disagreement.
-  const agree = (a: BuilderRunObservation, b: BuilderRunObservation) =>
-    (a.exitCode === 0) === (b.exitCode === 0) &&
-    a.sentinelObserved === b.sentinelObserved;
-
-  if (!agree(runs[0], runs[1])) {
-    const tie = await safeSandbox(args.sandbox.runRepro());
-    if (!tie.ok) {
-      await safeRevert(args.workspace, candidateTestPath);
-      return {
-        ok: false,
-        rejectStage: 'sandbox_error',
-        reason: `runRepro tiebreak threw: ${tie.error}`,
-        runs,
-        candidateTestPath,
-      };
-    }
-    runs.push(observe(tie.value, candidate.sentinel ?? "", candidate.expectedFailureSignature ?? ''));
-  }
-
-  // ---------------------------------------------------------------
-  // (9) Verdict
-  // ---------------------------------------------------------------
-
-  const failingWithSentinel = runs.filter(
-    (r) => r.exitCode !== 0 && r.sentinelObserved
-  ).length;
-  const failingAny = runs.filter((r) => r.exitCode !== 0).length;
-  const allPassed = runs.every((r) => r.exitCode === 0);
-  const allFailedNoSentinel = runs.every((r) => r.exitCode !== 0 && !r.sentinelObserved);
-
-  // For the testSource path the analyst wrote the full test; we don't require
-  // a sentinel string in the output — exit-code alone confirms the bug fires.
-  const hasSentinel = !!candidate.sentinel;
-  const verdictOk = hasSentinel ? failingWithSentinel >= 2 : failingAny >= 2;
-
-  if (allPassed) {
-    await safeRevert(args.workspace, candidateTestPath);
-    return {
-      ok: false,
-      rejectStage: 'run_repro_pass',
-      reason: 'Candidate test passed on every run; bug not triggered.',
-      runs,
-      candidateTestPath,
-    };
-  }
-
-  if (!verdictOk) {
-    if (hasSentinel && allFailedNoSentinel) {
-      await safeRevert(args.workspace, candidateTestPath);
-      return {
-        ok: false,
-        rejectStage: 'sentinel_absent',
-        reason: 'Runs failed but sentinel was absent from stdout+stderr; likely a pre-existing failure unrelated to the bug.',
-        runs,
-        candidateTestPath,
-      };
-    }
-    await safeRevert(args.workspace, candidateTestPath);
-    return {
-      ok: false,
-      rejectStage: 'run_repro_flaky',
-      reason: `Runs disagreed: ${runs.map((r) => `${r.exitCode}/${r.sentinelObserved ? 'S' : '_'}`).join('|')}`,
-      runs,
-      candidateTestPath,
-    };
-  }
-
-  const expectedOut = (candidate as any).expectedFailureOutput;
-  if (expectedOut && typeof expectedOut === 'string') {
-    const allOutput = runs.map(r => (r as any).stdout + (r as any).stderr).join('\n');
-    if (!allOutput.includes(expectedOut)) {
-      await safeRevert(args.workspace, candidateTestPath);
-      return rej('sentinel_absent', 'expectedFailureOutput "' + expectedOut + '" not found — likely unrelated failure');
-    }
-  }
-
-  // ---------------------------------------------------------------
-  // (10) Build the recipe
-  // ---------------------------------------------------------------
-
-  const lastFailing =
-    runs.filter((r) => r.exitCode !== 0 && r.sentinelObserved).slice(-1)[0] ?? runs[runs.length - 1];
-
-  const recipe: ReproRecipe = {
-    version: 1,
-    candidateTestPath,
-    testSource: source,
-    sentinelString: candidate.sentinel ?? '',
-    ...(candidate.expectedFailureSignature
-      ? { expectedFailureSignature: candidate.expectedFailureSignature }
-      : {}),
-    pipInstalls: candidate.pipInstalls,
-    requiresCredentials: candidate.requiresCredentials,
-    verbatimSnippetIncompatible: false,
-    approach: isTestSourcePath
-      ? `builder:test_source:${candidate.source}`
-      : `builder:${candidate.failureMode}:${candidate.source}`,
-    provenance: {
-      exerciseImports: candidate.imports,
-      preconditionsSatisfied: resolvedPreconditionsSatisfied,
-      observedProbe: {
-        sentinelObserved: lastFailing.sentinelObserved,
-        signatureObserved: lastFailing.signatureObserved,
-        exitCode: lastFailing.exitCode,
-        durationMs: lastFailing.durationMs,
-        stderrTail: lastFailing.stderrTail,
-        stdoutTail: lastFailing.stdoutTail,
-      },
-      proberAttempts: 0,
-      recordedAt: new Date().toISOString(),
-    },
-  };
-
-  // eslint-disable-next-line no-console
-  console.log(
-    `[v2-builder] attempt=${args.attemptId} ok=true ranRepro=${runs.length}` +
-      ` failingWithSentinel=${failingWithSentinel} failureMode=${candidate.failureMode}` +
-      ` source=${candidate.source} pipInstalls=${candidate.pipInstalls.length}`
-  );
-
-  return {
-    ok: true,
-    recipe,
-    reason: 'Builder produced a recipe; runs reproduced reliably with sentinel.',
-    runs,
-    candidateTestPath,
-  };
+  // No reproFilesCandidate — Builder cannot proceed.
+  return rej('no_candidate', 'Dossier candidateRepro has no reproFilesCandidate block; Builder requires the reproFiles path.');
 }
 
 // ---------------------------------------------------------------------------
@@ -886,14 +414,6 @@ function observe(run: SandboxRun, sentinel: string, signature: string): BuilderR
 function tail(s: string, n: number): string {
   if (!s) return '';
   return s.length <= n ? s : s.slice(-n);
-}
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function renderPipSpec(inst: ReproRecipePipInstall): string {
-  return inst.editable ? `-e ${inst.package}` : inst.package;
 }
 
 type SandboxOutcome<T> = { ok: true; value: T } | { ok: false; error: string };

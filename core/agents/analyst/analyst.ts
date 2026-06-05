@@ -108,65 +108,11 @@ Downstream stages are deterministic and consume this struct directly. Keep it co
 LOW-CONFIDENCE semantic seed handling:
 When \`semanticConfidence.low_confidence\` is true, you MUST explicitly state in your dossier summary that semantic suspects are low-confidence. You MUST carry that uncertainty into \`oracleSpec\`: only include suspect_path_assertions you can justify from direct file reads / concrete evidence, and avoid claiming suspect-path evidence you cannot verify.
 
-CANDIDATE REPRO (REQUIRED when suspect symbols are present):
-When suspectSymbols is non-empty, you MUST include reproFiles on record_evidence (even at low/medium confidence).
-
-You receive a testInfraProfile in your context (when available) with cassette naming convention, available fixtures, install extras, existing cassette names, and pinned tool versions. Use it.
-
-CHOOSE THE RIGHT TEST APPROACH based on the bug type:
-
-A) FUNCTION-LEVEL BUG (wrong argument, wrong return value, wrong attribute set):
-   Write a targeted unit test that calls the buggy function directly.
-   Use types.SimpleNamespace for any object the function reads via getattr.
-   No cassette needed — the function is tested in isolation.
-   Example for _update_tool_spans_from_messages:
-     block = types.SimpleNamespace(type='tool_result', tool_use_id='tu1', is_error=True, content='real error')
-     msg = types.SimpleNamespace(content=[block])
-     _update_tool_spans_from_messages(msg, tracker)
-     assert tracker.captured[0] != 'Tool execution error', f'BUG: got {tracker.captured[0]!r}'
-
-B) LIFECYCLE BUG (context propagation, span lifecycle, on_start/on_end ordering):
-   Write a cassette-based integration test that exercises the real library stack.
-   Use the cassette transport fixture from the testInfraProfile to replay API calls.
-   Copy an existing cassette, rename to match the test function name per cassetteNamingConvention.
-
-reproFiles is an array of {path, content, append?}:
-1. Test file: append existing test_*.py (append: true) rather than creating a new file
-2. Cassette file (type B only): copy content from an existing cassette, rename to match the test function name exactly per cassetteNamingConvention in the profile
-
-testEntryPoint: repo-relative pytest path e.g. "tests/test_foo.py::test_my_function"
-
-installSpec.editableInstall: install the library the instrumentation PATCHES (the SDK), not third-party consumers. Use extras from profile (e.g. [instruments,test]).
-installSpec.additionalPackages: from profile.additionalPackages
-
-expectedFailureOutput: substring that MUST appear in stdout/stderr when the bug is present. Used to distinguish real repro from import errors.
-
-fixHypothesis: {file: "src/path/to/file.py", description: "one sentence: what to change and why"}
-
-CRITICAL RULES — all learned from real failures:
-- Test MUST use assert or raise. if/print exits 0 even when bug present — pipeline cannot detect it.
-- Use types.SimpleNamespace(field=value) NOT plain dicts when calling library internals. Internal functions use getattr not dict access.
-- Inherit from SDK base classes (e.g. opentelemetry.sdk.trace.SpanProcessor). Duck typing crashes the SDK.
-- Cassette file MUST be named after the test function. conftest.py will pytest.fail if name is wrong.
-- Install the host library (SDK being instrumented), stub the third party (Langfuse = 10-line SpanProcessor, not pip install).
-- Test file MUST work as a standalone pytest file: top-level test_*() function, all imports at module level, no if-name-main guards.
-- testEntryPoint must be a valid pytest path: "tests/repro/test_issue_N.py::test_function_name"
-- The test will be COMMITTED to the branch as a permanent regression test — write it as production test code.
-
-WRONG (exits 0 even when bug present):
-  if captured[0] == "Tool execution error":
-      print("BUG CONFIRMED")  # exits 0 — pipeline blind
-
-CORRECT:
-  assert captured[0] != "Tool execution error", f"BUG: got {captured[0]!r}"
-
-Do NOT omit reproFiles solely because of uncertainty. Write your best attempt and note caveats in rationale.
-
 REPRO TARGETS (optional, low-cost):
 Independent of candidateRepro, you SHOULD include a \`reproTargets\` field on record_evidence when you've identified the structural setup the repro needs:
 
 - \`reproTargets.editableInstall\`: array of repo-relative directory paths the Repro Executor should \`pip install -e <dir>\` BEFORE running the candidate test. Each entry MUST be a directory containing pyproject.toml / setup.py / setup.cfg (the in-repo package whose imports the test needs). This replaces a fragile BFS heuristic downstream. Example: ["python/openinference-instrumentation-smolagents", "python/openinference-instrumentation"]. Omit when the bug is in a single-package repo with no nested packages.
-- \`reproTargets.runtimeForbidden\`: array of import names (lowercase) the Prober must NOT try to install in the runtime sandbox — frameworks known to either explode the dep tree or require network/credentials. When non-empty, the Prober pivots to a direct-call exercise of the underlying primitive. Examples: "smolagents", "langchain", "llama_index", "autogen", "crewai". Populate this when the issue body, snippet, or suspect path involves one of these frameworks AND the bug can be reproduced by exercising the wrapped primitive directly.
+- \`reproTargets.runtimeForbidden\`: array of import names (lowercase) that must NOT be installed in the runtime sandbox — frameworks known to either explode the dep tree or require network/credentials. Examples: "smolagents", "langchain", "llama_index", "autogen", "crewai". Populate this when the issue body, snippet, or suspect path involves one of these frameworks AND the bug can be reproduced by exercising the wrapped primitive directly.
 
 reproTargets is independent of confidence — even a low-confidence dossier benefits from naming the right package dir. Omit reproTargets entirely (or set both fields to []) when you cannot identify either.
 
