@@ -253,24 +253,69 @@ async function runReproFilesPath(
     }
   }
 
-  // (d) Run the test.
+  // (d) Run the test — with a self-repair loop for common errors.
+  // After the first failing run, if the output signals an ImportError or
+  // wrong class interface, we apply a targeted fix and retry rather than
+  // immediately rejecting. This avoids manual heuristic patching in the
+  // harness code for edge-cases the assembler couldn't anticipate.
   args.sandbox.setReproTestPath(testEntryPoint);
+
+  const PRIMARY_TEST_FILE = reproFilesCandidate.reproFiles[0];
+  let currentTestContent = PRIMARY_TEST_FILE?.content ?? '';
+  const MAX_REPAIR_ATTEMPTS = 3;
+  let repairCount = 0;
 
   const runs: BuilderRunObservation[] = [];
   for (let i = 0; i < 2; i++) {
-    const r = await safeSandbox(args.sandbox.runRepro());
-    if (!r.ok) {
-      for (const p of writtenPaths) await safeRevert(args.workspace, p);
-      return {
-        ok: false,
-        rejectStage: 'sandbox_error',
-        reason: `runRepro #${i + 1} threw: ${r.error}`,
-        runs,
-        candidateTestPath: testEntryPoint,
-      };
+    // Repair loop: on first run only, attempt targeted fixes for sandbox errors.
+    if (i === 0) {
+      for (let rep = 0; rep <= MAX_REPAIR_ATTEMPTS; rep++) {
+        const r = await safeSandbox(args.sandbox.runRepro());
+        if (!r.ok) {
+          for (const p of writtenPaths) await safeRevert(args.workspace, p);
+          return {
+            ok: false,
+            rejectStage: 'sandbox_error',
+            reason: `runRepro #1 threw: ${r.error}`,
+            runs,
+            candidateTestPath: testEntryPoint,
+          };
+        }
+        const combined = `${r.value.stdout}\n${r.value.stderr}`;
+        // If the test fails for a fixable reason and we haven't exhausted repair
+        // attempts, try to fix the test and re-run.
+        if (r.value.exitCode !== 0 && rep < MAX_REPAIR_ATTEMPTS && PRIMARY_TEST_FILE) {
+          const fixed = repairTestContent(currentTestContent, combined);
+          if (fixed !== null && fixed !== currentTestContent) {
+            // Rewrite the test file in the workspace and re-run.
+            try {
+              await args.workspace.writeTest(PRIMARY_TEST_FILE.path, fixed);
+              currentTestContent = fixed;
+              repairCount++;
+              continue; // retry with fixed test
+            } catch {
+              // writeTest failed — give up on repair, fall through with original
+            }
+          }
+        }
+        // No repair possible or test passed/failed correctly — record and move on.
+        runs.push(observe(r.value, '', ''));
+        break;
+      }
+    } else {
+      const r = await safeSandbox(args.sandbox.runRepro());
+      if (!r.ok) {
+        for (const p of writtenPaths) await safeRevert(args.workspace, p);
+        return {
+          ok: false,
+          rejectStage: 'sandbox_error',
+          reason: `runRepro #${i + 1} threw: ${r.error}`,
+          runs,
+          candidateTestPath: testEntryPoint,
+        };
+      }
+      runs.push(observe(r.value, '', ''));
     }
-    // No sentinel for reproFiles path — observe with empty sentinel.
-    runs.push(observe(r.value, '', ''));
   }
 
   // Tiebreak on disagreement.
@@ -433,4 +478,101 @@ async function safeRevert(ws: WorkspaceWriter, path: string): Promise<void> {
     // best effort — failure to revert is logged but never fails the Builder
     // result (the Prober fallback will overwrite anyway).
   }
+}
+
+// ---------------------------------------------------------------------------
+// Self-repair: targeted fixes for common test errors
+// ---------------------------------------------------------------------------
+
+/**
+ * Inspect the pytest output from a failing run and return a fixed version of
+ * the test source, or null if no deterministic fix applies.
+ *
+ * Handles:
+ *   - ImportError / ModuleNotFoundError: try progressively shorter module paths
+ *   - TypeError on __init__: strip base class inheritance (use plain `object`)
+ *   - AttributeError on missing method: strip abstract base class
+ *   - No-op when the test already fails for the right reason (assertion error)
+ */
+function repairTestContent(
+  source: string,
+  output: string
+): string | null {
+  // ── Fix 1: ImportError / ModuleNotFoundError ─────────────────────────────
+  // Pattern: "ModuleNotFoundError: No module named 'a.b.c.d'"
+  //          "ImportError: cannot import name 'X' from 'a.b.c'"
+  const moduleNotFoundMatch = output.match(
+    /(?:ModuleNotFoundError|ImportError)[^\n]*?'([A-Za-z0-9_.]+)'/
+  );
+  if (moduleNotFoundMatch) {
+    const badModule = moduleNotFoundMatch[1]!;
+    // Try progressively stripping leading segments from the bad module path.
+    // e.g. "instrumentation.openinference_foo.src.openinference.instrumentation.bar._wrappers"
+    //   -> try "openinference.instrumentation.bar._wrappers"
+    //   -> try "instrumentation.bar._wrappers"
+    //   -> try "bar._wrappers"
+    const parts = badModule.split('.');
+    for (let skip = 1; skip < parts.length - 1; skip++) {
+      const candidate = parts.slice(skip).join('.');
+      // Only try reasonable module paths — must start with a lowercase letter
+      // or underscore (Python identifier) and not contain hyphens.
+      if (/^[a-z_]/.test(candidate) && !candidate.includes('-')) {
+        const fixed = source.replace(badModule, candidate);
+        if (fixed !== source) return fixed;
+      }
+    }
+    // If the failing module contains a hyphen (package dir used as module),
+    // it can't be imported — strip to just the Python-importable suffix.
+    if (badModule.includes('-') || badModule.includes('__')) {
+      // Find the first segment that looks like a real Python package name.
+      const importableParts = parts.filter((p) => /^[a-z_][a-z0-9_]*$/i.test(p));
+      if (importableParts.length >= 2) {
+        // Guess the import as the LAST N importable segments that spell out
+        // a plausible namespace (e.g. openinference.instrumentation.foo._wrappers).
+        for (let n = importableParts.length; n >= 2; n--) {
+          const candidate = importableParts.slice(importableParts.length - n).join('.');
+          const fixed = source.replace(badModule, candidate);
+          if (fixed !== source) return fixed;
+        }
+      }
+    }
+  }
+
+  // ── Fix 2: TypeError — wrong number of args to __init__ ──────────────────
+  // The mock class inherits from a base that requires args the mock doesn't supply.
+  // Strip the base class so the mock inherits from `object` instead.
+  const initTypeError = output.match(/TypeError.*__init__.*argument/i);
+  if (initTypeError) {
+    // Replace "class _CaptureTracker(SomeBase):" -> "class _CaptureTracker(object):"
+    const fixed = source.replace(
+      /class\s+_CaptureTracker\s*\([^)]+\)\s*:/,
+      'class _CaptureTracker(object):'
+    );
+    if (fixed !== source) return fixed;
+  }
+
+  // ── Fix 3: AttributeError — abstract base has required abstract methods ───
+  const attrError = output.match(/(?:AttributeError|TypeError).*abstract/i);
+  if (attrError) {
+    // Same fix: use plain object base so no abstract methods are required.
+    const fixed = source.replace(
+      /class\s+_CaptureTracker\s*\([^)]+\)\s*:/,
+      'class _CaptureTracker(object):'
+    );
+    if (fixed !== source) return fixed;
+  }
+
+  // ── Fix 4: NameError on import alias (from X import Y as Z used before def) ─
+  const nameError = output.match(/NameError: name '([A-Za-z_][A-Za-z0-9_]*)' is not defined/);
+  if (nameError) {
+    const name = nameError[1]!;
+    // If the name appears in a base-class position, fall back to object.
+    const fixed = source.replace(
+      new RegExp(`class\\s+_CaptureTracker\\s*\\(${name}\\)\\s*:`),
+      'class _CaptureTracker(object):'
+    );
+    if (fixed !== source) return fixed;
+  }
+
+  return null; // No applicable fix — let the Builder verdict logic decide.
 }
