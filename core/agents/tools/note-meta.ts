@@ -120,7 +120,13 @@ const RecordEvidence = z.object({
      * Multi-file repro input under the ReproFiles redesign. Optional;
      * when present the Builder uses these files instead of the template path.
      */
-    reproFiles: ReproFilesInputSchema.optional(),
+    // Accept either: an array of {path, content, append?} files (what the analyst
+    // naturally emits), or the full ReproFilesInputSchema object. The execute()
+    // function normalizes via normalizeReproFilesInput which handles both shapes.
+    reproFiles: z.union([
+      z.array(z.object({ path: z.string().min(1), content: z.string(), append: z.boolean().optional() })),
+      ReproFilesInputSchema,
+    ]).optional(),
     /**
      * Structured repro oracle assertions consumed by deterministic repro/fix
      * gates. Optional on input; when omitted we derive defaults from
