@@ -2773,9 +2773,9 @@ export async function runPipeline(args: {
     // "5 dispatch-fail-fix cycles" caused by unknown base classes, wrong extras,
     // wrong cassette naming, wrong import scope, wrong pinned tool version.
     let testInfraProfile = null;
+    const ghRestForFingerprint = new GitHubRestClient(deps.token);
     try {
       const ghClientForFingerprint = new GitHubActionsClient(deps.token);
-      const ghRestForFingerprint = new GitHubRestClient(deps.token);
       testInfraProfile = await fingerprintTestInfra({
         repoFullName: fork.forkFullName,
         affectedPackagePath: routing.result.affectedModule ?? '',
@@ -2814,6 +2814,10 @@ export async function runPipeline(args: {
             sandboxDriver: v2SandboxDriver,
             ghActionsSandboxOptions: v2GhActionsSandboxOptions,
             testInfraProfile,
+            gitClient: {
+              getFileContents: (repo: string, filePath: string, ref: string) =>
+                ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
+            },
             log,
           }),
       });

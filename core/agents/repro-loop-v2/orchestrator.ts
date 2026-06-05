@@ -227,7 +227,10 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       (args.semanticSuspectSeed.suspectSymbols?.length ?? 0) > 0);
   const suspectSymbols = snapshot.body.suspectSymbols ?? [];
   const hasReproSpec = !!(snapshot.body.candidateRepro || (snapshot.body as any).reproFiles);
-  if (analystRanThisAttempt && hasSemanticSeedScope && suspectSymbols.length > 0 && !hasReproSpec) {
+  // The assembler (Stage A, below) provides the candidateRepro when gitClient is present —
+  // only block if BOTH the analyst AND the assembler have nothing to offer.
+  const assemblerCanRun = !!(args.gitClient && args.testInfraProfile && suspectSymbols.length > 0);
+  if (analystRanThisAttempt && hasSemanticSeedScope && suspectSymbols.length > 0 && !hasReproSpec && !assemblerCanRun) {
     return {
       status: 'not_runnable',
       dossier,
