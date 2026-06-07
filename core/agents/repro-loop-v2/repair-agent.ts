@@ -81,7 +81,9 @@ const PHASE_CONTEXT: Record<RepairErrorPhase, string> = {
 export async function repairHarness(ctx: RepairContext): Promise<RepairOutput | null> {
   let model;
   try {
-    model = getModel('REPRO_REPAIR');
+    // Allow per-deployment model override via REPRO_REPAIR_MODEL env var.
+    const modelOverride = process.env.REPRO_REPAIR_MODEL;
+    model = getModel('REPRO_REPAIR', modelOverride);
   } catch (err) {
     if (err instanceof MissingLlmApiKeyError) return null;
     throw err;
@@ -135,21 +137,30 @@ ${availableSection}${historySection}
 5. Keep changes minimal. Only return files you actually changed.
 6. Set abandon=true only if reproducing the bug requires external services, live network calls, or real credentials that cannot be mocked.`;
 
-  const result = await withAgentSpan(
-    'REPRO_REPAIR',
-    {
-      attempt_id: ctx.attemptId,
-      'repro.repair.round': ctx.roundNumber,
-      'repro.repair.phase': ctx.errorPhase,
-    },
-    async () =>
-      generateObject({
-        model,
-        schema: RepairOutputSchema,
-        prompt,
-        experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
-      })
-  );
+  let result;
+  try {
+    result = await withAgentSpan(
+      'REPRO_REPAIR',
+      {
+        attempt_id: ctx.attemptId,
+        'repro.repair.round': ctx.roundNumber,
+        'repro.repair.phase': ctx.errorPhase,
+      },
+      async () =>
+        generateObject({
+          model,
+          schema: RepairOutputSchema,
+          prompt,
+          experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
+        })
+    );
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[v2-repair] attempt=${ctx.attemptId} round=${ctx.roundNumber} phase=${ctx.errorPhase} LLM_ERROR=${err instanceof Error ? err.message : String(err)}`
+    );
+    return null;
+  }
 
   // eslint-disable-next-line no-console
   console.log(

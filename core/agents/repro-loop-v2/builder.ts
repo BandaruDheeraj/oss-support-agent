@@ -204,19 +204,29 @@ async function runReproFilesPath(
   const repair = async (phase: RepairErrorPhase, errorOutput: string): Promise<boolean> => {
     if (repairRounds >= MAX_REPAIR_ROUNDS - 1) return false;
 
-    const result = await repairHarness({
-      attemptId: args.attemptId,
-      errorPhase: phase,
-      errorOutput,
-      currentTestFiles: currentFiles.map((f) => ({ path: f.path, content: f.content })),
-      currentInstallSpec,
-      availableEditableInstalls: args.editableInstallCandidates ?? [],
-      issueTitle,
-      issueBody,
-      roundNumber: repairRounds,
-      maxRounds: MAX_REPAIR_ROUNDS,
-      repairHistory,
-    });
+    let result;
+    try {
+      result = await repairHarness({
+        attemptId: args.attemptId,
+        errorPhase: phase,
+        errorOutput,
+        currentTestFiles: currentFiles.map((f) => ({ path: f.path, content: f.content })),
+        currentInstallSpec,
+        availableEditableInstalls: args.editableInstallCandidates ?? [],
+        issueTitle,
+        issueBody,
+        roundNumber: repairRounds,
+        maxRounds: MAX_REPAIR_ROUNDS,
+        repairHistory,
+      });
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[v2-builder] repair LLM_ERROR round=${repairRounds} phase=${phase} err=${err instanceof Error ? err.message : String(err)}`
+      );
+      repairRounds++;
+      return false;
+    }
 
     repairRounds++;
 

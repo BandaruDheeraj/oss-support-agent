@@ -105,10 +105,10 @@ function getAnthropicProvider(): AnthropicProvider {
   return anthropicProvider;
 }
 
-// Use a model known to work with @ai-sdk/anthropic@0.0.56.
-// claude-sonnet-4-5 (Claude 4 series) is NOT in this SDK version's API surface
-// and causes a silent failure that falls through to OpenRouter.
-const DEFAULT_ANTHROPIC_MODEL = 'claude-3-5-sonnet-20241022';
+// Use a model that works with @ai-sdk/anthropic@0.0.56 and is available on all API keys.
+// claude-3-haiku-20240307 is the safest default — widely available since March 2024.
+// Override per-agent via REPRO_REPAIR_MODEL (in repair-agent.ts) or change this default.
+const DEFAULT_ANTHROPIC_MODEL = 'claude-3-haiku-20240307';
 
 export type PhaseEAgent =
   | OpenRouterAgent
