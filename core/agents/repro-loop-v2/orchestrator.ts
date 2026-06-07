@@ -359,6 +359,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       repo: args.repo,
       workspace: args.workspace,
       sandbox: args.sandbox,
+      editableInstallCandidates: effectiveEditableInstalls,
       env: runtimeEnv,
     });
   } catch (err) {
@@ -390,6 +391,9 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       editableInstallFallbacks: effectiveEditableInstalls,
       env: runtimeEnv,
       semanticConfidence: snapshot.body.semanticConfidence,
+      // When the Builder already confirmed ≥2 failing runs, pass them so the
+      // Oracle can evaluate criteria against that output without re-executing.
+      confirmedRuns: candidate.builder?.ok ? candidate.builder.runs : undefined,
     });
     candidate.executor = oracle.executor;
     candidate.oracle = oracle;
@@ -684,7 +688,23 @@ function buildNoReproMessage(candidates: ReproCandidateEvaluation[]): string {
   if (builderUnavailable) {
     return `Builder had no candidate repro to evaluate.`;
   }
-  return `Deterministic repro oracle rejected all ${candidates.length} candidates.`;
+  // Include the specific oracle rejection reason so the issue comment is self-diagnosing.
+  const reasons = candidates
+    .filter((c) => c.status === 'invalid' || c.status === 'generation_failed')
+    .map((c) => {
+      if (c.oracle) {
+        const crit = c.oracle.criteria;
+        const failing = Object.entries(crit)
+          .filter(([, v]) => !v)
+          .map(([k]) => k)
+          .join(', ');
+        return `${c.candidateId}: oracle_invalid(${failing || 'unknown'}) — ${c.oracle.message?.slice(0, 200) ?? ''}`;
+      }
+      return `${c.candidateId}: ${c.builderRejectStage ?? 'unknown'} — ${c.message?.slice(0, 120) ?? ''}`;
+    })
+    .join(' | ');
+  return `Deterministic repro oracle rejected all ${candidates.length} candidates. ${reasons}`;
+
 }
 
 function buildSandboxFailedMessage(candidates: ReproCandidateEvaluation[]): string {

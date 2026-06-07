@@ -1,14 +1,15 @@
 /**
- * Deterministic Repro Builder.
+ * Deterministic Repro Builder — with LLM self-repair loop.
  *
  * Consumes the Analyst's reproFiles block:
- *   1. validates credentials and pip installs.
- *   2. writes all reproFiles to workspace.
- *   3. flushes workspace to branch.
- *   4. runs GHA pytest via sandbox.runRepro() twice; tiebreak on disagreement.
- *   5. emits a fully-formed ReproRecipe on success.
+ *   1. Writes all reproFiles to workspace and flushes to branch.
+ *   2. pip-installs packages from installSpec.
+ *   3. Runs GHA pytest via sandbox.runRepro() twice; tiebreak on disagreement.
+ *   4. Emits a fully-formed ReproRecipe on success.
  *
- * NO LLM tool loops.
+ * On ANY failure (pip install, sandbox error, wrong test output, unexpected pass),
+ * calls the LLM repair agent to fix the test files and/or installSpec and retries.
+ * The loop runs up to MAX_REPAIR_ROUNDS times before giving up.
  */
 
 import type {
@@ -30,9 +31,12 @@ import type {
   WorkspaceReader,
   WorkspaceWriter,
 } from '../tools/handles';
+import { repairHarness, type RepairErrorPhase } from './repair-agent';
 
 const STDOUT_TAIL = REPRO_RECIPE_OBSERVED_TAIL_MAX;
 const STDERR_TAIL = REPRO_RECIPE_OBSERVED_TAIL_MAX;
+
+const MAX_REPAIR_ROUNDS = 5;
 
 /** Granular reject stages — every reject path gets its own histogram bucket. */
 export type BuilderRejectStage =
@@ -43,7 +47,8 @@ export type BuilderRejectStage =
   | 'sandbox_error'
   | 'run_repro_pass'
   | 'run_repro_flaky'
-  | 'expected_output_absent';
+  | 'expected_output_absent'
+  | 'repair_exhausted';
 
 export interface BuilderRunObservation {
   exitCode: number;
@@ -60,6 +65,8 @@ export interface ReproBuilderArgs {
   repo: RepoHandle;
   workspace: WorkspaceReader & WorkspaceWriter;
   sandbox: SandboxHandle;
+  /** Repo-relative editable install paths surfaced by the orchestrator (for the repair agent). */
+  editableInstallCandidates?: string[];
   /** Optional. Defaults to process.env. */
   env?: NodeJS.ProcessEnv;
 }
@@ -79,18 +86,15 @@ export interface ReproBuilderResult {
   missingCredentials?: string[];
   /** When set, pip install spec that failed. */
   pipInstallFailure?: { spec: string; exitCode: number; stderrTail: string };
+  /** Number of LLM repair rounds used. */
+  repairRounds?: number;
 }
 
-/** Build a single recipe from a candidate. No retries. */
+/** Build a single recipe from a candidate. No retries at this level — the repair loop is inside. */
 export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuilderResult> {
-  // Support both candidateRepro (legacy) and reproFiles (new integration-test schema).
-  // If reproFiles is present in the dossier, synthesize a minimal candidateRepro from it
-  // so the rest of the Builder pipeline can proceed unchanged.
   const rawReproFiles = (args.dossierSnapshot.body as any).reproFiles;
   let candidate = args.dossierSnapshot.body.candidateRepro;
   if (!candidate && rawReproFiles) {
-    // Promote reproFiles block to a candidateRepro with an inline reproFilesCandidate
-    // so the committed path (runReproFilesPath) is used directly.
     const promotedReproFilesCandidate: import('../analyst/candidate-repro').ReproFilesCandidate = {
       reproFiles: rawReproFiles.reproFiles ?? [],
       testEntryPoint: rawReproFiles.testEntryPoint ?? 'tests/repro/test_repro.py',
@@ -118,7 +122,6 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     return rej('no_candidate', 'Dossier carries no candidateRepro or reproFiles; Builder bypassed.');
   }
 
-  // (Pre-pip) — short-circuit on missing required credentials.
   const env = args.env ?? process.env;
   const missing = (candidate.requiresCredentials ?? []).filter(
     (n) => !env[n] || env[n]?.length === 0
@@ -132,10 +135,6 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
       missingCredentials: missing,
     };
   }
-
-  // ---------------------------------------------------------------
-  // (1) Validate preconditions against dossier
-  // ---------------------------------------------------------------
 
   const knownPreconditionIds = new Set<string>();
   const preconditionConditionToId = new Map<string, string>();
@@ -159,20 +158,15 @@ export async function runReproBuilder(args: ReproBuilderArgs): Promise<ReproBuil
     }
   }
 
-  // ---------------------------------------------------------------
-  // (2) Route to reproFilesCandidate path (the only supported path)
-  // ---------------------------------------------------------------
-
   if (candidate.reproFilesCandidate) {
     return runReproFilesPath(args, candidate.reproFilesCandidate, candidate, resolvedPreconditionsSatisfied);
   }
 
-  // No reproFilesCandidate — Builder cannot proceed.
   return rej('no_candidate', 'Dossier candidateRepro has no reproFilesCandidate block; Builder requires the reproFiles path.');
 }
 
 // ---------------------------------------------------------------------------
-// reproFiles path — multi-file repro execution
+// reproFiles path — multi-file repro execution with LLM self-repair loop
 // ---------------------------------------------------------------------------
 
 async function runReproFilesPath(
@@ -181,260 +175,406 @@ async function runReproFilesPath(
   candidate: CandidateRepro,
   resolvedPreconditionsSatisfied: string[]
 ): Promise<ReproBuilderResult> {
-  // (a) Write all files; track paths for cleanup on rejection.
-  const writtenPaths: string[] = [];
-  for (const file of reproFilesCandidate.reproFiles) {
-    try {
-      let content = file.content;
-      if (file.append) {
-        const existing = await args.workspace.readFile(file.path);
-        content = (existing ?? '') + file.content;
-      }
-      await args.workspace.writeTest(file.path, content);
-      writtenPaths.push(file.path);
-    } catch (err) {
-      // Revert already-written files before returning.
-      for (const p of writtenPaths) {
-        await safeRevert(args.workspace, p);
-      }
-      return rej(
-        'write_test_failed',
-        `workspace.writeTest threw for ${file.path}: ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-  }
-
-  // (b) Test entry point from reproFilesCandidate.
   const testEntryPoint = reproFilesCandidate.testEntryPoint;
+  const expectedOut = reproFilesCandidate.expectedFailureOutput;
 
-  // (c) Install packages from installSpec (skip candidate.pipInstalls).
-  const { installSpec } = reproFilesCandidate;
-  for (const editablePath of installSpec.editableInstall) {
-    const spec = `-e ${editablePath}`;
-    const run = await safeSandbox(args.sandbox.pipInstall(spec));
-    if (!run.ok) {
-      for (const p of writtenPaths) await safeRevert(args.workspace, p);
-      return rej('sandbox_error', `pip install (editable) threw for ${editablePath}: ${run.error}`);
+  // Mutable harness state — LLM repair updates these each round.
+  let currentFiles = reproFilesCandidate.reproFiles.map((f) => ({ path: f.path, content: f.content, append: f.append }));
+  let currentInstallSpec = {
+    editableInstall: [...(reproFilesCandidate.installSpec.editableInstall ?? [])],
+    additionalPackages: [...(reproFilesCandidate.installSpec.additionalPackages ?? [])],
+  };
+  const repairHistory: string[] = [];
+  let repairRounds = 0;
+
+  // Issue context for the repair agent (best-effort).
+  const issueTitle = (args.dossierSnapshot.body as any).issueTitle as string | undefined;
+  const issueBody = (args.dossierSnapshot.body as any).issueBody as string | undefined;
+
+  const writtenPaths: string[] = [];
+
+  // Helper: revert all written files.
+  const revertAll = async () => {
+    for (const p of writtenPaths) await safeRevert(args.workspace, p);
+    writtenPaths.length = 0;
+  };
+
+  // Helper: call LLM repair agent and apply result to mutable state.
+  // Returns true if repair was applied, false if we should give up.
+  const repair = async (phase: RepairErrorPhase, errorOutput: string): Promise<boolean> => {
+    if (repairRounds >= MAX_REPAIR_ROUNDS - 1) return false;
+
+    const result = await repairHarness({
+      attemptId: args.attemptId,
+      errorPhase: phase,
+      errorOutput,
+      currentTestFiles: currentFiles.map((f) => ({ path: f.path, content: f.content })),
+      currentInstallSpec,
+      availableEditableInstalls: args.editableInstallCandidates ?? [],
+      issueTitle,
+      issueBody,
+      roundNumber: repairRounds,
+      maxRounds: MAX_REPAIR_ROUNDS,
+      repairHistory,
+    });
+
+    repairRounds++;
+
+    if (!result || result.abandon) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[v2-builder] repair round=${repairRounds} abandon=${!result ? 'no_llm' : result.abandonReason ?? 'true'}`
+      );
+      return false;
     }
-    if (run.value.exitCode !== 0) {
-      for (const p of writtenPaths) await safeRevert(args.workspace, p);
-      return {
-        ok: false,
-        rejectStage: 'pip_install_failed',
-        reason: `pip install -e ${editablePath} failed (exit ${run.value.exitCode})`,
-        runs: [],
-        pipInstallFailure: {
+
+    repairHistory.push(result.explanation);
+
+    // Apply test file updates.
+    if (result.testFileUpdates.length > 0) {
+      const updatesByPath = new Map(result.testFileUpdates.map((u) => [u.path, u.content]));
+      currentFiles = currentFiles.map((f) =>
+        updatesByPath.has(f.path) ? { ...f, content: updatesByPath.get(f.path)! } : f
+      );
+      // Add any new files the agent introduced.
+      for (const update of result.testFileUpdates) {
+        if (!currentFiles.some((f) => f.path === update.path)) {
+          currentFiles.push({ path: update.path, content: update.content, append: undefined });
+        }
+      }
+    }
+
+    // Apply installSpec updates.
+    currentInstallSpec = {
+      editableInstall: result.installSpec.editableInstall,
+      additionalPackages: result.installSpec.additionalPackages,
+    };
+
+    return true;
+  };
+
+  // ── Self-repair loop ────────────────────────────────────────────────────────
+  for (let round = 0; round < MAX_REPAIR_ROUNDS; round++) {
+    // (a) Revert any files written in the previous round, then write fresh.
+    await revertAll();
+
+    let writeError: string | null = null;
+    for (const file of currentFiles) {
+      try {
+        let content = file.content;
+        if (file.append) {
+          const existing = await args.workspace.readFile(file.path);
+          content = (existing ?? '') + file.content;
+        }
+        await args.workspace.writeTest(file.path, content);
+        writtenPaths.push(file.path);
+      } catch (err) {
+        writeError = `workspace.writeTest threw for ${file.path}: ${err instanceof Error ? err.message : String(err)}`;
+        break;
+      }
+    }
+
+    if (writeError) {
+      const fixed = await repair('write_failed', writeError);
+      if (!fixed) {
+        await revertAll();
+        return rej('write_test_failed', writeError);
+      }
+      continue;
+    }
+
+    // (b) Flush workspace to branch so GHA can see updated test files.
+    try {
+      await args.sandbox.flushWorkspaceToBranch?.();
+    } catch {
+      // Non-fatal — best effort flush; the dispatch will pick up the branch anyway.
+    }
+
+    // (c) pip installs from current installSpec.
+    let installErrorMsg: string | null = null;
+    let installFailureDetail: ReproBuilderResult['pipInstallFailure'] | undefined;
+
+    for (const editablePath of currentInstallSpec.editableInstall) {
+      const spec = `-e ${editablePath}`;
+      const run = await safeSandbox(args.sandbox.pipInstall(spec));
+      if (!run.ok) {
+        installErrorMsg = `pip install (editable) threw for ${editablePath}: ${run.error}`;
+        break;
+      }
+      if (run.value.exitCode !== 0) {
+        installFailureDetail = {
           spec,
           exitCode: run.value.exitCode,
           stderrTail: tail(run.value.stderr, STDERR_TAIL),
-        },
-      };
-    }
-  }
-  for (const pkg of installSpec.additionalPackages) {
-    const run = await safeSandbox(args.sandbox.pipInstall(pkg));
-    if (!run.ok) {
-      for (const p of writtenPaths) await safeRevert(args.workspace, p);
-      return rej('sandbox_error', `pip install threw for ${pkg}: ${run.error}`);
-    }
-    if (run.value.exitCode !== 0) {
-      for (const p of writtenPaths) await safeRevert(args.workspace, p);
-      return {
-        ok: false,
-        rejectStage: 'pip_install_failed',
-        reason: `pip install ${pkg} failed (exit ${run.value.exitCode})`,
-        runs: [],
-        pipInstallFailure: {
-          spec: pkg,
-          exitCode: run.value.exitCode,
-          stderrTail: tail(run.value.stderr, STDERR_TAIL),
-        },
-      };
-    }
-  }
-
-  // (d) Run the test — with a self-repair loop for common errors.
-  // After the first failing run, if the output signals an ImportError or
-  // wrong class interface, we apply a targeted fix and retry rather than
-  // immediately rejecting. This avoids manual heuristic patching in the
-  // harness code for edge-cases the assembler couldn't anticipate.
-  args.sandbox.setReproTestPath(testEntryPoint);
-
-  const PRIMARY_TEST_FILE = reproFilesCandidate.reproFiles[0];
-  let currentTestContent = PRIMARY_TEST_FILE?.content ?? '';
-  const MAX_REPAIR_ATTEMPTS = 3;
-  let repairCount = 0;
-
-  const runs: BuilderRunObservation[] = [];
-  for (let i = 0; i < 2; i++) {
-    // Repair loop: on first run only, attempt targeted fixes for sandbox errors.
-    if (i === 0) {
-      for (let rep = 0; rep <= MAX_REPAIR_ATTEMPTS; rep++) {
-        const r = await safeSandbox(args.sandbox.runRepro());
-        if (!r.ok) {
-          for (const p of writtenPaths) await safeRevert(args.workspace, p);
-          return {
-            ok: false,
-            rejectStage: 'sandbox_error',
-            reason: `runRepro #1 threw: ${r.error}`,
-            runs,
-            candidateTestPath: testEntryPoint,
-          };
-        }
-        const combined = `${r.value.stdout}\n${r.value.stderr}`;
-        // If the test fails for a fixable reason and we haven't exhausted repair
-        // attempts, try to fix the test and re-run.
-        if (r.value.exitCode !== 0 && rep < MAX_REPAIR_ATTEMPTS && PRIMARY_TEST_FILE) {
-          const fixed = repairTestContent(currentTestContent, combined);
-          if (fixed !== null && fixed !== currentTestContent) {
-            // Rewrite the test file in the workspace and re-run.
-            try {
-              await args.workspace.writeTest(PRIMARY_TEST_FILE.path, fixed);
-              currentTestContent = fixed;
-              repairCount++;
-              continue; // retry with fixed test
-            } catch {
-              // writeTest failed — give up on repair, fall through with original
-            }
-          }
-        }
-        // No repair possible or test passed/failed correctly — record and move on.
-        runs.push(observe(r.value, '', ''));
+        };
+        installErrorMsg = `pip install -e ${editablePath} failed (exit ${run.value.exitCode})\n${run.value.stderr}`;
         break;
       }
-    } else {
-      const r = await safeSandbox(args.sandbox.runRepro());
-      if (!r.ok) {
-        for (const p of writtenPaths) await safeRevert(args.workspace, p);
+    }
+
+    if (!installErrorMsg) {
+      for (const pkg of currentInstallSpec.additionalPackages) {
+        const run = await safeSandbox(args.sandbox.pipInstall(pkg));
+        if (!run.ok) {
+          installErrorMsg = `pip install threw for ${pkg}: ${run.error}`;
+          break;
+        }
+        if (run.value.exitCode !== 0) {
+          installFailureDetail = {
+            spec: pkg,
+            exitCode: run.value.exitCode,
+            stderrTail: tail(run.value.stderr, STDERR_TAIL),
+          };
+          installErrorMsg = `pip install ${pkg} failed (exit ${run.value.exitCode})\n${run.value.stderr}`;
+          break;
+        }
+      }
+    }
+
+    if (installErrorMsg) {
+      const phase: RepairErrorPhase = installFailureDetail ? 'pip_install' : 'sandbox_error';
+      const fixed = await repair(phase, installErrorMsg);
+      if (!fixed) {
+        await revertAll();
+        if (installFailureDetail) {
+          return {
+            ok: false,
+            rejectStage: 'pip_install_failed',
+            reason: installErrorMsg,
+            runs: [],
+            pipInstallFailure: installFailureDetail,
+            repairRounds,
+          };
+        }
         return {
           ok: false,
           rejectStage: 'sandbox_error',
-          reason: `runRepro #${i + 1} threw: ${r.error}`,
-          runs,
+          reason: installErrorMsg,
+          runs: [],
           candidateTestPath: testEntryPoint,
+          repairRounds,
         };
       }
-      runs.push(observe(r.value, '', ''));
+      continue;
     }
-  }
 
-  // Tiebreak on disagreement.
-  const agree = (a: BuilderRunObservation, b: BuilderRunObservation) =>
-    (a.exitCode === 0) === (b.exitCode === 0);
+    // (d) Run the test.
+    args.sandbox.setReproTestPath(testEntryPoint);
+    const run1 = await safeSandbox(args.sandbox.runRepro());
 
-  if (!agree(runs[0], runs[1])) {
-    const tie = await safeSandbox(args.sandbox.runRepro());
-    if (!tie.ok) {
-      for (const p of writtenPaths) await safeRevert(args.workspace, p);
+    if (!run1.ok) {
+      const fixed = await repair('test_run_threw', `runRepro threw: ${run1.error}`);
+      if (!fixed) {
+        await revertAll();
+        return {
+          ok: false,
+          rejectStage: 'sandbox_error',
+          reason: `runRepro threw: ${run1.error}`,
+          runs: [],
+          candidateTestPath: testEntryPoint,
+          repairRounds,
+        };
+      }
+      continue;
+    }
+
+    if (run1.value.exitCode === 0) {
+      // Test passed — bug not triggered.
+      const combined = `${run1.value.stdout}\n${run1.value.stderr}`;
+      const fixed = await repair('test_pass_unexpected', `Test passed (exit 0) — the bug was not triggered.\nOutput:\n${combined.slice(0, 2000)}`);
+      if (!fixed) {
+        await revertAll();
+        return {
+          ok: false,
+          rejectStage: 'run_repro_pass',
+          reason: 'Candidate reproFiles test passed on every run; bug not triggered.',
+          runs: [observe(run1.value, '', '')],
+          candidateTestPath: testEntryPoint,
+          repairRounds,
+        };
+      }
+      continue;
+    }
+
+    // Test failed (exitCode !== 0) — this is what we want for a repro.
+    // Check expectedFailureOutput before doing the second run.
+    const combined1 = `${run1.value.stdout}\n${run1.value.stderr}`;
+    if (expectedOut && !combined1.includes(expectedOut)) {
+      const fixed = await repair(
+        'expected_output_absent',
+        `Test failed but expected output "${expectedOut}" not found.\nActual output:\n${combined1.slice(0, 2000)}`
+      );
+      if (!fixed) {
+        await revertAll();
+        return {
+          ok: false,
+          rejectStage: 'expected_output_absent',
+          reason: `expectedFailureOutput "${expectedOut.slice(0, 120)}" not found in run output.`,
+          runs: [observe(run1.value, '', '')],
+          candidateTestPath: testEntryPoint,
+          repairRounds,
+        };
+      }
+      continue;
+    }
+
+    // Run 1 is good. Do run 2 for confirmation.
+    const run2 = await safeSandbox(args.sandbox.runRepro());
+    if (!run2.ok) {
+      const fixed = await repair('test_run_threw', `runRepro #2 threw: ${run2.error}`);
+      if (!fixed) {
+        await revertAll();
+        return {
+          ok: false,
+          rejectStage: 'sandbox_error',
+          reason: `runRepro #2 threw: ${run2.error}`,
+          runs: [observe(run1.value, '', '')],
+          candidateTestPath: testEntryPoint,
+          repairRounds,
+        };
+      }
+      continue;
+    }
+
+    const runs: BuilderRunObservation[] = [observe(run1.value, '', ''), observe(run2.value, '', '')];
+
+    // Tiebreak if runs disagree.
+    const agree = (a: BuilderRunObservation, b: BuilderRunObservation) =>
+      (a.exitCode === 0) === (b.exitCode === 0);
+
+    if (!agree(runs[0], runs[1])) {
+      const tie = await safeSandbox(args.sandbox.runRepro());
+      if (!tie.ok) {
+        await revertAll();
+        return {
+          ok: false,
+          rejectStage: 'sandbox_error',
+          reason: `runRepro tiebreak threw: ${tie.error}`,
+          runs,
+          candidateTestPath: testEntryPoint,
+          repairRounds,
+        };
+      }
+      runs.push(observe(tie.value, '', ''));
+    }
+
+    const allPassed = runs.every((r) => r.exitCode === 0);
+    if (allPassed) {
+      const combined = runs.map((r) => `${r.stdoutTail}\n${r.stderrTail}`).join('\n---\n');
+      const fixed = await repair('test_pass_unexpected', `All runs passed — bug not triggered.\nOutput:\n${combined.slice(0, 2000)}`);
+      if (!fixed) {
+        await revertAll();
+        return {
+          ok: false,
+          rejectStage: 'run_repro_pass',
+          reason: 'Candidate reproFiles test passed on every run; bug not triggered.',
+          runs,
+          candidateTestPath: testEntryPoint,
+          repairRounds,
+        };
+      }
+      continue;
+    }
+
+    const failingCount = runs.filter((r) => r.exitCode !== 0).length;
+    if (failingCount < 2) {
+      await revertAll();
       return {
         ok: false,
-        rejectStage: 'sandbox_error',
-        reason: `runRepro tiebreak threw: ${tie.error}`,
+        rejectStage: 'run_repro_flaky',
+        reason: `Runs disagreed (reproFiles path): ${runs.map((r) => `${r.exitCode}`).join('|')}`,
         runs,
         candidateTestPath: testEntryPoint,
+        repairRounds,
       };
     }
-    runs.push(observe(tie.value, '', ''));
-  }
 
-  // (e) Verdict: need 2 failing runs.
-  const failingAny = runs.filter((r) => r.exitCode !== 0).length;
-  const allPassed = runs.every((r) => r.exitCode === 0);
-
-  if (allPassed) {
-    for (const p of writtenPaths) await safeRevert(args.workspace, p);
-    return {
-      ok: false,
-      rejectStage: 'run_repro_pass',
-      reason: 'Candidate reproFiles test passed on every run; bug not triggered.',
-      runs,
-      candidateTestPath: testEntryPoint,
-    };
-  }
-
-  if (failingAny < 2) {
-    for (const p of writtenPaths) await safeRevert(args.workspace, p);
-    return {
-      ok: false,
-      rejectStage: 'run_repro_flaky',
-      reason: `Runs disagreed (reproFiles path): ${runs.map((r) => `${r.exitCode}`).join('|')}`,
-      runs,
-      candidateTestPath: testEntryPoint,
-    };
-  }
-
-  // Validate expectedFailureOutput if set.
-  const expectedOut = reproFilesCandidate.expectedFailureOutput;
-  if (expectedOut) {
-    const anyRunContainsOutput = runs.some((r) => {
-      const combined = `${r.stderrTail}\n${r.stdoutTail}`;
-      return combined.includes(expectedOut);
-    });
-    if (!anyRunContainsOutput) {
-      for (const p of writtenPaths) await safeRevert(args.workspace, p);
-      return {
-        ok: false,
-        rejectStage: 'expected_output_absent',
-        reason: `expectedFailureOutput "${expectedOut.slice(0, 120)}" not found in any failing run's output.`,
-        runs,
-        candidateTestPath: testEntryPoint,
-      };
+    // Validate expectedFailureOutput across all runs.
+    if (expectedOut) {
+      const anyRunContainsOutput = runs.some((r) => {
+        const combined = `${r.stderrTail}\n${r.stdoutTail}`;
+        return combined.includes(expectedOut);
+      });
+      if (!anyRunContainsOutput) {
+        const combined = runs.map((r) => `${r.stderrTail}\n${r.stdoutTail}`).join('\n---\n');
+        const fixed = await repair(
+          'expected_output_absent',
+          `expectedFailureOutput "${expectedOut}" not found in any run.\nActual output:\n${combined.slice(0, 2000)}`
+        );
+        if (!fixed) {
+          await revertAll();
+          return {
+            ok: false,
+            rejectStage: 'expected_output_absent',
+            reason: `expectedFailureOutput "${expectedOut.slice(0, 120)}" not found in any failing run's output.`,
+            runs,
+            candidateTestPath: testEntryPoint,
+            repairRounds,
+          };
+        }
+        continue;
+      }
     }
-  }
 
-  // (g) Build recipe using reproFilesCandidate data.
-  const lastFailing = runs.filter((r) => r.exitCode !== 0).slice(-1)[0] ?? runs[runs.length - 1];
+    // ── SUCCESS ───────────────────────────────────────────────────────────────
+    const lastFailing = runs.filter((r) => r.exitCode !== 0).slice(-1)[0] ?? runs[runs.length - 1];
+    const primaryFile = currentFiles[0];
+    const recipeTestSource = (primaryFile?.content ?? '').slice(0, REPRO_RECIPE_TEST_SOURCE_MAX);
 
-  // Use the first repro file's content as testSource in the recipe
-  // (the recipe schema requires a testSource string; we record the entry-point file content).
-  const entryFile = reproFilesCandidate.reproFiles.find(
-    (f) => testEntryPoint.startsWith(f.path)
-  ) ?? reproFilesCandidate.reproFiles[0];
-  const recipeTestSource = entryFile
-    ? entryFile.content.slice(0, REPRO_RECIPE_TEST_SOURCE_MAX)
-    : testEntryPoint;
-
-  const recipe: ReproRecipe = {
-    version: 1,
-    candidateTestPath: testEntryPoint,
-    testSource: recipeTestSource,
-    sentinelString: expectedOut || testEntryPoint,
-    pipInstalls: [
-      ...installSpec.editableInstall.map((p) => ({ package: p, editable: true })),
-      ...installSpec.additionalPackages.map((p) => ({ package: p, editable: false })),
-    ],
-    requiresCredentials: candidate.requiresCredentials,
-    verbatimSnippetIncompatible: false,
-    approach: `reproFiles:${candidate.source}`,
-    provenance: {
-      exerciseImports: [],
-      preconditionsSatisfied: resolvedPreconditionsSatisfied,
-      observedProbe: {
-        sentinelObserved: false,
-        signatureObserved: false,
-        exitCode: lastFailing.exitCode,
-        durationMs: lastFailing.durationMs,
-        stderrTail: lastFailing.stderrTail,
-        stdoutTail: lastFailing.stdoutTail,
+    const recipe: ReproRecipe = {
+      version: 1,
+      candidateTestPath: testEntryPoint,
+      testSource: recipeTestSource,
+      sentinelString: expectedOut || testEntryPoint,
+      pipInstalls: [
+        ...currentInstallSpec.editableInstall.map((p) => ({ package: p, editable: true })),
+        ...currentInstallSpec.additionalPackages.map((p) => ({ package: p, editable: false })),
+      ],
+      requiresCredentials: candidate.requiresCredentials,
+      verbatimSnippetIncompatible: false,
+      approach: `reproFiles:${candidate.source}`,
+      provenance: {
+        exerciseImports: [],
+        preconditionsSatisfied: resolvedPreconditionsSatisfied,
+        observedProbe: {
+          sentinelObserved: false,
+          signatureObserved: false,
+          exitCode: lastFailing.exitCode,
+          durationMs: lastFailing.durationMs,
+          stderrTail: lastFailing.stderrTail,
+          stdoutTail: lastFailing.stdoutTail,
+        },
+        proberAttempts: 0,
+        recordedAt: new Date().toISOString(),
       },
-      proberAttempts: 0,
-      recordedAt: new Date().toISOString(),
-    },
-  };
+    };
 
-  // eslint-disable-next-line no-console
-  console.log(
-    `[v2-builder] attempt=${args.attemptId} ok=true path=reproFiles ranRepro=${runs.length}` +
-      ` failingAny=${failingAny} source=${candidate.source}` +
-      ` reproFiles=${reproFilesCandidate.reproFiles.length}`
-  );
+    // eslint-disable-next-line no-console
+    console.log(
+      `[v2-builder] attempt=${args.attemptId} ok=true path=reproFiles ranRepro=${runs.length}` +
+        ` failingCount=${failingCount} source=${candidate.source}` +
+        ` reproFiles=${currentFiles.length} repairRounds=${repairRounds}`
+    );
 
+    return {
+      ok: true,
+      recipe,
+      reason: 'Builder (reproFiles path) produced a recipe; runs reproduced reliably.',
+      runs,
+      candidateTestPath: testEntryPoint,
+      repairRounds,
+    };
+  }
+
+  // Loop exhausted without success.
+  await revertAll();
   return {
-    ok: true,
-    recipe,
-    reason: 'Builder (reproFiles path) produced a recipe; runs reproduced reliably.',
-    runs,
+    ok: false,
+    rejectStage: 'repair_exhausted',
+    reason: `Self-repair loop exhausted ${MAX_REPAIR_ROUNDS} rounds without producing a valid repro.`,
+    runs: [],
     candidateTestPath: testEntryPoint,
+    repairRounds,
   };
 }
 
@@ -475,104 +615,6 @@ async function safeRevert(ws: WorkspaceWriter, path: string): Promise<void> {
   try {
     await ws.revertFile(path);
   } catch {
-    // best effort — failure to revert is logged but never fails the Builder
-    // result (the Prober fallback will overwrite anyway).
+    // best effort
   }
-}
-
-// ---------------------------------------------------------------------------
-// Self-repair: targeted fixes for common test errors
-// ---------------------------------------------------------------------------
-
-/**
- * Inspect the pytest output from a failing run and return a fixed version of
- * the test source, or null if no deterministic fix applies.
- *
- * Handles:
- *   - ImportError / ModuleNotFoundError: try progressively shorter module paths
- *   - TypeError on __init__: strip base class inheritance (use plain `object`)
- *   - AttributeError on missing method: strip abstract base class
- *   - No-op when the test already fails for the right reason (assertion error)
- */
-function repairTestContent(
-  source: string,
-  output: string
-): string | null {
-  // ── Fix 1: ImportError / ModuleNotFoundError ─────────────────────────────
-  // Pattern: "ModuleNotFoundError: No module named 'a.b.c.d'"
-  //          "ImportError: cannot import name 'X' from 'a.b.c'"
-  const moduleNotFoundMatch = output.match(
-    /(?:ModuleNotFoundError|ImportError)[^\n]*?'([A-Za-z0-9_.]+)'/
-  );
-  if (moduleNotFoundMatch) {
-    const badModule = moduleNotFoundMatch[1]!;
-    // Try progressively stripping leading segments from the bad module path.
-    // e.g. "instrumentation.openinference_foo.src.openinference.instrumentation.bar._wrappers"
-    //   -> try "openinference.instrumentation.bar._wrappers"
-    //   -> try "instrumentation.bar._wrappers"
-    //   -> try "bar._wrappers"
-    const parts = badModule.split('.');
-    for (let skip = 1; skip < parts.length - 1; skip++) {
-      const candidate = parts.slice(skip).join('.');
-      // Only try reasonable module paths — must start with a lowercase letter
-      // or underscore (Python identifier) and not contain hyphens.
-      if (/^[a-z_]/.test(candidate) && !candidate.includes('-')) {
-        const fixed = source.replace(badModule, candidate);
-        if (fixed !== source) return fixed;
-      }
-    }
-    // If the failing module contains a hyphen (package dir used as module),
-    // it can't be imported — strip to just the Python-importable suffix.
-    if (badModule.includes('-') || badModule.includes('__')) {
-      // Find the first segment that looks like a real Python package name.
-      const importableParts = parts.filter((p) => /^[a-z_][a-z0-9_]*$/i.test(p));
-      if (importableParts.length >= 2) {
-        // Guess the import as the LAST N importable segments that spell out
-        // a plausible namespace (e.g. openinference.instrumentation.foo._wrappers).
-        for (let n = importableParts.length; n >= 2; n--) {
-          const candidate = importableParts.slice(importableParts.length - n).join('.');
-          const fixed = source.replace(badModule, candidate);
-          if (fixed !== source) return fixed;
-        }
-      }
-    }
-  }
-
-  // ── Fix 2: TypeError — wrong number of args to __init__ ──────────────────
-  // The mock class inherits from a base that requires args the mock doesn't supply.
-  // Strip the base class so the mock inherits from `object` instead.
-  const initTypeError = output.match(/TypeError.*__init__.*argument/i);
-  if (initTypeError) {
-    // Replace "class _CaptureTracker(SomeBase):" -> "class _CaptureTracker(object):"
-    const fixed = source.replace(
-      /class\s+_CaptureTracker\s*\([^)]+\)\s*:/,
-      'class _CaptureTracker(object):'
-    );
-    if (fixed !== source) return fixed;
-  }
-
-  // ── Fix 3: AttributeError — abstract base has required abstract methods ───
-  const attrError = output.match(/(?:AttributeError|TypeError).*abstract/i);
-  if (attrError) {
-    // Same fix: use plain object base so no abstract methods are required.
-    const fixed = source.replace(
-      /class\s+_CaptureTracker\s*\([^)]+\)\s*:/,
-      'class _CaptureTracker(object):'
-    );
-    if (fixed !== source) return fixed;
-  }
-
-  // ── Fix 4: NameError on import alias (from X import Y as Z used before def) ─
-  const nameError = output.match(/NameError: name '([A-Za-z_][A-Za-z0-9_]*)' is not defined/);
-  if (nameError) {
-    const name = nameError[1]!;
-    // If the name appears in a base-class position, fall back to object.
-    const fixed = source.replace(
-      new RegExp(`class\\s+_CaptureTracker\\s*\\(${name}\\)\\s*:`),
-      'class _CaptureTracker(object):'
-    );
-    if (fixed !== source) return fixed;
-  }
-
-  return null; // No applicable fix — let the Builder verdict logic decide.
 }
