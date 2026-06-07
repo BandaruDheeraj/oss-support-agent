@@ -27,6 +27,14 @@ export interface DeterministicReproOracleArgs {
   editableInstallFallbacks?: string[];
   env?: NodeJS.ProcessEnv;
   semanticConfidence?: SemanticConfidence;
+  /**
+   * Pre-confirmed run observations from the Builder. When provided (≥2 runs,
+   * all failing), the Oracle skips re-executing the test entirely and evaluates
+   * all criteria — including suspect_path_assertions — against this output.
+   * Eliminates the double write+run cycle that existed when the Builder had
+   * already confirmed the repro.
+   */
+  confirmedRuns?: DeterministicExecutorRun[];
 }
 
 export interface OracleSuspectAssertionResult {
@@ -164,6 +172,70 @@ export async function runDeterministicReproOracle(
     suspectFiles,
     suspectSymbols
   );
+
+  // Fast path: Builder already confirmed ≥2 failing runs — skip re-execution.
+  // Evaluate all oracle criteria against the Builder's run output directly.
+  if (args.confirmedRuns && args.confirmedRuns.length >= 2) {
+    const confirmedRuns = args.confirmedRuns;
+    const failingOutput = confirmedRuns
+      .filter((r) => r.exitCode !== 0)
+      .map((r) => `${r.stderrTail}\n${r.stdoutTail}`)
+      .join('\n');
+    const relaxSuspectPathAssertion = args.semanticConfidence?.low_confidence === true;
+    const suspectPathAssertionResult = evaluateSuspectPathAssertions(
+      failingOutput,
+      args.oracleSpec.suspect_path_assertions
+    );
+    const criteria: DeterministicReproOracleCriteria = {
+      baseline_head_fails: (confirmedRuns[0]?.exitCode ?? 0) !== 0,
+      reliable_failures: confirmedRuns.filter((r) => r.exitCode !== 0).length >= 2,
+      suspect_path_assertions: relaxSuspectPathAssertion ? true : suspectPathAssertionResult.passed,
+      precondition_assertions: preconditionAssertionResult.passed,
+      ast_preflight: ast.ok,
+    };
+    const syntheticExecutor: DeterministicExecutorResult = {
+      outcome: 'reproduced',
+      candidateTestPath: args.recipe.candidateTestPath,
+      sentinelString: args.recipe.sentinelString,
+      expectedFailureSignature: ((args.recipe as any).expectedFailureSignature ?? '').trim() || null,
+      ranReproCount: confirmedRuns.length,
+      lastReproExitCode: confirmedRuns[confirmedRuns.length - 1]?.exitCode ?? null,
+      runs: confirmedRuns,
+      reproducedReliably: criteria.reliable_failures,
+      signatureMatched: true,
+      missingCredentials: [],
+      installFailures: [],
+      reason: 'Builder pre-confirmed; oracle evaluated criteria against confirmed run output.',
+    };
+    if (allCriteriaPass(criteria)) {
+      const acceptedWithSoftCheck =
+        relaxSuspectPathAssertion && !suspectPathAssertionResult.passed && args.oracleSpec.suspect_path_assertions.length > 0;
+      return {
+        verdict: 'valid',
+        criteria,
+        message: acceptedWithSoftCheck
+          ? 'Builder pre-confirmed; oracle accepted with suspect_path soft-check (low semantic confidence).'
+          : 'Builder pre-confirmed; oracle accepted — all criteria satisfied against confirmed run output.',
+        executor: syntheticExecutor,
+        suspectPathAssertionResult,
+        preconditionAssertionResult,
+        astReason: ast.ok ? null : ast.reason,
+        sandboxResult: null,
+        credentialsTerminal: null,
+      };
+    }
+    return {
+      verdict: 'invalid',
+      criteria,
+      message: summarizeFailure(criteria, suspectPathAssertionResult, preconditionAssertionResult, ast),
+      executor: syntheticExecutor,
+      suspectPathAssertionResult,
+      preconditionAssertionResult,
+      astReason: ast.ok ? null : ast.reason,
+      sandboxResult: null,
+      credentialsTerminal: null,
+    };
+  }
 
   const suspectPathNeedles = args.oracleSpec.suspect_path_assertions
     .map((assertion) => assertion.needle)
