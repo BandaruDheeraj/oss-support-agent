@@ -105,10 +105,11 @@ function getAnthropicProvider(): AnthropicProvider {
   return anthropicProvider;
 }
 
-// Default to Claude Haiku 4.5 — available on current API keys and fast enough for repair tasks.
-// @ai-sdk/anthropic@0.0.56 accepts any model string via the (string & {}) union catch-all.
+// Default to Claude Sonnet 4.6 — more reliable than Haiku for structured output with large context.
+// Haiku 4.5 occasionally drops required schema fields (installSpec, abandon) on round 2+ when the
+// repair prompt grows. @ai-sdk/anthropic@0.0.56 accepts any model string via (string & {}).
 // Override per-deployment via REPRO_REPAIR_MODEL env var (see repair-agent.ts).
-const DEFAULT_ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001';
+const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-4-6';
 
 export type PhaseEAgent =
   | OpenRouterAgent
