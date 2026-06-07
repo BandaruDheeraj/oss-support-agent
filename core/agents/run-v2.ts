@@ -33,6 +33,7 @@ import {
 import { execCommand } from '../../bin/clients/local-workspace';
 import { getTracer, runWithSpan, type Span } from '../observability';
 import { emitOnlineEvaluation } from '../observability/evaluator';
+import * as fs from 'fs';
 
 async function withPipelineSpan<T>(
   name: string,
@@ -234,6 +235,21 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     log('[v2-driver] semantic suspect indexing skipped (requires gha sandbox mode with SandboxSession)');
   }
 
+  // Dossier replay: load a previously-saved analyst dossier to skip the
+  // 15-20 min analyst stage. Set OSA_SEED_DOSSIER_PATH to the JSON file
+  // written by a prior run's OSA_SAVE_DOSSIER_PATH.
+  let seedDossier: DossierStore | undefined;
+  const seedDossierPath = process.env.OSA_SEED_DOSSIER_PATH;
+  if (seedDossierPath) {
+    try {
+      const json = fs.readFileSync(seedDossierPath, 'utf-8');
+      seedDossier = DossierStore.deserialize(json);
+      log(`[v2-driver] loaded seed dossier from ${seedDossierPath} (analyst skipped)`);
+    } catch (err) {
+      log(`[v2-driver] failed to load seed dossier from ${seedDossierPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   const v2 = await runReproV2({
     attemptId: input.attemptId,
     issue: issueHandle,
@@ -248,7 +264,20 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     testInfraProfile: input.testInfraProfile ?? null,
     ...(input.gitClient ? { gitClient: input.gitClient } : {}),
     ...(semanticSuspectSeed ? { semanticSuspectSeed } : {}),
+    ...(seedDossier ? { dossier: seedDossier } : {}),
   });
+
+  // Dossier save: write the analyst output so future runs can replay it.
+  const saveDossierPath = process.env.OSA_SAVE_DOSSIER_PATH;
+  if (saveDossierPath) {
+    try {
+      fs.mkdirSync(require('path').dirname(saveDossierPath), { recursive: true });
+      fs.writeFileSync(saveDossierPath, v2.dossier.serialize(), 'utf-8');
+      log(`[v2-driver] saved dossier to ${saveDossierPath}`);
+    } catch (err) {
+      log(`[v2-driver] failed to save dossier to ${saveDossierPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   log(
     `[v2-driver] runReproPipeline DONE attemptId=${input.attemptId} status=${v2.status} ok=${v2.status === 'reproduced'} message=${JSON.stringify(v2.message).slice(0, 320)}`
