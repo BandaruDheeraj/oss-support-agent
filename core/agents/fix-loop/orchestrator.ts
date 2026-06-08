@@ -20,8 +20,9 @@ import { runFixInvestigator } from './investigator';
 import { runFixPlanner } from './planner';
 import { runFixExecutor, type FixExecutorResult } from './executor';
 import { runFixCritic, type FixVerdict } from './critic';
-import type { Plan } from '../tools/handles';
+import type { Plan, SandboxRun } from '../tools/handles';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
+import { repairFix } from './fix-repair-agent';
 
 const FIX_MAX_ITERATIONS_ENV = 'FIX_V2_MAX_ITERATIONS';
 const FIX_TOKEN_BUDGET_ENV = 'FIX_V2_TOKEN_BUDGET';
@@ -29,6 +30,7 @@ const AGENT_LOOP_MAX_TOKENS_ENV = 'AGENT_LOOP_MAX_TOKENS';
 const DEFAULT_FIX_MAX_ITERATIONS = 3;
 const DEFAULT_AGENT_LOOP_MAX_TOKENS = 16_000;
 const AGENT_LOOPS_PER_ITERATION = 3; // investigator + planner + executor
+const MAX_FIX_REPAIR_ROUNDS = 3;
 
 const DEPENDENCY_FILE_RE = new RegExp(
   String.raw`(^|/)(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|requirements(\.[^/]+)?\.txt|pyproject\.toml|poetry\.lock|pipfile(\.lock)?|go\.mod|go\.sum|cargo\.toml|cargo\.lock|pom\.xml|build\.gradle(\.kts)?)$`,
@@ -223,6 +225,48 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
       scope_ok: scopeEvaluation.outOfScope.length === 0,
     };
     if (!completionPromisePassed(checks)) {
+      // When only the repro test fails, attempt targeted repair before full retry.
+      if (!checks.repro_test_passes && executor.changedFiles.length > 0) {
+        const repaired = await runFixRepairLoop({
+          attemptId: args.attemptId,
+          snapshot: args.snapshot,
+          changedFiles: executor.changedFiles,
+          workspace: args.workspace,
+          sandbox: args.sandbox,
+          issue: args.issue,
+          initialFailureRun: executor.greenEvidence.lastReproRun ?? undefined,
+          iterationForLogging: iteration,
+        });
+        if (repaired.success) {
+          const repairedAllFiles = [...executor.changedFiles, ...repaired.additionalChangedFiles];
+          const repairedScope = evaluateScope(repairedAllFiles, allowedScope);
+          const repairedChecks: CompletionPromiseChecks = {
+            repro_test_passes: true,
+            regression_green: repaired.testsGreen ?? checks.regression_green,
+            no_head_drift: checks.no_head_drift,
+            scope_ok: repairedScope.outOfScope.length === 0,
+          };
+          if (completionPromisePassed(repairedChecks)) {
+            winningPlan = planner.plan;
+            winningExecutor = {
+              ...executor,
+              greenEvidence: {
+                ...executor.greenEvidence,
+                reproGreenAfterMutation: true,
+                testsGreenAfterMutation: repaired.testsGreen ?? executor.greenEvidence.testsGreenAfterMutation,
+                lastReproRun: repaired.lastReproRun ?? executor.greenEvidence.lastReproRun,
+                lastTestsRun: repaired.lastTestsRun ?? executor.greenEvidence.lastTestsRun,
+              },
+              changedFiles: repairedAllFiles,
+            };
+            winningScope = repairedScope;
+            winningNotes = notes;
+            winningHypotheses = hypotheses;
+            break;
+          }
+        }
+      }
+
       lastFailureStage = 'completion_promise';
       lastFeedback = formatCompletionPromiseFeedback({
         iteration,
@@ -469,6 +513,92 @@ function formatCompletionPromiseFeedback(args: {
   const hypothesis = formatUnconsumedHypothesisFeedback(args.executor.unconsumedHypothesisFiles);
   if (hypothesis) lines.push(hypothesis);
   return lines.join('\n');
+}
+
+type FixRepairLoopResult = {
+  success: boolean;
+  testsGreen?: boolean;
+  lastReproRun?: SandboxRun;
+  lastTestsRun?: SandboxRun;
+  additionalChangedFiles: string[];
+};
+
+async function runFixRepairLoop(args: {
+  attemptId: string;
+  snapshot: DossierSnapshot;
+  changedFiles: string[];
+  workspace: WorkspaceReader & WorkspaceWriter;
+  sandbox: SandboxHandle;
+  issue: IssueHandle;
+  initialFailureRun: SandboxRun | undefined;
+  iterationForLogging: number;
+}): Promise<FixRepairLoopResult> {
+  const repairHistory: string[] = [];
+  let lastReproRun: SandboxRun | undefined = args.initialFailureRun;
+  const additionalChangedFiles: string[] = [];
+
+  for (let round = 0; round < MAX_FIX_REPAIR_ROUNDS; round++) {
+    const reproFailureOutput = lastReproRun
+      ? `exit=${lastReproRun.exitCode}\nstdout:\n${lastReproRun.stdout}\nstderr:\n${lastReproRun.stderr}`
+      : 'repro output unavailable';
+
+    const allTrackedPaths = [...args.changedFiles, ...additionalChangedFiles];
+    const changedFileContents: Array<{ path: string; content: string }> = [];
+    for (const filePath of allTrackedPaths) {
+      const content = await args.workspace.readFile(filePath);
+      if (content !== null) changedFileContents.push({ path: filePath, content });
+    }
+
+    if (changedFileContents.length === 0) {
+      // eslint-disable-next-line no-console
+      console.log(`[v2-fix-repair-loop] attempt=${args.attemptId} iter=${args.iterationForLogging} round=${round} no_readable_files`);
+      break;
+    }
+
+    const repairOutput = await repairFix({
+      attemptId: args.attemptId,
+      snapshot: args.snapshot,
+      changedFiles: changedFileContents,
+      reproFailureOutput,
+      issueTitle: args.issue.title,
+      issueBody: args.issue.body,
+      roundNumber: round,
+      maxRounds: MAX_FIX_REPAIR_ROUNDS,
+      repairHistory,
+    });
+
+    if (!repairOutput || repairOutput.abandon) {
+      // eslint-disable-next-line no-console
+      console.log(`[v2-fix-repair-loop] attempt=${args.attemptId} iter=${args.iterationForLogging} round=${round} abandon=${repairOutput?.abandon}`);
+      if (repairOutput?.abandonReason) repairHistory.push(`round ${round + 1}: abandoned — ${repairOutput.abandonReason}`);
+      break;
+    }
+
+    if (repairOutput.fileUpdates.length === 0) {
+      // eslint-disable-next-line no-console
+      console.log(`[v2-fix-repair-loop] attempt=${args.attemptId} iter=${args.iterationForLogging} round=${round} no_updates`);
+      break;
+    }
+
+    for (const update of repairOutput.fileUpdates) {
+      const oldText = await args.workspace.readFile(update.path);
+      await args.workspace.applyPatch({ path: update.path, oldText: oldText ?? '', newText: update.content });
+      if (!allTrackedPaths.includes(update.path)) additionalChangedFiles.push(update.path);
+    }
+    repairHistory.push(`round ${round + 1}: ${repairOutput.explanation}`);
+
+    lastReproRun = await args.sandbox.runRepro();
+    if (lastReproRun.exitCode === 0) {
+      const lastTestsRun = await args.sandbox.runTests();
+      // eslint-disable-next-line no-console
+      console.log(`[v2-fix-repair-loop] attempt=${args.attemptId} iter=${args.iterationForLogging} round=${round} REPRO_GREEN testsGreen=${lastTestsRun.exitCode === 0}`);
+      return { success: true, testsGreen: lastTestsRun.exitCode === 0, lastReproRun, lastTestsRun, additionalChangedFiles };
+    }
+    // eslint-disable-next-line no-console
+    console.log(`[v2-fix-repair-loop] attempt=${args.attemptId} iter=${args.iterationForLogging} round=${round} still_failing exitCode=${lastReproRun.exitCode}`);
+  }
+
+  return { success: false, lastReproRun, additionalChangedFiles };
 }
 
 function collectDeterministicStructuralVetoes(args: {

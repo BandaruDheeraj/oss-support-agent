@@ -123,6 +123,7 @@ export type PhaseEAgent =
   | 'FIX_PLANNER'
   | 'FIX_EXECUTOR'
   | 'FIX_CRITIC'
+  | 'FIX_REPAIR'
   | 'EMAIL_COMPOSER'
   | 'REPLY_MAPPER';
 

@@ -2812,40 +2812,74 @@ export async function runPipeline(args: {
     }
 
     let reproOutcome: ReproPipelineOutcome;
-    try {
-      reproOutcome = await runReproPipelineWithTimeout({
-        attemptId: reproAttemptId,
-        timeoutMs: reproStageTimeoutMs,
-        log,
-        run: () =>
-          runReproPipeline({
-            attemptId: reproAttemptId,
-            payload,
-            workspace,
-            forkFullName: fork.forkFullName,
-            branch: fork.branchName,
-            baselineSha,
-            affectedModule: routing.result.affectedModule,
-            language: 'python',
-            sandboxDriver: v2SandboxDriver,
-            ghActionsSandboxOptions: v2GhActionsSandboxOptions,
-            testInfraProfile,
-            gitClient: {
-              getFileContents: (repo: string, filePath: string, ref: string) =>
-                ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
-            },
-            log,
-          }),
-      });
-    } catch (err) {
-      if (err instanceof ReproStageTimeoutError) {
-        return finish(
-          await haltForReproNotRunnable({
-            reason: err.message,
-          })
-        );
+    if (process.env.OSA_FIX_ONLY === '1') {
+      // Skip semantic search + repro pipeline. Requires OSA_SEED_DOSSIER_PATH
+      // (pre-saved dossier) and expects the repro test to already exist on the branch.
+      const seedDossierPath = process.env.OSA_SEED_DOSSIER_PATH;
+      if (!seedDossierPath) throw new Error('OSA_FIX_ONLY=1 requires OSA_SEED_DOSSIER_PATH');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { DossierStore } = require('../core/agents/analyst/dossier') as typeof import('../core/agents/analyst/dossier');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const nodeFs = require('fs') as typeof import('fs');
+      const dossier = DossierStore.deserialize(nodeFs.readFileSync(seedDossierPath, 'utf-8'));
+      const reproTestPath = process.env.OSA_REPRO_TEST_PATH ?? 'tests/repro/test_repro.py';
+      const testContent = workspace.readFile(reproTestPath);
+      log(`[v2-driver] fix-only mode: dossier loaded from ${seedDossierPath}, reproTest=${reproTestPath}`);
+      reproOutcome = {
+        ok: true,
+        status: 'reproduced',
+        message: 'fix-only: skipped repro pipeline',
+        candidateTestPath: reproTestPath,
+        candidateTestContent: testContent || undefined,
+        v2: {
+          status: 'reproduced',
+          dossier,
+          plan: {
+            candidateTestPath: reproTestPath,
+            sentinelString: '',
+            expectedFailureSignature: '',
+            approach: 'fix-only mode',
+          },
+          candidates: [],
+          message: 'fix-only: skipped repro pipeline',
+        },
+      };
+    } else {
+      try {
+        reproOutcome = await runReproPipelineWithTimeout({
+          attemptId: reproAttemptId,
+          timeoutMs: reproStageTimeoutMs,
+          log,
+          run: () =>
+            runReproPipeline({
+              attemptId: reproAttemptId,
+              payload,
+              workspace,
+              forkFullName: fork.forkFullName,
+              branch: fork.branchName,
+              baselineSha,
+              affectedModule: routing.result.affectedModule,
+              language: 'python',
+              sandboxDriver: v2SandboxDriver,
+              ghActionsSandboxOptions: v2GhActionsSandboxOptions,
+              testInfraProfile,
+              gitClient: {
+                getFileContents: (repo: string, filePath: string, ref: string) =>
+                  ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
+              },
+              log,
+            }),
+        });
+      } catch (err) {
+        if (err instanceof ReproStageTimeoutError) {
+          return finish(
+            await haltForReproNotRunnable({
+              reason: err.message,
+            })
+          );
+        }
+        throw err;
       }
-      throw err;
     }
 
     // Capture for typed halt/success emails (before any halt return path).
