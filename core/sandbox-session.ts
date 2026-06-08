@@ -492,7 +492,8 @@ export class SandboxSession {
   async dispatch(recipe: Recipe): Promise<SandboxDispatchResult> {
     this.assertPhaseSucceeded('branch', 'verifyAndPushBranch');
     this.assertPhaseSucceeded('workflow', 'verifyWorkflowReachability');
-    this.assertPhaseSucceeded('setup', 'setupDependencies');
+    // setup phase is NOT required — callers using the pipInstall()+recordReplayInstallCommand()
+    // pattern accumulate replay commands without calling setupDependencies() first.
 
     if (this.sandboxWorkflowRepo === this.targetRepo) {
       throw new Error(
