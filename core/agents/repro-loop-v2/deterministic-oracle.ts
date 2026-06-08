@@ -181,7 +181,10 @@ export async function runDeterministicReproOracle(
       .filter((r) => r.exitCode !== 0)
       .map((r) => `${r.stderrTail}\n${r.stdoutTail}`)
       .join('\n');
-    const relaxSuspectPathAssertion = args.semanticConfidence?.low_confidence === true;
+    // Relax when semantic confidence is low, OR when semanticConfidence is
+    // absent (semantic search failed to run — no evidence to anchor the check).
+    const relaxSuspectPathAssertion =
+      args.semanticConfidence == null || args.semanticConfidence.low_confidence === true;
     const suspectPathAssertionResult = evaluateSuspectPathAssertions(
       failingOutput,
       args.oracleSpec.suspect_path_assertions
@@ -322,7 +325,10 @@ export async function runDeterministicReproOracle(
 
   const baseline_head_fails = (executor.runs[0]?.exitCode ?? 0) !== 0;
   const reliable_failures = executor.runs.filter((r) => r.exitCode !== 0).length >= 2;
-  const relaxSuspectPathAssertion = args.semanticConfidence?.low_confidence === true;
+  // Relax when semantic confidence is low, OR when semanticConfidence is
+  // absent (semantic search failed to run — no evidence to anchor the check).
+  const relaxSuspectPathAssertion =
+    args.semanticConfidence == null || args.semanticConfidence.low_confidence === true;
   const suspectPathAssertionResult = sandboxResult
     ? evaluateSuspectPathAssertionsFromSandboxResult(
         sandboxResult.suspectPathHit,
