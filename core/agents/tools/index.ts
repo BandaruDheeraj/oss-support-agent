@@ -126,7 +126,8 @@ export function makeFixPlannerRegistry({ ctx }: RegistryFactoryArgs): ToolRegist
   return new ToolRegistry(
     {
       budgets: defaultBudgets({ total: 35, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }),
-      maxTurns: 10,
+      maxTurns: 18,
+      finalizationReserve: { calls: 5, allowTools: ['commit_plan', 'abandon'] },
       abandonGate: (transcript) => {
         const reads = transcript.filter((t) => t.tier === 'read' && t.ok).length;
         const committed = transcript.some((t) => t.tool === 'commit_plan' && t.ok);
