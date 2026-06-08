@@ -102,7 +102,7 @@ export function makeFixInvestigatorRegistry({ ctx }: RegistryFactoryArgs): ToolR
   return new ToolRegistry(
     {
       budgets: defaultBudgets({ total: 50, perTier: { mutation: 0, 'write-test': 0, sandbox: 0 } }),
-      maxTurns: 18,
+      maxTurns: 28,
       finalizationReserve: { calls: 5, allowTools: ['write_investigation_notes', 'abandon'] },
       abandonGate: (transcript) => {
         const reads = transcript.filter((t) => t.tier === 'read' && t.ok).length;
