@@ -152,6 +152,7 @@ ${availableSection}${historySection}
           model,
           schema: RepairOutputSchema,
           prompt,
+          abortSignal: AbortSignal.timeout(5 * 60 * 1000),
           experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
         })
     );
