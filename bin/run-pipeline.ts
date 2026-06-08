@@ -2945,7 +2945,12 @@ export async function runPipeline(args: {
     const reproPath = reproOutcome.candidateTestPath;
     await workspace.resetWorkingTree();
     workspace.writeFile(reproPath, reproOutcome.candidateTestContent);
-    await workspace.commitPaths([reproPath], "test: add repro for #" + issueNumber);
+    try {
+      await workspace.commitPaths([reproPath], "test: add repro for #" + issueNumber);
+    } catch (e) {
+      if (!(e instanceof Error && e.message === 'No changes to commit')) throw e;
+      // File already committed with identical content from a prior run — treat as success.
+    }
     await workspace.push();
     log("[v2-repro] committed and pushed " + reproPath);
 
