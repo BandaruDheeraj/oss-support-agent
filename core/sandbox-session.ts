@@ -839,7 +839,9 @@ export class SandboxSession {
     createdAfter: string,
     timeoutMins: number
   ): Promise<WorkflowRun | null> {
-    const maxWaitMs = Math.min(timeoutMins * 60 * 1_000, 60_000);
+    // Cap at 3 minutes — GitHub's API can take 60-90 s to list a freshly
+    // dispatched run; 60 s was too tight for semantic-search workflows.
+    const maxWaitMs = Math.min(timeoutMins * 60 * 1_000, 180_000);
     const pollIntervalMs = 2_000;
     const started = Date.now();
     while (Date.now() - started < maxWaitMs) {
