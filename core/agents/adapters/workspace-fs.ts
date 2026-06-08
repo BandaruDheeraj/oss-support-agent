@@ -147,7 +147,8 @@ export function createWorkspaceFsAdapter(
       workspace.writeFile(rel, content);
     },
     async applyPatch(patch) {
-      const inModule = patch.path.startsWith(opts.affectedModule);
+      // "." means repo root — every path is in scope.
+      const inModule = opts.affectedModule === '.' || patch.path.startsWith(opts.affectedModule);
       const inTests = testRoots.some((root) => patch.path.startsWith(root));
       if (!inModule && !inTests) {
         throw new Error(
