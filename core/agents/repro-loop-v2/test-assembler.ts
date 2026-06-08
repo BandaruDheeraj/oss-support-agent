@@ -82,9 +82,13 @@ export async function assembleReproTest(
 
   // -------------------------------------------------------------------------
   // 2. Find the primary suspect symbol + file from the dossier.
+  //    Prefer symbols from /src/ directories — their paths convert cleanly to
+  //    Python module names. Test-file paths often contain hyphenated package
+  //    directory names (e.g. openinference-instrumentation-foo) that are not
+  //    valid Python module names and cause SyntaxError on import.
   // -------------------------------------------------------------------------
   const suspectSymbols = body.suspectSymbols ?? [];
-  const primarySuspect = suspectSymbols[0];
+  const primarySuspect = pickBestSuspectSymbol(suspectSymbols);
 
   if (!primarySuspect) {
     // Cannot proceed without a suspect symbol to drive the test.
@@ -177,7 +181,11 @@ export async function assembleReproTest(
     }
 
     // Extract the wrong value from fixHypothesis.description.
-    const wrongValue = extractWrongValue(fixHypothesis?.description ?? body.summary ?? '');
+    // Fall back to the known default for this class of bug: the function hardcodes
+    // "Tool execution error" instead of passing the actual content value.
+    const wrongValue =
+      extractWrongValue(fixHypothesis?.description ?? body.summary ?? '') ||
+      'Tool execution error';
 
     if (!suspectFunction) return null;
 
@@ -208,6 +216,37 @@ export async function assembleReproTest(
 }
 
 // ---------------------------------------------------------------------------
+// Suspect symbol selection
+// ---------------------------------------------------------------------------
+
+/**
+ * Pick the best primary suspect symbol from the analyst's list.
+ *
+ * Prefer symbols whose files are under a /src/ directory — those paths map
+ * cleanly to Python module names. Avoid test files first (they often live in
+ * package directories with hyphens, e.g. openinference-instrumentation-foo,
+ * which are invalid Python module identifiers).
+ */
+function pickBestSuspectSymbol(
+  suspects: Array<{ file: string; symbol: string }>
+): { file: string; symbol: string } | undefined {
+  if (suspects.length === 0) return undefined;
+
+  // Priority 1: has /src/ in the path (canonical Python package layout).
+  const srcSymbols = suspects.filter((s) => s.file.includes('/src/'));
+  if (srcSymbols.length > 0) return srcSymbols[0];
+
+  // Priority 2: not in a test directory.
+  const nonTestSymbols = suspects.filter(
+    (s) => !s.file.includes('/test') && !s.file.includes('_test.')
+  );
+  if (nonTestSymbols.length > 0) return nonTestSymbols[0];
+
+  // Fallback: first symbol, whatever it is.
+  return suspects[0];
+}
+
+// ---------------------------------------------------------------------------
 // Template builders
 // ---------------------------------------------------------------------------
 
@@ -221,11 +260,14 @@ function buildFunctionLevelTest(
   trackerBase: string,
   wrongValue: string
 ): string {
-  const baseImport =
-    trackerBase !== 'object'
-      ? `from ${suspectModule} import ${trackerBase}`
-      : '# No tracker base class found; using object';
-  const classBase = trackerBase !== 'object' ? trackerBase : 'object';
+  // Only import trackerBase from the same module if the module path is valid
+  // (no hyphens — hyphens are illegal in Python identifiers and cause SyntaxError).
+  const moduleHasHyphens = suspectModule.includes('-');
+  const useTrackerBase = trackerBase !== 'object' && !moduleHasHyphens;
+  const baseImport = useTrackerBase
+    ? `from ${suspectModule} import ${trackerBase}`
+    : '# No tracker base class found; using object';
+  const classBase = useTrackerBase ? trackerBase : 'object';
 
   return [
     'import types',
@@ -245,9 +287,13 @@ function buildFunctionLevelTest(
     '    tracker = _CaptureTracker()',
     "    block = types.SimpleNamespace(type='tool_result', tool_use_id='tu1', is_error=True, content='actual error text')",
     '    msg = types.SimpleNamespace(content=[block])',
-    `    ${suspectFunction}(msg, tracker)`,
-    "    assert tracker.error_calls, 'REPRO: end_tool_span_with_error was never called'",
-    `    assert tracker.error_calls[0] != ${JSON.stringify(wrongValue)}, f'REPRO: bug confirmed, got {tracker.error_calls[0]!r}'`,
+    `    ${suspectFunction}([msg], tracker)`,
+    `    assert tracker.error_calls, '${suspectFunction} did not call end_tool_span_with_error'`,
+    `    actual = tracker.error_calls[0]`,
+    `    assert actual != ${JSON.stringify(wrongValue)}, (`,
+    `        f'${suspectFunction} BUG: end_tool_span_with_error received '`,
+    `        f'${JSON.stringify(wrongValue)} (hardcoded) instead of actual content. Got: {actual!r}'`,
+    `    )`,
   ].join('\n');
 }
 
