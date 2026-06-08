@@ -122,7 +122,8 @@ export async function assembleReproTest(
   const installSpec = buildInstallSpec(
     primarySuspect.file,
     testInfraProfile,
-    args.editableInstallCandidates ?? []
+    args.editableInstallCandidates ?? [],
+    analystInstallPaths
   );
 
   // -------------------------------------------------------------------------
@@ -525,20 +526,30 @@ function extractWrongValue(description: string): string {
 function buildInstallSpec(
   suspectFilePath: string,
   profile: TestInfraProfile | null,
-  editableInstallCandidates: string[] = []
+  editableInstallCandidates: string[] = [],
+  analystInstallPaths: string[] = []
 ): AssembledTest['installSpec'] {
   const additionalPackages: string[] = [];
 
   // Prefer pre-discovered editable candidates (produced by workspace BFS scan of
-  // pyproject.toml files). Filter to those that are a prefix of the suspect file,
-  // then fall back to ALL candidates. If none exist, derive from the file path.
+  // pyproject.toml files). Filter to those that are a prefix of the suspect file.
+  // When the BFS list doesn't cover the suspect package (e.g. BFS stopped before
+  // reaching it alphabetically), fall back to the analyst's explicit install paths
+  // rather than installing all BFS candidates (which may not include the right pkg).
   let editableInstall: string[] = [];
   if (editableInstallCandidates.length > 0) {
     const normalizedSuspect = suspectFilePath.replace(/\\/g, '/');
     const matched = editableInstallCandidates.filter((c) =>
       normalizedSuspect.startsWith(c.replace(/\\/g, '/').replace(/\/?$/, '/'))
     );
-    editableInstall = matched.length > 0 ? matched : editableInstallCandidates;
+    if (matched.length > 0) {
+      editableInstall = matched;
+    } else if (analystInstallPaths.length > 0) {
+      // BFS didn't surface the suspect's package — use the analyst's recommendation.
+      editableInstall = analystInstallPaths;
+    } else {
+      editableInstall = editableInstallCandidates;
+    }
   } else {
     // Fallback: derive from the suspect file path — take the first two segments
     // (e.g. "python/openinference-instrumentation-anthropic") to avoid
