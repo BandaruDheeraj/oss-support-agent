@@ -169,12 +169,14 @@ export async function assembleReproTest(
     // Derive the Python module import path from the file path:
     //   e.g.  "python/openinference/instrumentation/anthropic/_wrappers.py"
     //      -> "openinference.instrumentation.anthropic._wrappers"
-    const suspectModule = deriveModulePath(suspectFilePath);
+    const rawModule = deriveModulePath(suspectFilePath);
 
-    // Hyphens in the derived module path are illegal Python identifiers and
-    // cause SyntaxError at import time. Bail out rather than generate a broken
-    // test that burns repair rounds on an unfixable import.
-    if (suspectModule.includes('-')) return null;
+    // Normalize hyphens to underscores: Python packages with hyphenated
+    // directory names (e.g. openinference-instrumentation-foo) install with
+    // underscores in the module path. Normalizing avoids SyntaxError (hyphens
+    // are illegal Python identifiers) while leaving ImportError for the
+    // builder's repair loop to fix with correct context.
+    const suspectModule = rawModule.replace(/-/g, '_');
 
     // Attempt to read the source file to find the tracker base class.
     let trackerBase: string | null = null;
@@ -265,7 +267,8 @@ function pickBestSuspectSymbol(
       // module paths are illegal Python identifiers and cause SyntaxError.
       const validAnalyst = analystSymbols.filter((s) => !deriveModulePath(s.file).includes('-'));
       if (validAnalyst.length > 0) return validAnalyst[0];
-      return analystSymbols[0];
+      // All analyst symbols are from hyphenated/test paths — fall through to
+      // global priority checks which may find /src/ symbols from other packages.
     }
   }
 
