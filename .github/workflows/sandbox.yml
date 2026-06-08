@@ -36,6 +36,10 @@ jobs:
       - name: Checkout harness (scripts)
         uses: actions/checkout@v4
 
+      - name: Install Python test tools
+        shell: bash
+        run: pip install pytest pytest-asyncio
+
       - name: Clone fork branch
         shell: bash
         run: |
