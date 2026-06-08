@@ -132,10 +132,11 @@ ${availableSection}${historySection}
 ━━━ REPAIR RULES ━━━
 1. "SandboxSession.dispatch requires setupDependencies()" → The editable install path causes a sandbox lifecycle failure. Remove it from editableInstall, or swap it for a correct path from the available candidates list. Consider whether the package is even needed (it may be a transitive dep of another package you're already installing).
 2. ImportError / ModuleNotFoundError → Fix the import in the test, or add/correct the package in installSpec. Check the available candidates for the right path.
-3. Test PASSED when it should fail → Rewrite the test to actually call the function that has the bug and assert the incorrect (buggy) behavior triggers.
-4. Test fails with wrong error → The test is hitting a setup error before reaching the buggy code. Fix imports, mocks, and setup so the test reaches the bug.
-5. Keep changes minimal. Only return files you actually changed.
-6. Set abandon=true only if reproducing the bug requires external services, live network calls, or real credentials that cannot be mocked.`;
+3. exit code 127 / "command not found" → A CLI tool (e.g. pytest) is missing. Add it to additionalPackages (e.g. "pytest") so it gets pip-installed before the test runs.
+4. Test PASSED when it should fail → Rewrite the test to actually call the function that has the bug and assert the incorrect (buggy) behavior triggers.
+5. Test fails with wrong error → The test is hitting a setup error before reaching the buggy code. Fix imports, mocks, and setup so the test reaches the bug.
+6. Keep changes minimal. Only return files you actually changed.
+7. Set abandon=true only if reproducing the bug requires external services, live network calls, or real credentials that cannot be mocked.`;
 
   let result;
   try {
