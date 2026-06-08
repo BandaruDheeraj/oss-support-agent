@@ -380,10 +380,17 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
   // Stage C: deterministic oracle over every candidate with a recipe.
   for (const candidate of candidates) {
     if (!candidate.recipe) continue;
+    // Assembled tests are deterministically constructed; the dossier's oracle
+    // spec assertions (suspect_path_assertions, precondition_assertions) target
+    // LLM-generated tests and do not apply to assertion-based assembled tests.
+    // Use an empty spec so the oracle validates only reliable_failures and ast_preflight.
+    const effectiveOracleSpec = assembledTest
+      ? { suspect_path_assertions: [], precondition_assertions: [] }
+      : oracleSpec;
     const oracle = await runDeterministicReproOracle({
       attemptId: `${args.attemptId}:${candidate.candidateId}`,
       recipe: candidate.recipe,
-      oracleSpec,
+      oracleSpec: effectiveOracleSpec,
       suspectSymbols: snapshot.body.suspectSymbols,
       repoLanguage: args.repo.language,
       workspace: args.workspace,
