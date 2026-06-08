@@ -406,9 +406,36 @@ async function runReproFilesPath(
       continue;
     }
 
+    const combined1 = `${run1.value.stdout}\n${run1.value.stderr}`;
+
+    // exit code 4 = pytest collection error (syntax error, bad import, etc.)
+    // exit code 5 = no tests collected
+    // These mean the test file itself is broken — not a valid repro failure.
+    if (run1.value.exitCode === 4 || run1.value.exitCode === 5) {
+      const fixed = await repair(
+        'expected_output_absent',
+        `Test could not be collected (exit ${run1.value.exitCode}) — test file has a syntax error or bad import. ` +
+          `Fix imports to use the correct Python module path (no hyphens in module names). ` +
+          `Import the buggy function directly (e.g. from openinference.instrumentation.claude_agent_sdk._wrappers import ...) ` +
+          `and ensure the assertion message contains the function name and "Tool execution error".\n` +
+          `Actual output:\n${combined1.slice(0, 2000)}`
+      );
+      if (!fixed) {
+        await revertAll();
+        return {
+          ok: false,
+          rejectStage: 'expected_output_absent',
+          reason: `Test collection failed (exit ${run1.value.exitCode}) — test file has syntax error or bad import.`,
+          runs: [observe(run1.value, '', '')],
+          candidateTestPath: testEntryPoint,
+          repairRounds,
+        };
+      }
+      continue;
+    }
+
     // Test failed (exitCode !== 0) — this is what we want for a repro.
     // Check expectedFailureOutput before doing the second run.
-    const combined1 = `${run1.value.stdout}\n${run1.value.stderr}`;
     if (expectedOut && !combined1.includes(expectedOut)) {
       const fixed = await repair(
         'expected_output_absent',
