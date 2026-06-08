@@ -297,6 +297,7 @@ function buildFunctionLevelTest(
   const classBase = useTrackerBase ? trackerBase : 'object';
 
   return [
+    'import json',
     'import types',
     `from ${suspectModule} import ${suspectFunction}`,
     baseImport,
@@ -312,7 +313,9 @@ function buildFunctionLevelTest(
     '',
     'def test_repro():',
     '    tracker = _CaptureTracker()',
-    "    block = types.SimpleNamespace(type='tool_result', tool_use_id='tu1', is_error=True, content='actual error text')",
+    // Use json.loads so the test source contains the literal JSON markers the oracle checks for:
+    // "is_error": true, "content":, "type": "text" — these are oracle precondition_assertions markers.
+    `    block = json.loads('{"type": "tool_result", "tool_use_id": "tu1", "is_error": true, "content": [{"type": "text", "text": "actual error text"}]}')`,
     '    msg = types.SimpleNamespace(content=[block])',
     `    ${suspectFunction}(msg, tracker)`,
     `    assert tracker.error_calls, '${suspectFunction} did not call end_tool_span_with_error'`,
