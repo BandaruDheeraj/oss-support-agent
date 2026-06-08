@@ -1317,6 +1317,14 @@ async function runVerification(args: {
             `SandboxSession pushPendingChanges target mismatch: expected ${forkFullName}@${branchName}, got ${repoName}@${currentBranch}`
           );
         }
+        // Commit any files written to disk (e.g. by workspace.writeTest) before
+        // pushing — writeFile only writes to the FS, so without this the push
+        // sends the old HEAD and the test file never appears on the branch.
+        try {
+          await workspace.commitAll('chore: flush test files to branch');
+        } catch (e) {
+          if (!(e instanceof Error && e.message === 'No changes to commit')) throw e;
+        }
         await workspace.push();
       },
       getFileContents: (repoName, filePath, ref) =>
@@ -2723,6 +2731,14 @@ export async function runPipeline(args: {
                   throw new Error(
                     `SandboxSession pushPendingChanges target mismatch: expected ${fork.forkFullName}@${fork.branchName}, got ${repoName}@${branchName}`
                   );
+                }
+                // Commit any files written to disk (e.g. by workspace.writeTest) before
+                // pushing — writeFile only writes to the FS, so without this the push
+                // sends the old HEAD and the test file never appears on the branch.
+                try {
+                  await workspace.commitAll('chore: flush test files to branch');
+                } catch (e) {
+                  if (!(e instanceof Error && e.message === 'No changes to commit')) throw e;
                 }
                 await workspace.push();
               },
