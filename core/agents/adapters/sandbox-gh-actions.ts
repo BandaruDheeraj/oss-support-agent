@@ -111,10 +111,10 @@ export function createGhActionsSandboxAdapter(opts: GhActionsSandboxAdapterOptio
     },
     async flushWorkspaceToBranch() {
       preDispatchReady = false;
-      const branch = await session.verifyAndPushBranch();
-      if (!branch.ok) {
-        throw new Error('flushWorkspaceToBranch failed: ' + branch.reason);
-      }
+      // Use forceFlushBranch to bypass the verifyAndPushBranch cache — the
+      // cached result was set before writeTest wrote files to disk, so a
+      // cached return would skip the commitAll in pushPendingChanges.
+      await session.forceFlushBranch();
     },
     async runRepro(options?: { suspectPathNeedles?: string[] }) {
       const reproPath = opts.reproTestPath;

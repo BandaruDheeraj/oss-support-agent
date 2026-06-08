@@ -294,6 +294,15 @@ export class SandboxSession {
     }
   }
 
+  /**
+   * Push pending changes unconditionally, bypassing the branch-phase cache.
+   * Called by flushWorkspaceToBranch after writeTest writes files to disk so
+   * that the GHA sandbox sees the updated test file on the branch.
+   */
+  async forceFlushBranch(): Promise<void> {
+    await this.gitClient.pushPendingChanges(this.targetRepo, this.branch);
+  }
+
   async verifyWorkflowReachability(workflowId: string = SANDBOX_WORKFLOW_FILE): Promise<SandboxPhaseResult> {
     try {
       const probe = await this.gitClient.getFileContents(
