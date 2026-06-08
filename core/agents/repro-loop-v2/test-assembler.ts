@@ -314,7 +314,7 @@ function buildFunctionLevelTest(
     '    tracker = _CaptureTracker()',
     "    block = types.SimpleNamespace(type='tool_result', tool_use_id='tu1', is_error=True, content='actual error text')",
     '    msg = types.SimpleNamespace(content=[block])',
-    `    ${suspectFunction}([msg], tracker)`,
+    `    ${suspectFunction}(msg, tracker)`,
     `    assert tracker.error_calls, '${suspectFunction} did not call end_tool_span_with_error'`,
     `    actual = tracker.error_calls[0]`,
     `    assert actual != ${JSON.stringify(wrongValue)}, (`,
