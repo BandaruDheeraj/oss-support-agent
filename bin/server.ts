@@ -19,6 +19,7 @@
  */
 
 import * as http from 'http';
+import * as https from 'https';
 import * as path from 'path';
 import 'dotenv/config';
 
@@ -435,8 +436,9 @@ async function startServer(): Promise<void> {
       const pingUrl = `${selfUrl}/healthz`;
       // eslint-disable-next-line no-console
       console.log(`[server] keepalive: pinging ${pingUrl} every ${KEEPALIVE_MS / 60_000} min`);
+      const pinger = pingUrl.startsWith('https') ? https : http;
       setInterval(() => {
-        http.get(pingUrl, (res) => {
+        pinger.get(pingUrl, (res) => {
           // eslint-disable-next-line no-console
           console.log(`[server] keepalive: ping ${res.statusCode}`);
           res.resume();
