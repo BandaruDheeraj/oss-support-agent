@@ -171,6 +171,11 @@ export async function assembleReproTest(
     //      -> "openinference.instrumentation.anthropic._wrappers"
     const suspectModule = deriveModulePath(suspectFilePath);
 
+    // Hyphens in the derived module path are illegal Python identifiers and
+    // cause SyntaxError at import time. Bail out rather than generate a broken
+    // test that burns repair rounds on an unfixable import.
+    if (suspectModule.includes('-')) return null;
+
     // Attempt to read the source file to find the tracker base class.
     let trackerBase: string | null = null;
     try {
@@ -256,6 +261,10 @@ function pickBestSuspectSymbol(
       // Among these, still prefer /src/ files.
       const srcInAnalyst = analystSymbols.filter((s) => s.file.includes('/src/'));
       if (srcInAnalyst.length > 0) return srcInAnalyst[0];
+      // Prefer symbols whose derived module path has no hyphens — hyphens in
+      // module paths are illegal Python identifiers and cause SyntaxError.
+      const validAnalyst = analystSymbols.filter((s) => !deriveModulePath(s.file).includes('-'));
+      if (validAnalyst.length > 0) return validAnalyst[0];
       return analystSymbols[0];
     }
   }
