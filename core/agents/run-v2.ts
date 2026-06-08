@@ -283,7 +283,10 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     `[v2-driver] runReproPipeline DONE attemptId=${input.attemptId} status=${v2.status} ok=${v2.status === 'reproduced'} message=${JSON.stringify(v2.message).slice(0, 320)}`
   );
 
-  const candidateTestPath = v2.plan?.candidateTestPath;
+  // recipe.candidateTestPath may include a pytest "::test_name" suffix (e.g.
+  // "tests/repro/test_repro.py::test_repro"). Strip it for file I/O — only
+  // the file portion is a valid path; the suffix is a pytest selector.
+  const candidateTestPath = v2.plan?.candidateTestPath?.split('::')[0];
   let candidateTestContent: string | undefined;
   if (candidateTestPath) {
     const c = await workspaceAdapter.readFile(candidateTestPath);
