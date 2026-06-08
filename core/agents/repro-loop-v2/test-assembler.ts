@@ -82,13 +82,18 @@ export async function assembleReproTest(
 
   // -------------------------------------------------------------------------
   // 2. Find the primary suspect symbol + file from the dossier.
-  //    Prefer symbols from /src/ directories — their paths convert cleanly to
-  //    Python module names. Test-file paths often contain hyphenated package
+  //    Prefer symbols from the analyst's recommended install package, then
+  //    /src/ directories. Test-file paths often contain hyphenated package
   //    directory names (e.g. openinference-instrumentation-foo) that are not
   //    valid Python module names and cause SyntaxError on import.
   // -------------------------------------------------------------------------
   const suspectSymbols = body.suspectSymbols ?? [];
-  const primarySuspect = pickBestSuspectSymbol(suspectSymbols);
+  // The analyst may explicitly name the package to install under reproTargets.
+  // Use that as a filter so we don't accidentally pick a symbol from a
+  // different instrumentation package that shares similar method names.
+  const analystInstallPaths: string[] =
+    (body as Record<string, any>).reproTargets?.editableInstall ?? [];
+  const primarySuspect = pickBestSuspectSymbol(suspectSymbols, analystInstallPaths);
 
   if (!primarySuspect) {
     // Cannot proceed without a suspect symbol to drive the test.
@@ -222,15 +227,37 @@ export async function assembleReproTest(
 /**
  * Pick the best primary suspect symbol from the analyst's list.
  *
- * Prefer symbols whose files are under a /src/ directory — those paths map
- * cleanly to Python module names. Avoid test files first (they often live in
- * package directories with hyphens, e.g. openinference-instrumentation-foo,
- * which are invalid Python module identifiers).
+ * Priority order:
+ *   0. Symbol from analyst-recommended install paths (cross-repo contamination guard)
+ *   1. Symbol from a /src/ directory (canonical Python package layout)
+ *   2. Non-test-directory symbol
+ *   3. First symbol (last resort)
+ *
+ * Without the install-path filter, a symbol from a different instrumentation
+ * package that happens to share similar method names can rank above the real
+ * suspect when the analyst lists it as an oracle cross-reference.
  */
 function pickBestSuspectSymbol(
-  suspects: Array<{ file: string; symbol: string }>
+  suspects: Array<{ file: string; symbol: string }>,
+  analystInstallPaths: string[] = []
 ): { file: string; symbol: string } | undefined {
   if (suspects.length === 0) return undefined;
+
+  // Priority 0: symbols from analyst-recommended install packages.
+  // The analyst sets reproTargets.editableInstall to the specific package
+  // containing the bug. Symbols from OTHER packages may appear in the dossier
+  // as oracle cross-references but are NOT the primary suspect.
+  if (analystInstallPaths.length > 0) {
+    const analystSymbols = suspects.filter((s) =>
+      analystInstallPaths.some((p) => s.file.startsWith(p + '/') || s.file.startsWith(p))
+    );
+    if (analystSymbols.length > 0) {
+      // Among these, still prefer /src/ files.
+      const srcInAnalyst = analystSymbols.filter((s) => s.file.includes('/src/'));
+      if (srcInAnalyst.length > 0) return srcInAnalyst[0];
+      return analystSymbols[0];
+    }
+  }
 
   // Priority 1: has /src/ in the path (canonical Python package layout).
   const srcSymbols = suspects.filter((s) => s.file.includes('/src/'));
