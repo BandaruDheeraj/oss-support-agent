@@ -29,6 +29,13 @@ export interface WorkspaceReader {
   gitBlame(path: string, lineStart?: number, lineEnd?: number): Promise<GitBlameLine[]>;
   /** List changed files in current working set vs base. */
   changedFiles(): Promise<string[]>;
+  /**
+   * Read a file from the committed HEAD state, bypassing any local workspace
+   * modifications (e.g. from apply_patch). Use this to obtain the authoritative
+   * file content for constructing oldText in apply_patch calls. Returns null if
+   * the path does not exist at HEAD.
+   */
+  githubReadFile(path: string): Promise<string | null>;
 }
 
 export interface GrepMatch {
@@ -64,6 +71,12 @@ export interface WorkspaceWriter {
   affectedModule(): string;
   /** The path of the canonical repro test (for scope). */
   reproTestPath(): string | undefined;
+  /**
+   * Commit all locally-modified files (vs baseline) and push to GitHub.
+   * Must be called after apply_patch and BEFORE run_repro/run_tests — the GHA
+   * sandbox clones from GitHub and cannot see local patches until pushed.
+   */
+  commitAndPush(message: string): Promise<{ sha: string; pushedFiles: string[] }>;
 }
 
 export interface SandboxHandle {

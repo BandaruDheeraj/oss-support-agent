@@ -108,6 +108,9 @@ class FakeWorkspace implements WorkspaceWriter, WorkspaceReader {
   changedFiles(): Promise<string[]> {
     return Promise.resolve([]);
   }
+  githubReadFile(): Promise<string | null> {
+    return Promise.resolve(null);
+  }
 
   // WorkspaceWriter
   async writeTest(path: string, content: string): Promise<void> {
@@ -119,6 +122,9 @@ class FakeWorkspace implements WorkspaceWriter, WorkspaceReader {
   }
   async revertFile(path: string): Promise<void> {
     this.reverts.push(path);
+  }
+  commitAndPush(): Promise<{ sha: string; pushedFiles: string[] }> {
+    return Promise.resolve({ sha: 'abc123', pushedFiles: [] });
   }
   testRoots(): string[] {
     return ['tests'];

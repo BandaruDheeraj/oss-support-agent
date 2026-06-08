@@ -83,4 +83,26 @@ export const revertFile: ToolDef<z.infer<typeof RevertFile>, unknown> = {
   },
 };
 
-export const MUTATION_TOOLS = [applyPatch, revertFile] as const;
+const CommitAndPush = z
+  .object({
+    message: z.string().min(1).describe('Conventional commit message, e.g. "fix(scope): description"'),
+  })
+  .strict();
+
+export const commitAndPush: ToolDef<z.infer<typeof CommitAndPush>, unknown> = {
+  name: 'commit_and_push',
+  tier: 'mutation',
+  description:
+    'Commit all locally-patched files and push to the GitHub branch. ' +
+    'MUST be called after apply_patch and BEFORE run_repro or run_tests. ' +
+    'The GHA sandbox clones from GitHub and cannot see local workspace changes until they are committed and pushed here. ' +
+    'Do NOT call run_repro or run_tests to verify a fix until you have called this first.',
+  parameters: CommitAndPush,
+  async execute({ message }, ctx) {
+    const ws = asHandles(ctx.handles).workspace;
+    const result = await ws.commitAndPush(message);
+    return result;
+  },
+};
+
+export const MUTATION_TOOLS = [applyPatch, revertFile, commitAndPush] as const;

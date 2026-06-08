@@ -14,6 +14,9 @@ class FakeWorkspace {
   revertFile(): Promise<void> {
     return Promise.resolve();
   }
+  commitAndPush(): Promise<{ sha: string; pushedFiles: string[] }> {
+    return Promise.resolve({ sha: 'abc123', pushedFiles: [] });
+  }
   testRoots(): string[] {
     return ['tests'];
   }

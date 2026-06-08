@@ -157,10 +157,25 @@ const FilePath = z.object({ path: z.string().min(1) }).strict();
 export const readFile: ToolDef<z.infer<typeof FilePath>, { content: string | null }> = {
   name: 'read_file',
   tier: 'read',
-  description: 'Read a file from the repository workspace.',
+  description: 'Read a file from the local workspace (may include uncommitted apply_patch changes).',
   parameters: FilePath,
   async execute({ path }, ctx) {
     const content = await asHandles(ctx.handles).workspace.readFile(path);
+    return { content };
+  },
+};
+
+export const githubReadFile: ToolDef<z.infer<typeof FilePath>, { content: string | null }> = {
+  name: 'github_read_file',
+  tier: 'read',
+  description:
+    'Read a file directly from the committed HEAD on the branch — identical to what is on GitHub. ' +
+    'Unlike read_file, this bypasses any local apply_patch modifications. ' +
+    'Use this to get the authoritative content for constructing oldText in apply_patch calls. ' +
+    'Never use run_python or inspect.getsource to read source files — always use github_read_file or read_file.',
+  parameters: FilePath,
+  async execute({ path }, ctx) {
+    const content = await asHandles(ctx.handles).workspace.githubReadFile(path);
     return { content };
   },
 };
@@ -457,6 +472,7 @@ export const readInvestigationNotes: ToolDef<z.infer<typeof ReadNotes>, unknown>
 
 export const READ_TOOLS = [
   readFile,
+  githubReadFile,
   listDir,
   grep,
   readDiff,

@@ -139,7 +139,32 @@ export function createWorkspaceFsAdapter(
         .map((s) => s.trim())
         .filter((s) => s.length > 0);
     },
+    async githubReadFile(rel) {
+      // Reads from the committed HEAD state — never includes local apply_patch
+      // changes (which are uncommitted). Use this to get authoritative oldText.
+      const r = await execCommand('git', ['show', `HEAD:${rel}`], workspace.dir, {
+        timeoutMs: 30_000,
+      });
+      if (r.exitCode !== 0) return null;
+      return r.stdout;
+    },
 
+    async commitAndPush(message) {
+      // Collect only files changed vs baseline to avoid committing sandbox side-effects.
+      const r = await execCommand('git', ['diff', '--name-only', baselineRef], workspace.dir, {
+        timeoutMs: 15_000,
+      });
+      const changed = r.stdout
+        .split('\n')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      if (changed.length === 0) {
+        throw new Error('commitAndPush: no local changes to commit (apply_patch may have failed)');
+      }
+      const sha = await workspace.commitPaths(changed, message);
+      await workspace.push();
+      return { sha, pushedFiles: changed };
+    },
     async writeTest(rel, content) {
       if (!testRoots.some((root) => rel.startsWith(root))) {
         throw new Error(`writeTest path "${rel}" outside testRoots [${testRoots.join(', ')}]`);

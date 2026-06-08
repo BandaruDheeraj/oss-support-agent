@@ -146,18 +146,45 @@ export function makeFixPlannerRegistry({ ctx }: RegistryFactoryArgs): ToolRegist
     .registerMany([note, commitPlan, abandon]);
 }
 
+function lastSuccessfulIndex(transcript: import('./types').TranscriptEntry[], tool: string): number {
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    if (transcript[i].tool === tool && transcript[i].ok) return i;
+  }
+  return -1;
+}
+
+function requireCommitBeforeSandbox(transcript: import('./types').TranscriptEntry[]): string | null {
+  const lastPatch = lastSuccessfulIndex(transcript, 'apply_patch');
+  if (lastPatch === -1) return null; // no patch yet — allow baseline run
+  const lastCommit = lastSuccessfulIndex(transcript, 'commit_and_push');
+  if (lastCommit > lastPatch) return null; // committed after last patch — good
+  return (
+    'You must call commit_and_push BEFORE run_repro or run_tests. ' +
+    'The GHA sandbox clones from GitHub and cannot see local apply_patch changes until they are committed and pushed. ' +
+    'Call commit_and_push with a descriptive message, then re-run the sandbox tool.'
+  );
+}
+
 export function makeFixExecutorRegistry({ ctx }: RegistryFactoryArgs): ToolRegistry {
   return new ToolRegistry(
     {
       budgets: defaultBudgets({ total: 120 }),
       maxTurns: 30,
+      toolGates: {
+        run_repro: requireCommitBeforeSandbox,
+        run_tests: requireCommitBeforeSandbox,
+      },
       abandonGate: (transcript) => {
         const patched = transcript.some((t) => t.tool === 'apply_patch' && t.ok);
+        const committed = transcript.some((t) => t.tool === 'commit_and_push' && t.ok);
         const ranTests = transcript.filter(
           (t) => t.ok && (t.tool === 'run_repro' || t.tool === 'run_tests'),
         ).length;
         if (!patched) {
-          return 'abandon is forbidden before you have applied at least one patch with apply_patch. Make your best attempt at the fix from the plan, then run_repro/run_tests to validate.';
+          return 'abandon is forbidden before you have applied at least one patch with apply_patch. Make your best attempt at the fix from the plan, then commit_and_push → run_repro to validate.';
+        }
+        if (!committed) {
+          return 'abandon is forbidden before you have called commit_and_push. After apply_patch, call commit_and_push to push your changes to GitHub, then run_repro to verify.';
         }
         if (ranTests < 1) {
           return 'abandon is forbidden before you have run the tests at least once. Call run_repro or run_tests to observe the result of your patch.';
