@@ -11,6 +11,11 @@ export interface ForkConfig {
   branchPrefix: string;
   /** Sorted issue IDs for this issue group */
   issueIds: number[];
+  /**
+   * When true, skip resetting an existing branch to baseline.
+   * Use in fix-only mode where the branch already has a committed repro test.
+   */
+  skipReset?: boolean;
 }
 
 export interface ForkResult {

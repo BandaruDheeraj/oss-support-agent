@@ -425,6 +425,27 @@ async function startServer(): Promise<void> {
     console.log(
       `[server] live deps: ${live ? `enabled (from=${live.monitoredEmail})` : 'disabled (skip-PM-gate path only)'}`
     );
+
+    // Self-ping keepalive: prevent Render free-tier spin-down during long-running
+    // LLM operations (investigator → planner → executor have no incoming requests).
+    // RENDER_EXTERNAL_URL is auto-injected by Render; absent in local dev.
+    const selfUrl = process.env.RENDER_EXTERNAL_URL;
+    if (selfUrl) {
+      const KEEPALIVE_MS = 10 * 60 * 1000; // 10 minutes
+      const pingUrl = `${selfUrl}/healthz`;
+      // eslint-disable-next-line no-console
+      console.log(`[server] keepalive: pinging ${pingUrl} every ${KEEPALIVE_MS / 60_000} min`);
+      setInterval(() => {
+        http.get(pingUrl, (res) => {
+          // eslint-disable-next-line no-console
+          console.log(`[server] keepalive: ping ${res.statusCode}`);
+          res.resume();
+        }).on('error', (err) => {
+          // eslint-disable-next-line no-console
+          console.warn(`[server] keepalive: ping failed: ${err.message}`);
+        });
+      }, KEEPALIVE_MS).unref();
+    }
   });
 }
 

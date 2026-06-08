@@ -2187,6 +2187,7 @@ export async function runPipeline(args: {
     forkOrg: deps.forkOrg,
     branchPrefix: manifest.branch_prefix,
     issueIds: [issueNumber],
+    skipReset: process.env.OSA_FIX_ONLY === '1',
   });
   log(
     `[fork] ${fork.forkFullName} branch=${fork.branchName} ` +

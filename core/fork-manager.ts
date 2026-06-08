@@ -156,17 +156,19 @@ export async function createForkAndBranch(
   const existingBranchSha = await client.getBranchSha(expectedForkName, branchName);
 
   if (existingBranchSha) {
-    // Branch exists - reset it to fork's default branch (retry)
-    try {
-      await client.updateBranchRef(expectedForkName, branchName, baseSha);
-      branchReset = true;
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new BranchCreationError(
-        `Failed to reset existing branch: ${message}`,
-        expectedForkName,
-        branchName
-      );
+    // Branch exists - reset to fork's default branch (retry), unless skipReset
+    if (!config.skipReset) {
+      try {
+        await client.updateBranchRef(expectedForkName, branchName, baseSha);
+        branchReset = true;
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new BranchCreationError(
+          `Failed to reset existing branch: ${message}`,
+          expectedForkName,
+          branchName
+        );
+      }
     }
   } else {
     // Create new branch
