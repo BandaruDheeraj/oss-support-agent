@@ -74,9 +74,11 @@ export class HypothesisTracker {
     }
     const h = candidates[candidates.length - 1]; // most recent
 
-    // Must have a read_file / github_read_file / grep touching this file AFTER the hypothesis was created
+    // Must have a read_file / github_read_file / grep touching this file at any point before this apply_patch.
+    // We intentionally do NOT require the read to happen after the hypothesis was stated — the executor
+    // often reads the file once, states multiple hypotheses, then patches them in sequence. Requiring
+    // re-reads after each hypothesis causes false gate rejections on the second+ patch.
     const readSeen = transcript.some((entry) => {
-      if (entry.turn < h.createdAtTurn) return false;
       if (entry.tool === 'read_file' || entry.tool === 'github_read_file') {
         return (entry.args as any)?.path === file;
       }
