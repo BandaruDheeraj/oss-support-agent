@@ -42,5 +42,9 @@ export interface EmailContext {
     failureKind?: string;           // e.g. 'sandbox_crash', 'missing_python', etc.
     humanQuestion?: string;
     missingCredential?: string;
+    diff?: string;                  // raw git diff for fix_ready_for_review emails
+    branchUrl?: string;
+    commitSha?: string;
+    reproTestPath?: string;
   };
 }

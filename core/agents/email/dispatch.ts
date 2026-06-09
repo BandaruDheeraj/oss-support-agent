@@ -104,6 +104,58 @@ export function buildSuccessContext(args: {
 }
 
 /**
+ * buildFixReadyContext — context for the `fix_ready_for_review` email.
+ * Sent when the executor committed a fix to the branch but GHA sandbox
+ * verification could not run (e.g. dispatch timeout). The recipient reviews
+ * the diff and merges manually.
+ */
+export function buildFixReadyContext(args: {
+  attemptId: string;
+  recipient: string;
+  issueNumber: number;
+  issueUrl: string | null;
+  branchUrl: string;
+  commitSha: string;
+  summary?: string;
+  fixApproach?: string;
+  changedFiles?: string[];
+  diff?: string;
+  reproTestPath?: string;
+  dossier?: DossierSnapshot | null;
+}): EmailContext {
+  return {
+    to: [args.recipient],
+    recipient: args.recipient,
+    attemptId: args.attemptId,
+    issueNumber: args.issueNumber,
+    issueUrl: args.issueUrl,
+    prNumber: null,
+    prUrl: null,
+    dossier: args.dossier ?? null,
+    fixNotes: null,
+    inboxEntryId: `${args.attemptId}-fix-ready`,
+    nonce: '',
+    replyTo: args.recipient,
+    expectedActions: ['review diff on branch', 'merge or request changes'],
+    links: {
+      phoenix: null,
+      braintrust: null,
+      pr: null,
+      issue: args.issueUrl,
+    },
+    context: {
+      summary: args.summary,
+      fixApproach: args.fixApproach,
+      changedFiles: args.changedFiles,
+      diff: args.diff,
+      branchUrl: args.branchUrl,
+      commitSha: args.commitSha,
+      reproTestPath: args.reproTestPath,
+    },
+  };
+}
+
+/**
  * buildHaltContext — minimal EmailContext for informational halt emails.
  * inboxEntryId/nonce are placeholders (no reply expected); callers wanting
  * real reply binding should build the context themselves after

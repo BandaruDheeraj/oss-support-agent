@@ -16,6 +16,7 @@ import {
   regressionBlocker,
   humanDecisionNeeded,
   prOpened,
+  fixReadyForReview,
 } from './templates';
 import type { EmailContext } from './context';
 
@@ -27,7 +28,8 @@ export type EmailKind =
   | 'fix_failed'
   | 'regression_blocker'
   | 'human_decision_needed'
-  | 'pr_opened';
+  | 'pr_opened'
+  | 'fix_ready_for_review';
 
 export const EmailPayloadSchema = z.object({
   kind: z.string(),
@@ -73,6 +75,8 @@ export function composeEmail({ kind, context }: ComposeOptions): EmailPayload {
       return humanDecisionNeeded(context);
     case 'pr_opened':
       return prOpened(context);
+    case 'fix_ready_for_review':
+      return fixReadyForReview(context);
     default: {
       const _exhaustive: never = kind;
       throw new Error(`unknown email kind: ${_exhaustive}`);

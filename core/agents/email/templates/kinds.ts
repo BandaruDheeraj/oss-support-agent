@@ -122,6 +122,41 @@ export function humanDecisionNeeded(ctx: EmailContext): EmailPayload {
   return build(ctx, { kind: 'human_decision_needed', subject: `[osa] Human decision needed for #${ctx.issueNumber}`, bodyMarkdown: md });
 }
 
+export function fixReadyForReview(ctx: EmailContext): EmailPayload {
+  const md = [
+    header(ctx, 'Fix committed — ready for your review'),
+    '',
+    '> The agent committed a fix to the branch listed below. GHA sandbox verification',
+    '> could not run automatically, so the fix needs manual review before merging.',
+    '',
+    '## Root cause analysis',
+    redact(ctx.context.summary),
+    '',
+    '## Fix approach',
+    redact(ctx.context.fixApproach),
+    '',
+    '## Branch & commit',
+    ctx.context.branchUrl ? `**Branch:** [${ctx.context.branchUrl}](${ctx.context.branchUrl})` : '',
+    ctx.context.commitSha ? `**Commit SHA:** \`${ctx.context.commitSha}\`` : '',
+    ctx.context.reproTestPath ? `**Repro test:** \`${ctx.context.reproTestPath}\`` : '',
+    '',
+    '## Changed files',
+    ...(ctx.context.changedFiles ?? []).map((f) => `- \`${f}\``),
+    '',
+    '## Diff',
+    '```diff',
+    redact(ctx.context.diff ?? '(diff unavailable)').slice(0, 20_000),
+    '```',
+    dossierBlock(ctx),
+    footer(ctx),
+  ].filter(Boolean).join('\n');
+  return build(ctx, {
+    kind: 'fix_ready_for_review',
+    subject: `[osa] Fix ready for review — #${ctx.issueNumber}`,
+    bodyMarkdown: md,
+  });
+}
+
 export function prOpened(ctx: EmailContext): EmailPayload {
   const md = [
     header(ctx, 'PR opened from approved fix'),

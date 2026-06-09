@@ -38,7 +38,7 @@ import {
   runFixPipeline,
   type ReproPipelineOutcome,
 } from '../core/agents/run-v2';
-import { dispatchTypedHaltEmail, buildHaltContext, buildSuccessContext } from '../core/agents/email/dispatch';
+import { dispatchTypedHaltEmail, buildHaltContext, buildSuccessContext, buildFixReadyContext } from '../core/agents/email/dispatch';
 import type { ReproCandidateEvaluation, ReproV2Outcome } from '../core/agents/repro-loop-v2/orchestrator';
 import type { FixV2Outcome } from '../core/agents/fix-loop/orchestrator';
 
@@ -1512,9 +1512,10 @@ function resolveRecordedBackend(): string {
  * Gather the git diff of the last commit in the workspace directory.
  * Returns the diff string (capped at 20KB), or an error description on failure.
  */
-async function gatherFixDiff(workspaceDir: string, log: (msg: string) => void): Promise<string> {
+async function gatherFixDiff(workspaceDir: string, log: (msg: string) => void, baseSha?: string): Promise<string> {
   try {
-    const result = await execCommand('git', ['diff', 'HEAD~1', 'HEAD'], workspaceDir, {
+    const range = baseSha ? [baseSha, 'HEAD'] : ['HEAD~1', 'HEAD'];
+    const result = await execCommand('git', ['diff', ...range], workspaceDir, {
       timeoutMs: 15_000,
     });
     if (result.exitCode !== 0) {
@@ -3024,6 +3025,43 @@ export async function runPipeline(args: {
 
     if (!fixOutcome.ok) {
       log("[v2-fix] not approved: " + fixOutcome.status + " \u2014 " + fixOutcome.message);
+
+      // Check whether the executor committed a fix to the branch even though
+      // the pipeline couldn't auto-verify it (e.g. GHA sandbox dispatch timed out).
+      // If HEAD drifted from the fix baseline, a real commit exists \u2014 send a
+      // "fix ready for review" email so the user can review and merge manually.
+      let headAfterFix: string | null = null;
+      try { headAfterFix = await workspace.headSha(); } catch { /* best-effort */ }
+      const fixWasCommitted = headAfterFix !== null && headAfterFix !== fixBaselineSha;
+
+      if (fixWasCommitted && deps.live) {
+        log("[v2-fix] HEAD drifted from baseline \u2014 fix was committed, sending fix_ready_for_review email");
+        const planSummary = fixOutcome.v2.plan?.summary;
+        const dossierSummary = fixDossier?.body?.summary;
+        const branchUrl = `https://github.com/${fork.forkFullName}/tree/${fork.branchName}`;
+        const fixDiff = await gatherFixDiff(workspace.dir, log, fixBaselineSha);
+        await dispatchTypedHaltEmail({
+          kind: 'fix_ready_for_review',
+          context: buildFixReadyContext({
+            attemptId: fixAttemptId,
+            recipient: manifest.pm_email,
+            issueNumber,
+            issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
+            branchUrl,
+            commitSha: headAfterFix!,
+            summary: dossierSummary ?? planSummary ?? "See dossier for details.",
+            fixApproach: planSummary,
+            changedFiles: fixOutcome.changedFiles,
+            diff: fixDiff,
+            reproTestPath: reproPath,
+            dossier: fixDossier,
+          }),
+          notifier: deps.live.failureNotifier,
+          log,
+        });
+        return finish({ status: 'max-retries-exceeded', reason: 'fix committed to branch; awaiting manual review' });
+      }
+
       if (deps.live) {
         const criticReason = fixOutcome.v2.criticVerdict?.reason;
         const criticVerdict = fixOutcome.v2.criticVerdict?.verdict;

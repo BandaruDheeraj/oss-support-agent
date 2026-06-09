@@ -7,4 +7,5 @@ export {
   regressionBlocker,
   humanDecisionNeeded,
   prOpened,
+  fixReadyForReview,
 } from './kinds';
