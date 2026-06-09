@@ -50,6 +50,9 @@ function resolveEndpointAndHeaders(): { endpoint: string | null; headers: Record
   const headers = parseHeaders(process.env.PHOENIX_OTLP_HEADERS);
   if (process.env.ARIZE_API_KEY) headers['api_key'] = process.env.ARIZE_API_KEY;
   if (process.env.ARIZE_SPACE_ID) headers['space_id'] = process.env.ARIZE_SPACE_ID;
+  // model_id routes spans to the correct Arize AX project (required for Arize Cloud)
+  const modelId = process.env.ARIZE_MODEL_ID || process.env.OTEL_SERVICE_NAME;
+  if (modelId) headers['model_id'] = modelId;
   return { endpoint, headers };
 }
 
