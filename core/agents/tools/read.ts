@@ -171,7 +171,10 @@ export const githubReadFile: ToolDef<z.infer<typeof FilePath>, { content: string
   description:
     'Read a file directly from the committed HEAD on the branch — identical to what is on GitHub. ' +
     'Unlike read_file, this bypasses any local apply_patch modifications. ' +
-    'Use this to get the authoritative content for constructing oldText in apply_patch calls. ' +
+    'Use this BEFORE every apply_patch call. You MUST copy oldText VERBATIM from this output — ' +
+    'character-for-character, including all whitespace and indentation. ' +
+    'Do NOT retype, reconstruct, or paraphrase the content: any single character difference ' +
+    'will cause apply_patch to fail with "oldText not found". ' +
     'Never use run_python or inspect.getsource to read source files — always use github_read_file or read_file.',
   parameters: FilePath,
   async execute({ path }, ctx) {
@@ -409,16 +412,17 @@ export const readSymbolContext: ToolDef<z.infer<typeof ReadSymbolContext>, unkno
         callers: [],
       };
     }
-    const allDefs = await searchSymbolDefinitions(candidates, workspace, paths);
-    const definitions = await enrichWithContext(allDefs.slice(0, maxDefinitions), workspace, contextLines);
-
-    let callers: Array<GrepMatch & { context: string | null }> = [];
-    let callerTruncated = false;
-    if (includeCallers) {
-      const allCallers = await searchSymbolCallers(candidates, workspace, paths);
-      callerTruncated = allCallers.length > maxCallers;
-      callers = await enrichWithContext(allCallers.slice(0, maxCallers), workspace, contextLines);
-    }
+    const [allDefs, allCallersRaw] = await Promise.all([
+      searchSymbolDefinitions(candidates, workspace, paths),
+      includeCallers ? searchSymbolCallers(candidates, workspace, paths) : Promise.resolve([]),
+    ]);
+    const callerTruncated = includeCallers && allCallersRaw.length > maxCallers;
+    const [definitions, callers] = await Promise.all([
+      enrichWithContext(allDefs.slice(0, maxDefinitions), workspace, contextLines),
+      includeCallers
+        ? enrichWithContext(allCallersRaw.slice(0, maxCallers), workspace, contextLines)
+        : Promise.resolve<Array<GrepMatch & { context: string | null }>>([]),
+    ]);
 
     return {
       symbol,

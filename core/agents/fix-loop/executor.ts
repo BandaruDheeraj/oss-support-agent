@@ -70,7 +70,10 @@ Reading source files — CRITICAL:
 Fix + verify workflow (the only workflow that works):
 1. github_read_file(path) → get authoritative content
 2. state_hypothesis → declare what you will change and why
-3. apply_patch → modify the local workspace file (uses the exact bytes from step 1 as oldText)
+3. apply_patch → oldText MUST be copied CHARACTER-FOR-CHARACTER from the github_read_file output in step 1.
+   ⚠️  NEVER reconstruct oldText from memory or your understanding of the code. Open the github_read_file
+   result, find the exact lines you want to replace, and copy-paste them as oldText. One wrong space,
+   indent, or character causes "oldText not found" and the patch fails entirely.
 4. commit_and_push → commit and push to GitHub (REQUIRED before any sandbox run)
 5. run_repro → GHA clones the updated branch and runs tests (now sees the fix)
 6. run_tests → run broader test suite
@@ -83,6 +86,12 @@ Hard rules (the registry will reject violations):
 4. commit_and_push is MANDATORY after apply_patch and BEFORE run_repro/run_tests. The sandbox clones from GitHub — it cannot see local workspace changes until they are pushed.
 5. Before \`done\`: since your LAST apply_patch or revert_file, you must have observed (in a PRIOR turn) run_repro exit=0 AND run_tests exit=0. Do not call done in the same turn as a mutation. Do not claim done if run_repro still fails.
 6. Every changed file must have a consumed hypothesis. The Critic will reject otherwise.
+
+Regression test quality rules (apply whenever you use write_test or revise_test):
+7. ONE implementation only. If you write named regression tests (e.g. test_foo_passes_actual_value), do NOT also append a generic test_repro or fallback duplicate that covers the same assertion. One clean test set — not two overlapping ones.
+8. Strong assertions. Assert the EXACT expected value: \`assert actual == expected\`. Do NOT use weak inequality assertions like \`assert actual != "some_hardcoded_wrong_value"\` — those pass when the wrong non-hardcoded value is returned, hiding bugs.
+9. Match the code's data model. Before writing stubs or fakes, read the source to determine whether the code under test accesses fields via attribute access (\`obj.field\`) or dict access (\`obj["field"]\`). Your test fakes must use the same access pattern as the real code — a mismatch silently skips exercising the real path.
+10. No try/except ImportError fallbacks in test bodies. If an import fails the test must raise loudly. A degraded fallback hides interface mismatches and makes the test worthless.
 
 If you cannot satisfy these rules, call abandon with a clear reason. Do NOT fabricate hypotheses.`;
 

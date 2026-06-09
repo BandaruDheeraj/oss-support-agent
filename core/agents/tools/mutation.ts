@@ -31,7 +31,14 @@ function patchInScope(path: string, affectedModule: string, reproTestPath?: stri
 const ApplyPatch = z
   .object({
     path: z.string().min(1),
-    oldText: z.string().min(1, 'oldText must be a unique 3+ line block from the existing file'),
+    oldText: z
+      .string()
+      .min(1)
+      .describe(
+        'VERBATIM text from github_read_file or read_file — copy it character-for-character. ' +
+          'Do NOT retype or reconstruct from memory. Any whitespace or indentation difference ' +
+          'causes "oldText not found". Must be a unique 3+ line block.'
+      ),
     newText: z.string(),
     reason: z.string().optional(),
   })
@@ -41,7 +48,10 @@ export const applyPatch: ToolDef<z.infer<typeof ApplyPatch>, unknown> = {
   name: 'apply_patch',
   tier: 'mutation',
   description:
-    'Apply a search/replace patch. REQUIRES a prior state_hypothesis with the same `file` and a read_file/grep on that file in the transcript. Path must be inside the affected module (or the repro test path).',
+    'Apply a search/replace patch. oldText MUST be copied VERBATIM from github_read_file or read_file output — ' +
+    'do not retype it from memory, any character difference will fail. ' +
+    'REQUIRES a prior state_hypothesis with the same `file` and a github_read_file/read_file on that file in the transcript. ' +
+    'Path must be inside the affected module (or the repro test path).',
   parameters: ApplyPatch,
   async execute({ path, oldText, newText, reason }, ctx) {
     const h = asHandles(ctx.handles);
