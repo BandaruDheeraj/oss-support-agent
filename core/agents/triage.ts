@@ -220,13 +220,15 @@ export async function triageIssue(
     return { action: 'route_not_applicable', result, comment };
   }
 
+  // skip_pm_gate_label overrides the low-confidence gate: the human has
+  // explicitly declared the fix is trivial, so skip clarification and proceed.
+  if (input.hasSkipPmGate) {
+    return { action: 'route_fork', result };
+  }
+
   if (result.confidence < LOW_CONFIDENCE_THRESHOLD) {
     const comment = buildClarificationComment(result);
     return { action: 'clarify', result, comment };
-  }
-
-  if (input.hasSkipPmGate) {
-    return { action: 'route_fork', result };
   }
 
   switch (result.issueType) {
