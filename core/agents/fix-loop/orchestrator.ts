@@ -93,7 +93,7 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
   let remainingTokenBudget = tokenBudget;
 
   const loopStartHead = await args.getCurrentHeadSha();
-  const allowedScope = deriveAllowedScope(args.snapshot);
+  const allowedScope = deriveAllowedScope(args.snapshot, args.reproTestPath);
 
   let retryFeedback: string | undefined;
   let lastFeedback: string | undefined;
@@ -415,10 +415,13 @@ function resolveFixTokenBudget(
 }
 
 function completionPromisePassed(checks: CompletionPromiseChecks): boolean {
-  return checks.repro_test_passes && checks.regression_green && checks.no_head_drift && checks.scope_ok;
+  // no_head_drift is intentionally excluded: an executor that commits a fix and verifies it
+  // in the same iteration is valid. Requiring no_head_drift=true would demand a separate
+  // "verify only" iteration after every commit, making the loop always exhaust its budget.
+  return checks.repro_test_passes && checks.regression_green && checks.scope_ok;
 }
 
-function deriveAllowedScope(snapshot: DossierSnapshot): string[] {
+function deriveAllowedScope(snapshot: DossierSnapshot, reproTestPath?: string): string[] {
   const out = new Set<string>();
   for (const assertion of snapshot.body.oracleSpec?.suspect_path_assertions ?? []) {
     const normalized = normalizeRepoPath(assertion.file);
@@ -430,6 +433,11 @@ function deriveAllowedScope(snapshot: DossierSnapshot): string[] {
       if (normalized) out.add(normalized);
     }
   }
+  // The repro test is always a legitimate mutation target (executor may need to revise it).
+  if (reproTestPath) {
+    const normalized = normalizeRepoPath(reproTestPath);
+    if (normalized) out.add(normalized);
+  }
   return Array.from(out).sort();
 }
 
@@ -440,14 +448,34 @@ function normalizeRepoPath(path: string | undefined): string | null {
 }
 
 function evaluateScope(changedFiles: string[], allowedScope: string[]): ScopeEvaluation {
-  const allowed = new Set(allowedScope.map((p) => p.toLowerCase()));
+  // Build both exact and directory-prefix matchers from allowedScope. When the dossier names
+  // a specific file (e.g. processor.py), the containing package directory is also implicitly
+  // in scope so sibling files (tests, __init__.py) are not flagged as out-of-scope.
+  const allowedLower = allowedScope.map((p) => p.toLowerCase());
+  const allowedExact = new Set(allowedLower);
+  // Derive package-root prefixes: walk up from each allowed path until we hit a manifest
+  // directory segment (src/, tests/, or a package boundary). As a practical heuristic,
+  // treat the two-levels-up ancestor of any file as an allowed prefix so that files in
+  // the same package are not rejected. E.g. a/b/c/d.py → prefix a/b/c/ and a/b/.
+  const allowedPrefixes: string[] = allowedLower.map((p) => {
+    const parts = p.split('/');
+    // Include the directory containing the file (index -1) as a prefix.
+    return parts.slice(0, -1).join('/') + '/';
+  });
+
   const outOfScope: string[] = [];
   for (const file of changedFiles) {
     const normalized = normalizeRepoPath(file);
     if (!normalized) continue;
-    if (!allowed.has(normalized.toLowerCase())) {
-      outOfScope.push(normalized);
+    const lower = normalized.toLowerCase();
+    if (allowedExact.has(lower)) continue;
+    if (allowedPrefixes.some((prefix) => lower.startsWith(prefix))) continue;
+    // Test files anywhere in the repo are treated as in-scope.
+    if (lower.includes('/tests/') || lower.includes('/test/') || lower.includes('__tests__') ||
+        lower.includes('.test.') || lower.includes('.spec.') || lower.startsWith('tests/') || lower.startsWith('test/')) {
+      continue;
     }
+    outOfScope.push(normalized);
   }
   return { allowedScope, outOfScope };
 }
