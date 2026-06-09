@@ -166,8 +166,14 @@ export function createWorkspaceFsAdapter(
       return { sha, pushedFiles: changed };
     },
     async writeTest(rel, content) {
-      if (!testRoots.some((root) => rel.startsWith(root))) {
-        throw new Error(`writeTest path "${rel}" outside testRoots [${testRoots.join(', ')}]`);
+      const norm = rel.replace(/\\/g, '/');
+      const inTestRoots = testRoots.some((root) => norm.startsWith(root));
+      // Also allow any path that contains a /tests/ or /test/ directory component,
+      // so package-level test directories (e.g. python/pkg/tests/) are permitted.
+      const isNestedTestDir =
+        norm.includes('/tests/') || norm.includes('/test/') || norm.startsWith('tests/') || norm.startsWith('test/');
+      if (!inTestRoots && !isNestedTestDir) {
+        throw new Error(`write-test path "${rel}" must be under one of: tests/, test/, or a nested tests/ directory`);
       }
       workspace.writeFile(rel, content);
     },
@@ -185,11 +191,27 @@ export function createWorkspaceFsAdapter(
       }
       const abs = resolve(patch.path);
       const current = fs.readFileSync(abs, 'utf-8');
-      const idx = current.indexOf(patch.oldText);
+
+      // Try exact match first.
+      let idx = current.indexOf(patch.oldText);
+      let replaceLen = patch.oldText.length;
+
+      if (idx < 0) {
+        // Fallback: normalize trailing whitespace on each line of oldText.
+        // LLMs sometimes add trailing spaces when constructing oldText; well-maintained
+        // source files never have trailing spaces, so stripping them makes the match succeed.
+        const trimmedOld = patch.oldText.split('\n').map((l) => l.trimEnd()).join('\n');
+        if (trimmedOld !== patch.oldText) {
+          idx = current.indexOf(trimmedOld);
+          replaceLen = trimmedOld.length;
+        }
+      }
+
       if (idx < 0) {
         throw new Error(`applyPatch oldText not found in ${patch.path}`);
       }
-      const updated = current.slice(0, idx) + patch.newText + current.slice(idx + patch.oldText.length);
+
+      const updated = current.slice(0, idx) + patch.newText + current.slice(idx + replaceLen);
       fs.writeFileSync(abs, updated, 'utf-8');
       const patchId = `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
       return { patchId };
