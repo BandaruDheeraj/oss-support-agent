@@ -49,7 +49,7 @@ const IGNORED_DIRS = new Set([
 
 const DEFAULT_MAX_DEPTH = 6;
 const DEFAULT_CAP = 50;
-const FINAL_RETURN_CAP = 20; // matches MAX_EDITABLE_INSTALLS in repro-setup-validation
+const FINAL_RETURN_CAP = 50; // matches MAX_EDITABLE_INSTALLS in repro-setup-validation
 
 export interface EditableInstallDiscoveryOptions {
   /** Repo-relative module path triage identified (used for walk-up priority). */

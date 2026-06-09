@@ -117,14 +117,14 @@ describe('discoverEditableInstallCandidates', () => {
     expect(got).toEqual(['src/foo']);
   });
 
-  it('caps results at 20 entries (validator max)', () => {
+  it('caps results at 50 entries (validator max)', () => {
     const layout: Record<string, string> = {};
-    for (let i = 0; i < 25; i++) {
+    for (let i = 0; i < 60; i++) {
       layout[`pkg${i}/pyproject.toml`] = `[project]\nname="pkg${i}"\n`;
     }
     dir = makeTempRepo(layout);
     const got = discoverEditableInstallCandidates(dir);
-    expect(got.length).toBeLessThanOrEqual(20);
+    expect(got.length).toBeLessThanOrEqual(50);
   });
 });
 
@@ -268,11 +268,11 @@ describe('deriveEditableInstallsFromSuspectPaths', () => {
 });
 
 describe('mergeEditableInstallCandidates', () => {
-  it('prioritises prioritized entries first, de-duplicates, caps at 20', () => {
+  it('prioritises prioritized entries first, de-duplicates, caps at 50', () => {
     const prioritized = ['a', 'b', 'a'];
-    const fallback = Array.from({ length: 22 }, (_, i) => `pkg${i}`);
+    const fallback = Array.from({ length: 55 }, (_, i) => `pkg${i}`);
     const out = mergeEditableInstallCandidates(prioritized, fallback);
-    expect(out.length).toBeLessThanOrEqual(20);
+    expect(out.length).toBeLessThanOrEqual(50);
     expect(out[0]).toBe('a');
     expect(out[1]).toBe('b');
   });
