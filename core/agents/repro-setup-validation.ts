@@ -44,7 +44,7 @@ const EDITABLE_PATH = /^[A-Za-z0-9_./-]+$/;
 //   foo bar                      (whitespace = two tokens)
 const PIP_PACKAGE = /^[A-Za-z0-9_]([A-Za-z0-9_.-]*[A-Za-z0-9_])?(\[[A-Za-z0-9_.,-]+\])?([<>=!~]=?[A-Za-z0-9_.*+-]+)?$/;
 
-const MAX_EDITABLE_INSTALLS = 5;
+const MAX_EDITABLE_INSTALLS = 20;
 const MAX_PIP_PACKAGES = 30;
 const MAX_TOKEN_LEN = 200;
 

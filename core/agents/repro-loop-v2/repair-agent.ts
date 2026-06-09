@@ -131,7 +131,10 @@ ${availableSection}${historySection}
 
 ━━━ REPAIR RULES ━━━
 1. "SandboxSession.dispatch requires setupDependencies()" → The editable install path causes a sandbox lifecycle failure. Remove it from editableInstall, or swap it for a correct path from the available candidates list. Consider whether the package is even needed (it may be a transitive dep of another package you're already installing).
-2. ImportError / ModuleNotFoundError → Fix the import in the test, or add/correct the package in installSpec. Check the available candidates for the right path.
+2. ImportError / ModuleNotFoundError →
+   (a) In-repo package: add the correct repo-relative path to editableInstall (check available candidates list). For a monorepo the path is typically python/instrumentation/<package-dir> or similar.
+   (b) External/PyPI package OR in-repo package not in the available candidates list: add the PyPI name to additionalPackages (e.g. "opentelemetry-sdk", "openinference-instrumentation-strands-agents"). pip install will fetch it from PyPI. The PyPI name is usually the module path with dots replaced by dashes (e.g. openinference.instrumentation.strands_agents → openinference-instrumentation-strands-agents).
+   (c) Never leave a ModuleNotFoundError unaddressed — always add the package somewhere in installSpec.
 3. exit code 127 / "command not found" → A CLI tool (e.g. pytest) is missing. Add it to additionalPackages (e.g. "pytest") so it gets pip-installed before the test runs.
 4. Test PASSED when it should fail → Rewrite the test to actually call the function that has the bug and assert the incorrect (buggy) behavior triggers.
 5. Test fails with wrong error → The test is hitting a setup error before reaching the buggy code. Fix imports, mocks, and setup so the test reaches the bug.

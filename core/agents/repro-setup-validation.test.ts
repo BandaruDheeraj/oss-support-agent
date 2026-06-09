@@ -59,8 +59,8 @@ describe('validateReproSetup', () => {
 
   it('caps editableInstalls count', () => {
     expect(() =>
-      validateReproSetup({ editableInstalls: Array(10).fill('packages/foo') })
-    ).toThrow(/max 5/);
+      validateReproSetup({ editableInstalls: Array(25).fill('packages/foo') })
+    ).toThrow(/max 20/);
   });
 
   it('caps pipPackages count', () => {
