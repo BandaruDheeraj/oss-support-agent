@@ -4,8 +4,8 @@
  * apply_patch enforces:
  *   - path is inside affectedModule, or is the repro test path
  *   - a hypothesis tracker exists; that file has at least one unconsumed
- *     hypothesis; a read_file/grep on `file` appears in transcript AFTER
- *     the hypothesis was stated; hypothesis is then marked consumed
+ *     hypothesis; a read_file/github_read_file/grep on `file` appears in
+ *     transcript AFTER the hypothesis was stated; hypothesis is then marked consumed
  *
  * revert_file resets a single file to baseline. No guard required beyond
  * tier budget.
@@ -67,9 +67,12 @@ export const applyPatch: ToolDef<z.infer<typeof ApplyPatch>, unknown> = {
     const transcript = ctx.getTranscript();
     const turn = transcript.length > 0 ? transcript[transcript.length - 1].turn : 1;
 
-    // applyPatch must succeed before we mark the hypothesis consumed
+    // Gate check BEFORE mutating workspace — prevents dirty workspace if gate rejects.
+    tracker.checkApplyPatchGate(path, transcript);
+
+    // Gate passed; apply patch then mark hypothesis consumed.
     const { patchId } = await ws.applyPatch({ path, oldText, newText });
-    const consumed = tracker.consumeForPatch(path, patchId, transcript, turn);
+    const consumed = tracker.consumeForPatch(path, patchId, turn);
 
     return {
       applied: true,

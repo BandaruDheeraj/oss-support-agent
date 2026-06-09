@@ -384,9 +384,17 @@ async function runFixPipelineImpl(input: FixPipelineInput): Promise<FixPipelineO
     throw new Error('runFixPipeline: dossier has no snapshot — Analyst must run first');
   }
 
+  // Derive test roots from reproTestPath so the executor can write regression tests
+  // to the package-local test directory (e.g. python/instrumentation/.../tests/).
+  const reproDir = input.reproTestPath
+    ? input.reproTestPath.replace(/[^/]+$/, '') // strip filename, keep trailing slash
+    : undefined;
+  const testRoots = [...new Set([...(reproDir ? [reproDir] : []), 'tests/', 'test/'])];
+
   const workspaceAdapter = createWorkspaceFsAdapter(input.workspace, {
     affectedModule: input.affectedModule,
     reproTestPath: input.reproTestPath,
+    testRoots,
   });
   const issueHandle = createIssueHandle(input.payload);
   const repoHandle = createRepoHandle({

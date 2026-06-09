@@ -56,16 +56,14 @@ export class HypothesisTracker {
   }
 
   /**
-   * Mark a hypothesis consumed by a patch. Throws if no matching unconsumed
-   * hypothesis exists, or if the transcript prior to this turn does not show
-   * a read_file/grep of `file` AFTER the hypothesis was created.
+   * Pre-flight gate check for apply_patch. Must be called BEFORE ws.applyPatch
+   * to avoid dirtying the workspace when the gate rejects.
+   *
+   * Throws if no unconsumed hypothesis exists for `file`, or if the transcript
+   * contains no read_file / github_read_file / grep on `file` at or after the
+   * hypothesis was created.
    */
-  consumeForPatch(
-    file: string,
-    patchId: string,
-    transcript: TranscriptEntry[],
-    atTurn: number
-  ): Hypothesis {
+  checkApplyPatchGate(file: string, transcript: TranscriptEntry[]): Hypothesis {
     const candidates = this.unconsumedFor(file);
     if (candidates.length === 0) {
       const err = new Error(
@@ -76,10 +74,10 @@ export class HypothesisTracker {
     }
     const h = candidates[candidates.length - 1]; // most recent
 
-    // Must have a read_file / grep touching this file AFTER the hypothesis was created
+    // Must have a read_file / github_read_file / grep touching this file AFTER the hypothesis was created
     const readSeen = transcript.some((entry) => {
       if (entry.turn < h.createdAtTurn) return false;
-      if (entry.tool === 'read_file') {
+      if (entry.tool === 'read_file' || entry.tool === 'github_read_file') {
         return (entry.args as any)?.path === file;
       }
       if (entry.tool === 'grep') {
@@ -92,12 +90,28 @@ export class HypothesisTracker {
     });
     if (!readSeen) {
       const err = new Error(
-        `apply_patch on ${file} requires a read_file or grep on ${file} after the hypothesis was stated (registry transcript shows none).`
+        `apply_patch on ${file} requires a read_file, github_read_file, or grep on ${file} after the hypothesis was stated (registry transcript shows none).`
       );
       (err as any).kind = 'hypothesis_required';
       throw err;
     }
+    return h;
+  }
 
+  /**
+   * Mark a hypothesis consumed by a patch. Call AFTER ws.applyPatch succeeds.
+   * Gate validation must have been done via checkApplyPatchGate beforehand.
+   */
+  consumeForPatch(file: string, patchId: string, atTurn: number): Hypothesis {
+    const candidates = this.unconsumedFor(file);
+    if (candidates.length === 0) {
+      const err = new Error(
+        `apply_patch on ${file} requires a prior state_hypothesis with file="${file}", observedEvidenceIds non-empty, and unconsumed.`
+      );
+      (err as any).kind = 'hypothesis_required';
+      throw err;
+    }
+    const h = candidates[candidates.length - 1]; // most recent
     h.consumed = { byPatchId: patchId, consumedAtTurn: atTurn };
     return h;
   }
