@@ -211,7 +211,13 @@ export class ToolRegistry {
           if (err instanceof ToolGuardError) {
             return errorReturn(err) as unknown as TResult;
           }
-          throw err;
+          // Surface execution errors to the model as a tool response instead
+          // of throwing through generateText — a throw kills the entire agent
+          // run, so the model never sees the message and cannot self-correct
+          // (it would just repeat the same call next iteration). The
+          // transcript entry records ok=false, so changed-file/green-evidence
+          // audits ignore the failed call.
+          return { __toolError: errorMsg, __kind: 'execution_error' } as unknown as TResult;
         } finally {
           this.totalCalls += 1;
           this.tierCounts.set(tier, (this.tierCounts.get(tier) ?? 0) + 1);

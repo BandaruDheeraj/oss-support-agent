@@ -153,6 +153,7 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
         'failed_stage=investigator',
         `terminated=${investigator.terminated}`,
         `reason=${investigator.reason ?? '(none)'}`,
+        `tool_calls_and_errors=${investigator.transcriptSummary}`,
       ].join('\n');
       retryFeedback = lastFeedback;
       continue;
@@ -180,6 +181,7 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
         'failed_stage=planner',
         `terminated=${planner.terminated}`,
         `reason=${planner.reason ?? '(none)'}`,
+        `tool_calls_and_errors=${planner.transcriptSummary}`,
       ].join('\n');
       retryFeedback = lastFeedback;
       continue;
@@ -208,6 +210,11 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
         'failed_stage=executor',
         `terminated=${executor.terminated}`,
         `reason=${executor.reason ?? '(none)'}`,
+        // The terminating reason is often a downstream symptom (e.g. "no local
+        // changes to commit" after a rejected write_test). Include every
+        // tool's call counts and last error so the next iteration sees the
+        // actual blocker, not just the final failure.
+        `tool_calls_and_errors=${executor.transcriptSummary}`,
         formatUnconsumedHypothesisFeedback(executor.unconsumedHypothesisFiles),
       ]
         .filter((line) => line.length > 0)

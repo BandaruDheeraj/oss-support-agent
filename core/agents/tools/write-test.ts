@@ -34,8 +34,14 @@ export function ensureTestRootScoped(path: string, roots: string[], label = 'wri
   }
   const norm = path.replace(/\\/g, '/');
   const inRoot = roots.some((r) => norm.startsWith(r.replace(/\\/g, '/')));
-  if (!inRoot) {
-    throw new Error(`${label} path "${path}" must be under one of: ${roots.join(', ')}`);
+  // Also allow package-local test directories (e.g. python/pkg/tests/), matching
+  // the workspace adapter's writeTest rule — monorepos keep tests per-package.
+  const isNestedTestDir =
+    norm.includes('/tests/') || norm.includes('/test/') || norm.startsWith('tests/') || norm.startsWith('test/');
+  if (!inRoot && !isNestedTestDir) {
+    throw new Error(
+      `${label} path "${path}" must be under one of: ${roots.join(', ')}, or a nested tests/ directory`
+    );
   }
 }
 

@@ -10,7 +10,7 @@
  * trapping the loop until the turn budget was exhausted.
  */
 
-import { writeTest, reviseTest } from './write-test';
+import { writeTest, reviseTest, ensureTestRootScoped } from './write-test';
 import type { ToolContext } from './types';
 
 function makeWorkspace() {
@@ -102,5 +102,41 @@ describe('write_test / revise_test — auto-set repro test path for Prober', () 
     await writeTest.execute({ path: 'tests/test_a.py', content: '# a' }, ctx);
     await reviseTest.execute({ path: 'tests/test_b.py', content: '# b' }, ctx);
     expect(sandbox.setCalls).toEqual(['tests/test_a.py', 'tests/test_b.py']);
+  });
+});
+
+describe('ensureTestRootScoped — package-local test directories', () => {
+  // Regression: openinference#62 — the executor wrote the regression test to
+  // the package-local tests/ dir (the monorepo convention), which the adapter
+  // allowed but this outer gate rejected, burning all 3 fix iterations.
+  const roots = ['tests/repro/', 'tests/', 'test/'];
+
+  it('allows package-local tests/ directories (monorepo convention)', () => {
+    expect(() =>
+      ensureTestRootScoped(
+        'python/instrumentation/openinference-instrumentation-agno/tests/test_extract.py',
+        roots,
+      ),
+    ).not.toThrow();
+  });
+
+  it('allows package-local test/ directories', () => {
+    expect(() => ensureTestRootScoped('pkg/sub/test/test_x.py', roots)).not.toThrow();
+  });
+
+  it('still allows configured roots', () => {
+    expect(() => ensureTestRootScoped('tests/repro/test_repro.py', roots)).not.toThrow();
+    expect(() => ensureTestRootScoped('tests/test_y.py', roots)).not.toThrow();
+  });
+
+  it('still rejects non-test paths', () => {
+    expect(() => ensureTestRootScoped('python/pkg/src/module.py', roots)).toThrow(
+      /must be under one of/,
+    );
+  });
+
+  it('still rejects escapes and absolute paths', () => {
+    expect(() => ensureTestRootScoped('../tests/evil.py', roots)).toThrow(/repo-relative/);
+    expect(() => ensureTestRootScoped('/tests/abs.py', roots)).toThrow(/repo-relative/);
   });
 });

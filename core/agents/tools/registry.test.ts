@@ -84,3 +84,47 @@ describe('ToolRegistry budget governors', () => {
     expect((allowed as any).ok).toBe(true);
   });
 });
+
+describe('ToolRegistry execution-error handling', () => {
+  // Regression: openinference#62 — tool implementation errors (applyPatch
+  // anchor mismatch, write_test path rejection, commitAndPush no-changes)
+  // were re-thrown, which propagates through generateText and kills the
+  // entire agent run. The model never saw the error and repeated the same
+  // call every retry iteration. Execution errors must come back as tool
+  // results the model can read and react to.
+  test('returns thrown execution errors as a tool result instead of rethrowing', async () => {
+    const registry = makeRegistry({
+      budgets: {
+        total: 10,
+        perTier: { read: 10, note: 10, 'write-test': 10, mutation: 10, sandbox: 10, meta: 10 },
+      },
+      maxTurns: 10,
+    });
+
+    const noArgs = z.object({}).strict();
+    const boom: ToolDef<z.infer<typeof noArgs>, { ok: boolean }> = {
+      name: 'boom',
+      tier: 'write-test',
+      description: 'always throws',
+      parameters: noArgs,
+      execute: async () => {
+        throw new Error('write-test path "pkg/tests/x.py" must be under one of: tests/');
+      },
+    };
+    registry.register(boom);
+
+    registry.beginTurn();
+    const result = await registry.dispatch(boom, {});
+    expect((result as any).__kind).toBe('execution_error');
+    expect((result as any).__toolError).toContain('must be under one of');
+
+    // The failure is recorded in the transcript with ok=false so audits
+    // (changed files, green evidence) ignore it.
+    const entry = registry.getTranscript().find((e) => e.tool === 'boom');
+    expect(entry?.ok).toBe(false);
+    expect(entry?.error).toContain('must be under one of');
+
+    // The registry is not terminated — the loop continues.
+    expect(registry.isTerminated()).toBeNull();
+  });
+});
