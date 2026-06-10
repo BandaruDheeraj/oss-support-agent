@@ -303,7 +303,8 @@ async function startServer(): Promise<void> {
 
   let gistStore: GistStateStore | undefined;
   if (env.GIST_ID) {
-    gistStore = new GistStateStore(env.GIST_ID, env.GITHUB_TOKEN);
+    const gistToken = process.env.GIST_TOKEN ?? env.GITHUB_TOKEN;
+    gistStore = new GistStateStore(env.GIST_ID, gistToken);
     await gistStore.initialize();
     baseLog(`[state] using GitHub Gist state store (gist=${env.GIST_ID})`);
   } else {
