@@ -89,7 +89,8 @@ import {
 } from './clients/issue-sweep-deps';
 import {
   HeuristicIssueSweeper,
-  runIssueSweep,
+  sendScopeConfirmation,
+  enrichSweepWithExplanations,
   processScopeReply,
 } from '../core/issue-sweep';
 import type { ScopeConfirmationConfig } from '../core/issue-sweep-types';
@@ -1845,18 +1846,15 @@ async function runIssueSweepLoop(args: {
     runId: sweepRunId,
   };
 
+  log('[sweep] writing plain-language explanations for the scope email');
+  await enrichSweepWithExplanations(live.llm, sweepResult, agreedDesign, log);
+
   log(`[sweep] sending scope-confirmation email to ${manifest.pm_email} (runId=${sweepRunId})`);
-  const sendResult = await runIssueSweep(
+  const sendResult = await sendScopeConfirmation(
     live.gmail,
     live.watcher,
     config,
-    {
-      agreedDesign,
-      affectedModule,
-      openIssues,
-      primaryIssueNumber,
-    },
-    sweeper,
+    sweepResult,
     sweepStateStore
   );
   if (sendResult.action !== 'scope_email_sent') {

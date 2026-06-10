@@ -29,8 +29,8 @@ function authHeaders(token: string): Record<string, string> {
 }
 
 /**
- * Fetch open issues from a GitHub repo. Returns title + labels + number.
- * Bodies are not fetched (heuristic sweeper scores titles only).
+ * Fetch open issues from a GitHub repo. Returns number + title + labels +
+ * body (truncated; used for plain-language summaries in the scope email).
  * Excludes pull requests (the REST endpoint returns both unless filtered).
  */
 export async function listOpenIssues(
@@ -53,6 +53,7 @@ export async function listOpenIssues(
       title: (i.title ?? '') as string,
       labels: (i.labels ?? []).map((l: any) => (typeof l === 'string' ? l : l.name)),
       reason: '',
+      body: typeof i.body === 'string' ? i.body.slice(0, 2000) : '',
     }));
 }
 

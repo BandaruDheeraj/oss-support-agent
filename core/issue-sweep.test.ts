@@ -275,13 +275,13 @@ describe('formatScopeEmail', () => {
 
   it('shows (none) when no maybe in scope issues', () => {
     const email = formatScopeEmail(makeSweepResult({ maybeInScope: [] }));
-    expect(email).toMatch(/Maybe in scope.*\n.*\(none\)/s);
+    expect(email).toMatch(/MAYBE related.*\n.*\(none\)/s);
   });
 
   it('separates high confidence and maybe in scope sections', () => {
     const email = formatScopeEmail(makeSweepResult());
-    expect(email).toContain('High confidence');
-    expect(email).toContain('Maybe in scope');
+    expect(email).toContain('VERY LIKELY related');
+    expect(email).toContain('MAYBE related');
   });
 });
 

@@ -20,6 +20,27 @@ export interface SweepIssue {
   labels: string[];
   /** One-sentence reason this issue is related to the agreed design */
   reason: string;
+  /** Issue body (possibly truncated); used for plain-language summaries in the scope email */
+  body?: string;
+  /** Detailed relevance analysis shown in the scope-confirmation email */
+  analysis?: SweepAnalysis;
+}
+
+/**
+ * Full reasoning behind an issue's inclusion in the sweep result, so the
+ * scope-confirmation email can show the complete thought process.
+ */
+export interface SweepAnalysis {
+  /** 0–1 relevance score from the heuristic sweeper */
+  score: number;
+  /** Plain-language sentences describing each scoring signal and its point value */
+  scoreSignals: string[];
+  /** Plain-language summary of what the issue is about (LLM-written when available) */
+  plainSummary?: string;
+  /** Reasons the issue might be related to the agreed fix (LLM-written) */
+  whyRelated?: string[];
+  /** Reasons the issue might NOT be related to the agreed fix (LLM-written) */
+  whyNotRelated?: string[];
 }
 
 /**

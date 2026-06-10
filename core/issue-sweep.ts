@@ -14,12 +14,15 @@ import {
   SweepInput,
   SweepResult,
   SweepIssue,
+  SweepAnalysis,
   ScopeConfirmationConfig,
   ScopeConfirmationResult,
   IssueSweeper,
   SweepStateStore,
   SweepError,
 } from './issue-sweep-types';
+
+import type { LLMMessage } from './llm/types';
 
 import {
   EmailThread,
@@ -53,16 +56,23 @@ export class HeuristicIssueSweeper implements IssueSweeper {
         highConfidence.push({
           ...issue,
           reason: 'Primary issue that triggered this run.',
+          analysis: {
+            score: 1,
+            scoreSignals: [
+              'This is the issue that started this whole run, so it is always included.',
+            ],
+          },
         });
         continue;
       }
 
-      const score = scoreIssueRelevance(issue, designLower, moduleLower, moduleSegments);
+      const { score, signals } = scoreIssueRelevance(issue, designLower, moduleLower, moduleSegments);
+      const scored: SweepIssue = { ...issue, analysis: { score, scoreSignals: signals } };
 
       if (score >= HIGH_CONFIDENCE_THRESHOLD) {
-        highConfidence.push(issue);
+        highConfidence.push(scored);
       } else if (score >= MAYBE_IN_SCOPE_THRESHOLD) {
-        maybeInScope.push(issue);
+        maybeInScope.push(scored);
       }
       // Below threshold: not included
     }
@@ -78,89 +88,285 @@ const MAYBE_IN_SCOPE_THRESHOLD = 0.3;
 
 /**
  * Score an issue's relevance to the agreed design.
- * Returns 0-1 float.
+ * Returns a 0-1 score plus a plain-language sentence for every signal checked
+ * (both the ones that added points and the ones that did not), so the scope
+ * email can show the complete reasoning.
  */
 function scoreIssueRelevance(
   issue: SweepIssue,
   designLower: string,
   moduleLower: string,
   moduleSegments: string[]
-): number {
+): { score: number; signals: string[] } {
   let score = 0;
+  const signals: string[] = [];
   const titleLower = issue.title.toLowerCase();
   const reasonLower = issue.reason.toLowerCase();
 
   // Title words appear in the design summary
   const titleWords = titleLower.split(/\s+/).filter((w) => w.length > 3);
-  const titleMatchCount = titleWords.filter((w) => designLower.includes(w)).length;
+  const matchedWords = titleWords.filter((w) => designLower.includes(w));
   if (titleWords.length > 0) {
-    score += (titleMatchCount / titleWords.length) * 0.4;
+    const pts = (matchedWords.length / titleWords.length) * 0.4;
+    score += pts;
+    if (matchedWords.length > 0) {
+      signals.push(
+        `${matchedWords.length} of the ${titleWords.length} significant words in this issue's title ` +
+          `also appear in the agreed fix plan (${matchedWords.slice(0, 6).map((w) => `"${w}"`).join(', ')}): ` +
+          `+${Math.round(pts * 100)} points (out of a possible 40).`
+      );
+    } else {
+      signals.push(
+        `None of the ${titleWords.length} significant words in this issue's title appear in the agreed fix plan: +0 points.`
+      );
+    }
   }
 
-  // Issue references the same module
-  if (reasonLower.includes(moduleLower) || titleLower.includes(moduleLower)) {
+  // Issue references the same module. A trivial module name like "." would
+  // match almost any title, so only exact-match on meaningful names.
+  const moduleIsMeaningful = moduleLower.length > 1;
+  if (moduleIsMeaningful && (reasonLower.includes(moduleLower) || titleLower.includes(moduleLower))) {
     score += 0.3;
+    signals.push(`This issue mentions the exact part of the code being fixed ("${moduleLower}"): +30 points.`);
   } else {
     // Partial module match (any segment)
-    const hasSegmentMatch = moduleSegments.some(
-      (seg) => seg.length > 3 && (titleLower.includes(seg) || reasonLower.includes(seg))
+    const matchedSegment = moduleSegments.find(
+      (seg) => seg.length > 3 && (titleLower.includes(seg.toLowerCase()) || reasonLower.includes(seg.toLowerCase()))
     );
-    if (hasSegmentMatch) {
+    if (matchedSegment) {
       score += 0.15;
+      signals.push(`This issue mentions part of the code area being fixed ("${matchedSegment}"): +15 points.`);
+    } else if (moduleIsMeaningful) {
+      signals.push(`This issue does not mention the part of the code being fixed ("${moduleLower}"): +0 points.`);
+    } else {
+      signals.push('The fix plan does not name a specific code area, so no points could be given for that check.');
     }
   }
 
   // Shared labels with the design context
-  const designMentionsLabel = issue.labels.some((l) => designLower.includes(l.toLowerCase()));
-  if (designMentionsLabel) {
+  const matchedLabel = issue.labels.find((l) => designLower.includes(l.toLowerCase()));
+  if (matchedLabel) {
     score += 0.15;
+    signals.push(`This issue has the label "${matchedLabel}", which the fix plan also mentions: +15 points.`);
+  } else if (issue.labels.length > 0) {
+    signals.push(
+      `None of this issue's labels (${issue.labels.join(', ')}) appear in the fix plan: +0 points.`
+    );
+  } else {
+    signals.push('This issue has no labels, so no points could be given for matching labels.');
   }
 
   // Keywords suggesting relevance
   const relevanceKeywords = ['related', 'same', 'also', 'similar', 'duplicate', 'affects'];
-  if (relevanceKeywords.some((kw) => reasonLower.includes(kw))) {
+  const matchedKeyword = relevanceKeywords.find((kw) => reasonLower.includes(kw));
+  if (matchedKeyword) {
     score += 0.15;
+    signals.push(`This issue's notes contain the word "${matchedKeyword}", which hints it is connected: +15 points.`);
   }
 
-  return Math.min(score, 1.0);
+  return { score: Math.min(score, 1.0), signals };
 }
 
 /**
- * Format the scope confirmation email per PRD section 5.3.
+ * Minimal LLM surface needed by the sweep explainer. ChatClient satisfies this.
+ */
+export interface SweepExplainerLLM {
+  chatJson<T>(
+    messages: LLMMessage[],
+    schema: unknown,
+    options?: { agent?: string; temperature?: number }
+  ): Promise<{ data: T }>;
+}
+
+interface SweepExplanation {
+  number: number;
+  plainSummary: string;
+  whyRelated: string[];
+  whyNotRelated: string[];
+}
+
+const SWEEP_EXPLANATION_SCHEMA = {
+  type: 'object',
+  required: ['issues'],
+  properties: {
+    issues: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['number', 'plainSummary', 'whyRelated', 'whyNotRelated'],
+        properties: {
+          number: { type: 'number' },
+          plainSummary: { type: 'string' },
+          whyRelated: { type: 'array', items: { type: 'string' } },
+          whyNotRelated: { type: 'array', items: { type: 'string' } },
+        },
+      },
+    },
+  },
+};
+
+/**
+ * Use the LLM to write a plain-language summary and explicit for/against
+ * reasoning for every issue in the sweep result, so the scope email gives the
+ * reader everything they need to decide. Mutates the issues' `analysis` in
+ * place. Best-effort: on LLM failure the email falls back to heuristic-only.
+ */
+export async function enrichSweepWithExplanations(
+  llm: SweepExplainerLLM,
+  sweepResult: SweepResult,
+  agreedDesign: string,
+  log?: (msg: string) => void
+): Promise<void> {
+  const allIssues = [...sweepResult.highConfidence, ...sweepResult.maybeInScope];
+  if (allIssues.length === 0) return;
+
+  const issueBlocks = allIssues
+    .map((i) => {
+      const body = (i.body ?? '').trim();
+      return [
+        `Issue #${i.number}: ${i.title}`,
+        `Labels: ${i.labels.join(', ') || '(none)'}`,
+        `Automatic scoring notes: ${i.analysis?.scoreSignals.join(' ') ?? '(none)'}`,
+        `Issue description:\n${body || '(no description provided)'}`,
+      ].join('\n');
+    })
+    .join('\n\n---\n\n');
+
+  const messages: LLMMessage[] = [
+    {
+      role: 'system',
+      content:
+        'You explain GitHub issues to a non-technical project owner deciding which issues to bundle ' +
+        'into one fix. Write at a middle-school reading level: short sentences, no unexplained jargon. ' +
+        'If you must use a technical term, explain it in parentheses the first time. Be honest and ' +
+        'complete — list every reason an issue might be related to the planned fix AND every reason it ' +
+        'might not be. Never invent details that are not in the issue text.',
+    },
+    {
+      role: 'user',
+      content:
+        `Here is the fix plan that was agreed on:\n\n${agreedDesign}\n\n` +
+        `Here are the candidate issues:\n\n${issueBlocks}\n\n` +
+        'For EACH issue, return:\n' +
+        '- plainSummary: 2-4 sentences explaining what the person who filed the issue is reporting, ' +
+        'simple enough for a middle schooler.\n' +
+        '- whyRelated: every reason this issue might be caused by the same problem the fix plan addresses.\n' +
+        '- whyNotRelated: every reason this issue might be a different problem that the fix plan would NOT solve.\n',
+    },
+  ];
+
+  try {
+    const { data } = await llm.chatJson<{ issues: SweepExplanation[] }>(
+      messages,
+      SWEEP_EXPLANATION_SCHEMA,
+      { agent: 'PM', temperature: 0 }
+    );
+    const byNumber = new Map(data.issues.map((e) => [e.number, e]));
+    for (const issue of allIssues) {
+      const exp = byNumber.get(issue.number);
+      if (!exp || !issue.analysis) continue;
+      issue.analysis.plainSummary = exp.plainSummary;
+      issue.analysis.whyRelated = exp.whyRelated;
+      issue.analysis.whyNotRelated = exp.whyNotRelated;
+    }
+  } catch (err) {
+    log?.(`[sweep] LLM explanation failed (${(err as Error).message}); using heuristic-only email`);
+  }
+}
+
+/** Render one issue as a fully-explained section of the scope email. */
+function formatIssueSection(issue: SweepIssue): string[] {
+  const lines: string[] = [];
+  const a = issue.analysis;
+  const scoreSuffix = a ? ` — relevance score: ${Math.round(a.score * 100)}/100` : '';
+  lines.push(`### Issue #${issue.number}: ${issue.title}${scoreSuffix}`);
+  if (issue.labels.length > 0) {
+    lines.push(`Labels: ${issue.labels.join(', ')}`);
+  }
+  lines.push('');
+
+  const summary = a?.plainSummary ?? (issue.body ? excerpt(issue.body) : issue.reason);
+  if (summary) {
+    lines.push('**What this issue is about (in plain words):**');
+    lines.push(summary);
+    lines.push('');
+  }
+
+  if (a?.whyRelated?.length) {
+    lines.push('**Why it MIGHT be related to our fix:**');
+    for (const r of a.whyRelated) lines.push(`- ${r}`);
+    lines.push('');
+  }
+  if (a?.whyNotRelated?.length) {
+    lines.push('**Why it might NOT be related:**');
+    for (const r of a.whyNotRelated) lines.push(`- ${r}`);
+    lines.push('');
+  }
+  if (a?.scoreSignals.length) {
+    lines.push('**How the automatic scorer added up the points:**');
+    for (const s of a.scoreSignals) lines.push(`- ${s}`);
+    lines.push('');
+  }
+  return lines;
+}
+
+/** First ~350 characters of an issue body, whitespace-collapsed. */
+function excerpt(body: string, max = 350): string {
+  const collapsed = body.replace(/\s+/g, ' ').trim();
+  return collapsed.length > max ? `${collapsed.slice(0, max)}…` : collapsed;
+}
+
+/**
+ * Format the scope confirmation email per PRD section 5.3, with the complete
+ * per-issue reasoning (plain-language summary, for/against arguments, and the
+ * heuristic score breakdown).
  */
 export function formatScopeEmail(sweepResult: SweepResult): string {
   const sections: string[] = [];
 
-  sections.push('## Scope Confirmation\n');
+  sections.push('## Scope Confirmation — which issues should we fix together?\n');
   sections.push(
-    'The following issues have been identified as related to the approved design. ' +
-    'Please confirm which issues should be included in the fix scope.\n'
+    'Before starting the fix, we scanned every open issue in the repo to see if any of them ' +
+      'look like they are caused by the same underlying problem. Fixing them together saves a ' +
+      'separate round of work later — but bundling an unrelated issue would make the change ' +
+      'bigger and riskier. Your job here is just to pick which issue numbers to include.\n'
   );
 
-  sections.push('**High confidence (design directly closes):**');
+  sections.push('**How the scoring works (in plain words):**');
+  sections.push(
+    '- Each issue gets points for overlapping with the agreed fix plan: words its title shares ' +
+      'with the plan (up to 40 points), mentioning the same part of the code (up to 30), ' +
+      'sharing a label the plan mentions (15), and wording that hints at a connection (15).'
+  );
+  sections.push('- 70+ points → listed as "very likely related". 30–69 points → "maybe related".');
+  sections.push(
+    '- The score is a rough hint, not a verdict — read the reasoning under each issue before deciding.\n'
+  );
+
+  sections.push('## Issues we think are VERY LIKELY related\n');
   if (sweepResult.highConfidence.length > 0) {
     for (const issue of sweepResult.highConfidence) {
-      sections.push(`- #${issue.number}: ${issue.title} — ${issue.reason}`);
+      sections.push(...formatIssueSection(issue));
     }
   } else {
-    sections.push('- (none)');
+    sections.push('(none)\n');
   }
-  sections.push('');
 
-  sections.push('**Maybe in scope (partial overlap):**');
+  sections.push('## Issues that are MAYBE related\n');
   if (sweepResult.maybeInScope.length > 0) {
     for (const issue of sweepResult.maybeInScope) {
-      sections.push(`- #${issue.number}: ${issue.title} — ${issue.reason}`);
+      sections.push(...formatIssueSection(issue));
     }
   } else {
-    sections.push('- (none)');
+    sections.push('(none)\n');
   }
-  sections.push('');
 
   sections.push('---');
+  sections.push('**How to reply:**');
+  sections.push('- Reply "all" to include every issue listed above.');
+  sections.push('- Reply with the numbers to include, e.g. "include 142 and 156 but drop 201".');
   sections.push(
-    'Please reply with the final issue numbers to include (e.g., "include 142 and 156 but drop 201") ' +
-    'or reply "all" to include everything listed above.'
+    '- If you only want the primary issue, reply with just its number or "only the primary issue".'
   );
 
   return sections.join('\n');
