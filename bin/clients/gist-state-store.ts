@@ -14,6 +14,7 @@ export interface StorageBackend {
   save(key: string, value: unknown): void;
   load<T>(key: string): T | null;
   remove(key: string): void;
+  entries(): [string, unknown][];
 }
 
 export class FileBackend implements StorageBackend {
@@ -46,24 +47,44 @@ export class FileBackend implements StorageBackend {
     const f = this.path.join(this.dir, `${key}.json`);
     if (this.fs.existsSync(f)) this.fs.unlinkSync(f);
   }
+
+  entries(): [string, unknown][] {
+    let files: string[];
+    try {
+      files = this.fs.readdirSync(this.dir).filter((f: string) => f.endsWith('.json'));
+    } catch {
+      return [];
+    }
+    return files.flatMap((f: string) => {
+      const key = f.slice(0, -5);
+      const v = this.load(key);
+      return v !== null ? [[key, v] as [string, unknown]] : [];
+    });
+  }
 }
 
 class GistNamespaceBackend implements StorageBackend {
   constructor(
-    private readonly store: GistStateStore,
-    private readonly namespace: string,
+    private readonly map: Map<string, unknown>,
+    private readonly onWrite: () => void,
   ) {}
 
   save(key: string, value: unknown): void {
-    this.store.set(this.namespace, key, value);
+    this.map.set(key, value);
+    this.onWrite();
   }
 
   load<T>(key: string): T | null {
-    return this.store.get<T>(this.namespace, key);
+    return (this.map.get(key) as T) ?? null;
   }
 
   remove(key: string): void {
-    this.store.delete(this.namespace, key);
+    this.map.delete(key);
+    this.onWrite();
+  }
+
+  entries(): [string, unknown][] {
+    return Array.from(this.map.entries());
   }
 }
 
@@ -100,22 +121,8 @@ export class GistStateStore {
   }
 
   namespace(name: string): StorageBackend {
-    if (!this.data.has(name)) this.data.set(name, new Map());
-    return new GistNamespaceBackend(this, name);
-  }
-
-  set(namespace: string, key: string, value: unknown): void {
-    this.ns(namespace).set(key, value);
-    this.scheduleWrite(namespace);
-  }
-
-  get<T>(namespace: string, key: string): T | null {
-    return (this.ns(namespace).get(key) as T) ?? null;
-  }
-
-  delete(namespace: string, key: string): void {
-    this.ns(namespace).delete(key);
-    this.scheduleWrite(namespace);
+    const map = this.ns(name);
+    return new GistNamespaceBackend(map, () => this.scheduleWrite(name));
   }
 
   private ns(name: string): Map<string, unknown> {

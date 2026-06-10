@@ -313,6 +313,8 @@ async function startServer(): Promise<void> {
   const runStateStore = new FilePipelineRunStateStore(
     gistStore ? gistStore.namespace('pipeline-runs') : env.STATE_ROOT,
   );
+  const pruned = runStateStore.pruneOldRuns();
+  if (pruned > 0) baseLog(`[state] pruned ${pruned} old pipeline run record(s)`);
 
   const live = buildLiveDeps(process.env, {
     token: env.GITHUB_TOKEN,

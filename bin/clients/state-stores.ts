@@ -36,6 +36,10 @@ abstract class BaseStore<T> {
   protected remove(key: string): void {
     this.backend.remove(safeKey(key));
   }
+
+  protected allEntries(): [string, T][] {
+    return this.backend.entries() as [string, T][];
+  }
 }
 
 export class FileIntrospectionStateStore
@@ -203,6 +207,21 @@ export class FilePipelineRunStateStore extends BaseStore<PipelineRunRecord> {
 
   loadRun(key: string): PipelineRunRecord | null {
     return this.load(key);
+  }
+
+  /** Remove completed/failed runs older than maxAgeMs (default 30 days). */
+  pruneOldRuns(maxAgeMs = 30 * 24 * 60 * 60 * 1000): number {
+    const cutoff = Date.now() - maxAgeMs;
+    let pruned = 0;
+    for (const [key, record] of this.allEntries()) {
+      if (record.status === 'running') continue;
+      const ts = Date.parse(record.completedAt ?? record.updatedAt);
+      if (Number.isFinite(ts) && ts < cutoff) {
+        this.remove(key);
+        pruned++;
+      }
+    }
+    return pruned;
   }
 }
 
