@@ -168,6 +168,7 @@ describe('runDeterministicReproOracle', () => {
       workspace,
       sandbox,
       env: {},
+      semanticConfidence: { top_score: 0.9, low_confidence: false, diagnostics: 'high confidence' },
     });
 
     expect(result.verdict).toBe('invalid');

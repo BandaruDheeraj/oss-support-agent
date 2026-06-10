@@ -398,7 +398,7 @@ async function runReproFilesPath(
           ok: false,
           rejectStage: 'run_repro_pass',
           reason: 'Candidate reproFiles test passed on every run; bug not triggered.',
-          runs: [observe(run1.value, '', '')],
+          runs: [observe(run1.value)],
           candidateTestPath: testEntryPoint,
           repairRounds,
         };
@@ -426,7 +426,7 @@ async function runReproFilesPath(
           ok: false,
           rejectStage: 'expected_output_absent',
           reason: `Test collection failed (exit ${run1.value.exitCode}) — test file has syntax error or bad import.`,
-          runs: [observe(run1.value, '', '')],
+          runs: [observe(run1.value)],
           candidateTestPath: testEntryPoint,
           repairRounds,
         };
@@ -447,7 +447,7 @@ async function runReproFilesPath(
           ok: false,
           rejectStage: 'expected_output_absent',
           reason: `expectedFailureOutput "${expectedOut.slice(0, 120)}" not found in run output.`,
-          runs: [observe(run1.value, '', '')],
+          runs: [observe(run1.value)],
           candidateTestPath: testEntryPoint,
           repairRounds,
         };
@@ -465,7 +465,7 @@ async function runReproFilesPath(
           ok: false,
           rejectStage: 'sandbox_error',
           reason: `runRepro #2 threw: ${run2.error}`,
-          runs: [observe(run1.value, '', '')],
+          runs: [observe(run1.value)],
           candidateTestPath: testEntryPoint,
           repairRounds,
         };
@@ -473,7 +473,7 @@ async function runReproFilesPath(
       continue;
     }
 
-    const runs: BuilderRunObservation[] = [observe(run1.value, '', ''), observe(run2.value, '', '')];
+    const runs: BuilderRunObservation[] = [observe(run1.value), observe(run2.value)];
 
     // Tiebreak if runs disagree.
     const agree = (a: BuilderRunObservation, b: BuilderRunObservation) =>
@@ -492,7 +492,7 @@ async function runReproFilesPath(
           repairRounds,
         };
       }
-      runs.push(observe(tie.value, '', ''));
+      runs.push(observe(tie.value));
     }
 
     const allPassed = runs.every((r) => r.exitCode === 0);
@@ -621,15 +621,14 @@ function rej(stage: BuilderRejectStage, reason: string): ReproBuilderResult {
   return { ok: false, rejectStage: stage, reason, runs: [] };
 }
 
-function observe(run: SandboxRun, sentinel: string, signature: string): BuilderRunObservation {
-  const combined = `${run.stderr}\n${run.stdout}`;
+function observe(run: SandboxRun): BuilderRunObservation {
   return {
     exitCode: run.exitCode,
     stdoutTail: tail(run.stdout, STDOUT_TAIL),
     stderrTail: tail(run.stderr, STDERR_TAIL),
     durationMs: run.durationMs,
-    sentinelObserved: sentinel.length > 0 && combined.includes(sentinel),
-    signatureObserved: signature.length > 0 && combined.includes(signature),
+    sentinelObserved: false,
+    signatureObserved: false,
   };
 }
 

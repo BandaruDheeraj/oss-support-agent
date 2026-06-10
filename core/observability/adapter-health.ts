@@ -142,14 +142,11 @@ function retryAttempts(): number {
   return parsePositiveInt(process.env.OBSERVABILITY_RETRY_ATTEMPTS, 3);
 }
 
-function retryBaseDelayMs(): number {
-  return parsePositiveInt(process.env.OBSERVABILITY_RETRY_BASE_MS, 200);
-}
+const RETRY_BASE_DELAY_MS = parsePositiveInt(process.env.OBSERVABILITY_RETRY_BASE_MS, 200);
 
 function backoffDelayMs(attempt: number): number {
   // attempt starts at 1 for first retry
-  const base = retryBaseDelayMs();
-  return base * Math.pow(2, Math.max(0, attempt - 1));
+  return RETRY_BASE_DELAY_MS * Math.pow(2, Math.max(0, attempt - 1));
 }
 
 function sleep(ms: number): Promise<void> {

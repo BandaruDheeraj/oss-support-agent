@@ -419,7 +419,7 @@ export function renderTestSource(candidate: CandidateRepro): RenderTestSourceRes
 
   const importsBlock = candidate.imports.length === 0
     ? '# (no imports)'
-    : candidate.imports.map((s) => s).join('\n');
+    : candidate.imports.join('\n');
 
   const setupBlock = candidate.setup.trim().length === 0
     ? '    pass  # (no setup)'

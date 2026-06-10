@@ -22,7 +22,7 @@ import type { SemanticSuspectSeed } from '../analyst/semantic-search';
 import type { TestInfraProfile } from './test-infra-fingerprint';
 import { assembleReproTest } from './test-assembler';
 
-type CandidateSource = 'builder';
+type CandidateSource = 'builder' | 'prober';
 type CandidateStatus =
   | 'generation_failed'
   | 'sandbox_failed'

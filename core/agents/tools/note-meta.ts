@@ -64,21 +64,6 @@ export const stateHypothesis: ToolDef<z.infer<typeof StateHypothesisArgs>, unkno
   },
 };
 
-// Anthropic emits null for absent optional fields instead of omitting them.
-// Zod treats null and undefined differently: .optional()/.default() fire on
-// undefined but not on null. A single recursive null→undefined pass at the
-// schema boundary fixes all nested fields in one shot.
-function deepNullToUndefined(v: unknown): unknown {
-  if (v === null) return undefined;
-  if (Array.isArray(v)) return v.map(deepNullToUndefined);
-  if (v && typeof v === 'object') {
-    return Object.fromEntries(
-      Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, deepNullToUndefined(val)])
-    );
-  }
-  return v;
-}
-
 function nullToArr<T>(v: unknown): T[] {
   return Array.isArray(v) ? (v as T[]) : [];
 }

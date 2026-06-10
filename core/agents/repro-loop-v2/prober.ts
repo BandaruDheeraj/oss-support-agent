@@ -216,6 +216,15 @@ export function shouldRecoverFromToolCallsEmptyTermination(loop: AgentLoopResult
   return loop.terminated === 'finished' && TOOL_CALLS_EMPTY_TERMINATION.test(loop.reason ?? '');
 }
 
+function getProberState(registry: { getTranscript: () => Array<{ tool: string; ok: boolean; result?: unknown }> }) {
+  const t = registry.getTranscript();
+  return {
+    reproCalls: t.filter((e) => e.tool === 'run_repro').length,
+    wroteTest: t.some((e) => (e.tool === 'write_test' || e.tool === 'revise_test') && e.ok),
+    recipeRecorded: t.some((e) => e.tool === 'record_evidence' && e.ok && (e.result as any)?.recipe_recorded === true),
+  };
+}
+
 export async function runReproProber(args: RunReproProberArgs): Promise<ReproProberResult> {
   const snapshotIdBeforeProber = args.dossierSnapshot.snapshotId;
   const registry = makeReproProberRegistry({
@@ -292,13 +301,7 @@ export async function runReproProber(args: RunReproProberArgs): Promise<ReproPro
   // once with an explicit reminder. The registry preserves state.
   let finalLoop = loop;
   if (loop.terminated === 'finished' && registry.isTerminated() === null) {
-    const reproCalls = registry.getTranscript().filter((e) => e.tool === 'run_repro').length;
-    const wroteTest = registry
-      .getTranscript()
-      .some((e) => (e.tool === 'write_test' || e.tool === 'revise_test') && e.ok);
-    const recipeRecorded = registry
-      .getTranscript()
-      .some((e) => e.tool === 'record_evidence' && e.ok && (e.result as any)?.recipe_recorded === true);
+    const { reproCalls, wroteTest, recipeRecorded } = getProberState(registry);
     const remind = `${userPrompt}\n\n[ORCHESTRATOR REMINDER] Your previous turn ended without calling done or abandon. State: wrote_test=${wroteTest}, run_repro_count=${reproCalls}, recipe_recorded=${recipeRecorded}. You MUST end the session with a tool call. If recipe_recorded=false, you also need to call record_evidence with a complete reproRecipe before done — the registry will reject done until that is recorded. Plain-text replies are discarded.`;
     finalLoop = await runLoop(remind);
   }
@@ -307,13 +310,7 @@ export async function runReproProber(args: RunReproProberArgs): Promise<ReproPro
     if (registry.isTerminated() !== null || !shouldRecoverFromToolCallsEmptyTermination(finalLoop)) {
       break;
     }
-    const reproCalls = registry.getTranscript().filter((e) => e.tool === 'run_repro').length;
-    const wroteTest = registry
-      .getTranscript()
-      .some((e) => (e.tool === 'write_test' || e.tool === 'revise_test') && e.ok);
-    const recipeRecorded = registry
-      .getTranscript()
-      .some((e) => e.tool === 'record_evidence' && e.ok && (e.result as any)?.recipe_recorded === true);
+    const { reproCalls, wroteTest, recipeRecorded } = getProberState(registry);
     const recoverPrompt =
       `${userPrompt}\n\n` +
       `[ORCHESTRATOR RECOVERY] The previous attempt ended with "${finalLoop.reason ?? 'unknown'}" ` +

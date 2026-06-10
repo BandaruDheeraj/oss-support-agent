@@ -133,18 +133,6 @@ export class RunStore {
     return rows.map((r) => rowToRun(r));
   }
 
-  updateState(id: string, newState: RunState, now: string): void {
-    this.db
-      .prepare('UPDATE runs SET state = ?, updated_at = ? WHERE id = ?')
-      .run(newState, now, id);
-  }
-
-  incrementRetryCount(id: string, now: string): void {
-    this.db
-      .prepare('UPDATE runs SET retry_count = retry_count + 1, updated_at = ? WHERE id = ?')
-      .run(now, id);
-  }
-
   insertTransitionLog(runId: string, fromState: RunState, toState: RunState, timestamp: string): void {
     this.db
       .prepare(

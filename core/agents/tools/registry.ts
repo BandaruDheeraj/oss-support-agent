@@ -5,7 +5,7 @@
 import { tool as aiTool, type CoreTool } from 'ai';
 
 /** Recursively convert null → undefined so Zod .optional()/.default() fire correctly. */
-function nullToUndefinedDeep(v: unknown): unknown {
+export function nullToUndefinedDeep(v: unknown): unknown {
   if (v === null) return undefined;
   if (Array.isArray(v)) return v.map(nullToUndefinedDeep);
   if (v && typeof v === 'object') {
@@ -43,9 +43,11 @@ export class ToolRegistry {
   private readonly transcript: TranscriptEntry[] = [];
   private readonly opts: RegistryOptions;
   private readonly ctx: ToolContext;
+  private readonly now: () => Date;
 
   constructor(opts: RegistryOptions, ctx: Omit<ToolContext, 'recordTranscript' | 'getTranscript'>) {
     this.opts = opts;
+    this.now = opts.now ?? (() => new Date());
     this.ctx = {
       ...ctx,
       recordTranscript: (e) => this.transcript.push(e),
@@ -156,7 +158,7 @@ export class ToolRegistry {
           result: undefined,
           ok: false,
           error: `[${err.kind}] ${err.message}`.slice(0, 2000),
-          startedAt: ((this.opts.now ?? (() => new Date()))()).toISOString(),
+          startedAt: (this.now()).toISOString(),
           durationMs: 0,
         });
         return errorReturn(err);
@@ -164,7 +166,7 @@ export class ToolRegistry {
       throw err;
     }
 
-    const startedAt = (this.opts.now ?? (() => new Date()))();
+    const startedAt = this.now();
     const tier = def.tier;
 
     return withToolSpan(

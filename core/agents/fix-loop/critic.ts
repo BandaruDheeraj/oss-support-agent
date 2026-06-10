@@ -51,7 +51,7 @@ const JUDGE_SYSTEM = `You are the Fix Critic judge. Given the investigation tran
 
 approve: only if (a) read_diff was called, (b) every changed file was read, (c) run_repro is green, (d) run_tests outside the repro is green, (e) the diff is minimal and addresses the root cause.
 reject: the diff is wrong / unsafe / off-scope.
-revise: the diff is mostly right but needs a small change (give a specific suggestion).
+revise: the diff is mostly right but needs a targeted change. Common test-quality reasons to revise: (i) duplicate test functions covering the same assertion (e.g. a test_repro alongside proper named tests), (ii) weak inequality assertions (assert actual != "hardcoded") instead of equality checks (assert actual == expected), (iii) test stubs/fakes using dict access when the real code uses attribute access (or vice-versa), (iv) try/except ImportError fallbacks inside test bodies.
 abandon: not fixable with current evidence; escalate to human.`;
 
 export async function runFixCritic(args: RunFixCriticArgs): Promise<{ verdict: FixVerdict; transcriptSummary: string }> {
