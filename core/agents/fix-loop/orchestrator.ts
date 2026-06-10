@@ -5,7 +5,9 @@
  * Deterministic completion promise (must all be true):
  *   - repro_test_passes
  *   - regression_green
- *   - no_head_drift
+ *   - no_head_drift — HEAD is either unchanged since the iteration started or
+ *     sits on a commit the executor itself pushed via commit_and_push. Foreign
+ *     movement (another process/human pushing mid-iteration) still fails.
  *   - scope_ok
  *
  * The loop retries with structured feedback until the promise is satisfied or
@@ -92,7 +94,6 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
   const tokenBudget = resolveFixTokenBudget(process.env, maxIterations, perIterationTokenAllocation);
   let remainingTokenBudget = tokenBudget;
 
-  const loopStartHead = await args.getCurrentHeadSha();
   const allowedScope = deriveAllowedScope(args.snapshot, args.reproTestPath);
 
   let retryFeedback: string | undefined;
@@ -127,6 +128,10 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
       };
     }
     remainingTokenBudget -= perIterationTokenAllocation;
+
+    // Re-baseline HEAD each iteration: a previous iteration's executor may
+    // have legitimately committed work, so the loop-start sha goes stale.
+    const iterationStartHead = await args.getCurrentHeadSha();
 
     const notes = new InvestigationNotesStore();
     const hypotheses = new HypothesisTracker();
@@ -225,10 +230,13 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
 
     const headAfterExecutor = await args.getCurrentHeadSha();
     const scopeEvaluation = evaluateScope(executor.changedFiles, allowedScope);
+    // The executor saving its own work via commit_and_push is legitimate HEAD
+    // movement; only foreign movement (some other writer) counts as drift.
+    const headIsOwnCommit = executor.pushedShas.includes(headAfterExecutor);
     const checks: CompletionPromiseChecks = {
       repro_test_passes: executor.greenEvidence.reproGreenAfterMutation,
       regression_green: executor.greenEvidence.testsGreenAfterMutation,
-      no_head_drift: headAfterExecutor === loopStartHead,
+      no_head_drift: headAfterExecutor === iterationStartHead || headIsOwnCommit,
       scope_ok: scopeEvaluation.outOfScope.length === 0,
     };
     if (!completionPromisePassed(checks)) {
@@ -280,7 +288,7 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
         checks,
         executor,
         scopeEvaluation,
-        loopStartHead,
+        iterationStartHead,
         headAfterExecutor,
       });
       retryFeedback = lastFeedback;
@@ -422,10 +430,10 @@ function resolveFixTokenBudget(
 }
 
 function completionPromisePassed(checks: CompletionPromiseChecks): boolean {
-  // no_head_drift is intentionally excluded: an executor that commits a fix and verifies it
-  // in the same iteration is valid. Requiring no_head_drift=true would demand a separate
-  // "verify only" iteration after every commit, making the loop always exhaust its budget.
-  return checks.repro_test_passes && checks.regression_green && checks.scope_ok;
+  // no_head_drift is own-commit aware: HEAD landing on a sha the executor itself
+  // pushed via commit_and_push passes; only foreign movement (another writer
+  // touching the branch mid-iteration) fails.
+  return checks.repro_test_passes && checks.regression_green && checks.no_head_drift && checks.scope_ok;
 }
 
 function deriveAllowedScope(snapshot: DossierSnapshot, reproTestPath?: string): string[] {
@@ -503,7 +511,7 @@ function formatCompletionPromiseFeedback(args: {
   checks: CompletionPromiseChecks;
   executor: FixExecutorResult;
   scopeEvaluation: ScopeEvaluation;
-  loopStartHead: string;
+  iterationStartHead: string;
   headAfterExecutor: string;
 }): string {
   const failedChecks = Object.entries(args.checks)
@@ -534,8 +542,9 @@ function formatCompletionPromiseFeedback(args: {
   if (!args.checks.no_head_drift) {
     lines.push(
       'no_head_drift=false',
-      `head_before_loop=${args.loopStartHead}`,
-      `head_after_executor=${args.headAfterExecutor}`
+      `head_before_iteration=${args.iterationStartHead}`,
+      `head_after_executor=${args.headAfterExecutor}`,
+      `executor_pushed_shas=${args.executor.pushedShas.join(', ') || '(none)'}`
     );
   }
   if (!args.checks.scope_ok) {

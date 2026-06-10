@@ -117,6 +117,7 @@ function makeExecutorResult(overrides: Partial<FixExecutorResult> = {}): FixExec
     },
     changedFiles: ['src/module.py'],
     unconsumedHypothesisFiles: [],
+    pushedShas: [],
     ...overrides,
   };
 }
@@ -230,6 +231,98 @@ describe('runFixV2 stage4 loop', () => {
     );
     expect(outcome.status).toBe('fix_approved');
     expect(outcome.criticVerdict?.verdict).toBe('reject');
+  });
+
+  test('accepts the executor pushing its own commits as legitimate HEAD movement', async () => {
+    process.env.FIX_V2_MAX_ITERATIONS = '1';
+
+    const { dossier, snapshot } = makeDossier();
+    const workspace = makeWorkspace();
+    const sandbox = makeSandbox();
+    // HEAD before the iteration is sha-0; the executor commits and pushes,
+    // moving HEAD to sha-fix. Previously this failed no_head_drift and burned
+    // the iteration despite green evidence (openinference#62).
+    const headMock = jest
+      .fn<Promise<string>, []>()
+      .mockResolvedValueOnce('sha-0') // iteration baseline
+      .mockResolvedValue('sha-fix'); // after executor + critic checks
+
+    runFixInvestigatorMock.mockResolvedValue({
+      notes: makeNotes(snapshot.snapshotId),
+      terminated: 'done',
+      reason: undefined,
+      toolCalls: 1,
+      transcriptSummary: 'ok',
+    });
+    runFixPlannerMock.mockResolvedValue({
+      plan: makePlan(),
+      terminated: 'done',
+      reason: undefined,
+      transcriptSummary: 'ok',
+    });
+    runFixExecutorMock.mockResolvedValue(makeExecutorResult({ pushedShas: ['sha-fix'] }));
+    runFixCriticMock.mockResolvedValue({
+      verdict: { verdict: 'approve', reason: 'fix verified' },
+      transcriptSummary: 'critic-summary',
+    });
+
+    const outcome = await runFixV2({
+      attemptId: 'attempt-1',
+      dossier,
+      snapshot,
+      reproTestPath: 'tests/test_repro.py',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      getCurrentHeadSha: headMock,
+    });
+
+    expect(runFixExecutorMock).toHaveBeenCalledTimes(1);
+    expect(outcome.status).toBe('fix_approved');
+  });
+
+  test('still fails no_head_drift when HEAD moves to a commit the executor did not push', async () => {
+    process.env.FIX_V2_MAX_ITERATIONS = '1';
+
+    const { dossier, snapshot } = makeDossier();
+    const workspace = makeWorkspace();
+    const sandbox = makeSandbox();
+    const headMock = jest
+      .fn<Promise<string>, []>()
+      .mockResolvedValueOnce('sha-0')
+      .mockResolvedValue('sha-foreign'); // someone else pushed
+
+    runFixInvestigatorMock.mockResolvedValue({
+      notes: makeNotes(snapshot.snapshotId),
+      terminated: 'done',
+      reason: undefined,
+      toolCalls: 1,
+      transcriptSummary: 'ok',
+    });
+    runFixPlannerMock.mockResolvedValue({
+      plan: makePlan(),
+      terminated: 'done',
+      reason: undefined,
+      transcriptSummary: 'ok',
+    });
+    runFixExecutorMock.mockResolvedValue(makeExecutorResult({ pushedShas: ['sha-fix'] }));
+
+    const outcome = await runFixV2({
+      attemptId: 'attempt-1',
+      dossier,
+      snapshot,
+      reproTestPath: 'tests/test_repro.py',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      getCurrentHeadSha: headMock,
+    });
+
+    expect(runFixCriticMock).not.toHaveBeenCalled();
+    expect(outcome.status).toBe('fix_failed');
+    expect(outcome.message).toContain('exhausted without satisfying deterministic completion promise');
   });
 
   test('returns fix_failed when iteration cap is hit without a green completion promise', async () => {

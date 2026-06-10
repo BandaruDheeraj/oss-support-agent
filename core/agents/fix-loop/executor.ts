@@ -42,16 +42,20 @@ export interface RunFixExecutorArgs {
   retryFeedback?: string;
 }
 
+export interface GreenEvidence {
+  lastMutationTurn: number | null;
+  reproGreenAfterMutation: boolean;
+  testsGreenAfterMutation: boolean;
+  lastReproRun: SandboxRun | null;
+  lastTestsRun: SandboxRun | null;
+}
+
 export interface FixExecutorResult extends AgentLoopResult {
-  greenEvidence: {
-    lastMutationTurn: number | null;
-    reproGreenAfterMutation: boolean;
-    testsGreenAfterMutation: boolean;
-    lastReproRun: SandboxRun | null;
-    lastTestsRun: SandboxRun | null;
-  };
+  greenEvidence: GreenEvidence;
   changedFiles: string[];
   unconsumedHypothesisFiles: string[];
+  /** SHAs the executor itself pushed via commit_and_push, in call order. */
+  pushedShas: string[];
 }
 
 const SYSTEM = `You are the Fix Executor. Mutate source code via apply_patch to fix the bug, then verify with run_repro and run_tests.
@@ -160,38 +164,15 @@ export async function runFixExecutor(args: RunFixExecutorArgs): Promise<FixExecu
     )
   );
 
-  // Green-evidence audit: find the last mutation, then check that a green run_repro and run_tests occurred AFTER it.
-  let lastMutationTurn: number | null = null;
-  for (let i = transcript.length - 1; i >= 0; i -= 1) {
-    const e = transcript[i];
-    if (e.ok && (e.tool === 'apply_patch' || e.tool === 'revert_file' || e.tool === 'write_test' || e.tool === 'revise_test')) {
-      lastMutationTurn = e.turn;
-      break;
-    }
-  }
-  let reproGreen = false;
-  let testsGreen = false;
-  let lastReproRun: SandboxRun | null = null;
-  let lastTestsRun: SandboxRun | null = null;
-  if (lastMutationTurn !== null) {
-    for (const e of transcript) {
-      if (e.turn <= lastMutationTurn) continue;
-      if (e.tool === 'run_repro' && e.ok) {
-        const run = asSandboxRun(e.result);
-        if (run) {
-          lastReproRun = run;
-          if (run.exitCode === 0) reproGreen = true;
-        }
-      }
-      if (e.tool === 'run_tests' && e.ok) {
-        const run = asSandboxRun(e.result);
-        if (run) {
-          lastTestsRun = run;
-          if (run.exitCode === 0) testsGreen = true;
-        }
-      }
-    }
-  }
+  const greenEvidence = computeGreenEvidence(transcript);
+  const { reproGreenAfterMutation: reproGreen, testsGreenAfterMutation: testsGreen } = greenEvidence;
+
+  // SHAs the executor pushed itself — the orchestrator's head-drift check
+  // treats these as legitimate movement (the executor saving its own work).
+  const pushedShas = transcript
+    .filter((e) => e.ok && e.tool === 'commit_and_push')
+    .map((e) => (e.result as { sha?: unknown } | undefined)?.sha)
+    .filter((s): s is string => typeof s === 'string');
 
   const hypothesisAudit = args.hypotheses.allChangedFilesConsumed(changed);
 
@@ -207,14 +188,63 @@ export async function runFixExecutor(args: RunFixExecutorArgs): Promise<FixExecu
 
   return {
     ...loop,
-    greenEvidence: {
-      lastMutationTurn,
-      reproGreenAfterMutation: reproGreen,
-      testsGreenAfterMutation: testsGreen,
-      lastReproRun,
-      lastTestsRun,
-    },
+    greenEvidence,
     changedFiles: changed,
     unconsumedHypothesisFiles: hypothesisAudit.missing,
+    pushedShas,
+  };
+}
+
+/**
+ * Green-evidence audit. After the LAST mutation in the run, a green run_repro
+ * and run_tests must have occurred — this proves the finished code is what
+ * passed, not an earlier state.
+ *
+ * A verify-only run (no mutations at all) never changes the code state, so
+ * any green run during it is valid evidence about the final state. This is
+ * the normal shape when a previous iteration already committed the fix and
+ * the current iteration only re-verifies.
+ */
+export function computeGreenEvidence(
+  transcript: Array<{ turn: number; tool: string; ok: boolean; result?: unknown }>
+): GreenEvidence {
+  let lastMutationTurn: number | null = null;
+  for (let i = transcript.length - 1; i >= 0; i -= 1) {
+    const e = transcript[i];
+    if (e.ok && (e.tool === 'apply_patch' || e.tool === 'revert_file' || e.tool === 'write_test' || e.tool === 'revise_test')) {
+      lastMutationTurn = e.turn;
+      break;
+    }
+  }
+
+  const evidenceAfterTurn = lastMutationTurn ?? -1;
+  let reproGreen = false;
+  let testsGreen = false;
+  let lastReproRun: SandboxRun | null = null;
+  let lastTestsRun: SandboxRun | null = null;
+  for (const e of transcript) {
+    if (e.turn <= evidenceAfterTurn) continue;
+    if (e.tool === 'run_repro' && e.ok) {
+      const run = asSandboxRun(e.result);
+      if (run) {
+        lastReproRun = run;
+        if (run.exitCode === 0) reproGreen = true;
+      }
+    }
+    if (e.tool === 'run_tests' && e.ok) {
+      const run = asSandboxRun(e.result);
+      if (run) {
+        lastTestsRun = run;
+        if (run.exitCode === 0) testsGreen = true;
+      }
+    }
+  }
+
+  return {
+    lastMutationTurn,
+    reproGreenAfterMutation: reproGreen,
+    testsGreenAfterMutation: testsGreen,
+    lastReproRun,
+    lastTestsRun,
   };
 }
