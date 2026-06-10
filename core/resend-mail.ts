@@ -15,6 +15,7 @@
  */
 import { Resend } from 'resend';
 
+import { renderMarkdownToHtml, wrapEmailHtml, markdownToPlainText } from './email-html';
 import {
   GmailClient,
   GmailMessage,
@@ -100,11 +101,15 @@ export class ResendMailClient implements GmailClient {
         headers['References'] = message.threadId;
       }
 
+      // Bodies are authored as Markdown throughout the codebase. Send a
+      // rendered HTML part (what mail clients display) plus a cleaned-up
+      // plain-text alternative, instead of raw Markdown as text.
       const resp = await this.resend.emails.send({
         from: this.fromAddress,
         to: [message.to],
         subject: message.subject,
-        text: message.body,
+        html: wrapEmailHtml(renderMarkdownToHtml(message.body)),
+        text: markdownToPlainText(message.body),
         replyTo: message.replyTo,
         headers: Object.keys(headers).length ? headers : undefined,
       });

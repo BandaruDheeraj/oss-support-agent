@@ -9,6 +9,7 @@
 
 import { renderDossierMarkdown } from '../../hitl/trace-and-dossier-links';
 import { redactString } from '../../../observability/redact';
+import { markdownToPlainText } from '../../../email-html';
 import type { EmailContext } from '../context';
 import type { EmailPayload } from '../composer';
 
@@ -48,10 +49,7 @@ export function footer(ctx: EmailContext): string {
 }
 
 export function toPlainText(md: string): string {
-  return md
-    .replace(/\*\*/g, '')
-    .replace(/`/g, '')
-    .replace(/\[(.+?)\]\((.+?)\)/g, '$1 ($2)');
+  return markdownToPlainText(md);
 }
 
 export function build(
