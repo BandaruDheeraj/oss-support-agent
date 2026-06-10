@@ -8,7 +8,7 @@ import type {
   LLMChatResult,
   LLMMessage,
   LLMUsage,
-} from './client';
+} from './types';
 
 export interface LLMClientLike {
   chat(messages: LLMMessage[], options?: LLMChatOptions): Promise<LLMChatResult>;

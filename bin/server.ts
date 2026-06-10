@@ -38,6 +38,7 @@ import { FsManifestRegistry } from './clients/manifest-registry';
 import { runPipeline, defaultWorkspaceRoot } from './run-pipeline';
 import { buildLiveDeps, defaultStateRoot, type LiveDeps } from './clients/live-deps';
 import { FilePipelineRunStateStore } from './clients/state-stores';
+import { GistStateStore } from './clients/gist-state-store';
 
 interface RequiredEnv {
   GITHUB_TOKEN: string;
@@ -51,6 +52,7 @@ interface OptionalEnv {
   REPO_ROOT: string;
   WORKSPACE_ROOT: string;
   STATE_ROOT: string;
+  GIST_ID: string | undefined;
   GIT_AUTHOR_NAME: string;
   GIT_AUTHOR_EMAIL: string;
 }
@@ -81,6 +83,7 @@ function loadEnv(): RequiredEnv & OptionalEnv {
     REPO_ROOT: process.env.REPO_ROOT ?? process.cwd(),
     WORKSPACE_ROOT: process.env.WORKSPACE_ROOT ?? defaultWorkspaceRoot(),
     STATE_ROOT: process.env.STATE_ROOT ?? defaultStateRoot(),
+    GIST_ID: process.env.GIST_ID,
     GIT_AUTHOR_NAME: process.env.GIT_AUTHOR_NAME ?? 'oss-support-agent',
     GIT_AUTHOR_EMAIL: process.env.GIT_AUTHOR_EMAIL ?? 'agent@users.noreply.github.com',
   };
@@ -297,11 +300,24 @@ async function startServer(): Promise<void> {
     process.exit(1);
   }
   const registry = new FsManifestRegistry(env.REPO_ROOT);
-  const runStateStore = new FilePipelineRunStateStore(env.STATE_ROOT);
+
+  let gistStore: GistStateStore | undefined;
+  if (env.GIST_ID) {
+    gistStore = new GistStateStore(env.GIST_ID, env.GITHUB_TOKEN);
+    await gistStore.initialize();
+    baseLog(`[state] using GitHub Gist state store (gist=${env.GIST_ID})`);
+  } else {
+    baseLog(`[state] using file-backed state store (root=${env.STATE_ROOT})`);
+  }
+
+  const runStateStore = new FilePipelineRunStateStore(
+    gistStore ? gistStore.namespace('pipeline-runs') : env.STATE_ROOT,
+  );
 
   const live = buildLiveDeps(process.env, {
     token: env.GITHUB_TOKEN,
     stateRoot: env.STATE_ROOT,
+    gistStore,
     log: baseLog,
     repoRoot: env.REPO_ROOT,
   });

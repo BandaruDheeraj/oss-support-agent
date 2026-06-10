@@ -353,15 +353,33 @@ export function resumeIntrospectionEmailLoop(
  * (slash, '#', uppercase, etc.) still match when the inbound webhook
  * dispatches the reply with the encoded form.
  */
+
+/** Persists a reply when no active waiter exists; checked before creating a new Promise. */
+export interface ReplyMailbox {
+  store(runId: string, reply: GmailReply, thread: EmailThread): void;
+  take(runId: string): { reply: GmailReply; thread: EmailThread } | null;
+}
+
+/** Called when a reply arrives with no active waiter; lets the approval store update itself. */
+export interface PrReviewApprovalHook {
+  resolveByRunId(prReviewRunId: string, replyBody: string): void;
+}
+
 export class IntrospectionReplyWaiter implements ReplyHandler {
   private readonly pending = new Map<string, { resolve: (v: { reply: GmailReply; thread: EmailThread }) => void; reject: (e: Error) => void }>();
 
-  waitForEmailReply(repoFullName: string): Promise<{ reply: GmailReply; thread: EmailThread }> {
-    const key = encodeRunIdForLocalPart(repoFullName);
-    if (this.pending.has(key)) {
-      return Promise.reject(new Error(`Already waiting for reply for ${repoFullName}`));
-    }
+  constructor(
+    private readonly mailbox?: ReplyMailbox,
+    private readonly prReviewApprovalHook?: PrReviewApprovalHook,
+  ) {}
 
+  waitForEmailReply(runId: string): Promise<{ reply: GmailReply; thread: EmailThread }> {
+    const key = encodeRunIdForLocalPart(runId);
+    if (this.pending.has(key)) {
+      return Promise.reject(new Error(`Already waiting for reply for ${runId}`));
+    }
+    const stored = this.mailbox?.take(runId);
+    if (stored) return Promise.resolve(stored);
     return new Promise((resolve, reject) => {
       this.pending.set(key, { resolve, reject });
     });
@@ -370,7 +388,11 @@ export class IntrospectionReplyWaiter implements ReplyHandler {
   async onReply(runId: string, reply: GmailReply, thread: EmailThread): Promise<void> {
     const key = encodeRunIdForLocalPart(runId);
     const p = this.pending.get(key);
-    if (!p) return;
+    if (!p) {
+      this.mailbox?.store(runId, reply, thread);
+      this.prReviewApprovalHook?.resolveByRunId(runId, reply.body);
+      return;
+    }
     this.pending.delete(key);
     p.resolve({ reply, thread });
   }

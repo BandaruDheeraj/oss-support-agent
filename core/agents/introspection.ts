@@ -23,8 +23,9 @@ import type {
   ComposeServicesSignal,
 } from './introspection-types';
 
-import { LLMClient, type LLMUsage, type LLMMessage } from '../llm/client';
+import type { LLMUsage, LLMMessage } from '../llm/types';
 import type { LLMClientLike } from '../llm/test-utils';
+import { ChatClient } from '../llm/v2/chat-client';
 
 function execFileAsync(file: string, args: string[], options: { cwd?: string } = {}): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -537,7 +538,7 @@ export async function generateDraftAdapter(
 
   const messages: LLMMessage[] = [{ role: 'user', content: prompt }];
 
-  const client = options.llmClient ?? new LLMClient();
+  const client = options.llmClient ?? new ChatClient();
   const { data } = await client.chatJson<DraftAdapter>(messages, DRAFT_ADAPTER_SCHEMA, {
     agent: 'INTROSPECTION',
     temperature: 0,

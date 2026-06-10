@@ -12,7 +12,22 @@
 import { createAnthropic, type AnthropicProvider } from '@ai-sdk/anthropic';
 import { createOpenAI, type OpenAIProvider } from '@ai-sdk/openai';
 import type { LanguageModelV1 } from 'ai';
-import { resolveModelFromEnv, type OpenRouterAgent } from '../client';
+
+import type { OpenRouterAgent } from '../types';
+
+export type { OpenRouterAgent };
+
+const DEFAULT_MODEL_FALLBACK = 'anthropic/claude-3.7-sonnet';
+
+function envModelKey(agent: OpenRouterAgent): string {
+  return `OPENROUTER_MODEL_${agent}`;
+}
+
+export function resolveModelFromEnv(agent?: OpenRouterAgent): string {
+  const defaultModel = process.env.OPENROUTER_MODEL_DEFAULT || DEFAULT_MODEL_FALLBACK;
+  if (!agent) return defaultModel;
+  return process.env[envModelKey(agent)] || defaultModel;
+}
 
 const openrouterByKey = new Map<string, OpenAIProvider>();
 let anthropicProvider: AnthropicProvider | undefined;

@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-import { LLMClient } from '../llm/client';
+import { ChatClient } from '../llm/v2/chat-client';
 import { MockLLMClient } from '../llm/test-utils';
 import { generateDraftAdapter } from './introspection';
 import type { RepoSignals } from './introspection-types';
@@ -154,11 +154,12 @@ export class BaseRepoAdapter implements RepoAdapter {
     );
   });
 
-  test('retries malformed JSON via LLMClient.chatJson parse retries', async () => {
+  test('retries malformed JSON via ChatClient.chatJson parse retries', async () => {
     const tmpRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'oss-agent-us105-llm-'));
 
     let call = 0;
-    const fetchFn = async () => {
+    const client = new ChatClient();
+    jest.spyOn(client, 'chat').mockImplementation(async () => {
       call++;
       const content =
         call === 1
@@ -169,18 +170,11 @@ export class BaseRepoAdapter implements RepoAdapter {
               rationale: {},
               openItems: [],
             });
-
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ choices: [{ message: { content } }] }),
-      };
-    };
-
-    const real = new LLMClient({ apiKey: 'test', fetchFn });
+      return { content, usage: null, raw: null };
+    });
 
     await expect(
-      generateDraftAdapter(baseSignals(), 'acme/demo', { llmClient: real, tmpRoot })
+      generateDraftAdapter(baseSignals(), 'acme/demo', { llmClient: client, tmpRoot })
     ).resolves.toBeTruthy();
 
     expect(call).toBeGreaterThanOrEqual(2);

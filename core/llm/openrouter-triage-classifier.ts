@@ -17,7 +17,8 @@ import type {
   TriageInput,
 } from '../agents/triage-types';
 import { DefaultIssueTypeClassifier } from '../agents/triage';
-import { LLMClient, type LLMMessage } from './client';
+import type { LLMMessage } from './types';
+import { ChatClient } from './v2/chat-client';
 
 export interface TriageBrowserContext {
   browser: {
@@ -112,11 +113,11 @@ const SYSTEM_PROMPT = (repo: string, ref: string | undefined, hasBrowser: boolea
   `Always return a single JSON object — exactly one of the four action shapes — with no commentary, fences, or markdown around it.`;
 
 export class OpenRouterTriageClassifier implements TriageTypeClassifier {
-  private readonly client: LLMClient;
+  private readonly client: ChatClient;
   private readonly browserCtx?: TriageBrowserContext;
 
-  constructor(client?: LLMClient, browserCtx?: TriageBrowserContext) {
-    this.client = client ?? new LLMClient();
+  constructor(client?: ChatClient, browserCtx?: TriageBrowserContext) {
+    this.client = client ?? new ChatClient();
     this.browserCtx = browserCtx;
   }
 
@@ -226,13 +227,13 @@ export class OpenRouterTriageClassifier implements TriageTypeClassifier {
 
 /**
  * Default triage classifier selection:
- * - If OPENROUTER_API_KEY is set, use OpenRouter (with browser context if provided).
+ * - If ANTHROPIC_API_KEY or OPENROUTER_API_KEY is set, use the LLM classifier.
  * - Otherwise, use the deterministic heuristic implementation.
  */
 export function createDefaultTriageClassifier(
   browserCtx?: TriageBrowserContext
 ): TriageTypeClassifier {
-  if (!process.env.OPENROUTER_API_KEY) {
+  if (!process.env.ANTHROPIC_API_KEY && !process.env.OPENROUTER_API_KEY) {
     return new DefaultIssueTypeClassifier();
   }
   return new OpenRouterTriageClassifier(undefined, browserCtx);

@@ -39,10 +39,14 @@ function namedSecretRegex(name: string): RegExp {
   return new RegExp(`\\b${escaped}\\b\\s*[=:]\\s*"?([^"\\s,;]+)"?`, 'g');
 }
 
+const KNOWN_SECRET_REGEXES: RegExp[] = KNOWN_SECRET_NAMES.map(namedSecretRegex);
+
+let _denylistCache: string[] | null = null;
 function denylistFromEnv(): string[] {
+  if (_denylistCache !== null) return _denylistCache;
   const raw = process.env.REDACT_DENY;
-  if (!raw) return [];
-  return raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  _denylistCache = !raw ? [] : raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+  return _denylistCache;
 }
 
 const cache = new Map<string, string>();
@@ -61,9 +65,9 @@ export function redactString(input: string): string {
   let out = input;
   out = out.replace(URL_WITH_USERINFO, (_, scheme) => `${scheme}<REDACTED:URL_CRED>@`);
   out = out.replace(HEADER_LINE, (_m, name) => `${name}: <REDACTED:HEADER>`);
-  for (const name of KNOWN_SECRET_NAMES) {
-    out = out.replace(namedSecretRegex(name), (_match: string, value: string) => {
-      return _match.replace(value, placeholderFor(name, value));
+  for (let i = 0; i < KNOWN_SECRET_NAMES.length; i++) {
+    out = out.replace(KNOWN_SECRET_REGEXES[i], (_match: string, value: string) => {
+      return _match.replace(value, placeholderFor(KNOWN_SECRET_NAMES[i], value));
     });
   }
   for (const re of KEY_SHAPES) {
@@ -99,4 +103,5 @@ export function redactValue<T>(v: T): T {
 
 export function _resetRedactCache(): void {
   cache.clear();
+  _denylistCache = null;
 }

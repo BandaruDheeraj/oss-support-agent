@@ -18,7 +18,8 @@
  * same either way.
  */
 
-import { LLMClient, type LLMMessage } from './llm/client';
+import type { LLMMessage } from './llm/types';
+import { ChatClient } from './llm/v2/chat-client';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -255,12 +256,12 @@ async function getAnthropicClient(): Promise<any | null> {
   }
 }
 
-let cachedOpenRouter: LLMClient | null = null;
+let cachedChatClient: ChatClient | null = null;
 
-function getOpenRouter(): LLMClient {
-  if (cachedOpenRouter) return cachedOpenRouter;
-  cachedOpenRouter = new LLMClient();
-  return cachedOpenRouter;
+function getChatClient(): ChatClient {
+  if (cachedChatClient) return cachedChatClient;
+  cachedChatClient = new ChatClient();
+  return cachedChatClient;
 }
 
 function newSpanId(): string {
@@ -343,7 +344,7 @@ export async function tracedAnthropic(
         },
       };
     } else {
-      const result = await getOpenRouter().chat(anthropicMessagesToLLMMessages(input), {
+      const result = await getChatClient().chat(anthropicMessagesToLLMMessages(input), {
         model: input.model,
         temperature: input.temperature ?? 0,
         maxTokens: input.max_tokens,

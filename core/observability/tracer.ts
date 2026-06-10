@@ -8,7 +8,7 @@
  *   - "none"      → NoopTracer (default — zero overhead, no extra deps loaded)
  *
  * Span parent context flows via AsyncLocalStorage so call-site wrappers
- * (e.g. the LLM chokepoint in core/llm/client.ts) don't have to thread it
+ * (e.g. the LLM chokepoint in core/llm/v2/chat-client.ts) don't have to thread it
  * through call signatures.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';

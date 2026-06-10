@@ -1,55 +1,49 @@
 /**
- * File-backed state stores. Persistence survives server restarts.
- * Stored as JSON files under data/state/<kind>/<key>.json.
+ * State stores backed by a pluggable StorageBackend.
+ *
+ * Pass a string rootDir to use file-backed storage (FileBackend).
+ * Pass a StorageBackend from GistStateStore.namespace() to use gist-backed storage.
  */
 
-import * as fs from 'fs';
 import * as path from 'path';
 
 import type { IntrospectionStateStore, IntrospectionEmailState } from '../../core/introspection-email-types';
 import type { RetryStateStore, RetryHistory } from '../../core/retry-loop-types';
 import type { EmailStateStore } from '../../core/pm-email-types';
-import type { EmailThread } from '../../core/gmail-types';
+import type { EmailThread, GmailReply } from '../../core/gmail-types';
+import type { ReplyMailbox, PrReviewApprovalHook } from '../../core/introspection-email-loop';
+import { FileBackend, type StorageBackend } from './gist-state-store';
 
 function safeKey(key: string): string {
   return key.replace(/[^A-Za-z0-9_-]+/g, '_');
 }
 
-function ensureDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true });
-}
+abstract class BaseStore<T> {
+  private readonly backend: StorageBackend;
 
-abstract class FileStore<T> {
-  constructor(private readonly dir: string) {
-    ensureDir(dir);
+  constructor(backendOrDir: StorageBackend | string) {
+    this.backend = typeof backendOrDir === 'string' ? new FileBackend(backendOrDir) : backendOrDir;
   }
-  protected file(key: string): string {
-    return path.join(this.dir, `${safeKey(key)}.json`);
-  }
+
   protected save(key: string, value: T): void {
-    fs.writeFileSync(this.file(key), JSON.stringify(value, null, 2), 'utf-8');
+    this.backend.save(safeKey(key), value);
   }
+
   protected load(key: string): T | null {
-    const f = this.file(key);
-    if (!fs.existsSync(f)) return null;
-    try {
-      return JSON.parse(fs.readFileSync(f, 'utf-8')) as T;
-    } catch {
-      return null;
-    }
+    return this.backend.load<T>(safeKey(key));
   }
+
   protected remove(key: string): void {
-    const f = this.file(key);
-    if (fs.existsSync(f)) fs.unlinkSync(f);
+    this.backend.remove(safeKey(key));
   }
 }
 
 export class FileIntrospectionStateStore
-  extends FileStore<IntrospectionEmailState>
+  extends BaseStore<IntrospectionEmailState>
   implements IntrospectionStateStore
 {
-  constructor(rootDir: string) {
-    super(path.join(rootDir, 'introspection'));
+  constructor(backendOrRootDir: StorageBackend | string) {
+    super(typeof backendOrRootDir === 'string' ? path.join(backendOrRootDir, 'introspection') : backendOrRootDir);
   }
   saveState(repoFullName: string, state: IntrospectionEmailState): void {
     this.save(repoFullName, state);
@@ -62,12 +56,9 @@ export class FileIntrospectionStateStore
   }
 }
 
-export class FileRetryStateStore
-  extends FileStore<RetryHistory>
-  implements RetryStateStore
-{
-  constructor(rootDir: string) {
-    super(path.join(rootDir, 'retry'));
+export class FileRetryStateStore extends BaseStore<RetryHistory> implements RetryStateStore {
+  constructor(backendOrRootDir: StorageBackend | string) {
+    super(typeof backendOrRootDir === 'string' ? path.join(backendOrRootDir, 'retry') : backendOrRootDir);
   }
   async saveRetryHistory(history: RetryHistory): Promise<void> {
     this.save(history.runId, history);
@@ -86,12 +77,9 @@ interface PMEmailPayload {
   unresolvedQuestions: string[];
 }
 
-export class FilePMEmailStateStore
-  extends FileStore<PMEmailPayload>
-  implements EmailStateStore
-{
-  constructor(rootDir: string) {
-    super(path.join(rootDir, 'pm-email'));
+export class FilePMEmailStateStore extends BaseStore<PMEmailPayload> implements EmailStateStore {
+  constructor(backendOrRootDir: StorageBackend | string) {
+    super(typeof backendOrRootDir === 'string' ? path.join(backendOrRootDir, 'pm-email') : backendOrRootDir);
   }
   saveThreadState(
     runId: string,
@@ -132,9 +120,11 @@ export interface PipelineRunAcquireResult {
   reason?: 'already-running';
 }
 
-export class FilePipelineRunStateStore extends FileStore<PipelineRunRecord> {
-  constructor(rootDir: string) {
-    super(path.join(rootDir, 'pipeline-runs'));
+export class FilePipelineRunStateStore extends BaseStore<PipelineRunRecord> {
+  constructor(backendOrRootDir: StorageBackend | string) {
+    super(
+      typeof backendOrRootDir === 'string' ? path.join(backendOrRootDir, 'pipeline-runs') : backendOrRootDir,
+    );
   }
 
   acquireRun(
@@ -213,5 +203,101 @@ export class FilePipelineRunStateStore extends FileStore<PipelineRunRecord> {
 
   loadRun(key: string): PipelineRunRecord | null {
     return this.load(key);
+  }
+}
+
+/** Stores email replies that arrive when no active waiter exists, so they can be picked up after a restart. */
+export class FileReplyMailbox
+  extends BaseStore<{ reply: GmailReply; thread: EmailThread }>
+  implements ReplyMailbox
+{
+  constructor(backendOrRootDir: StorageBackend | string) {
+    super(
+      typeof backendOrRootDir === 'string' ? path.join(backendOrRootDir, 'reply-mailbox') : backendOrRootDir,
+    );
+  }
+  store(runId: string, reply: GmailReply, thread: EmailThread): void {
+    this.save(runId, { reply, thread });
+  }
+  take(runId: string): { reply: GmailReply; thread: EmailThread } | null {
+    const stored = this.load(runId);
+    if (stored) this.remove(runId);
+    return stored;
+  }
+}
+
+interface PrReviewRunIdRecord {
+  repoFullName: string;
+  issueNumber: number;
+  approvalKeywords: string[];
+}
+
+export interface PrReviewApprovalRecord {
+  status: 'approved';
+  approvedAt: string;
+}
+
+const PR_REVIEW_APPROVAL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+/**
+ * Persists pre-PR review approvals so re-triggered runs skip the email gate.
+ *
+ * Uses a single backend with two key prefixes:
+ *   "approval:{safeKey(repo)}_{issue}" → PrReviewApprovalRecord
+ *   "runid:{safeKey(prReviewRunId)}"   → PrReviewRunIdRecord (maps runId → issue)
+ */
+export class FilePrReviewApprovalStore implements PrReviewApprovalHook {
+  private readonly backend: StorageBackend;
+
+  constructor(backendOrRootDir: StorageBackend | string) {
+    this.backend =
+      typeof backendOrRootDir === 'string'
+        ? new FileBackend(path.join(backendOrRootDir, 'pr-review'))
+        : backendOrRootDir;
+  }
+
+  writePending(
+    prReviewRunId: string,
+    repoFullName: string,
+    issueNumber: number,
+    approvalKeywords: string[],
+  ): void {
+    this.backend.save(`runid_${safeKey(prReviewRunId)}`, {
+      repoFullName,
+      issueNumber,
+      approvalKeywords,
+    } satisfies PrReviewRunIdRecord);
+  }
+
+  writeApproval(repoFullName: string, issueNumber: number): void {
+    this.backend.save(`approval_${safeKey(repoFullName)}_${issueNumber}`, {
+      status: 'approved',
+      approvedAt: new Date().toISOString(),
+    } satisfies PrReviewApprovalRecord);
+  }
+
+  resolveByRunId(prReviewRunId: string, replyBody: string): void {
+    const record = this.backend.load<PrReviewRunIdRecord>(`runid_${safeKey(prReviewRunId)}`);
+    if (!record) return;
+    const matched = record.approvalKeywords.some((kw) =>
+      replyBody.toLowerCase().includes(kw.toLowerCase()),
+    );
+    if (!matched) return;
+    this.writeApproval(record.repoFullName, record.issueNumber);
+  }
+
+  loadApproval(repoFullName: string, issueNumber: number): PrReviewApprovalRecord | null {
+    const key = `approval_${safeKey(repoFullName)}_${issueNumber}`;
+    const record = this.backend.load<PrReviewApprovalRecord>(key);
+    if (!record) return null;
+    if (Date.now() - Date.parse(record.approvedAt) > PR_REVIEW_APPROVAL_MAX_AGE_MS) {
+      this.backend.remove(key);
+      return null;
+    }
+    return record;
+  }
+
+  clearApproval(repoFullName: string, issueNumber: number): void {
+    this.backend.remove(`approval_${safeKey(repoFullName)}_${issueNumber}`);
   }
 }

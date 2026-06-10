@@ -3,7 +3,8 @@
  */
 
 import type { BuildAgentInput, ScaffoldGenerator, ScaffoldGeneratorOutput } from '../agents/build-types';
-import { LLMClient, type LLMMessage } from './client';
+import type { LLMMessage } from './types';
+import { ChatClient } from './v2/chat-client';
 
 const SCAFFOLD_OUTPUT_SCHEMA = {
   type: 'object',
@@ -54,10 +55,10 @@ const SCAFFOLD_OUTPUT_SCHEMA = {
 } as const;
 
 export class OpenRouterScaffoldGenerator implements ScaffoldGenerator {
-  private readonly client: LLMClient;
+  private readonly client: ChatClient;
 
-  constructor(client?: LLMClient) {
-    this.client = client ?? new LLMClient();
+  constructor(client?: ChatClient) {
+    this.client = client ?? new ChatClient();
   }
 
   async generateScaffold(input: BuildAgentInput): Promise<ScaffoldGeneratorOutput> {

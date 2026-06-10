@@ -3,7 +3,8 @@
  */
 
 import type { DocsAgentInput, DocsGenerator, DocsGeneratorOutput } from '../../core/agents/docs-types';
-import { LLMClient, type LLMMessage } from '../../core/llm/client';
+import type { LLMMessage } from '../../core/llm/types';
+import { ChatClient } from '../../core/llm/v2/chat-client';
 
 const DOCS_OUTPUT_SCHEMA = {
   type: 'object',
@@ -28,9 +29,9 @@ const DOCS_OUTPUT_SCHEMA = {
 } as const;
 
 export class OpenRouterDocsGenerator implements DocsGenerator {
-  private readonly client: LLMClient;
-  constructor(client?: LLMClient) {
-    this.client = client ?? new LLMClient();
+  private readonly client: ChatClient;
+  constructor(client?: ChatClient) {
+    this.client = client ?? new ChatClient();
   }
 
   async generateDocs(input: DocsAgentInput): Promise<DocsGeneratorOutput> {

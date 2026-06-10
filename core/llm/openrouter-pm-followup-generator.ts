@@ -13,7 +13,8 @@ import type {
   FollowUpInput,
   FollowUpResult,
 } from '../pm-email-types';
-import { LLMClient, type LLMMessage } from './client';
+import type { LLMMessage } from './types';
+import { ChatClient } from './v2/chat-client';
 import { extractDecisions } from '../pm-email-loop';
 
 export interface PMBrowserContext {
@@ -108,11 +109,11 @@ const SYSTEM_PROMPT = (repo: string, ref: string | undefined, hasBrowser: boolea
   `Always return a single JSON object — exactly one of the four action shapes — with no commentary, fences, or markdown around it.`;
 
 export class OpenRouterPMFollowUpGenerator implements FollowUpGenerator {
-  private readonly client: LLMClient;
+  private readonly client: ChatClient;
   private readonly browserCtx?: PMBrowserContext;
 
-  constructor(client?: LLMClient, browserCtx?: PMBrowserContext) {
-    this.client = client ?? new LLMClient();
+  constructor(client?: ChatClient, browserCtx?: PMBrowserContext) {
+    this.client = client ?? new ChatClient();
     this.browserCtx = browserCtx;
   }
 

@@ -988,6 +988,11 @@ function summarizeOracleCandidate(
   };
 }
 
+function extractProberInnerReason(msg: string): string {
+  const m = /^Prober sample terminated without recipe \((.+)\)$/.exec(msg);
+  return m ? m[1] : msg;
+}
+
 function detectLlmQuotaFailure(v2: ReproV2Outcome): NotReproducedRunDiagnostics['llm_quota_failure'] {
   if (isLlmQuotaFailure(v2.message)) {
     return {
@@ -998,10 +1003,12 @@ function detectLlmQuotaFailure(v2: ReproV2Outcome): NotReproducedRunDiagnostics[
   for (const candidate of v2.candidates) {
     const candidateReason = candidate.message;
     if (!isLlmQuotaFailure(candidateReason)) continue;
+    const reason =
+      candidate.source === 'prober' ? extractProberInnerReason(candidateReason) : candidateReason;
     return {
-      stage: 'builder' as const,
+      stage: candidate.source,
       candidate_id: candidate.candidateId,
-      reason: candidateReason,
+      reason,
     };
   }
   return null;
@@ -1635,6 +1642,13 @@ async function sendPrePrReviewEmail(args: {
 
   const prReviewRunId = `${runId}-pr-review`;
 
+  // Skip gate if this issue was already approved within the last 7 days (survives redeploys)
+  const cachedApproval = live.prReviewApprovalStore?.loadApproval(repoFullName, issueNumber);
+  if (cachedApproval) {
+    log(`[pre-pr-review] using cached approval from ${cachedApproval.approvedAt}`);
+    return { approved: true, skipped: true, skipReason: `cached-approval:${cachedApproval.approvedAt}` };
+  }
+
   const reproSection = reproTestPath
     ? [
         `**Repro test path:** \`${reproTestPath}\``,
@@ -1714,6 +1728,9 @@ async function sendPrePrReviewEmail(args: {
     return { approved: true, skipped: true, skipReason: `email-send-failed: ${err?.message ?? err}` };
   }
 
+  // Persist the pending record so a reply that arrives after a restart can resolve the gate
+  live.prReviewApprovalStore?.writePending(prReviewRunId, repoFullName, issueNumber, approvalKeywords);
+
   log(`[pre-pr-review] waiting for reply (runId=${prReviewRunId})`);
 
   let reply: import('../core/gmail-types').GmailReply;
@@ -1730,10 +1747,12 @@ async function sendPrePrReviewEmail(args: {
   const approval = detectApproval(reply.body, approvalKeywords);
   if (approval.approved) {
     log(`[pre-pr-review] approved (keyword: ${approval.matchedKeyword})`);
+    live.prReviewApprovalStore?.writeApproval(repoFullName, issueNumber);
     return { approved: true, skipped: false };
   }
 
   log(`[pre-pr-review] reply did not contain approval keyword — gate rejected`);
+  live.prReviewApprovalStore?.clearApproval(repoFullName, issueNumber);
   return { approved: false, skipped: false };
 }
 

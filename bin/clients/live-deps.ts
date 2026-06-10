@@ -12,7 +12,7 @@
 
 import * as path from 'path';
 
-import { LLMClient } from '../../core/llm/client';
+import { ChatClient } from '../../core/llm/v2/chat-client';
 import {
   GmailWatcher,
 } from '../../core/gmail-mcp';
@@ -29,11 +29,15 @@ import {
 import { formatPlusReplyTo } from '../../core/resend-mail';
 
 import { buildResendDepsFromEnv, type ResendDeps } from './resend-real';
+import { type GistStateStore } from './gist-state-store';
 import { GitHubLabelClient } from './github-rest';
 import {
   FileIntrospectionStateStore,
   FileRetryStateStore,
   FilePMEmailStateStore,
+  FileReplyMailbox,
+  FilePrReviewApprovalStore,
+  type PrReviewApprovalRecord,
 } from './state-stores';
 import {
   GitHubIssueSearcher,
@@ -59,6 +63,7 @@ export interface LiveDeps {
   introspectionStateStore: FileIntrospectionStateStore;
   retryStateStore: FileRetryStateStore;
   pmEmailStateStore: FilePMEmailStateStore;
+  prReviewApprovalStore?: FilePrReviewApprovalStore;
   labelClient: GitHubLabelClient;
   issueSearcher: GitHubIssueSearcher;
   prFetcher: GitHubPRFetcher;
@@ -67,7 +72,7 @@ export interface LiveDeps {
   failureNotifier: GmailFailureNotifier;
   issueLabeler: GitHubIssueLabeler;
   docsGenerator: OpenRouterDocsGenerator;
-  llm: LLMClient;
+  llm: ChatClient;
   /** From: address on outbound mail. */
   monitoredEmail: string;
   /** Base reply-to address (no plus tag); use replyToFor(runId) for the per-run address. */
@@ -99,6 +104,8 @@ export interface LiveDeps {
 export interface BuildLiveDepsOptions {
   token: string;
   stateRoot: string;
+  /** When set, all state stores use gist-backed storage instead of the local filesystem. */
+  gistStore?: GistStateStore;
   log: (msg: string) => void;
   /** Repo root used to write configs/<org>/<repo>/. Defaults to process.cwd(). */
   repoRoot?: string;
@@ -124,7 +131,11 @@ export function buildLiveDeps(
   const replyToBase = resendDeps.replyToBase;
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
 
-  const replyWaiter = new IntrospectionReplyWaiter();
+  const stateRoot = options.stateRoot;
+  const g = options.gistStore;
+  const replyMailbox = new FileReplyMailbox(g ? g.namespace('reply-mailbox') : stateRoot);
+  const prReviewApprovalStore = new FilePrReviewApprovalStore(g ? g.namespace('pr-review') : stateRoot);
+  const replyWaiter = new IntrospectionReplyWaiter(replyMailbox, prReviewApprovalStore);
   // Watcher is constructed for type/back-compat (sendAndTrack calls registerThread)
   // but never started — inbound is push-based via webhook.
   const watcher = new GmailWatcher(
@@ -137,10 +148,9 @@ export function buildLiveDeps(
     replyWaiter
   );
 
-  const stateRoot = options.stateRoot;
-  const introspectionStateStore = new FileIntrospectionStateStore(stateRoot);
-  const retryStateStore = new FileRetryStateStore(stateRoot);
-  const pmEmailStateStore = new FilePMEmailStateStore(stateRoot);
+  const introspectionStateStore = new FileIntrospectionStateStore(g ? g.namespace('introspection') : stateRoot);
+  const retryStateStore = new FileRetryStateStore(g ? g.namespace('retry') : stateRoot);
+  const pmEmailStateStore = new FilePMEmailStateStore(g ? g.namespace('pm-email') : stateRoot);
 
   const labelClient = new GitHubLabelClient(options.token);
   const issueSearcher = new GitHubIssueSearcher(options.token);
@@ -150,7 +160,7 @@ export function buildLiveDeps(
   const failureNotifier = new GmailFailureNotifier(resendDeps.client);
   const issueLabeler = new GitHubIssueLabeler(options.token);
   const docsGenerator = new OpenRouterDocsGenerator();
-  const llm = new LLMClient();
+  const llm = new ChatClient();
 
   const repoRoot = options.repoRoot ?? process.cwd();
 
@@ -197,6 +207,7 @@ export function buildLiveDeps(
     introspectionStateStore,
     retryStateStore,
     pmEmailStateStore,
+    prReviewApprovalStore,
     labelClient,
     issueSearcher,
     prFetcher,
