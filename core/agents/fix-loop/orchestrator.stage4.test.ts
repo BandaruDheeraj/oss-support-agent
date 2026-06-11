@@ -282,6 +282,115 @@ describe('runFixV2 stage4 loop', () => {
     expect(outcome.status).toBe('fix_approved');
   });
 
+  test('scope accepts files named by the committed plan even when dossier suspects are wrong', async () => {
+    // Regression: openinference#62 — the repro-phase dossier named suspects in
+    // the wrong packages (it even claimed the agno module did not exist). The
+    // fix investigator+planner found the real file and the plan named it, but
+    // scope was derived from the dossier alone, so the green iteration failed
+    // scope_ok and the loop burned its budget.
+    process.env.FIX_V2_MAX_ITERATIONS = '1';
+
+    const { dossier, snapshot } = makeDossier(); // dossier suspects: src/module.py
+    const workspace = makeWorkspace();
+    const sandbox = makeSandbox();
+    const headMock = jest.fn(async () => 'sha-1');
+
+    const planTargetingOtherFile: Plan = {
+      summary: 'fix the real file the investigation found',
+      steps: [
+        {
+          stepId: 's1',
+          goal: 'edit the actual buggy file',
+          hypothesisSummary: 'dossier suspect was wrong; investigation found the real site',
+          successCheck: 'run_repro green && run_tests green',
+          files: ['python/instrumentation/pkg/src/pkg/_workflow_wrapper.py'],
+          risk: 'low',
+        },
+      ],
+    };
+
+    runFixInvestigatorMock.mockResolvedValue({
+      notes: makeNotes(snapshot.snapshotId),
+      terminated: 'done',
+      reason: undefined,
+      toolCalls: 1,
+      transcriptSummary: 'ok',
+    });
+    runFixPlannerMock.mockResolvedValue({
+      plan: planTargetingOtherFile,
+      terminated: 'done',
+      reason: undefined,
+      transcriptSummary: 'ok',
+    });
+    runFixExecutorMock.mockResolvedValue(
+      makeExecutorResult({
+        changedFiles: ['python/instrumentation/pkg/src/pkg/_workflow_wrapper.py'],
+      })
+    );
+    runFixCriticMock.mockResolvedValue({
+      verdict: { verdict: 'approve', reason: 'fix verified' },
+      transcriptSummary: 'critic-summary',
+    });
+
+    const outcome = await runFixV2({
+      attemptId: 'attempt-1',
+      dossier,
+      snapshot,
+      reproTestPath: 'tests/test_repro.py',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      getCurrentHeadSha: headMock,
+    });
+
+    expect(runFixExecutorMock).toHaveBeenCalledTimes(1);
+    expect(outcome.status).toBe('fix_approved');
+  });
+
+  test('scope still rejects files named by neither the dossier nor the plan', async () => {
+    process.env.FIX_V2_MAX_ITERATIONS = '1';
+
+    const { dossier, snapshot } = makeDossier();
+    const workspace = makeWorkspace();
+    const sandbox = makeSandbox();
+    const headMock = jest.fn(async () => 'sha-1');
+
+    runFixInvestigatorMock.mockResolvedValue({
+      notes: makeNotes(snapshot.snapshotId),
+      terminated: 'done',
+      reason: undefined,
+      toolCalls: 1,
+      transcriptSummary: 'ok',
+    });
+    runFixPlannerMock.mockResolvedValue({
+      plan: makePlan(), // plans src/module.py
+      terminated: 'done',
+      reason: undefined,
+      transcriptSummary: 'ok',
+    });
+    runFixExecutorMock.mockResolvedValue(
+      makeExecutorResult({
+        changedFiles: ['unrelated/sneaky_change.py'],
+      })
+    );
+
+    const outcome = await runFixV2({
+      attemptId: 'attempt-1',
+      dossier,
+      snapshot,
+      reproTestPath: 'tests/test_repro.py',
+      issue,
+      repo,
+      workspace,
+      sandbox,
+      getCurrentHeadSha: headMock,
+    });
+
+    expect(runFixCriticMock).not.toHaveBeenCalled();
+    expect(outcome.status).toBe('fix_failed');
+  });
+
   test('still fails no_head_drift when HEAD moves to a commit the executor did not push', async () => {
     process.env.FIX_V2_MAX_ITERATIONS = '1';
 

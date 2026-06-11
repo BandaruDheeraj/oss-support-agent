@@ -94,8 +94,6 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
   const tokenBudget = resolveFixTokenBudget(process.env, maxIterations, perIterationTokenAllocation);
   let remainingTokenBudget = tokenBudget;
 
-  const allowedScope = deriveAllowedScope(args.snapshot, args.reproTestPath);
-
   let retryFeedback: string | undefined;
   let lastFeedback: string | undefined;
   let lastPlan: Plan | undefined;
@@ -229,6 +227,12 @@ export async function runFixV2(args: RunFixV2Args): Promise<FixV2Outcome> {
     }
 
     const headAfterExecutor = await args.getCurrentHeadSha();
+    // Scope is anchored to the committed plan (the contract the executor was
+    // handed) plus the dossier's suspects. The dossier alone is the earliest,
+    // least-informed artifact — when its suspect paths are wrong, the plan
+    // produced by this iteration's own investigation is the better source of
+    // truth for which files were agreed to change.
+    const allowedScope = deriveAllowedScope(args.snapshot, args.reproTestPath, planner.plan);
     const scopeEvaluation = evaluateScope(executor.changedFiles, allowedScope);
     // The executor saving its own work via commit_and_push is legitimate HEAD
     // movement; only foreign movement (some other writer) counts as drift.
@@ -436,7 +440,7 @@ function completionPromisePassed(checks: CompletionPromiseChecks): boolean {
   return checks.repro_test_passes && checks.regression_green && checks.no_head_drift && checks.scope_ok;
 }
 
-function deriveAllowedScope(snapshot: DossierSnapshot, reproTestPath?: string): string[] {
+function deriveAllowedScope(snapshot: DossierSnapshot, reproTestPath?: string, plan?: Plan): string[] {
   const out = new Set<string>();
   for (const assertion of snapshot.body.oracleSpec?.suspect_path_assertions ?? []) {
     const normalized = normalizeRepoPath(assertion.file);
@@ -445,6 +449,16 @@ function deriveAllowedScope(snapshot: DossierSnapshot, reproTestPath?: string): 
   if (out.size === 0) {
     for (const suspect of snapshot.body.suspectSymbols) {
       const normalized = normalizeRepoPath(suspect.file);
+      if (normalized) out.add(normalized);
+    }
+  }
+  // The committed plan is the contract the executor implements — every file a
+  // plan step names is an agreed mutation target. The dossier's suspects can
+  // be wrong (it is written by the repro-phase analyst before the fix
+  // investigation); the plan reflects this iteration's own investigation.
+  for (const step of plan?.steps ?? []) {
+    for (const file of step.files) {
+      const normalized = normalizeRepoPath(file);
       if (normalized) out.add(normalized);
     }
   }
