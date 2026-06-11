@@ -136,15 +136,51 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       source: e.source ?? defaultEvidenceSource(e, ctx.issueNumber),
       recordedAt: e.recordedAt ?? now,
     }));
-    const seededSuspectFiles = normalizeSuspectFiles(handles.semanticSuspectSeed?.suspectFiles ?? []);
-    const seededSuspectSymbols = handles.semanticSuspectSeed?.suspectSymbols ?? [];
-    const seededSemanticConfidence = handles.semanticSuspectSeed?.semanticConfidence;
-    const suspectFiles = mergeSuspectFiles(seededSuspectFiles, args.suspectFiles ?? []);
-    const suspectSymbols = mergeSuspectSymbols(seededSuspectSymbols, args.suspectSymbols);
+    // The semantic seed is a recall fallback for when the analyst names no
+    // suspects of its own. An analyst that read the code and named suspects
+    // must not have them diluted by cosine-similar files from other packages
+    // (observed on openinference#62: seeded suspects in google-genai/langchain
+    // polluted scope and editable-install derivation for an agno bug).
+    const analystSuspectFiles = mergeSuspectFiles(args.suspectFiles ?? [], []);
+    const analystSuspectSymbols = mergeSuspectSymbols(args.suspectSymbols, []);
+    const analystNamedSuspects = analystSuspectFiles.length > 0 || analystSuspectSymbols.length > 0;
+    const seededSuspectFiles = analystNamedSuspects
+      ? []
+      : normalizeSuspectFiles(handles.semanticSuspectSeed?.suspectFiles ?? []);
+    const seededSuspectSymbols = analystNamedSuspects
+      ? []
+      : handles.semanticSuspectSeed?.suspectSymbols ?? [];
+    const seededSemanticConfidence = analystNamedSuspects
+      ? undefined
+      : handles.semanticSuspectSeed?.semanticConfidence;
+    let suspectFiles = mergeSuspectFiles(seededSuspectFiles, analystSuspectFiles);
+    let suspectSymbols = mergeSuspectSymbols(seededSuspectSymbols, analystSuspectSymbols);
     if (suspectFiles.length === 0 && suspectSymbols.length > 0) {
       for (const file of suspectSymbols.map((s) => normalizeSuspectFilePath(s.file))) {
         if (!file || suspectFiles.includes(file)) continue;
         suspectFiles.push(file);
+      }
+    }
+    // Reality check: a suspect path that does not exist in the workspace is
+    // hallucinated (or from a stale index) and poisons downstream scope and
+    // install derivation. Drop bad entries and surface them in the result so
+    // the model can correct itself and re-record.
+    const droppedSuspectFiles: string[] = [];
+    const workspace = handles.workspace;
+    if (workspace && typeof workspace.readFile === 'function' && (suspectFiles.length > 0 || suspectSymbols.length > 0)) {
+      const allPaths = new Set([...suspectFiles, ...suspectSymbols.map((s) => s.file)]);
+      const missing = new Set<string>();
+      for (const path of allPaths) {
+        try {
+          if ((await workspace.readFile(path)) === null) missing.add(path);
+        } catch {
+          missing.add(path);
+        }
+      }
+      if (missing.size > 0) {
+        droppedSuspectFiles.push(...missing);
+        suspectFiles = suspectFiles.filter((f) => !missing.has(f));
+        suspectSymbols = suspectSymbols.filter((s) => !missing.has(s.file));
       }
     }
     const summary = normalizeEvidenceSummary(args.summary, evidence, suspectSymbols);
@@ -233,6 +269,14 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       oracle_spec_recorded: oracleSpec ? true : false,
       suspect_files_count: suspectFiles.length,
       suspect_symbols_count: suspectSymbols.length,
+      ...(droppedSuspectFiles.length > 0
+        ? {
+            dropped_nonexistent_suspect_files: droppedSuspectFiles,
+            warning:
+              'Some suspect file paths do not exist in the repository and were dropped. ' +
+              'Verify paths with list_dir/grep and call record_evidence again with corrected suspects.',
+          }
+        : {}),
     };
   },
 };

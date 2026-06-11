@@ -468,3 +468,100 @@ describe('write_investigation_notes — server-stamped recordedAt on findings', 
     expect(all[0].body.findings[0].recordedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 });
+
+describe('record_evidence — suspect validation and seed-as-fallback', () => {
+  // Regression: openinference#62 — the dossier carried suspects in the wrong
+  // packages (seeded semantic hits) plus a hallucinated claim, which poisoned
+  // downstream scope checks and editable-install derivation.
+
+  function workspaceWith(existing: Record<string, string>) {
+    return {
+      readFile: async (path: string) => existing[path] ?? null,
+    };
+  }
+
+  it('drops suspect files that do not exist in the workspace and warns', async () => {
+    const dossier = new DossierStore();
+    const res = await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectFiles: ['python/pkg/real.py', 'python/pkg/hallucinated.py'],
+        suspectSymbols: [
+          { file: 'python/pkg/real.py', symbol: 'real_func', reasoning: 'read it' },
+          { file: 'python/pkg/hallucinated.py', symbol: 'ghost', reasoning: 'made up' },
+        ],
+        openQuestions: [],
+        preconditions: [],
+        summary: 's',
+        confidence: 'medium',
+      } as any,
+      ctxFor({ dossier, workspace: workspaceWith({ 'python/pkg/real.py': 'def real_func(): pass' }) })
+    );
+
+    const snap = dossier.latest()!;
+    expect(snap.body.suspectFiles).toEqual(['python/pkg/real.py']);
+    expect(snap.body.suspectSymbols).toEqual([
+      { file: 'python/pkg/real.py', symbol: 'real_func', reasoning: 'read it' },
+    ]);
+    expect((res as any).dropped_nonexistent_suspect_files).toEqual(['python/pkg/hallucinated.py']);
+    expect((res as any).warning).toContain('do not exist');
+  });
+
+  it('skips validation when no workspace handle is available', async () => {
+    const dossier = new DossierStore();
+    const res = await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectFiles: ['anything/goes.py'],
+        suspectSymbols: [],
+        openQuestions: [],
+        preconditions: [],
+        summary: 's',
+        confidence: 'medium',
+      } as any,
+      ctxFor({ dossier })
+    );
+    expect(dossier.latest()!.body.suspectFiles).toEqual(['anything/goes.py']);
+    expect((res as any).dropped_nonexistent_suspect_files).toBeUndefined();
+  });
+
+  it('ignores the semantic seed when the analyst names its own suspects', async () => {
+    const dossier = new DossierStore();
+    await recordEvidence.execute(
+      {
+        evidence: [],
+        suspectFiles: ['python/agno/wrapper.py'],
+        suspectSymbols: [
+          { file: 'python/agno/wrapper.py', symbol: '_extract_output', reasoning: 'read the code' },
+        ],
+        openQuestions: [],
+        preconditions: [],
+        summary: 's',
+        confidence: 'high',
+      } as any,
+      ctxFor({
+        dossier,
+        semanticSuspectSeed: {
+          model: 'BAAI/bge-small-en-v1.5',
+          query: 'q',
+          cacheHit: true,
+          cacheKey: 'k',
+          indexedFileCount: 618,
+          instrumentationDirs: ['python/instrumentation'],
+          suspectFiles: ['python/google-genai/mod.py', 'python/langchain/mod.py'],
+          suspectSymbols: [
+            { file: 'python/google-genai/mod.py', symbol: 'Other', reasoning: 'semantic hit' },
+          ],
+          semanticConfidence: { top_score: 0.4, low_confidence: true, diagnostics: 'low' },
+        },
+      })
+    );
+
+    const snap = dossier.latest()!;
+    expect(snap.body.suspectFiles).toEqual(['python/agno/wrapper.py']);
+    expect(snap.body.suspectSymbols).toEqual([
+      { file: 'python/agno/wrapper.py', symbol: '_extract_output', reasoning: 'read the code' },
+    ]);
+    expect(snap.body.semanticConfidence).toBeUndefined();
+  });
+});
