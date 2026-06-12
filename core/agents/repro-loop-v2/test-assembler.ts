@@ -178,8 +178,10 @@ export async function assembleReproTest(
     // builder's repair loop to fix with correct context.
     const suspectModule = rawModule.replace(/-/g, '_');
 
-    // Attempt to read the source file to find the tracker base class.
+    // Attempt to read the source file to find the tracker base class and
+    // detect SpanProcessor subclasses (different test template needed).
     let trackerBase: string | null = null;
+    let spanProcessorClass: string | null = null;
     try {
       const result = await gitClient.getFileContents(
         repoFullName,
@@ -188,9 +190,35 @@ export async function assembleReproTest(
       );
       if (result.ok && result.content) {
         trackerBase = findTrackerBaseClass(result.content);
+        spanProcessorClass = findSpanProcessorClass(result.content);
       }
     } catch {
       // best-effort; proceed without a base class
+    }
+
+    // TYPE 1.5 — Span processor guard: suspect file defines a SpanProcessor
+    // subclass. The bug is that on_end() runs on ALL spans (no framework-
+    // specific guard), destroying attributes of non-framework spans.
+    // Generate a test that creates a plain OTEL span with custom attributes
+    // and asserts they survive the processor.
+    if (spanProcessorClass) {
+      const testContent = buildSpanProcessorGuardTest(
+        suspectModule,
+        spanProcessorClass
+      );
+      return {
+        reproFiles: [
+          {
+            path: 'tests/repro/test_repro.py',
+            content: testContent,
+            append: false,
+          },
+        ],
+        testEntryPoint: 'tests/repro/test_repro.py::test_repro',
+        installSpec,
+        bugType: 'function-level',
+        rationale: `Span processor guard bug in ${spanProcessorClass} (${suspectFilePath}): assembling non-framework-span attribute-preservation test.`,
+      };
     }
 
     // Extract the wrong value from fixHypothesis.description.
@@ -380,6 +408,49 @@ function buildLifecycleTest(
   ].join('\n');
 }
 
+/**
+ * Build a span-processor guard test: creates a plain OTEL span with custom
+ * attributes (no framework-specific marker), runs it through the processor,
+ * and asserts the custom attributes are preserved.
+ *
+ * This test FAILS on buggy code (processor overwrites all spans' attributes)
+ * and PASSES on fixed code (processor skips non-framework spans).
+ */
+function buildSpanProcessorGuardTest(
+  suspectModule: string,
+  processorClass: string
+): string {
+  return [
+    'from opentelemetry.sdk.trace import TracerProvider',
+    'from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter',
+    'from opentelemetry.sdk.trace.export import SimpleSpanProcessor',
+    `from ${suspectModule} import ${processorClass}`,
+    '',
+    'SENTINEL = "REPRO_BUG_SENTINEL"',
+    '',
+    'def test_repro():',
+    `    # Bug: ${processorClass}.on_end() runs on ALL spans with no framework guard,`,
+    '    # destroying attributes of spans that do not belong to the framework.',
+    '    exporter = InMemorySpanExporter()',
+    '    provider = TracerProvider()',
+    `    provider.add_span_processor(${processorClass}())`,
+    '    provider.add_span_processor(SimpleSpanProcessor(exporter))',
+    '    tracer = provider.get_tracer("test")',
+    '',
+    '    with tracer.start_as_current_span("non-framework-span") as span:',
+    '        span.set_attribute("custom.key", "preserved_value")',
+    '        span.set_attribute("http.method", "GET")',
+    '',
+    '    spans = exporter.get_finished_spans()',
+    "    assert spans, f'REPRO: {SENTINEL} — no spans recorded'",
+    '    attrs = dict(spans[0].attributes or {})',
+    "    assert attrs.get('custom.key') == 'preserved_value', (",
+    `        f'REPRO: {SENTINEL} — {processorClass}.on_end() destroyed non-framework span attributes. '`,
+    "        f'Expected custom.key=preserved_value but got: {attrs}'",
+    '    )',
+  ].join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // Source analysis helpers
 // ---------------------------------------------------------------------------
@@ -485,6 +556,17 @@ function findTrackerBaseClass(source: string): string | null {
   }
 
   return null;
+}
+
+/**
+ * Scan the Python source file for a class that inherits from SpanProcessor
+ * (any variant: SpanProcessor, SynchronousMultiSpanProcessor, etc.).
+ * Returns the class name, or null if none found.
+ */
+function findSpanProcessorClass(source: string): string | null {
+  const re = /^class\s+(\w+)\s*\([^)]*SpanProcessor[^)]*\)\s*:/gm;
+  const m = re.exec(source);
+  return m ? (m[1] ?? null) : null;
 }
 
 /**
