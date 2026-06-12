@@ -46,11 +46,15 @@ function runOne(command, cwd) {
     let stderr = '';
 
     child.stdout.on('data', (d) => {
-      stdout += d.toString();
+      const s = d.toString();
+      stdout += s;
+      process.stdout.write(s);
     });
 
     child.stderr.on('data', (d) => {
-      stderr += d.toString();
+      const s = d.toString();
+      stderr += s;
+      process.stderr.write(s);
     });
 
     child.on('error', (err) => {
