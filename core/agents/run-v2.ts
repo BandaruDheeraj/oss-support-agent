@@ -422,6 +422,27 @@ async function runFixPipelineImpl(input: FixPipelineInput): Promise<FixPipelineO
       : undefined,
   });
 
+  // Pre-seed the GHA sandbox session with editable installs derived from the
+  // affected module. This guarantees run_repro always tests the code on the
+  // local branch rather than a stale PyPI build — regardless of whether the
+  // repro stage used an editable or a package-index install.  The commands are
+  // prepended to every session.dispatch() call via buildInstallReplayCommands().
+  if (input.ghActionsSandboxOptions?.sandboxSession) {
+    const editableCandidates = discoverEditableInstallCandidates(input.workspace.dir, {
+      affectedModule: input.affectedModule,
+    });
+    for (const candidate of editableCandidates) {
+      input.ghActionsSandboxOptions.sandboxSession.recordReplayInstallCommand(
+        `pip install -e ${candidate}`
+      );
+    }
+    if (editableCandidates.length > 0) {
+      log(
+        `[v2-driver] pre-seeded fix sandbox with ${editableCandidates.length} editable install(s): ${editableCandidates.join(', ')}`
+      );
+    }
+  }
+
   log(`[v2-driver] runFixPipeline attemptId=${input.attemptId} reproTest=${input.reproTestPath}`);
 
   const v2 = await runFixV2({

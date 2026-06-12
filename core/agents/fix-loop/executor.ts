@@ -86,7 +86,7 @@ Fix + verify workflow (the only workflow that works):
 Hard rules (the registry will reject violations):
 1. ONE stateful tool call per assistant turn (mutation/sandbox/write-test/meta). Reads may be parallel.
 2. apply_patch(path) requires (a) you have called github_read_file or read_file or grep on the same path AFTER (b) calling state_hypothesis with the same file, observedEvidenceIds non-empty, and unconsumed. Each hypothesis is consumed by exactly one apply_patch.
-3. apply_patch path must be inside the repo's affectedModule, OR be the canonical repro test path, OR clearly under a test directory.
+3. apply_patch path must be inside the repo's affectedModule OR clearly under a test directory. Do NOT use apply_patch on the canonical repro test path — use revise_test to rewrite it instead.
 4. commit_and_push is MANDATORY after apply_patch and BEFORE run_repro/run_tests. The sandbox clones from GitHub — it cannot see local workspace changes until they are pushed.
 5. Before \`done\`: since your LAST apply_patch or revert_file, you must have observed (in a PRIOR turn) run_repro exit=0 AND run_tests exit=0. Do not call done in the same turn as a mutation. Do not claim done if run_repro still fails.
 6. Every changed file must have a consumed hypothesis. The Critic will reject otherwise.

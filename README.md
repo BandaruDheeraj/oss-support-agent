@@ -1,315 +1,218 @@
 # oss-support-agent
 
-Repo-agnostic OSS autonomous fix loop harness.
+An autonomous bug-fix pipeline for open-source repos. Point it at a GitHub repo, label a bug issue, and it will reproduce the bug, write a fix, verify it, and open a draft PR — without a human writing a line of code.
 
-## OpenRouter (US-100)
+## What it solves
 
-This harness supports a shared LLM client via OpenRouter (OpenAI-compatible `chat/completions`).
+Triaging and fixing bugs in open-source projects is slow. Maintainers get the same classes of bugs repeatedly, most fixes are mechanical, and there are never enough reviewers. This agent runs the full fix workflow autonomously:
 
-### Required
+1. **Reads the issue** and decides if it's a fixable bug (skips feature requests and design questions).
+2. **Finds the right code** via semantic search across the repo.
+3. **Writes a deterministic repro test** and confirms it actually fails before doing anything else.
+4. **Patches the source**, commits to a branch on a fork, and runs the repro test again to confirm green.
+5. **Opens a draft PR** with the fix, the repro test, and a summary of what changed and why.
 
-- `OPENROUTER_API_KEY`: primary OpenRouter API key.
-  - Optional additional keys for quota failover: `OPENROUTER_API_KEYS` or `OPENROUTER_API_KEY_FALLBACKS` (comma-separated).
+If it gets stuck (can't reproduce, hits its retry budget, needs credentials), it emails the PM instead of silently failing.
 
-### Model selection
+## Architecture
 
-- `OPENROUTER_MODEL_DEFAULT`: default model when an agent-specific model is not set.
-- `OPENROUTER_MODEL_FALLBACKS`: optional comma-separated model fallback chain applied after the selected model.
-- `OPENROUTER_MODEL_FALLBACKS_<AGENT>`: optional per-agent fallback model chain (e.g. `OPENROUTER_MODEL_FALLBACKS_ANALYST`).
-- Agent-specific overrides:
-  - `OPENROUTER_MODEL_TRIAGE`
-  - `OPENROUTER_MODEL_PM`
-  - `OPENROUTER_MODEL_FIX`
-  - `OPENROUTER_MODEL_BUILD`
-  - `OPENROUTER_MODEL_EVAL`
-  - `OPENROUTER_MODEL_DOCS`
-  - `OPENROUTER_MODEL_USABILITY`
-  - `OPENROUTER_MODEL_INTROSPECTION`
+The pipeline is a sequence of bounded tool-using agent loops, each with a specific job:
 
-See OpenRouter’s model list: https://openrouter.ai/models
+```
+GitHub issue labeled
+        │
+        ▼
+   Triage agent ──── not a bug? → ignore
+        │
+        ▼
+  Fork + branch
+        │
+        ▼
+  Semantic search (GHA) → suspect files + symbols
+        │
+        ▼
+   Analyst agent → Evidence Dossier (read-only, versioned)
+        │
+        ▼
+   Repro loop ──────────────────────────────────────────────
+   │  Planner   → candidate test file + install spec       │
+   │  Executor  → writes test, pip installs, runs sandbox  │
+   │  Critic    → independent re-run to confirm failure    │
+   └────────────────────────────────────────────────────────
+        │  repro confirmed failing
+        ▼
+   Fix loop (up to max_retries) ───────────────────────────
+   │  Investigator → reads dossier, proposes hypotheses    │
+   │  Planner      → ordered steps with risk ratings       │
+   │  Executor     → patches code, commits, runs sandbox   │
+   │  Critic       → verifies repro is green               │
+   └────────────────────────────────────────────────────────
+        │  fix verified
+        ▼
+   Draft PR opened upstream
+```
 
-### Optional identification headers
+**Key design decisions:**
 
-OpenRouter recommends sending:
-- `OPENROUTER_HTTP_REFERER` (sent as `HTTP-Referer`)
-- `OPENROUTER_X_TITLE` (sent as `X-Title`)
+- **Sandbox isolation** — all test runs happen in ephemeral GitHub Actions jobs that clone the fork branch fresh. The agent never runs arbitrary code on the host.
+- **Evidence Dossier** — the Analyst writes a structured, append-only snapshot before any mutation happens. Every hypothesis the Executor makes must cite evidence from the Dossier; the Critic rejects uncited changes.
+- **Deterministic repro first** — the pipeline won't attempt a fix until it has a test that reliably fails 2/2 runs. This prevents the agent from "fixing" bugs it can't actually reproduce.
+- **HITL email loop** — when human judgment is needed (credentials required, PM design gate, fix ready for review), typed emails go out with signed reply tokens. No Slack bots, no dashboards required.
 
-These are included on all OpenRouter requests.
+### Code layout
 
-## Directory layout (US-102)
+```
+core/          Repo-agnostic pipeline code (orchestrator, agents, sandbox runner)
+  agents/      Individual agent loops (analyst, repro, fix, email, HITL)
+  observability/ Pluggable tracing backends (Arize AX, LangSmith, Braintrust)
+  llm/         LLM client with retry, fallback, and token tracking
+configs/       Per-repo configuration (one subdirectory per repo)
+  <org>/<repo>/
+    manifest.yaml   Trigger label, fork org, retry limits, sandbox settings
+    adapter.ts      Test command, docker services, repo-specific hooks
+bin/           Server entrypoint + CLI utilities
+```
 
-- `core/`: repo-agnostic harness code (orchestrator, agents, sandbox runner, etc.)
-- `configs/`: per-repo configuration and adapters (`configs/<org>/<repo>/`)
+`core/` never imports from `configs/`. `configs/` imports only from `core/adapter.interface.ts`.
 
-### One-way dependency rule
+## Getting started
 
-`core/` must never import from `configs/`. This is enforced by `npm run lint`.
-`configs/` may import from `core/` (typically from `core/adapter.interface.ts`).
+### Prerequisites
 
-## Onboarding a new repo (US-112)
+- **Node.js 20+**
+- A **GitHub bot account** (a dedicated machine user, not your personal account) that will own the forks.
+- A **classic PAT** on that account with `repo` and `workflow` scopes.
+- An **LLM API key**: Anthropic direct (`ANTHROPIC_API_KEY`) or OpenRouter (`OPENROUTER_API_KEY`).
+- A **fork of this repo** under the bot account (e.g. `my-bot/oss-support-agent`) — the GHA sandbox workflows live here.
 
-High-level flow:
-1. Ensure defaults are set: `DEFAULT_PM_EMAIL` and `DEFAULT_FORK_ORG`.
-2. Trigger introspection either by:
-   - adding the repo to an operator watched list and running `bootstrapWatchedRepos()`, or
-   - labeling an issue with the trigger label (default `agent-fix`) and letting the handler call introspection when `configs/<org>/<repo>/manifest.yaml` is missing.
-3. Introspection generates `configs/<org>/<repo>/{manifest.yaml,adapter.ts}`.
-4. Required labels are created on the upstream repo (`agent-fix`, `trivial-fix`, `agent-failed`, `needs-design`).
-5. The original issue event is re-processed through the normal pipeline now that the adapter/manifest exist.
+### Step 1 — Clone and install
 
-## Live testing the full pipeline
+```bash
+git clone https://github.com/your-org/oss-support-agent.git
+cd oss-support-agent
+npm ci
+cp .env.example .env   # then fill in the required values below
+```
 
-`bin/server.ts` is the live entrypoint for the v2 pipeline:
-**webhook → triage/PM gate → fork/branch → GHA semantic search → deterministic repro → fix loop → GHA verification → draft PR**.
+### Step 2 — Set environment variables
 
-The webhook responds `202` immediately and records a file-backed run state under
-`STATE_ROOT/pipeline-runs`. Duplicate triggers for the same issue are ignored while
-a run is already active; stale running records can be reacquired after the default
-six-hour lease window.
+The minimum set to get a run working:
 
-Unknown repos can be auto-onboarded when mail/introspection deps are configured.
-Known repos must have `configs/<org>/<repo>/{manifest.yaml,adapter.ts}` checked in.
-
-### Required env vars
-
-| Name | Purpose |
+| Variable | Value |
 |---|---|
-| `GITHUB_TOKEN` | Fine-grained PAT. Needs `issues:write` and `metadata:read` on upstream; `contents:write` and `pull-requests:write` on `<DEFAULT_FORK_ORG>/*`. |
-| `WEBHOOK_SECRET` | Shared secret configured on the GitHub webhook. |
-| `DEFAULT_FORK_ORG` | Org/user the agent forks into and pushes to. Production should use a separate bot fork/org, not the upstream owner. |
-| `OPENROUTER_API_KEY` | (recommended) Primary OpenRouter key for real LLM-backed triage + fix. |
-| `OPENROUTER_API_KEYS` / `OPENROUTER_API_KEY_FALLBACKS` | Optional comma-separated backup OpenRouter keys used automatically on quota/rate/provider failures. |
+| `GITHUB_TOKEN` | PAT from above (`ghp_...`) |
+| `WEBHOOK_SECRET` | Any random string — must match what you put in the GitHub webhook |
+| `DEFAULT_FORK_ORG` | The bot account or org that owns forks (e.g. `my-bot`) |
+| `ANTHROPIC_API_KEY` | Claude API key — or use `OPENROUTER_API_KEY` instead |
+| `HARNESS_REPO_FULL_NAME` | Your fork of this repo, e.g. `my-bot/oss-support-agent` |
+| `REPRO_AGENT_MODE` | Set to `loop` to enable the full repro agent |
+| `FIX_AGENT_MODE` | Set to `loop` to enable the full fix agent |
 
-### Optional env vars
+See `.env.example` for the full list including observability, email (Resend), and eval options.
 
-| Name | Default | Purpose |
-|---|---|---|
-| `PORT` | `3000` | HTTP port. |
-| `REPO_ROOT` | `cwd` | Where `configs/` lives. |
-| `STATE_ROOT` | `data/state` | Persistent run, retry, PM email, and introspection state. On Render this should point at a persistent disk, e.g. `/var/data/state`. |
-| `WORKSPACE_ROOT` | `data/workspaces` | Scratch clone workspace. This can be ephemeral when `sandbox_runner: gha`. |
-| `HARNESS_REPO_FULL_NAME` | unset | Repo hosting shared GHA workflows when a manifest does not set `sandbox_workflow_repo`. Prefer setting the manifest field explicitly. |
-| `HARNESS_WORKFLOW_REF` | `main` | Ref used for shared GHA workflow dispatch. |
-| `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` | `oss-support-agent` / `agent@users.noreply.github.com` | Author for commits. |
+### Step 3 — Configure the target repo
 
-### Run it
+Create `configs/<org>/<repo>/manifest.yaml`:
 
-```powershell
-$env:GITHUB_TOKEN          = 'ghp_...'
-$env:WEBHOOK_SECRET        = 'pick-a-secret'
-$env:DEFAULT_FORK_ORG      = 'your-bot-account'
-$env:OPENROUTER_API_KEY    = 'sk-or-...'
-$env:STATE_ROOT            = '/var/data/state'
-$env:HARNESS_REPO_FULL_NAME = 'your-org/oss-support-agent'
+```yaml
+repo: "myorg/myrepo"
+trigger_label: "agent-fix"        # adding this label fires the pipeline
+skip_pm_gate_label: "trivial-fix" # also add this to skip the PM approval step
+fork_org: "my-bot"
+branch_prefix: "agent/scope-"
+pm_email: "you@example.com"       # gets fix-ready and halt emails
+max_retries: 3
+sandbox_timeout_mins: 15
+sandbox_runner: gha
+sandbox_workflow_repo: "my-bot/oss-support-agent"
+sandbox_workflow_ref: "main"
+```
+
+Then create `configs/<org>/<repo>/adapter.ts`. Copy `configs/BandaruDheeraj/openinference/adapter.ts` as a template — it exports `getTestCommands()` (the pytest command to run) and `getSandboxServices()` (any Docker services the tests need).
+
+Create the required labels on the target repo:
+
+```bash
+gh label create "agent-fix"    --repo myorg/myrepo --color 0075ca
+gh label create "trivial-fix"  --repo myorg/myrepo --color e4e669
+gh label create "agent-failed" --repo myorg/myrepo --color d93f0b
+gh label create "needs-design" --repo myorg/myrepo --color ededed
+```
+
+### Step 4 — Confirm the sandbox workflows are present
+
+The bot account's fork of this repo needs the GHA workflows:
+
+```bash
+gh workflow list --repo my-bot/oss-support-agent
+# should show: sandbox, semantic-search
+```
+
+If they're missing, copy `.github/workflows/sandbox.yml` and `.github/workflows/semantic-search.yml` from this repo into your fork and push.
+
+### Step 5 — Start the server and expose a webhook
+
+**Local dev:**
+
+```bash
+# Terminal 1
 npm run start:dev
+
+# Terminal 2 — forward GitHub webhooks to localhost
+npx smee-client --url https://smee.io/YOUR_CHANNEL --target http://localhost:3000/webhook
 ```
 
-Expose the port with smee.io or ngrok and configure a GitHub webhook on a repo that has
-configs (e.g. `arize-ai/openinference`):
+**Production (Render):** deploy with `render.yaml` — the service URL becomes the webhook endpoint directly.
 
-```powershell
-npx smee-client -u https://smee.io/<channel> -t http://localhost:3000/webhook
-```
+Configure the webhook on `myorg/myrepo → Settings → Webhooks → Add webhook`:
+- **Payload URL**: your server URL or smee channel
+- **Content type**: `application/json`
+- **Secret**: same as `WEBHOOK_SECRET`
+- **Events**: Issues only
 
-- Payload URL: smee channel
-- Content type: `application/json`
-- Secret: same as `WEBHOOK_SECRET`
-- Events: **Issues** only
+### Step 6 — Trigger a run
 
-Then label an issue with the manifest's `trigger_label` (default `agent-fix`).
-The `skip_pm_gate_label` is read from the issue's full label set, but adding that
-label alone does not start a run.
-The server will:
+Find a bug issue on `myorg/myrepo` and add both `trivial-fix` and `agent-fix` labels. The webhook fires, the server picks it up, and the pipeline starts.
 
-1. Verify the HMAC signature
-2. Load the manifest + adapter (with runtime contract checks)
-3. Run triage (OpenRouter or heuristic) → must route to `route_fork`
-4. Create/sync the fork under `DEFAULT_FORK_ORG` and create a per-issue branch
-5. Clone the fork into `WORKSPACE_ROOT`
-6. Dispatch GHA semantic search when `sandbox_runner: gha`
-7. Build and validate a deterministic failing repro test
-8. Commit the verified repro test, run the fix loop, and verify the repro now passes
-9. Run GHA regression/usability verification when configured
-10. Open a **draft PR** upstream and apply adapter-provided labels
-
-### What's still TODO in live mode
-
-- Build agent (new-feature scaffolding) and Docs agent
-- Full durable workflow engine with step-level replay; current run state prevents duplicates and records outcomes, but does not resume inside a partially completed pipeline step.
-- Cost guardrails enforcement at the live entrypoint.
-- Multi-repo coordinator productionization.
-
-## Phase E (v2) — tool-using agent loops
-
-The v2 stack replaces one-shot LLM repro/fix calls with bounded tool-using loops, structured evidence, and HITL.
-
-### Architecture
-
-- **Analyst** (read-only loop) → writes versioned, append-only `EvidenceDossier` snapshots.
-- **Repro loop**: Planner (one-shot) → Executor (tool loop, no `run_shell`) → AST preflight → mandatory Critic with independent re-run.
-- **Fix loop**: Investigator → Planner → Executor → Critic + orchestrator-level final gate (green evidence audit, hypothesis-consumption audit, HEAD-drift check).
-- **HITL**: `inbox_entries` state machine with CAS transitions, signed approval tokens, plus-addressed reply routing, eight typed email kinds (`triage_unrelated`, `need_credentials`, `repro_unreachable`, `fix_proposal`, `fix_failed`, `regression_blocker`, `human_decision_needed`, `pr_opened`).
-- **Observability**: Arize AX / Braintrust / LangSmith tracing with redaction, agent/tool span ownership, and a per-run eval-recorder row (sqlite/jsonl) for shadow-mode comparison.
-
-### Cutover
-
-V2 is opt-in behind environment flags (defaults stay one-shot):
-
-| Flag | Values |
-| --- | --- |
-| `REPRO_AGENT_MODE` | `oneshot` (default) / `shadow` / `loop` |
-| `FIX_AGENT_MODE` | `oneshot` (default) / `shadow` / `loop` |
-
-`shadow` runs the v2 loops dry alongside legacy and writes eval rows with `mode='shadow_loop'` for comparison. Promote to `loop` only after a green shadow baseline.
-
-### Ops
-
-- `npm run osa-admin -- inbox pending` — list outstanding decision-point emails.
-- `npm run osa-admin -- inbox set-action <id> <action> [--hint ...]` — force-resolve a stuck entry.
-- `npm run osa-admin -- inbox expire-sweep` — expire decision points past their TTL.
-- `npm run trace-smoke` — assert OTEL spans flush against the configured backends.
-
-See `.env.example` for the full v2 env table.
-
+Watch the logs for progress. Terminal signals:
+- `[v2-done]` — PR opened successfully
+- `[v2-halt]` — hit max retries; check your `pm_email` inbox for a summary and the agent branch for whatever was committed
 
 ## Observability
 
-The harness ships a pluggable observability layer that emits one parent span per pipeline phase and one child span per LLM call. Backends are selected at process start via `OBSERVABILITY_BACKEND`:
+Set `OBSERVABILITY_BACKEND` to route traces to your preferred backend:
 
-| Value | Backend | Notes |
-| --- | --- | --- |
-| `none` (default) | No-op | No SDK loaded, zero runtime overhead. |
-| `langsmith` | LangSmith | Requires `LANGSMITH_API_KEY`. Spans appear in the LangSmith project named by `LANGSMITH_PROJECT` (default `oss-support-agent`). |
-| `arize` | Arize AX | OTLP/HTTP exporter; set `ARIZE_API_KEY`, `ARIZE_SPACE_ID`, and `ARIZE_PROJECT_NAME` (production uses `oss-fix-loop`). `ARIZE_ENDPOINT` is optional and defaults to the US AX OTLP traces endpoint. Spans carry OpenInference semantic conventions. |
-| `braintrust` | Braintrust | Requires `BRAINTRUST_API_KEY`. Project name comes from `BRAINTRUST_PROJECT` (default `oss-support-agent`). |
-| `all` | LangSmith + Arize + Braintrust | Fans out the same spans to all three backends in one run. Startup is fail-fast on missing config, includes per-adapter contract logs, emits a `telemetry_smoke` span to each enabled backend, and tracks adapter delivery counters (`sent`, `failed`, `dropped`) exposed by `/healthz`. |
+| Value | Backend | Required vars |
+|---|---|---|
+| `none` (default) | No-op | — |
+| `arize` | Arize AX (OTLP/HTTP) | `ARIZE_API_KEY`, `ARIZE_SPACE_ID`, `ARIZE_PROJECT_NAME` |
+| `langsmith` | LangSmith | `LANGSMITH_API_KEY` |
+| `braintrust` | Braintrust | `BRAINTRUST_API_KEY` |
+| `all` | All three | All of the above |
 
-Adapter delivery now retries transient provider failures with exponential backoff and writes a local spool fallback when retries are exhausted. Configure `OBSERVABILITY_RETRY_ATTEMPTS`, `OBSERVABILITY_RETRY_BASE_MS`, and `OBSERVABILITY_SPOOL_DIR` as needed.
+Every pipeline run emits one parent span per stage (`pipeline.repro`, `pipeline.fix`) and one child span per LLM call. Spans carry OpenInference semantic conventions and include token counts, latency, and pass/fail eval signals.
 
-### What gets traced
+Run `npm run trace-smoke` to confirm spans are reaching your backend before running a live issue.
 
-- One `pipeline.repro` / `pipeline.fix` parent span around every `runReproPipeline` / `runFixPipeline` call, tagged with `attempt_id`, `issue_number`, `repo`, and `affected_module`.
-- One `llm.<model>` child span per `LLMClient.chat()` call, with `llm.model_name`, `llm.temperature`, prompt + completion token counts, latency, and retry attempt count.
-- One `evaluator.<stage>` span for online pass/fail checks (`repro`, `fix`, `build`, `verification`), including normalized `evaluation.*` attributes and score keys (`evaluation.key.<metric>`), so each run emits evaluator signals in all configured backends.
-- Parent context flows through `AsyncLocalStorage`, so the LLM chokepoint automatically attaches to the enclosing phase span without threading anything through call signatures.
+## Operations
 
-### Outcome-based backend comparison
+```bash
+# List pending human-decision emails (HITL inbox)
+npm run osa-admin -- inbox pending
 
-Use this when you want to know whether the agent actually reproduced and resolved issues per backend (instead of only triage/PM golden-set scoring):
+# Force-resolve a stuck inbox entry
+npm run osa-admin -- inbox set-action <id> approve
 
-1. Enable recorder output:
-   - `OSA_EVAL_BACKEND=sqlite` (or `jsonl`)
-   - `OSA_EVAL_PATH=.osa-evals.sqlite`
-2. Run the same issue set once per backend:
-   - `OBSERVABILITY_BACKEND=arize`
-   - `OBSERVABILITY_BACKEND=braintrust`
-   - `OBSERVABILITY_BACKEND=langsmith`
-3. Compare outcomes:
-   - `npm run eval:observability`
+# Expire old inbox entries past their TTL
+npm run osa-admin -- inbox expire-sweep
 
-The outcomes report is written to `evals/results/eval-outcomes-<timestamp>.json` and compares per-backend rates for:
-- `repro_passed`
-- `fix_passed`
-- `verification_gate_passed` (skipped verification is tracked as `skipped_non_gha`, not counted as pass)
-- resolved issues (`final_disposition=pr-opened`)
+# Smoke-test tracing against configured backends
+npm run trace-smoke
+```
 
-Legacy triage/PM golden-set comparison is still available via:
-- `npm run eval:observability:triage`
+## Known limitations
 
-### Redaction
-
-Set `OBSERVABILITY_REDACT_IO=true` to replace each span's input/output payload with `{ redacted, length, sha1 }` — latency and token counts stay observable but raw prompt/completion text never leaves the process. String-level secret scrubbing (API keys, tokens, `Authorization:` headers) always runs via `core/observability/redact.ts`.
-
-### Adding a backend
-
-Drop a new file under `core/observability/<backend>.ts` that exports a class implementing `Tracer` from `./tracer`, then add the lazy-require branch in the factory in `tracer.ts`. No call sites need to change.
-
-## Agent skill: observability-gap-analysis
-
-This repo includes a reusable skill for competitive observability analysis:
-
-- `.github/skills/observability-gap-analysis/SKILL.md` (Copilot)
-- `.claude/skills/observability-gap-analysis/SKILL.md` (Claude-compatible hosts)
-- `.agents/skills/observability-gap-analysis/SKILL.md` (generic agent hosts)
-
-Use it when you want an agent to compare **Arize AX + OpenInference** against **Braintrust + LangSmith** and produce an evidence-backed, prioritized backlog split into:
-
-1. Arize AX platform items
-2. OpenInference spec/SDK items
-
-The skill now also persists findings for future runs:
-
-- Canonical ledger in `evals/COMPETITIVE-ANALYSIS-TEMPLATE.md` (`## 8` and `## 9` sections)
-- Per-run structured artifact in `evals/gap-runs/<timestamp>.json`
-- Latest artifact pointer in `evals/gap-runs/latest.json`
-- Each gap must capture competitor-specific ease (`how they do it`) and a single owner label: `arize-ax` or `openinference`
-
-## Agent skill: observability-gap-one-pagers
-
-This repo also includes a follow-on skill that turns persisted gaps into one-page briefs:
-
-- `.github/skills/observability-gap-one-pagers/SKILL.md` (Copilot)
-- `.claude/skills/observability-gap-one-pagers/SKILL.md` (Claude-compatible hosts)
-- `.agents/skills/observability-gap-one-pagers/SKILL.md` (generic agent hosts)
-
-Use it after `observability-gap-analysis` when you want one document per gap that clearly states:
-
-1. What the competitor does (and why it is easier)
-2. What oss-support-agent does today
-3. The exact gap
-4. The proposed fix and measurable success criteria
-
-Persisted outputs for this workflow:
-
-- Per-gap pages in `evals/gap-one-pagers/<gap_id>.md`
-- Index in `evals/gap-one-pagers/index.md`
-- Latest pointer in `evals/gap-one-pagers/latest.json`
-- Authoring template in `evals/gap-one-pagers/TEMPLATE.md`
-
-## How to use the skills (end-to-end)
-
-### 1) Run competitive gap analysis
-
-Use `observability-gap-analysis` first.
-
-Example prompts:
-
-- "Use observability-gap-analysis on current setup and persist findings."
-- "Run observability-gap-analysis for OpenInference vs Braintrust/LangSmith setup friction."
-
-Expected outputs:
-
-- `evals/gap-runs/<timestamp>.json`
-- `evals/gap-runs/latest.json` (updated pointer)
-- `evals/COMPETITIVE-ANALYSIS-TEMPLATE.md` sections `## 8` and `## 9` (updated ledger/history)
-
-### 2) Generate one-pagers from persisted gaps
-
-Use `observability-gap-one-pagers` after step 1.
-
-Example prompts:
-
-- "Use observability-gap-one-pagers for all current non-rejected gaps."
-- "Use observability-gap-one-pagers for AX-001, AX-005, and OI-002 only."
-
-Expected outputs:
-
-- `evals/gap-one-pagers/<gap_id>.md` (one file per gap)
-- `evals/gap-one-pagers/index.md` (updated index table)
-- `evals/gap-one-pagers/latest.json` (updated pointer + generated gap IDs)
-
-### 3) Typical operating loop
-
-1. Re-run `observability-gap-analysis` after new integration/eval work.
-2. Re-run `observability-gap-one-pagers` to refresh product-ready briefs.
-3. Use the one-pagers as implementation specs and roadmap inputs.
-
-### Host note
-
-These skills are mirrored for multiple agent hosts:
-
-- Copilot: `.github/skills/...`
-- Claude-compatible: `.claude/skills/...`
-- Generic agent hosts: `.agents/skills/...`
-
-If your host does not auto-discover repository skills, open the relevant `SKILL.md` and follow it manually.
+- **Python only** — the repro and fix loops are wired for Python/pytest. JavaScript/Go support requires a new sandbox adapter.
+- **No mid-step resume** — if the server restarts mid-pipeline, the run won't continue from where it left off (duplicate triggers are blocked, but the in-flight work is lost).
+- **Single instance** — run state is file-backed under `STATE_ROOT`; multiple replicas would need a shared database.
+- **No build/docs agents yet** — new feature scaffolding and documentation generation aren't implemented.
