@@ -3095,6 +3095,23 @@ export async function runPipeline(args: {
     reproTestUrl = buildGitHubBlobUrl(fork.forkFullName, fork.branchName, reproPath);
     reproPRSection = buildReproPRSectionFromV2(reproOutcome.v2, { reproTestUrl });
 
+    // Post an issue comment with the test source + failure output so the
+    // maintainer can see exactly what reproduced without opening GHA logs.
+    try {
+      const issueCommenter = new GitHubIssueCommenter(deps.token);
+      const reproComment = buildReproConfirmedComment({
+        v2: reproOutcome.v2,
+        reproTestContent: reproOutcome.candidateTestContent ?? '',
+        reproTestUrl: reproTestUrl ?? '',
+        sandboxRunner: v2SandboxDriver,
+        forkFullName: fork.forkFullName,
+      });
+      await issueCommenter.postComment(repoFullName, issueNumber, reproComment);
+      log('[v2-repro] posted repro-confirmed comment on issue #' + issueNumber);
+    } catch (commentErr: any) {
+      log('[v2-repro] repro comment failed (non-blocking): ' + (commentErr?.message ?? commentErr));
+    }
+
     // Capture branch SHA AFTER the repro commit \u2014 the fix pipeline runs on
     // top of this baseline.
     let fixBaselineSha = baselineSha;
@@ -3653,6 +3670,79 @@ function buildReproPRSectionFromV2(
     lines.push('');
     lines.push(`**Analyst summary**: ${dossierLatest.body.summary}`);
   }
+  return lines.join('\n');
+}
+
+/**
+ * Build an issue comment body posted immediately after repro is confirmed.
+ * Shows the analyst root cause, the failing test code, and the stderr tail
+ * from the first failing sandbox run — all visible on the issue without
+ * opening GHA logs or the fork branch.
+ */
+function buildReproConfirmedComment(args: {
+  v2: ReproV2Outcome;
+  reproTestContent: string;
+  reproTestUrl: string;
+  sandboxRunner: string;
+  forkFullName: string;
+}): string {
+  const { v2, reproTestContent, reproTestUrl, sandboxRunner, forkFullName } = args;
+  const dossier = v2.dossier.latest();
+  const executor = v2.executor;
+
+  const lines: string[] = [];
+  lines.push('🔬 **Reproduction confirmed** — the agent verified this bug reproduces consistently.');
+  lines.push('');
+
+  if (dossier) {
+    lines.push(`**Root cause**: ${dossier.body.summary}`);
+    lines.push(`**Analyst confidence**: ${dossier.body.confidence}`);
+    if (dossier.body.suspectSymbols.length) {
+      lines.push('**Suspect location**:');
+      for (const s of dossier.body.suspectSymbols.slice(0, 3)) {
+        lines.push(`- \`${s.file}::${s.symbol}\` — ${s.reasoning}`);
+      }
+    }
+    lines.push('');
+  }
+
+  lines.push(`**Repro test**: [\`${v2.plan?.candidateTestPath ?? 'tests/repro/test_repro.py'}\`](${reproTestUrl})`);
+  lines.push('');
+
+  // Collapse the test source
+  lines.push('<details>');
+  lines.push('<summary>Test source</summary>');
+  lines.push('');
+  lines.push('```python');
+  lines.push(reproTestContent.slice(0, 4000));
+  if (reproTestContent.length > 4000) lines.push('# ... (truncated)');
+  lines.push('```');
+  lines.push('</details>');
+  lines.push('');
+
+  // Show failure output from the first non-zero run
+  const failRun = executor?.runs.find((r) => r.exitCode !== 0);
+  if (failRun) {
+    const output = [failRun.stderrTail, failRun.stdoutTail].filter(Boolean).join('\n').trim();
+    if (output) {
+      lines.push('<details>');
+      lines.push(`<summary>Failure output (exit=${failRun.exitCode}${failRun.sentinelObserved ? ', sentinel ✓' : ''})</summary>`);
+      lines.push('');
+      lines.push('```');
+      lines.push(output.slice(0, 3000));
+      if (output.length > 3000) lines.push('... (truncated)');
+      lines.push('```');
+      lines.push('</details>');
+      lines.push('');
+    }
+  }
+
+  if (sandboxRunner === 'gha') {
+    lines.push(`**Sandbox runs**: [GitHub Actions](https://github.com/${forkFullName}/actions)`);
+    lines.push('');
+  }
+
+  lines.push('The agent is now applying a fix.');
   return lines.join('\n');
 }
 
