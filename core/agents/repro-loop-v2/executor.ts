@@ -319,9 +319,34 @@ export function reproAstPreflight(
     .replace(/'''[\s\S]*?'''/g, '')
     .replace(/(^|\n)\s*#[^\n]*/g, '$1');
 
+  // For each suspect file, check (a) the full repo-relative dotted path, or
+  // (b) the Python-importable suffix after "src/" — needed because deep monorepo
+  // paths like python/instrumentation/.../src/openinference/.../processor.py
+  // are imported as openinference.instrumentation.strands_agents.processor.
+  const fileMatch = (f: string): boolean => {
+    const fullDot = f.replace(/[\\/]/g, '.').replace(/\.py$/, '');
+    if (stripped.includes(fullDot)) return true;
+    const srcIdx = f.search(/(?:^|[\\/])src[\\/]/);
+    if (srcIdx !== -1) {
+      const afterSrc = f.slice(srcIdx + f.slice(srcIdx).indexOf('src') + 4); // past "src/"
+      const importable = afterSrc.replace(/[\\/]/g, '.').replace(/\.py$/, '');
+      if (stripped.includes(importable)) return true;
+    }
+    return false;
+  };
+  // Symbols may be stored as "ClassName.method" — also check the base class name
+  // so "StrandsAgentsToOpenInferenceProcessor.on_end" matches a test that only
+  // imports StrandsAgentsToOpenInferenceProcessor.
+  const symbolMatch = (s: string): boolean => {
+    if (new RegExp(`\\b${s.replace(/\./g, '\\.')}\\b`).test(stripped)) return true;
+    const base = s.split('.')[0];
+    if (base && base !== s && new RegExp(`\\b${base}\\b`).test(stripped)) return true;
+    return false;
+  };
   const exercises =
-    suspectFiles.some((f) => stripped.includes(f.replace(/[\\/]/g, '.').replace(/\.py$/, ''))) ||
-    suspectSymbols.some((s) => new RegExp(`\\b${s}\\b`).test(stripped));
+    (suspectFiles.length > 0 && suspectFiles.some(fileMatch)) ||
+    (suspectSymbols.length > 0 && suspectSymbols.some(symbolMatch)) ||
+    (suspectFiles.length === 0 && suspectSymbols.length === 0);
   if (!exercises) {
     return {
       ok: false,
