@@ -30,6 +30,14 @@ export interface DesignBriefInput {
   scoringResult: PMScoringResult;
   /** Candidate repo paths explicitly mentioned in issue title/body */
   issueMentionedPaths?: string[];
+  /** Analyst dossier snapshot — populated when PM gate runs after repro. */
+  reproDossierSnapshot?: {
+    summary: string;
+    confidence: 'low' | 'medium' | 'high';
+    suspectSymbols: Array<{ file: string; symbol: string; reasoning: string }>;
+  } | null;
+  /** Repro outcome — populated when PM gate runs after repro. */
+  reproEvidence?: { reproduced: boolean; message?: string } | null;
 }
 
 /**
@@ -54,6 +62,8 @@ export interface DesignBrief {
   proposedApproaches: ApproachOption[];
   /** Open questions that need resolution */
   openQuestions: string[];
+  /** Repro outcome — carried through from DesignBriefInput for email rendering. */
+  reproEvidence?: { reproduced: boolean; message?: string } | null;
 }
 
 /**

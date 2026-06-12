@@ -73,6 +73,7 @@ export class HeuristicBriefGenerator implements DesignBriefGenerator {
       proposedCodeChanges,
       proposedApproaches,
       openQuestions,
+      reproEvidence: input.reproEvidence ?? null,
     };
   }
 }
@@ -81,6 +82,15 @@ export class HeuristicBriefGenerator implements DesignBriefGenerator {
  * Generate 2-3 proposed approaches based on the scoring signals.
  */
 function generateApproaches(input: DesignBriefInput): ApproachOption[] {
+  if (input.reproDossierSnapshot?.suspectSymbols.length) {
+    const primary = input.reproDossierSnapshot.suspectSymbols[0];
+    return [{
+      name: 'Agent-proposed fix',
+      description: `Modify \`${primary.symbol}\` in \`${primary.file}\`: ${primary.reasoning}`,
+      pros: ['Directly targets the root cause identified by the analyst', 'Minimal scope change'],
+      cons: ['Analyst confidence may not capture all edge cases — review the diff carefully'],
+    }];
+  }
   const approaches: ApproachOption[] = [];
   const signals = input.scoringResult.signals.filter((s) => s.triggered);
 
@@ -165,6 +175,12 @@ function generateOpenQuestions(input: DesignBriefInput): string[] {
 }
 
 function buildRootCauseAnalysis(input: DesignBriefInput): string {
+  if (input.reproDossierSnapshot) {
+    const d = input.reproDossierSnapshot;
+    const confidence = d.confidence.charAt(0).toUpperCase() + d.confidence.slice(1);
+    return `${d.summary} (Analyst confidence: ${confidence})`;
+  }
+  // ... keep existing heuristic logic below unchanged ...
   const issueContext = `${input.issueTitle}\n${input.issueSummary}\n${input.issueBody ?? ''}`.toLowerCase();
 
   if (/\b(conflict|incompatible|dependency|version|pip install|constraints?)\b/.test(issueContext)) {
@@ -183,6 +199,12 @@ function buildRootCauseAnalysis(input: DesignBriefInput): string {
 }
 
 function buildPlannedFileChanges(input: DesignBriefInput): PlannedFileChange[] {
+  if (input.reproDossierSnapshot?.suspectSymbols.length) {
+    return input.reproDossierSnapshot.suspectSymbols.slice(0, 5).map((s) => ({
+      path: s.file,
+      plannedChange: s.reasoning,
+    }));
+  }
   const candidates = collectCandidatePaths(input).slice(0, 6);
 
   if (candidates.length === 0) {
@@ -342,6 +364,14 @@ export function formatDesignBriefEmail(brief: DesignBrief): string {
   sections.push(`**Related Open Issues:**\n${brief.relatedOpenIssues}\n`);
   sections.push(`**Recent PR Context:**\n${brief.recentPRContext}\n`);
   sections.push(`**Suspected Root Cause (Working Hypothesis):**\n${brief.rootCauseAnalysis}\n`);
+
+  if (brief.reproEvidence) {
+    const status = brief.reproEvidence.reproduced
+      ? `✅ Confirmed reproducible`
+      : `⚠️ Could not reproduce`;
+    const detail = brief.reproEvidence.message ? ` — ${brief.reproEvidence.message}` : '';
+    sections.push(`**Repro Status:** ${status}${detail}\n`);
+  }
 
   sections.push('**Planned File Touches (first pass):**');
   if (brief.plannedFileChanges.length > 0) {

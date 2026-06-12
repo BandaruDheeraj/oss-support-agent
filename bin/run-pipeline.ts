@@ -627,6 +627,12 @@ async function runPMDesignLoop(args: {
   live: LiveDeps;
   log: (msg: string) => void;
   runId: string;
+  reproDossierSnapshot?: {
+    summary: string;
+    confidence: 'low' | 'medium' | 'high';
+    suspectSymbols: Array<{ file: string; symbol: string; reasoning: string }>;
+  } | null;
+  reproEvidence?: { reproduced: boolean; message?: string } | null;
 }): Promise<{ approved: true; agreedDesign: string }> {
   const { payload, manifest, triageSummary, affectedModule, issueType, live, log, runId } = args;
   const repoFullName = payload.repository.full_name;
@@ -682,6 +688,8 @@ async function runPMDesignLoop(args: {
     issueLabels: labels,
     scoringResult: scoring,
     issueMentionedPaths,
+    reproDossierSnapshot: args.reproDossierSnapshot ?? null,
+    reproEvidence: args.reproEvidence ?? null,
   };
 
   const config: PMEmailLoopConfig = {
@@ -2224,53 +2232,12 @@ export async function runPipeline(args: {
     return finish({ status: 'skipped', reason: 'pm-design-loop-deps-missing' });
   }
 
-  // ---------- Optional PM design loop ----------
-  let designSummary = `Skip-PM-gate fix for issue #${issueNumber}: ${routing.result.summary}`;
+  // designSummary is set by the PM gate (route_pm) or defaults to skip-PM summary.
+  // For bug_fix + route_pm, the PM gate runs AFTER repro so it can include dossier findings.
+  // For new_feature + route_pm, the PM gate runs before the build loop (no repro available).
+  let designSummary = `Fix for issue #${issueNumber}: ${routing.result.summary}`;
   let agreedDesignText: string | null = null;
-  if (routing.action === 'route_pm') {
-    const result = await runPMDesignLoop({
-      payload,
-      manifest,
-      triageSummary: routing.result.summary,
-      affectedModule: routing.result.affectedModule,
-      issueType: routing.result.issueType,
-      live: deps.live!,
-      log,
-      runId,
-    });
-    designSummary = `Approved design for issue #${issueNumber}:\n${result.agreedDesign}`;
-    agreedDesignText = result.agreedDesign;
-  }
-
-  // ---------- Optional issue sweep (Phase 5) ----------
-  // Only sweep when PM design loop ran AND live deps are present. Sweep is a
-  // no-op short-circuit when no other in-scope issues are found (no email).
   let extraConfirmedNumbers: number[] = [];
-  if (routing.action === 'route_pm' && deps.live && agreedDesignText) {
-    try {
-      const sweep = await runIssueSweepLoop({
-        repoFullName,
-        primaryIssueNumber: issueNumber,
-        primaryIssueTitle: payload.issue.title ?? '',
-        agreedDesign: agreedDesignText,
-        affectedModule: routing.result.affectedModule,
-        manifest,
-        live: deps.live,
-        token: deps.token,
-        log,
-        parentRunId: runId,
-        sweepStateStore,
-      });
-      extraConfirmedNumbers = sweep.confirmedIssueNumbers.filter((n) => n !== issueNumber);
-      if (sweep.skipped) {
-        log(`[sweep] skipped (${sweep.reason ?? 'unknown'})`);
-      }
-    } catch (err) {
-      // Sweep is best-effort; never block the pipeline on failure.
-      log(`[sweep] error: ${(err as Error).message}; falling back to primary issue only`);
-      extraConfirmedNumbers = [];
-    }
-  }
 
   // ---------- Fork + branch ----------
   const ghClient = new GitHubRestClient(deps.token);
@@ -2390,6 +2357,42 @@ export async function runPipeline(args: {
         ` (${referenceModules.map((r) => r.path).join(', ') || 'none'})` +
         `; CONTRIBUTING: ${contributingGuide ? 'found' : 'not found'}`
     );
+
+    // PM gate for new_feature — runs before build loop (no repro available for features).
+    if (routing.action === 'route_pm' && deps.live) {
+      const pmResult = await runPMDesignLoop({
+        payload,
+        manifest,
+        triageSummary: routing.result.summary,
+        affectedModule: routing.result.affectedModule,
+        issueType: routing.result.issueType,
+        live: deps.live,
+        log,
+        runId,
+      });
+      designSummary = `Approved design for issue #${issueNumber}:\n${pmResult.agreedDesign}`;
+      agreedDesignText = pmResult.agreedDesign;
+      // Issue sweep — find related issues resolved by the same design.
+      try {
+        const sweep = await runIssueSweepLoop({
+          repoFullName,
+          primaryIssueNumber: issueNumber,
+          primaryIssueTitle: payload.issue.title ?? '',
+          agreedDesign: agreedDesignText,
+          affectedModule: routing.result.affectedModule,
+          manifest,
+          live: deps.live,
+          token: deps.token,
+          log,
+          parentRunId: runId,
+          sweepStateStore,
+        });
+        extraConfirmedNumbers = sweep.confirmedIssueNumbers.filter((n) => n !== issueNumber);
+        if (sweep.skipped) log(`[sweep] skipped (${sweep.reason ?? 'unknown'})`);
+      } catch (err) {
+        log(`[sweep] error: ${(err as Error).message}; falling back to primary issue only`);
+      }
+    }
 
     const buildInputBase: BuildAgentInput = {
       designSummary,
@@ -3099,6 +3102,53 @@ export async function runPipeline(args: {
       fixBaselineSha = await workspace.headSha();
     } catch {
       /* best-effort */
+    }
+
+    // PM gate for bug_fix — runs after repro so the email includes analyst findings.
+    if (routing.action === 'route_pm' && deps.live) {
+      const pmDossierCtx = reproDossier ? {
+        summary: reproDossier.body.summary,
+        confidence: reproDossier.body.confidence,
+        suspectSymbols: reproDossier.body.suspectSymbols.map((s) => ({
+          file: s.file,
+          symbol: s.symbol,
+          reasoning: s.reasoning,
+        })),
+      } : null;
+      const pmResult = await runPMDesignLoop({
+        payload,
+        manifest,
+        triageSummary: routing.result.summary,
+        affectedModule: routing.result.affectedModule,
+        issueType: routing.result.issueType,
+        live: deps.live,
+        log,
+        runId,
+        reproDossierSnapshot: pmDossierCtx,
+        reproEvidence: { reproduced: reproOutcome.ok, message: reproOutcome.message },
+      });
+      designSummary = `Approved design for issue #${issueNumber}:\n${pmResult.agreedDesign}`;
+      agreedDesignText = pmResult.agreedDesign;
+      // Issue sweep.
+      try {
+        const sweep = await runIssueSweepLoop({
+          repoFullName,
+          primaryIssueNumber: issueNumber,
+          primaryIssueTitle: payload.issue.title ?? '',
+          agreedDesign: agreedDesignText,
+          affectedModule: routing.result.affectedModule,
+          manifest,
+          live: deps.live,
+          token: deps.token,
+          log,
+          parentRunId: runId,
+          sweepStateStore,
+        });
+        extraConfirmedNumbers = sweep.confirmedIssueNumbers.filter((n) => n !== issueNumber);
+        if (sweep.skipped) log(`[sweep] skipped (${sweep.reason ?? 'unknown'})`);
+      } catch (err) {
+        log(`[sweep] error: ${(err as Error).message}; falling back to primary issue only`);
+      }
     }
 
     // ---- Fix stage (v2) -------------------------------------------------
