@@ -53,7 +53,7 @@ export class ChatClient {
   }
 
   async chat(messages: LLMMessage[], options: LLMChatOptions = {}): Promise<LLMChatResult> {
-    const agent: PhaseEAgent | undefined = options.agent;
+    const agent: PhaseEAgent | undefined = options.agent as PhaseEAgent | undefined;
     const model = getModel(agent ?? 'TRIAGE', options.model);
     const temperature = options.temperature ?? 0;
     const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;

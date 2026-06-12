@@ -21,6 +21,7 @@ import type { IssueCodeSnippet } from './repro-hints';
 import type { SemanticSuspectSeed } from '../analyst/semantic-search';
 import type { TestInfraProfile } from './test-infra-fingerprint';
 import { assembleReproTest } from './test-assembler';
+import { ChatClient } from '../../llm/v2/chat-client';
 
 type CandidateSource = 'builder' | 'prober';
 type CandidateStatus =
@@ -249,10 +250,10 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       precondition_assertions: [],
     };
 
-  // Stage A: Deterministic Test Assembly
-  // Replaces the LLM-based Prober entirely. The assembler reads the suspect
-  // function source, finds the tracker base class, and builds a working test
-  // from known-good patterns — no LLM creativity needed.
+  // Stage A: LLM-backed Test Assembly
+  // A single claude-opus-4-8 call reads the suspect source, bug description,
+  // oracle spec, and fix hypothesis to write a test for any bug pattern.
+  // Falls back to static templates when the LLM call fails.
   let assembledTest: import('./test-assembler').AssembledTest | null = null;
   if (args.gitClient) {
     try {
@@ -263,6 +264,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
         repoFullName: args.repo.forkFullName,
         ref: args.repo.branch,
         editableInstallCandidates: args.editableInstallCandidates,
+        llmClient: new ChatClient(),
       });
       if (assembledTest) {
         log('[v2-orchestrator] assembled test: type=' + assembledTest.bugType + ' path=' + assembledTest.testEntryPoint);

@@ -1,31 +1,28 @@
 /**
- * Deterministic Test Assembler.
+ * Test Assembler.
  *
- * Takes a dossier snapshot (suspect function, oracle spec, fixHypothesis) and
- * the test infrastructure fingerprint profile, reads the suspect function's
- * source from the repo, and produces a working test deterministically — no
- * LLM loop.
+ * Generates a repro test for a given dossier snapshot. Uses a single LLM call
+ * (claude-opus-4-8) when a client is provided — the LLM reads the full suspect
+ * source file, the bug description, the oracle spec, and the fix hypothesis,
+ * then writes an appropriate pytest test. This generalises across all bug types
+ * without hardcoded pattern detection.
  *
- * Supports two bug types:
- *
- *   TYPE 1 — Function-level bug (oracle has symbol assertion, bug is wrong
- *             argument / return): imports the suspect function, derives the
- *             tracker base class from the source file, generates a mock tracker
- *             that captures calls, calls the function with a constructed
- *             SimpleNamespace message, and asserts the captured argument does
- *             NOT equal the wrong hardcoded value from fixHypothesis.
- *
- *   TYPE 2 — Lifecycle bug (oracle has span_attribute assertion, involves OTel
- *             span lifecycle): uses an existing cassette from the fingerprint
- *             profile and generates a test using the cassette_transport fixture.
+ * Falls back to static templates when no LLM client is supplied (e.g. in unit
+ * tests) or when the LLM call fails, so the assembler never becomes a hard
+ * blocker.
  */
 
+import type { LLMChatOptions, LLMChatResult, LLMMessage } from '../../llm/types';
 import type { DossierSnapshot } from '../analyst/dossier';
 import type { TestInfraProfile } from './test-infra-fingerprint';
 
 // ---------------------------------------------------------------------------
 // Public interface
 // ---------------------------------------------------------------------------
+
+export interface LlmClient {
+  chat(messages: LLMMessage[], options: LLMChatOptions): Promise<LLMChatResult>;
+}
 
 export interface TestAssemblerArgs {
   dossierSnapshot: DossierSnapshot;
@@ -42,6 +39,12 @@ export interface TestAssemblerArgs {
   /** Pre-discovered editable-install paths from workspace BFS scan. When provided,
    *  these replace the file-path heuristic in buildInstallSpec. */
   editableInstallCandidates?: string[];
+  /**
+   * LLM client for test generation. When provided, a single high-quality model
+   * call replaces all hardcoded template logic, generalising across bug types.
+   * Falls back to static templates when absent or on error.
+   */
+  llmClient?: LlmClient;
 }
 
 export interface AssembledTest {
@@ -51,7 +54,7 @@ export interface AssembledTest {
     editableInstall: string[];
     additionalPackages: string[];
   };
-  bugType: 'function-level' | 'lifecycle' | 'unknown';
+  bugType: 'llm-generated' | 'function-level' | 'lifecycle' | 'unknown';
   rationale: string;
 }
 
@@ -127,7 +130,43 @@ export async function assembleReproTest(
   );
 
   // -------------------------------------------------------------------------
-  // 5a. TYPE 2 — Lifecycle (span_attribute oracle): cassette-based test.
+  // 5a. LLM-generated test — preferred path when a client is provided.
+  // A single high-quality model call reads the full suspect source, bug
+  // description, oracle spec, and fix hypothesis to write an appropriate test
+  // for any bug pattern — no hardcoded type detection needed.
+  // -------------------------------------------------------------------------
+  if (args.llmClient) {
+    let fileSource: string | null = null;
+    try {
+      const r = await gitClient.getFileContents(repoFullName, primarySuspect.file, ref);
+      if (r.ok && r.content) fileSource = r.content;
+    } catch { /* best-effort */ }
+
+    const suspectModule = deriveModulePath(primarySuspect.file).replace(/-/g, '_');
+    const llmTest = await generateTestWithLlm(args.llmClient, {
+      suspectFilePath: primarySuspect.file,
+      suspectSymbol: primarySuspect.symbol,
+      suspectFileSource: fileSource,
+      suspectModule,
+      dossierBody: body,
+      installSpec,
+    });
+
+    if (llmTest) {
+      return {
+        reproFiles: [{ path: 'tests/repro/test_repro.py', content: llmTest, append: false }],
+        testEntryPoint: 'tests/repro/test_repro.py::test_repro',
+        installSpec,
+        bugType: 'llm-generated',
+        rationale: `LLM-generated test for ${primarySuspect.symbol} in ${primarySuspect.file}.`,
+      };
+    }
+    // eslint-disable-next-line no-console
+    console.log('[v2-assembler] LLM test generation failed, falling back to templates');
+  }
+
+  // -------------------------------------------------------------------------
+  // 5b. TYPE 2 — Lifecycle (span_attribute oracle): cassette-based test.
   // -------------------------------------------------------------------------
   if (hasSpanAttributeAssertion) {
     const cassette = pickCassette(testInfraProfile);
@@ -316,6 +355,138 @@ function pickBestSuspectSymbol(
 
 // ---------------------------------------------------------------------------
 // Template builders
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// LLM-based test generation
+// ---------------------------------------------------------------------------
+
+const SUSPECT_FILE_MAX_CHARS = 80_000; // ~20k tokens of context
+
+/**
+ * Make a single high-quality LLM call to generate a self-contained pytest
+ * `test_repro` function for any bug pattern.
+ *
+ * Returns the raw Python source, or null if the call fails or produces no
+ * usable output (caller falls through to static templates).
+ */
+async function generateTestWithLlm(
+  llmClient: LlmClient,
+  ctx: {
+    suspectFilePath: string;
+    suspectSymbol: string;
+    suspectFileSource: string | null;
+    suspectModule: string;
+    dossierBody: Record<string, unknown>;
+    installSpec: AssembledTest['installSpec'];
+  }
+): Promise<string | null> {
+  const body = ctx.dossierBody;
+
+  const fileBlock = ctx.suspectFileSource
+    ? `\`\`\`python\n${ctx.suspectFileSource.slice(0, SUSPECT_FILE_MAX_CHARS)}\n\`\`\``
+    : '(source not available)';
+
+  const installLines = [
+    ...ctx.installSpec.editableInstall.map((p) => `pip install -e ${p}`),
+    ...ctx.installSpec.additionalPackages.map((p) => `pip install ${p}`),
+  ].join('\n') || '(none specified)';
+
+  const oracleText = body['oracleSpec']
+    ? JSON.stringify(body['oracleSpec'], null, 2).slice(0, 2000)
+    : '(not specified)';
+
+  const reproFiles = (body['reproFiles'] as Record<string, unknown>) ?? {};
+  const fixHypothesis: string =
+    (reproFiles['fixHypothesis'] as any)?.description ??
+    (body['candidateRepro'] as any)?.fixHypothesis?.description ??
+    '';
+
+  const userPrompt = `\
+You are an expert Python test author. Write a single self-contained pytest function \
+named \`test_repro\` that demonstrates a specific bug.
+
+## Suspect file: ${ctx.suspectFilePath}
+${fileBlock}
+
+## Primary suspect symbol
+${ctx.suspectSymbol}
+
+## Bug summary
+${String(body['summary'] ?? '(not provided)')}
+
+## Root cause
+${String(body['rootCause'] ?? '(not provided)')}
+
+## Fix hypothesis
+${fixHypothesis || '(not provided)'}
+
+## Oracle spec (what the test must verify)
+${oracleText}
+
+## Environment — packages installed when the test runs
+${installLines}
+
+The importable Python module path for the suspect file is: \`${ctx.suspectModule}\`
+
+## Requirements
+- Write a SINGLE function named \`test_repro\` with no arguments and no pytest fixtures.
+- The test must FAIL (raise AssertionError with a descriptive message) on the CURRENT \
+buggy code, directly demonstrating the bug.
+- The test must PASS after the fix described in the fix hypothesis is applied.
+- Import ONLY from the installed packages listed above — no external services, no network \
+calls, no credentials.
+- Prefer calling library code directly (e.g. instantiate the class and call the buggy \
+method) rather than using TracerProvider unless the bug specifically requires observing \
+exported spans.
+- Include the exact string \`REPRO_BUG_SENTINEL\` in at least one assertion failure message.
+- Keep it concise: 20–60 lines, no parametrize, no conftest dependencies.
+
+## Output
+Return ONLY raw Python source code — no markdown fences, no prose explanation.`;
+
+  const messages: LLMMessage[] = [
+    {
+      role: 'system',
+      content:
+        'You are an expert Python test author. Return only raw Python source code — ' +
+        'no markdown fences, no explanations, no comments beyond what is essential.',
+    },
+    { role: 'user', content: userPrompt },
+  ];
+
+  const options: LLMChatOptions = {
+    agent: 'REPRO_ASSEMBLER',
+    // claude-opus-4-8: highest-quality model, best at reading unfamiliar code
+    // and reasoning about what will fail vs pass. The assembler is called once
+    // per pipeline (not in a loop) so the extra cost is acceptable.
+    model: 'claude-opus-4-8',
+    temperature: 0,
+    maxTokens: 4096,
+  };
+
+  try {
+    const result = await llmClient.chat(messages, options);
+    const src = extractPythonSource(result.content);
+    if (!src || !src.includes('def test_repro')) return null;
+    return src;
+  } catch (err: any) {
+    // eslint-disable-next-line no-console
+    console.log('[v2-assembler] LLM call error: ' + (err?.message ?? String(err)));
+    return null;
+  }
+}
+
+/** Strip markdown code fences the model may emit despite instructions. */
+function extractPythonSource(text: string): string {
+  const t = text.trim();
+  const fenced = t.match(/^```(?:python)?\n([\s\S]+?)\n```\s*$/m);
+  if (fenced) return fenced[1]!.trim();
+  return t;
+}
+
+// ---------------------------------------------------------------------------
+// Template builders (static fallback when no LLM client is supplied)
 // ---------------------------------------------------------------------------
 
 /**

@@ -134,6 +134,7 @@ export type PhaseEAgent =
   | 'REPRO_PROBER'
   | 'REPRO_CRITIC'
   | 'REPRO_REPAIR'
+  | 'REPRO_ASSEMBLER'
   | 'FIX_INVESTIGATOR'
   | 'FIX_PLANNER'
   | 'FIX_EXECUTOR'

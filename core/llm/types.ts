@@ -32,7 +32,8 @@ export type OpenRouterAgent =
   | 'REPRO';
 
 export interface LLMChatOptions {
-  agent?: OpenRouterAgent;
+  /** OpenRouterAgent or any PhaseEAgent string (e.g. 'REPRO_ASSEMBLER'). */
+  agent?: string;
   model?: string;
   temperature?: number;
   onUsage?: (usage: LLMUsage) => void;
