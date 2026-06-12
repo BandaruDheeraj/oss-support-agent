@@ -15,7 +15,7 @@ jest.mock('../llm/v2/client', () => ({
 
 jest.mock('../observability/spans', () => ({
   withAgentSpan: async (_agent: string, _attrs: Record<string, unknown>, fn: () => Promise<unknown>) => fn(),
-  withToolSpan: async (_name: string, _tier: string, _attrs: Record<string, unknown>, fn: (span: { setAttribute: () => void }) => Promise<unknown>) => fn({ setAttribute: () => {} }),
+  withToolSpan: async (_name: string, _tier: string, _attrs: Record<string, unknown>, fn: (span: { setAttributes: () => void }) => Promise<unknown>) => fn({ setAttributes: () => {} }),
 }));
 
 function makeRegistry() {

@@ -49,7 +49,7 @@ describe('BraintrustTracer', () => {
   it('startSpan emits a top-level span and logs input/output on end', async () => {
     const tracer = new BraintrustTracer();
     const span = tracer.startSpan('llm.foo', {
-      kind: 'llm',
+      kind: 'LLM',
       attributes: { 'llm.model_name': 'foo' },
     });
     span.setInput({ messages: [{ role: 'user', content: 'q' }] });
@@ -63,6 +63,7 @@ describe('BraintrustTracer', () => {
     expect(logged.input).toEqual({ messages: [{ role: 'user', content: 'q' }] });
     expect(logged.output).toEqual({ content: 'a' });
     expect((logged.metadata as any)['llm.model_name']).toBe('foo');
+    expect((logged.metadata as any)['openinference.span.kind']).toBe('LLM');
     expect(childEndMock).toHaveBeenCalled();
     await tracer.flush();
     expect(flushMock).toHaveBeenCalled();
@@ -87,6 +88,33 @@ describe('BraintrustTracer', () => {
     );
     child.end();
     parent.end();
+  });
+
+  it('maps OpenInference kinds to Braintrust native types while preserving metadata', async () => {
+    const tracer = new BraintrustTracer();
+    const cases = [
+      ['CHAIN', 'task'],
+      ['AGENT', 'task'],
+      ['LLM', 'llm'],
+      ['TOOL', 'tool'],
+      ['RETRIEVER', 'task'],
+      ['EMBEDDING', 'task'],
+      ['RERANKER', 'task'],
+      ['GUARDRAIL', 'task'],
+      ['EVALUATOR', 'task'],
+    ] as const;
+
+    for (const [kind] of cases) {
+      tracer.startSpan(`span.${kind.toLowerCase()}`, { kind }).end();
+    }
+    await tracer.flush();
+
+    expect((startChildSpanMock.mock.calls as any[]).map((c) => c[0].type)).toEqual(
+      cases.map(([, type]) => type)
+    );
+    expect(childLogMock.mock.calls.map((c) => c[0].metadata['openinference.span.kind'])).toEqual(
+      cases.map(([kind]) => kind)
+    );
   });
 
   it('warns once and returns inert spans when BRAINTRUST_API_KEY is missing', () => {
@@ -117,7 +145,7 @@ describe('BraintrustTracer', () => {
   it('writes evaluation scores for evaluator spans', () => {
     const tracer = new BraintrustTracer();
     const span = tracer.startSpan('evaluator.fix', {
-      kind: 'evaluator',
+      kind: 'EVALUATOR',
       attributes: {
         'evaluation.name': 'fix_passed',
         'evaluation.score': 0,

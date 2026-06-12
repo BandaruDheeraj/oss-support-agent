@@ -41,7 +41,7 @@ export function decisionSection(ctx: EmailContext, intro: string): string {
 
 export function footer(ctx: EmailContext): string {
   const lines = ['\n\n---'];
-  if (ctx.links.phoenix) lines.push(`Phoenix trace: ${ctx.links.phoenix}`);
+  if (ctx.links.arize) lines.push(`Arize AX trace: ${ctx.links.arize}`);
   if (ctx.links.braintrust) lines.push(`Braintrust trace: ${ctx.links.braintrust}`);
   if (ctx.links.pr) lines.push(`PR: ${ctx.links.pr}`);
   if (ctx.links.issue) lines.push(`Issue: ${ctx.links.issue}`);
@@ -66,7 +66,7 @@ export function build(
     inboxEntryId: ctx.inboxEntryId,
     expectedActions: ctx.expectedActions,
     links: {
-      phoenix: ctx.links.phoenix,
+      arize: ctx.links.arize,
       braintrust: ctx.links.braintrust,
       pr: ctx.links.pr,
       issue: ctx.links.issue,

@@ -42,7 +42,7 @@ export const EmailPayloadSchema = z.object({
   expectedActions: z.array(z.string()),
   links: z
     .object({
-      phoenix: z.string().nullable().optional(),
+      arize: z.string().nullable().optional(),
       braintrust: z.string().nullable().optional(),
       pr: z.string().nullable().optional(),
       issue: z.string().nullable().optional(),

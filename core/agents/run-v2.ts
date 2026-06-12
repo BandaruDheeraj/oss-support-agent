@@ -41,7 +41,7 @@ async function withPipelineSpan<T>(
   fn: () => Promise<T>
 ): Promise<T> {
   const tracer = getTracer();
-  const span: Span = tracer.startSpan(name, { kind: 'phase', attributes: attrs });
+  const span: Span = tracer.startSpan(name, { kind: 'CHAIN', attributes: attrs });
   try {
     return await runWithSpan(span, fn);
   } catch (err) {

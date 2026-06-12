@@ -8,8 +8,10 @@ import {
   currentSpan,
   getObservabilityConfigErrors,
   getTracer,
+  normalizeOpenInferenceSpanKind,
   NoopTracer,
   runWithSpan,
+  withOpenInferenceSpanKind,
 } from '../tracer';
 
 describe('tracer factory', () => {
@@ -20,7 +22,9 @@ describe('tracer factory', () => {
     delete process.env.OBSERVABILITY_BACKEND;
     delete process.env.LANGSMITH_API_KEY;
     delete process.env.ARIZE_ENDPOINT;
-    delete process.env.PHOENIX_OTLP_ENDPOINT;
+    delete process.env.ARIZE_API_KEY;
+    delete process.env.ARIZE_SPACE_ID;
+    delete process.env.ARIZE_PROJECT_NAME;
     delete process.env.BRAINTRUST_API_KEY;
   });
 
@@ -73,7 +77,9 @@ describe('tracer factory', () => {
     expect(getObservabilityConfigErrors()).toEqual(
       expect.arrayContaining([
         'langsmith: LANGSMITH_API_KEY (or LANGCHAIN_API_KEY)',
-        'arize: ARIZE_ENDPOINT (or PHOENIX_OTLP_ENDPOINT)',
+        'arize: ARIZE_API_KEY',
+        'arize: ARIZE_SPACE_ID',
+        'arize: ARIZE_PROJECT_NAME',
         'braintrust: BRAINTRUST_API_KEY',
       ])
     );
@@ -89,7 +95,9 @@ describe('tracer factory', () => {
   it('passes config validation when all required keys are present', () => {
     process.env.OBSERVABILITY_BACKEND = 'all';
     process.env.LANGSMITH_API_KEY = 'x';
-    process.env.ARIZE_ENDPOINT = 'https://example.test/v1/traces';
+    process.env.ARIZE_API_KEY = 'arize-key';
+    process.env.ARIZE_SPACE_ID = 'space-id';
+    process.env.ARIZE_PROJECT_NAME = 'oss-fix-loop';
     process.env.BRAINTRUST_API_KEY = 'y';
     expect(() => assertObservabilityConfigured()).not.toThrow();
   });
@@ -109,5 +117,32 @@ describe('currentSpan + runWithSpan', () => {
     });
     expect(seen).toBe(parent);
     expect(currentSpan()).toBeUndefined();
+  });
+});
+
+describe('OpenInference span kind normalization', () => {
+  it('normalizes legacy internal kinds', () => {
+    expect(normalizeOpenInferenceSpanKind('phase')).toBe('CHAIN');
+    expect(normalizeOpenInferenceSpanKind('llm')).toBe('LLM');
+    expect(normalizeOpenInferenceSpanKind('tool')).toBe('TOOL');
+    expect(normalizeOpenInferenceSpanKind('evaluator')).toBe('EVALUATOR');
+  });
+
+  it('preserves full OpenInference kinds', () => {
+    expect(normalizeOpenInferenceSpanKind('AGENT')).toBe('AGENT');
+    expect(normalizeOpenInferenceSpanKind('RETRIEVER')).toBe('RETRIEVER');
+    expect(normalizeOpenInferenceSpanKind('EMBEDDING')).toBe('EMBEDDING');
+    expect(normalizeOpenInferenceSpanKind('RERANKER')).toBe('RERANKER');
+    expect(normalizeOpenInferenceSpanKind('GUARDRAIL')).toBe('GUARDRAIL');
+  });
+
+  it('lets explicit OpenInference attributes override legacy kind values', () => {
+    expect(
+      normalizeOpenInferenceSpanKind('tool', { 'openinference.span.kind': 'EVALUATOR' })
+    ).toBe('EVALUATOR');
+    expect(withOpenInferenceSpanKind({ a: 1 }, 'retriever')).toEqual({
+      a: 1,
+      'openinference.span.kind': 'RETRIEVER',
+    });
   });
 });

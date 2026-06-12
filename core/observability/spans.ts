@@ -2,22 +2,26 @@
  * Span helpers.
  */
 
-import { context, SpanKind, SpanStatusCode, trace, type Attributes, type Span } from '@opentelemetry/api';
-import { getTracer } from './tracing';
+import { context, trace } from '@opentelemetry/api';
+import {
+  currentSpan,
+  getTracer,
+  runWithSpan as runWithActiveSpan,
+  type OpenInferenceSpanKind,
+  type Span,
+} from './tracer';
 import { redactString } from './redact';
 
-export type OpenInferenceSpanKind = 'AGENT' | 'TOOL' | 'LLM' | 'RETRIEVER' | 'CHAIN';
-
-export interface BaseSpanAttrs extends Attributes {
+export interface BaseSpanAttrs extends Record<string, unknown> {
   issue_number?: number;
   attempt_id?: string;
   dossier_snapshot_id?: string;
   agent_name?: string;
 }
 
-function redactedAttrs<T extends Attributes>(attrs: T | undefined): Attributes {
+function redactedAttrs<T extends Record<string, unknown>>(attrs: T | undefined): Record<string, unknown> {
   if (!attrs) return {};
-  const out: Attributes = {};
+  const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(attrs)) {
     if (v == null) continue;
     if (typeof v === 'string') out[k] = redactString(v);
@@ -27,36 +31,28 @@ function redactedAttrs<T extends Attributes>(attrs: T | undefined): Attributes {
   return out;
 }
 
-function setKind(span: Span, kind: OpenInferenceSpanKind): void {
-  span.setAttribute('openinference.span.kind', kind);
-}
-
-async function runWithSpan<T>(
+export async function withOpenInferenceSpan<T>(
   name: string,
   kind: OpenInferenceSpanKind,
-  attrs: Attributes | undefined,
+  attrs: Record<string, unknown> | undefined,
   fn: (span: Span) => Promise<T>
 ): Promise<T> {
   const tracer = getTracer();
-  return await tracer.startActiveSpan(
-    name,
-    { kind: SpanKind.INTERNAL, attributes: redactedAttrs(attrs) },
-    async (span) => {
-      setKind(span, kind);
-      try {
-        const result = await fn(span);
-        span.setStatus({ code: SpanStatusCode.OK });
-        return result;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: redactString(msg) });
-        span.recordException(err instanceof Error ? err : new Error(msg));
-        throw err;
-      } finally {
-        span.end();
-      }
-    }
-  );
+  const parent = currentSpan();
+  const span = tracer.startSpan(name, {
+    kind,
+    parent,
+    attributes: redactedAttrs(attrs),
+  });
+  try {
+    return await runWithActiveSpan(span, () => fn(span));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    span.recordError(new Error(redactString(msg)));
+    throw err;
+  } finally {
+    span.end();
+  }
 }
 
 export function withAgentSpan<T>(
@@ -64,7 +60,7 @@ export function withAgentSpan<T>(
   attrs: BaseSpanAttrs,
   fn: (span: Span) => Promise<T>
 ): Promise<T> {
-  return runWithSpan(`agent.${agentName}`, 'AGENT', { agent_name: agentName, ...attrs }, fn);
+  return withOpenInferenceSpan(`agent.${agentName}`, 'AGENT', { agent_name: agentName, ...attrs }, fn);
 }
 
 export function withToolSpan<T>(
@@ -73,19 +69,18 @@ export function withToolSpan<T>(
   attrs: BaseSpanAttrs & { tool_args?: string },
   fn: (span: Span) => Promise<T>
 ): Promise<T> {
-  return runWithSpan(
+  return withOpenInferenceSpan(
     `tool.${toolName}`,
     'TOOL',
     { 'tool.name': toolName, 'tool.tier': tier, ...attrs },
     async (span) => {
       try {
         const result = await fn(span);
-        span.setAttribute('tool.success', true);
+        span.setAttributes({ 'tool.success': true });
         return result;
       } catch (err) {
-        span.setAttribute('tool.success', false);
         const msg = err instanceof Error ? err.message : String(err);
-        span.setAttribute('tool.error', redactString(msg));
+        span.setAttributes({ 'tool.success': false, 'tool.error': redactString(msg) });
         throw err;
       }
     }

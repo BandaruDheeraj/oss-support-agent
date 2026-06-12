@@ -123,6 +123,11 @@ export function humanDecisionNeeded(ctx: EmailContext): EmailPayload {
 }
 
 export function fixReadyForReview(ctx: EmailContext): EmailPayload {
+  const reproTestLine = ctx.context.reproTestUrl && ctx.context.reproTestPath
+    ? `**Repro test:** [${ctx.context.reproTestPath}](${ctx.context.reproTestUrl})`
+    : ctx.context.reproTestPath
+      ? `**Repro test:** \`${ctx.context.reproTestPath}\``
+      : '';
   const md = [
     header(ctx, 'Fix committed — ready for your review'),
     '',
@@ -138,7 +143,8 @@ export function fixReadyForReview(ctx: EmailContext): EmailPayload {
     '## Branch & commit',
     ctx.context.branchUrl ? `**Branch:** [${ctx.context.branchUrl}](${ctx.context.branchUrl})` : '',
     ctx.context.commitSha ? `**Commit SHA:** \`${ctx.context.commitSha}\`` : '',
-    ctx.context.reproTestPath ? `**Repro test:** \`${ctx.context.reproTestPath}\`` : '',
+    reproTestLine,
+    ctx.context.reproMethodNote ? `**Repro method:** ${redact(ctx.context.reproMethodNote)}` : '',
     '',
     '## Changed files',
     ...(ctx.context.changedFiles ?? []).map((f) => `- \`${f}\``),
@@ -158,10 +164,17 @@ export function fixReadyForReview(ctx: EmailContext): EmailPayload {
 }
 
 export function prOpened(ctx: EmailContext): EmailPayload {
+  const reproTestLine = ctx.context.reproTestUrl && ctx.context.reproTestPath
+    ? `Repro test: [${ctx.context.reproTestPath}](${ctx.context.reproTestUrl})`
+    : ctx.context.reproTestPath
+      ? `Repro test: \`${ctx.context.reproTestPath}\``
+      : '';
   const md = [
     header(ctx, 'PR opened from approved fix'),
     '',
     `PR: ${ctx.prUrl ?? '(no url)'}`,
+    reproTestLine,
+    ctx.context.reproMethodNote ? `Repro method: ${redact(ctx.context.reproMethodNote)}` : '',
     '',
     'This email is informational; no action required.',
     footer(ctx),

@@ -66,24 +66,24 @@
       "status": "new",
       "priority": "P0",
       "job": "Configure Arize cloud auth without trial-and-error",
-      "observed_friction": "Cloud path needs `api_key` plus `space_id`, and env aliasing (`ARIZE_SPACE_KEY`/`ARIZE_SPACE_ID`) is easy to misconfigure.",
+      "observed_friction": "Cloud path now needs `arize-api-key`, `arize-space-id`, and `ARIZE_PROJECT_NAME`; missing fields fail preflight.",
       "competitor_platform": "langsmith",
       "competitor_mechanism": "LangSmith client takes API key + optional endpoint URL in one constructor.",
       "why_competitor_easier": "Single primary credential pattern reduces auth setup ambiguity.",
       "current_behavior_in_oss_support_agent": "Arize adapter builds cloud headers manually and switches behavior between local and cloud targets.",
-      "root_cause": "Arize cloud credential contract diverges from common bearer-key setup and local Phoenix semantics.",
+      "root_cause": "Arize cloud credential contract diverges from common bearer-key setup and local Arize AX semantics.",
       "proposed_fix": "Provide one canonical JS auth contract with strong preflight validation and clearer migration aliases.",
       "success_metric": "Credential-related setup retries reduced to one attempt median in onboarding runs.",
       "evidence": [
         {
           "type": "code",
           "source": "evals/platforms/arize.ts:132-145",
-          "note": "Notes on `api_key` and `space_id` behavior."
+          "note": "Notes on `arize-api-key`, `arize-space-id`, and project routing behavior."
         },
         {
           "type": "code",
           "source": "evals/platforms/arize.ts:339-343",
-          "note": "Header construction with `ARIZE_SPACE_KEY`/`ARIZE_SPACE_ID` aliasing."
+          "note": "Header construction with `ARIZE_SPACE_ID`/`ARIZE_SPACE_ID` aliasing."
         },
         {
           "type": "code",
@@ -116,13 +116,13 @@
       "status": "new",
       "priority": "P0",
       "job": "Create datasets consistently for local and cloud setups",
-      "observed_friction": "Dataset auto-create is attempted only for local Phoenix; cloud flow is separate and manual.",
+      "observed_friction": "Dataset auto-create is attempted only for local Arize AX; cloud flow is separate and manual.",
       "competitor_platform": "langsmith",
       "competitor_mechanism": "LangSmith offers direct dataset creation in setup (`createDataset`).",
       "why_competitor_easier": "A single SDK path handles dataset provisioning as part of bootstrap.",
       "current_behavior_in_oss_support_agent": "Arize adapter skips cloud dataset provisioning and records a setup note about dashboard/tabular API dependency.",
       "root_cause": "No symmetric local/cloud dataset creation helper in Arize JS tooling.",
-      "proposed_fix": "Add `createDatasetIfMissing` for Phoenix local and Arize cloud with one contract.",
+      "proposed_fix": "Add `createDatasetIfMissing` for Arize AX local and Arize cloud with one contract.",
       "success_metric": "Dataset-ready state reached by setup code alone in local and cloud modes.",
       "evidence": [
         {
@@ -158,15 +158,15 @@
       "owner": "arize-ax",
       "status": "new",
       "priority": "P1",
-      "job": "Reliably validate Arize/Phoenix readiness before eval runs",
-      "observed_friction": "Phoenix can return 404 on `/healthz` while OTLP ingestion still works, so readiness checks remain ambiguous.",
+      "job": "Reliably validate Arize AX readiness before eval runs",
+      "observed_friction": "Arize AX can return 404 on `/healthz` while OTLP ingestion still works, so readiness checks remain ambiguous.",
       "competitor_platform": "braintrust",
       "competitor_mechanism": "Braintrust ping uses an experiment summarize round-trip call.",
       "why_competitor_easier": "Round-trip API checks confirm backend reachability without endpoint-version branching.",
       "current_behavior_in_oss_support_agent": "Arize ping accepts `404` as potentially healthy and defers certainty to later span delivery checks.",
-      "root_cause": "Health endpoint behavior differs across Phoenix builds and does not directly prove ingestion.",
+      "root_cause": "Health endpoint behavior differs across Arize AX builds and does not directly prove ingestion.",
       "proposed_fix": "Implement a probe-span readiness check that confirms ingestion, not only HTTP endpoint status.",
-      "success_metric": "Zero false-positive readiness signals across supported Phoenix/Arize versions.",
+      "success_metric": "Zero false-positive readiness signals across supported Arize AX versions.",
       "evidence": [
         {
           "type": "code",

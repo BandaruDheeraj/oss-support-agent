@@ -23,7 +23,38 @@ import {
   type AdapterName,
 } from './adapter-health';
 
-export type SpanKind = 'phase' | 'llm' | 'tool' | 'evaluator';
+export const OPENINFERENCE_SPAN_KIND_ATTRIBUTE = 'openinference.span.kind';
+
+export const OPENINFERENCE_SPAN_KINDS = [
+  'CHAIN',
+  'AGENT',
+  'LLM',
+  'TOOL',
+  'RETRIEVER',
+  'EMBEDDING',
+  'RERANKER',
+  'GUARDRAIL',
+  'EVALUATOR',
+] as const;
+
+export type OpenInferenceSpanKind = (typeof OPENINFERENCE_SPAN_KINDS)[number];
+
+/**
+ * Lowercase kinds are kept for compatibility with existing call sites. New code
+ * should prefer the OpenInference values above.
+ */
+export type LegacySpanKind =
+  | 'phase'
+  | 'agent'
+  | 'llm'
+  | 'tool'
+  | 'retriever'
+  | 'embedding'
+  | 'reranker'
+  | 'guardrail'
+  | 'evaluator';
+
+export type SpanKind = OpenInferenceSpanKind | LegacySpanKind;
 
 export interface Span {
   setAttributes(attrs: Record<string, unknown>): void;
@@ -42,6 +73,37 @@ export interface StartSpanOpts {
 export interface Tracer {
   startSpan(name: string, opts?: StartSpanOpts): Span;
   flush(): Promise<void>;
+}
+
+const OPENINFERENCE_KIND_SET = new Set<string>(OPENINFERENCE_SPAN_KINDS);
+
+export function normalizeOpenInferenceSpanKind(
+  kind?: SpanKind,
+  attributes?: Record<string, unknown>
+): OpenInferenceSpanKind {
+  const rawAttr = attributes?.[OPENINFERENCE_SPAN_KIND_ATTRIBUTE];
+  if (typeof rawAttr === 'string') {
+    const normalizedAttr = rawAttr.trim().toUpperCase();
+    if (OPENINFERENCE_KIND_SET.has(normalizedAttr)) {
+      return normalizedAttr as OpenInferenceSpanKind;
+    }
+  }
+
+  if (!kind) return 'CHAIN';
+  const normalized = String(kind).trim().toUpperCase();
+  if (OPENINFERENCE_KIND_SET.has(normalized)) return normalized as OpenInferenceSpanKind;
+  if (normalized === 'PHASE') return 'CHAIN';
+  return 'CHAIN';
+}
+
+export function withOpenInferenceSpanKind(
+  attributes: Record<string, unknown> | undefined,
+  kind?: SpanKind
+): Record<string, unknown> {
+  return {
+    ...(attributes ?? {}),
+    [OPENINFERENCE_SPAN_KIND_ATTRIBUTE]: normalizeOpenInferenceSpanKind(kind, attributes),
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -134,9 +196,9 @@ function missingConfigForAdapter(adapter: AdapterName): string[] {
     }
   }
   if (adapter === 'arize') {
-    if (!hasValue(process.env.ARIZE_ENDPOINT) && !hasValue(process.env.PHOENIX_OTLP_ENDPOINT)) {
-      missing.push('ARIZE_ENDPOINT (or PHOENIX_OTLP_ENDPOINT)');
-    }
+    if (!hasValue(process.env.ARIZE_API_KEY)) missing.push('ARIZE_API_KEY');
+    if (!hasValue(process.env.ARIZE_SPACE_ID)) missing.push('ARIZE_SPACE_ID');
+    if (!hasValue(process.env.ARIZE_PROJECT_NAME)) missing.push('ARIZE_PROJECT_NAME');
   }
   if (adapter === 'braintrust') {
     if (!hasValue(process.env.BRAINTRUST_API_KEY)) {
@@ -421,7 +483,7 @@ export async function runObservabilityStartupSmoke(): Promise<ObservabilitySmoke
 
     try {
       const span = adapterEntry.tracer.startSpan('telemetry_smoke', {
-        kind: 'evaluator',
+        kind: 'EVALUATOR',
         attributes: {
           'telemetry.synthetic': true,
           'telemetry.adapter': adapterEntry.name,

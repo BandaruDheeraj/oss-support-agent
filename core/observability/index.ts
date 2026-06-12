@@ -2,16 +2,24 @@
  * Public observability surface for the pluggable Tracer.
  *
  * Existing call-sites that use withAgentSpan / withToolSpan / redactString
- * keep importing directly from ./spans and ./redact — they are not affected.
- *
- * New call-sites (the LLM chokepoint in core/llm/v2/chat-client.ts and the phase
- * wrappers in core/agents/run-v2.ts) import getTracer from here.
+ * keep working, and new call-sites can import the full public surface here.
  */
-export type { Tracer, Span, StartSpanOpts, SpanKind, BackendName } from './tracer';
+export type {
+  Tracer,
+  Span,
+  StartSpanOpts,
+  SpanKind,
+  OpenInferenceSpanKind,
+  BackendName,
+} from './tracer';
 export {
+  OPENINFERENCE_SPAN_KIND_ATTRIBUTE,
+  OPENINFERENCE_SPAN_KINDS,
   getTracer,
   currentSpan,
   runWithSpan,
+  normalizeOpenInferenceSpanKind,
+  withOpenInferenceSpanKind,
   NoopTracer,
   activeBackend,
   getObservabilityAdapterContracts,
@@ -22,3 +30,10 @@ export {
   _resetTracer,
 } from './tracer';
 export type { AdapterDiagnostics } from './adapter-health';
+export {
+  withOpenInferenceSpan,
+  withAgentSpan,
+  withToolSpan,
+  currentTraceIds,
+  type BaseSpanAttrs,
+} from './spans';

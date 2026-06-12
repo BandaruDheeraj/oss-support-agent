@@ -13,6 +13,12 @@
 import { randomUUID } from 'node:crypto';
 import type { Span, StartSpanOpts, Tracer } from './tracer';
 import {
+  normalizeOpenInferenceSpanKind,
+  withOpenInferenceSpanKind,
+  type OpenInferenceSpanKind,
+} from './tracer';
+import { redactString } from './redact';
+import {
   deliverWithRetryAndSpool,
   markAdapterEnabled,
   recordAdapterDropped,
@@ -45,16 +51,16 @@ interface LangSmithSpanState {
 
 const kSymbol = Symbol('langsmith.state');
 
-function runTypeFor(kind: StartSpanOpts['kind']): string {
+function runTypeFor(kind: OpenInferenceSpanKind): string {
   switch (kind) {
-    case 'llm':
+    case 'LLM':
       return 'llm';
-    case 'tool':
+    case 'TOOL':
       return 'tool';
-    case 'evaluator':
-      return 'chain';
-    case 'phase':
-      return 'chain';
+    case 'RETRIEVER':
+      return 'retriever';
+    case 'EMBEDDING':
+      return 'embedding';
     default:
       return 'chain';
   }
@@ -116,14 +122,16 @@ export class LangSmithTracer implements Tracer {
       return new NoopLangSmithSpan();
     }
 
+    const openInferenceKind = normalizeOpenInferenceSpanKind(opts.kind, opts.attributes);
+    const attributes = withOpenInferenceSpanKind(opts.attributes, openInferenceKind);
     const parentState = opts.parent ? (opts.parent as unknown as { [kSymbol]?: LangSmithSpanState })[kSymbol] : undefined;
     const state: LangSmithSpanState = {
       id: randomUUID(),
       parentId: parentState?.id ?? null,
       name,
-      runType: runTypeFor(opts.kind),
+      runType: runTypeFor(openInferenceKind),
       startTimeMs: Date.now(),
-      attrs: { ...(opts.attributes ?? {}) },
+      attrs: { ...attributes },
       inputs: {},
       outputs: null,
       error: null,
@@ -170,7 +178,7 @@ export class LangSmithTracer implements Tracer {
         state.outputs = { value: redactIo('output', output) } as Record<string, unknown>;
       },
       recordError(err) {
-        state.error = err instanceof Error ? err.message : String(err);
+        state.error = redactString(err instanceof Error ? err.message : String(err));
       },
       end() {
         if (state.ended) return;

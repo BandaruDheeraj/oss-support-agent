@@ -12,7 +12,7 @@
   {
     "issue_number": 1002,
     "title": "openinference-instrumentation-openai: missing input.value attribute when tools are passed",
-    "body": "Calls that include a `tools=[...]` argument generate spans without the `input.value` attribute set. Without `tools`, `input.value` is populated correctly. The Phoenix UI shows the span as empty, making it impossible to debug tool-call flows. Affects openinference-instrumentation-openai 0.1.21.",
+    "body": "Calls that include a `tools=[...]` argument generate spans without the `input.value` attribute set. Without `tools`, `input.value` is populated correctly. The Arize AX UI shows the span as empty, making it impossible to debug tool-call flows. Affects openinference-instrumentation-openai 0.1.21.",
     "expected_issue_type": "bug_fix",
     "expected_module": "python/instrumentation/openinference-instrumentation-openai",
     "expected_design_needed": false,
@@ -32,7 +32,7 @@
   {
     "issue_number": 1004,
     "title": "JS openinference-instrumentation-langchain: child spans not nested when using RunnableSequence",
-    "body": "In Node 20 with @langchain/core 0.2.x and @arizeai/openinference-instrumentation-langchain 1.0.4, child spans emitted inside a RunnableSequence appear as siblings of the parent rather than children in Phoenix. The OTel context appears to be lost across the async boundary. Repro repo attached.",
+    "body": "In Node 20 with @langchain/core 0.2.x and @arizeai/openinference-instrumentation-langchain 1.0.4, child spans emitted inside a RunnableSequence appear as siblings of the parent rather than children in Arize AX. The OTel context appears to be lost across the async boundary. Repro repo attached.",
     "expected_issue_type": "bug_fix",
     "expected_module": "js/packages/openinference-instrumentation-langchain",
     "expected_design_needed": false,
@@ -62,7 +62,7 @@
   {
     "issue_number": 1007,
     "title": "Semantic conventions: clarify `input.value` vs `llm.input_messages` precedence",
-    "body": "The current spec is ambiguous about which attribute Phoenix should prefer when both `input.value` (string) and `llm.input_messages` (structured) are present on the same LLM span. Different instrumentations populate one, the other, or both, which makes the UI rendering inconsistent. Could the spec define a precedence rule and a `mime_type` expectation?",
+    "body": "The current spec is ambiguous about which attribute Arize AX should prefer when both `input.value` (string) and `llm.input_messages` (structured) are present on the same LLM span. Different instrumentations populate one, the other, or both, which makes the UI rendering inconsistent. Could the spec define a precedence rule and a `mime_type` expectation?",
     "expected_issue_type": "new_feature",
     "expected_module": "python/openinference-semantic-conventions",
     "expected_design_needed": true,
@@ -72,7 +72,7 @@
   {
     "issue_number": 1008,
     "title": "Add OpenInference instrumentation for Cohere",
-    "body": "We'd like to use Phoenix to trace Cohere Generate, Embed, and Rerank calls. Today the only path is generic Python OTel which doesn't tag the spans with OpenInference conventions. A dedicated `openinference-instrumentation-cohere` package (matching the structure of -anthropic / -openai) would unblock us.",
+    "body": "We'd like to use Arize AX to trace Cohere Generate, Embed, and Rerank calls. Today the only path is generic Python OTel which doesn't tag the spans with OpenInference conventions. A dedicated `openinference-instrumentation-cohere` package (matching the structure of -anthropic / -openai) would unblock us.",
     "expected_issue_type": "new_feature",
     "expected_module": "python/instrumentation",
     "expected_design_needed": true,
@@ -92,7 +92,7 @@
   {
     "issue_number": 1010,
     "title": "Support OpenInference tracing for Vercel AI SDK (JS)",
-    "body": "The Vercel AI SDK (`ai` package v4) is the de facto JS LLM SDK in many React/Next.js apps. A `@arizeai/openinference-instrumentation-vercel-ai-sdk` package would let those apps light up in Phoenix without rewriting their LLM call sites.",
+    "body": "The Vercel AI SDK (`ai` package v4) is the de facto JS LLM SDK in many React/Next.js apps. A `@arizeai/openinference-instrumentation-vercel-ai-sdk` package would let those apps light up in Arize AX without rewriting their LLM call sites.",
     "expected_issue_type": "new_feature",
     "expected_module": "js/packages",
     "expected_design_needed": true,
@@ -122,7 +122,7 @@
   {
     "issue_number": 1013,
     "title": "Span attributes not showing up",
-    "body": "I'm setting span attributes manually but they don't show up in Phoenix. Using Python.",
+    "body": "I'm setting span attributes manually but they don't show up in Arize AX. Using Python.",
     "expected_issue_type": "bug_fix",
     "expected_module": ".",
     "expected_design_needed": false,
@@ -132,7 +132,7 @@
   {
     "issue_number": 1014,
     "title": "Token counts are wrong",
-    "body": "Token counts in Phoenix don't match what my provider's dashboard shows. Off by ~5%. Could be any provider — I use a few.",
+    "body": "Token counts in Arize AX don't match what my provider's dashboard shows. Off by ~5%. Could be any provider — I use a few.",
     "expected_issue_type": "bug_fix",
     "expected_module": ".",
     "expected_design_needed": false,
@@ -181,7 +181,7 @@
   },
   {
     "issue_number": 1019,
-    "title": "How do I use Phoenix with my self-hosted LLM?",
+    "title": "How do I use Arize AX with my self-hosted LLM?",
     "body": "I have an in-house Llama-3 70B fine-tune served via vLLM behind a custom OpenAI-compatible endpoint. Will openinference-instrumentation-openai work if I point the OpenAI client at the custom base_url? Or do I need a different instrumentation? Couldn't find this in the docs.",
     "expected_issue_type": "bug_fix",
     "expected_module": ".",

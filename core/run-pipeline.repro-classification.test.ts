@@ -1,9 +1,12 @@
 import {
   buildApiUnavailableRunDiagnostics,
+  buildGitHubBlobUrl,
   buildNotReproducedRunDiagnostics,
+  buildReproMethodNoteFromV2,
   buildSandboxFailedRunDiagnostics,
   classifyAlreadyFixedOnMain,
   classifyNotReproducedAsApiUnavailable,
+  evaluatePrReproSafety,
   ReproStageTimeoutError,
   resolveReproStageTimeoutMs,
   runReproPipelineWithTimeout,
@@ -566,5 +569,115 @@ describe('resolveReproStageTimeoutMs', () => {
 
   test('returns configured timeout from env', () => {
     expect(resolveReproStageTimeoutMs({ OSA_REPRO_STAGE_TIMEOUT_MS: '45000' })).toBe(45_000);
+  });
+});
+
+describe('evaluatePrReproSafety', () => {
+  test('allows bug-fix PR creation only with verified repro evidence', () => {
+    expect(
+      evaluatePrReproSafety({
+        bugFixPath: true,
+        fixOnlyMode: false,
+        fixOnlyAllowPr: false,
+        reproPassed: true,
+        reproPRSection: '## Reproduction Verification',
+      })
+    ).toEqual({ ok: true });
+  });
+
+  test('blocks bug-fix PR creation when repro did not pass', () => {
+    expect(
+      evaluatePrReproSafety({
+        bugFixPath: true,
+        fixOnlyMode: false,
+        fixOnlyAllowPr: false,
+        reproPassed: false,
+        reproPRSection: null,
+      })
+    ).toEqual({
+      ok: false,
+      reason: 'verified repro evidence missing before PR creation',
+    });
+  });
+
+  test('blocks fix-only PR creation unless explicitly allowed', () => {
+    expect(
+      evaluatePrReproSafety({
+        bugFixPath: true,
+        fixOnlyMode: true,
+        fixOnlyAllowPr: false,
+        reproPassed: true,
+        reproPRSection: '## Reproduction Verification',
+      })
+    ).toEqual({
+      ok: false,
+      reason:
+        'OSA_FIX_ONLY=1 skipped repro verification; refusing to open a PR without OSA_FIX_ONLY_ALLOW_PR=1',
+    });
+  });
+
+  test('does not require repro evidence for docs or feature paths', () => {
+    expect(
+      evaluatePrReproSafety({
+        bugFixPath: false,
+        fixOnlyMode: false,
+        fixOnlyAllowPr: false,
+        reproPassed: null,
+        reproPRSection: null,
+      })
+    ).toEqual({ ok: true });
+  });
+});
+
+describe('buildReproMethodNoteFromV2', () => {
+  test('explains synthetic gateway repros', () => {
+    const note = buildReproMethodNoteFromV2({
+      dossier: new DossierStore(),
+      recipe: {
+        approach:
+          'Synthetic unit test simulates the PAIG gateway streaming chunks because direct APIs do not reproduce the dropped cached token field.',
+        verbatimSnippetIncompatible: true,
+      },
+      plan: {
+        approach: 'fallback',
+      },
+    } as any);
+
+    expect(note).toContain('targeted synthetic/unit repro');
+    expect(note).toContain('PAIG gateway');
+    expect(note).toContain('direct APIs do not reproduce');
+  });
+
+  test('omits note for normal live repros', () => {
+    const note = buildReproMethodNoteFromV2({
+      dossier: new DossierStore(),
+      recipe: {
+        approach: 'reproFiles:issue_snippet',
+        verbatimSnippetIncompatible: false,
+      },
+      plan: {
+        approach: 'reproFiles:issue_snippet',
+      },
+    } as any);
+
+    expect(note).toBeNull();
+  });
+});
+
+describe('buildGitHubBlobUrl', () => {
+  test('links directly to a generated repro file on a branch', () => {
+    expect(
+      buildGitHubBlobUrl(
+        'BandaruDheeraj/pydantic-ai',
+        'fix/google stream cache',
+        '/tests/models/test_google.py'
+      )
+    ).toBe(
+      'https://github.com/BandaruDheeraj/pydantic-ai/blob/fix/google%20stream%20cache/tests/models/test_google.py'
+    );
+  });
+
+  test('returns null without a file path', () => {
+    expect(buildGitHubBlobUrl('owner/repo', 'branch', null)).toBeNull();
   });
 });

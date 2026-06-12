@@ -155,6 +155,7 @@ export type PipelineResult =
 
 const DEFAULT_REPRO_STAGE_TIMEOUT_MS = 60 * 60 * 1000; // 60 min; analyst alone takes 15-20 min
 const REPRO_STAGE_TIMEOUT_MS_ENV = 'OSA_REPRO_STAGE_TIMEOUT_MS';
+const FIX_ONLY_ALLOW_PR_ENV = 'OSA_FIX_ONLY_ALLOW_PR';
 
 export class ReproStageTimeoutError extends Error {
   readonly timeoutMs: number;
@@ -174,6 +175,71 @@ export function resolveReproStageTimeoutMs(env: NodeJS.ProcessEnv = process.env)
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_REPRO_STAGE_TIMEOUT_MS;
   return Math.floor(parsed);
+}
+
+export function evaluatePrReproSafety(args: {
+  bugFixPath: boolean;
+  fixOnlyMode: boolean;
+  fixOnlyAllowPr: boolean;
+  reproPassed: boolean | null;
+  reproPRSection: string | null;
+}): { ok: true } | { ok: false; reason: string } {
+  if (!args.bugFixPath) return { ok: true };
+  if (args.fixOnlyMode && !args.fixOnlyAllowPr) {
+    return {
+      ok: false,
+      reason:
+        `OSA_FIX_ONLY=1 skipped repro verification; refusing to open a PR without ${FIX_ONLY_ALLOW_PR_ENV}=1`,
+    };
+  }
+  if (args.reproPassed !== true || !args.reproPRSection) {
+    return {
+      ok: false,
+      reason: 'verified repro evidence missing before PR creation',
+    };
+  }
+  return { ok: true };
+}
+
+export function buildReproMethodNoteFromV2(v2: ReproV2Outcome | null | undefined): string | null {
+  const recipe = v2?.recipe;
+  const approach = (recipe?.approach || v2?.plan?.approach || '').trim();
+  const verbatimIncompatible = recipe?.verbatimSnippetIncompatible === true;
+  const syntheticSignal =
+    /\b(synthetic|mock(?:ed)?|simulate(?:d|s|ion)?|gateway|external service|live api|direct api|vcr|unit test)\b/i.test(
+      approach
+    );
+
+  if (!verbatimIncompatible && !syntheticSignal) return null;
+
+  const reason =
+    approach ||
+    v2?.dossier.latest()?.body.summary ||
+    'the original/live issue path was not runnable in the sandbox';
+
+  return (
+    'The original/live reproduction path was not used as the primary proof. ' +
+    'The agent used a targeted synthetic/unit repro instead. Reason: ' +
+    reason
+  );
+}
+
+export function buildGitHubBlobUrl(
+  repoFullName: string,
+  branchName: string,
+  filePath: string | null | undefined
+): string | null {
+  const normalizedPath = filePath?.replace(/^\/+/, '').trim();
+  if (!repoFullName || !branchName || !normalizedPath) return null;
+  const branch = branchName
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/');
+  const pathSegments = normalizedPath
+    .split('/')
+    .map((part) => encodeURIComponent(part))
+    .join('/');
+  return `https://github.com/${repoFullName}/blob/${branch}/${pathSegments}`;
 }
 
 export async function runReproPipelineWithTimeout(args: {
@@ -1549,10 +1615,12 @@ async function gatherFixDiff(workspaceDir: string, log: (msg: string) => void, b
 async function sendPrePrNotificationEmail(args: {
   issueUrl: string;
   branchUrl: string;
+  reproMethodNote?: string | null;
+  reproTestUrl?: string | null;
   log: (msg: string) => void;
   live: import('./clients/live-deps').LiveDeps | null | undefined;
 }): Promise<void> {
-  const { issueUrl, branchUrl, log, live } = args;
+  const { issueUrl, branchUrl, reproMethodNote, reproTestUrl, log, live } = args;
   if (!live || !live.sendMail) {
     log('[pre-pr-review] mail not configured, skipping review gate');
     return;
@@ -1561,7 +1629,10 @@ async function sendPrePrNotificationEmail(args: {
   const body = [
     'Branch ready for upstream PR: ' + branchUrl,
     '',
-    'The repro test fails on the buggy code and passes after the fix.',
+    reproMethodNote
+      ? 'The repro is a targeted synthetic/unit repro. ' + reproMethodNote
+      : 'The repro test fails on the buggy code and passes after the fix.',
+    reproTestUrl ? 'Repro test: ' + reproTestUrl : '',
     'Review the branch diff before replying.',
     '',
     'NOTE: If this is your first PR to this repo, you will need to sign the CLA.',
@@ -1611,6 +1682,8 @@ async function sendPrePrReviewEmail(args: {
   sandbox2ExitCode: number | null;
   sandbox2Output: string;
   changedFiles: string[];
+  reproMethodNote?: string | null;
+  reproTestUrl?: string | null;
   forkFullName: string;
   branchName: string;
   pmEmail: string;
@@ -1632,6 +1705,8 @@ async function sendPrePrReviewEmail(args: {
     sandbox2ExitCode,
     sandbox2Output,
     changedFiles,
+    reproMethodNote,
+    reproTestUrl,
     forkFullName,
     branchName,
     pmEmail,
@@ -1653,10 +1728,11 @@ async function sendPrePrReviewEmail(args: {
   const reproSection = reproTestPath
     ? [
         `**Repro test path:** \`${reproTestPath}\``,
+        reproTestUrl ? `**Repro test link:** [${reproTestPath}](${reproTestUrl})` : '',
         reproTestContent
           ? `\`\`\`python\n${reproTestContent.slice(0, 3_000)}${reproTestContent.length > 3_000 ? '\n... (truncated)' : ''}\n\`\`\``
           : '(content unavailable)',
-      ].join('\n')
+      ].filter(Boolean).join('\n')
     : '(repro test path not available)';
 
   const run1Section = [
@@ -1679,6 +1755,10 @@ async function sendPrePrReviewEmail(args: {
       ? `**Changed files:**\n${changedFiles.map((f) => `- \`${f}\``).join('\n')}`
       : '**Changed files:** (none recorded)';
 
+  const reproMethodSection = reproMethodNote
+    ? ['### Repro Method', reproMethodNote, '']
+    : [];
+
   const claNote = `> **Note:** If this is the first PR from this agent to \`${repoFullName}\`, please check whether the upstream repo requires a CLA signature before merging. The agent will open the PR as a draft.`;
 
   const branchUrl = `https://github.com/${forkFullName}/tree/${branchName}`;
@@ -1693,6 +1773,7 @@ async function sendPrePrReviewEmail(args: {
     ``,
     `---`,
     ``,
+    ...reproMethodSection,
     `### Repro Test`,
     reproSection,
     ``,
@@ -2277,6 +2358,7 @@ export async function runPipeline(args: {
   let usabilitySection = '';
   let usabilityLabels: string[] = [];
   let reproPRSection: string | null = null;
+  let reproTestUrl: string | null = null;
   let agentInvestigationSection: string | null = null;
   let v2ReproOutcomeForEmail: ReproPipelineOutcome | null = null;
   let v2FixOutcomeForEmail: import('../core/agents/run-v2').FixPipelineOutcome | null = null;
@@ -3007,7 +3089,8 @@ export async function runPipeline(args: {
     await workspace.push();
     log("[v2-repro] committed and pushed " + reproPath);
 
-    reproPRSection = buildReproPRSectionFromV2(reproOutcome.v2);
+    reproTestUrl = buildGitHubBlobUrl(fork.forkFullName, fork.branchName, reproPath);
+    reproPRSection = buildReproPRSectionFromV2(reproOutcome.v2, { reproTestUrl });
 
     // Capture branch SHA AFTER the repro commit \u2014 the fix pipeline runs on
     // top of this baseline.
@@ -3071,6 +3154,8 @@ export async function runPipeline(args: {
             changedFiles: fixOutcome.changedFiles,
             diff: fixDiff,
             reproTestPath: reproPath,
+            reproTestUrl,
+            reproMethodNote: buildReproMethodNoteFromV2(reproOutcome.v2),
             dossier: fixDossier,
           }),
           notifier: deps.live.failureNotifier,
@@ -3229,6 +3314,18 @@ export async function runPipeline(args: {
     }
   }
 
+  const prReproSafety = evaluatePrReproSafety({
+    bugFixPath: routing.action !== 'route_docs' && routing.result.issueType !== 'new_feature',
+    fixOnlyMode: process.env.OSA_FIX_ONLY === '1',
+    fixOnlyAllowPr: process.env[FIX_ONLY_ALLOW_PR_ENV] === '1',
+    reproPassed,
+    reproPRSection,
+  });
+  if (!prReproSafety.ok) {
+    log(`[pr/safety] blocked PR creation: ${prReproSafety.reason}`);
+    return finish({ status: 'repro-not-runnable', reason: prReproSafety.reason });
+  }
+
   // ---------- Draft PR ----------
   const prMeta = await adapter.getPRMetadata(
     confirmedIssues.map((i) => ({
@@ -3264,6 +3361,8 @@ export async function runPipeline(args: {
     ...(prMeta.extraBodySections ?? []),
   ].join('\n');
 
+  const reproMethodNote = buildReproMethodNoteFromV2(v2ReproOutcomeForEmail?.v2);
+
   // ---------- Pre-PR notification (simple, no gate) ----------
   // Send a lightweight notification email via live.sendMail so the operator is
   // aware the agent is about to open a PR. This runs unconditionally when mail
@@ -3271,6 +3370,8 @@ export async function runPipeline(args: {
   await sendPrePrNotificationEmail({
     issueUrl: 'https://github.com/' + repoFullName + '/issues/' + issueNumber,
     branchUrl: 'https://github.com/' + fork.forkFullName + '/tree/' + fork.branchName,
+    reproMethodNote,
+    reproTestUrl,
     log,
     live: deps.live || null,
   });
@@ -3325,6 +3426,8 @@ export async function runPipeline(args: {
       sandbox2ExitCode: sb2ExitCode,
       sandbox2Output: sb2Output,
       changedFiles: v2FixOutcomeForEmail?.changedFiles ?? [],
+      reproMethodNote,
+      reproTestUrl,
       forkFullName: fork.forkFullName,
       branchName: fork.branchName,
       pmEmail: manifest.pm_email,
@@ -3405,6 +3508,9 @@ export async function runPipeline(args: {
         diffSummary: evalSummary,
         changedFiles: fxo.changedFiles,
         failureSnippet: v2ReproOutcomeForEmail?.v2.criticVerdict?.reason,
+        reproTestPath: v2ReproOutcomeForEmail?.candidateTestPath,
+        reproTestUrl,
+        reproMethodNote,
         dossier: fixDossier ?? reproDossier,
       }),
       notifier: deps.live.failureNotifier,
@@ -3463,10 +3569,14 @@ export { formatDesignBriefEmail, summarizeAgreedDesign, detectApproval };
  * ReproV2Outcome. Renders plan info, critic verdict, and the latest analyst
  * dossier summary.
  */
-function buildReproPRSectionFromV2(v2: ReproV2Outcome): string {
+function buildReproPRSectionFromV2(
+  v2: ReproV2Outcome,
+  opts: { reproTestUrl?: string | null } = {}
+): string {
   const plan = v2.plan;
   const verdict = v2.criticVerdict;
   const dossierLatest = v2.dossier.latest();
+  const reproMethodNote = buildReproMethodNoteFromV2(v2);
   const lines: string[] = ['## Reproduction Verification'];
   if (plan) {
     lines.push(
@@ -3474,8 +3584,14 @@ function buildReproPRSectionFromV2(v2: ReproV2Outcome): string {
     );
     lines.push('');
     lines.push(`- **Path**: \`${plan.candidateTestPath}\``);
+    if (opts.reproTestUrl) {
+      lines.push(`- **Repro test link**: [${plan.candidateTestPath}](${opts.reproTestUrl})`);
+    }
     lines.push(`- **Sentinel**: \`${plan.sentinelString}\``);
     lines.push(`- **Approach**: ${plan.approach}`);
+    if (reproMethodNote) {
+      lines.push(`- **Repro method**: ${reproMethodNote}`);
+    }
   }
   if (verdict) {
     lines.push(`- **Critic verdict**: ${verdict.verdict} — ${verdict.reason}`);

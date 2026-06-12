@@ -35,6 +35,18 @@ services:
       - key: HARNESS_WORKFLOW_REF
         value: main
 
+      # Observability — production traces go only to the Arize AX project.
+      - key: OBSERVABILITY_BACKEND
+        value: arize
+      - key: ARIZE_ENDPOINT
+        value: https://otlp.arize.com/v1/traces
+      - key: ARIZE_PROJECT_NAME
+        value: oss-fix-loop
+      - key: ARIZE_API_KEY
+        sync: false
+      - key: ARIZE_SPACE_ID
+        sync: false
+
       # Required — set these in the Render dashboard (mark as secret)
       - key: GITHUB_TOKEN
         sync: false

@@ -70,6 +70,9 @@ export function buildSuccessContext(args: {
   changedFiles?: string[];
   testsRunOutside?: string[];
   failureSnippet?: string;
+  reproTestPath?: string;
+  reproTestUrl?: string | null;
+  reproMethodNote?: string | null;
   dossier?: DossierSnapshot | null;
 }): EmailContext {
   return {
@@ -87,7 +90,7 @@ export function buildSuccessContext(args: {
     replyTo: args.recipient,
     expectedActions: ['review PR', 'merge or request changes'],
     links: {
-      phoenix: null,
+      arize: null,
       braintrust: null,
       pr: args.prUrl,
       issue: args.issueUrl,
@@ -99,6 +102,9 @@ export function buildSuccessContext(args: {
       changedFiles: args.changedFiles,
       testsRunOutside: args.testsRunOutside,
       failureSnippet: args.failureSnippet,
+      reproTestPath: args.reproTestPath,
+      reproTestUrl: args.reproTestUrl ?? undefined,
+      reproMethodNote: args.reproMethodNote ?? undefined,
     },
   };
 }
@@ -121,6 +127,8 @@ export function buildFixReadyContext(args: {
   changedFiles?: string[];
   diff?: string;
   reproTestPath?: string;
+  reproTestUrl?: string | null;
+  reproMethodNote?: string | null;
   dossier?: DossierSnapshot | null;
 }): EmailContext {
   return {
@@ -138,7 +146,7 @@ export function buildFixReadyContext(args: {
     replyTo: args.recipient,
     expectedActions: ['review diff on branch', 'merge or request changes'],
     links: {
-      phoenix: null,
+      arize: null,
       braintrust: null,
       pr: null,
       issue: args.issueUrl,
@@ -151,6 +159,8 @@ export function buildFixReadyContext(args: {
       branchUrl: args.branchUrl,
       commitSha: args.commitSha,
       reproTestPath: args.reproTestPath,
+      reproTestUrl: args.reproTestUrl ?? undefined,
+      reproMethodNote: args.reproMethodNote ?? undefined,
     },
   };
 }
@@ -191,7 +201,7 @@ export function buildHaltContext(args: {
     replyTo: args.recipient,
     expectedActions: ['reply with guidance'],
     links: {
-      phoenix: null,
+      arize: null,
       braintrust: null,
       pr: args.prUrl ?? null,
       issue: args.issueUrl,

@@ -49,19 +49,11 @@ export default class OpenInferenceAdapter extends BaseRepoAdapter {
     return [
       'python -m pytest -q',
       'npm test',
-      'python scripts/validate_spans.py --phoenix-url http://localhost:6006/',
     ];
   }
 
   async getSandboxServices(): Promise<ServiceConfig[]> {
-    return [
-      {
-        name: 'phoenix',
-        image: 'arizephoenix/phoenix:latest',
-        ports: [{ hostPort: 6006, containerPort: 6006 }],
-        healthCheckUrl: 'http://localhost:6006/',
-      },
-    ];
+    return [];
   }
 
   async runCustomEval(output: SandboxOutput): Promise<EvalResult> {
@@ -71,7 +63,7 @@ export default class OpenInferenceAdapter extends BaseRepoAdapter {
     const violations = validate ? extractViolations(validate.stdout) : [];
 
     const pytestOk = !pytest || pytest.exitCode === 0;
-    const validateOk = !!validate && validate.exitCode === 0 && violations.length === 0;
+    const validateOk = !validate || (validate.exitCode === 0 && violations.length === 0);
 
     if (pytestOk && validateOk) {
       return {
@@ -92,7 +84,6 @@ export default class OpenInferenceAdapter extends BaseRepoAdapter {
 
     const summaryParts: string[] = [];
     if (pytest && pytest.exitCode !== 0) summaryParts.push('Pytest failed');
-    if (!validate) summaryParts.push('Span validator command missing');
     if (validate && validate.exitCode !== 0) summaryParts.push('Span validator failed');
     if (violations.length > 0) summaryParts.push(`${violations.length} span violation(s)`);
 

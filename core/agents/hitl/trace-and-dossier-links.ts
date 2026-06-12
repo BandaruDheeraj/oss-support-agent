@@ -1,7 +1,7 @@
 /**
  * Helpers that build:
  *   - dossier markdown render (for email bodies)
- *   - Phoenix / Braintrust deep-trace links from a trace id
+ *   - Arize AX / Braintrust deep-trace links from a trace id
  *   - Reply-To plus-addressed nonce extraction
  */
 
@@ -35,10 +35,11 @@ export function renderDossierMarkdown(snapshot: DossierSnapshot, notes?: Investi
   return lines.join('\n');
 }
 
-export function phoenixTraceUrl(traceId: string): string | null {
-  const base = process.env.PHOENIX_UI_BASE_URL;
+export function arizeTraceUrl(traceId: string): string | null {
+  const base = process.env.ARIZE_UI_BASE_URL;
   if (!base || !traceId) return null;
-  return `${base.replace(/\/+$/, '')}/projects/default/traces/${traceId}`;
+  const joiner = base.includes('?') ? '&' : '?';
+  return `${base.replace(/\/+$/, '')}${joiner}selectedTrace=${encodeURIComponent(traceId)}`;
 }
 
 export function braintrustTraceUrl(traceId: string): string | null {

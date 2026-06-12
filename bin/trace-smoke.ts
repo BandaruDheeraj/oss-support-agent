@@ -5,14 +5,12 @@
  */
 
 import 'dotenv/config';
-import { initTracing } from '../core/observability/tracing';
 import { runTraceSmoke } from '../core/observability/trace-smoke-test';
 
 async function main(): Promise<number> {
-  initTracing();
   const r = await runTraceSmoke();
   console.log(JSON.stringify(r, null, 2));
-  if (!r.agentSpanEmitted || !r.toolSpanEmitted || !r.flushedOk || r.errors.length > 0) return 1;
+  if (!r.allKindSpansEmitted || !r.flushedOk || r.errors.length > 0) return 1;
   return 0;
 }
 

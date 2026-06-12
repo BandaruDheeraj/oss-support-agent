@@ -60,7 +60,7 @@ export class ChatClient {
 
     const tracer = getTracer();
     const span = tracer.startSpan('llm.chat', {
-      kind: 'llm',
+      kind: 'LLM',
       parent: currentSpan(),
       attributes: {
         'llm.temperature': temperature,

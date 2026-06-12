@@ -1,13 +1,13 @@
 /**
- * Arize / Phoenix adapter — OpenTelemetry-based.
+ * Arize AX adapter — OpenTelemetry-based.
  *
- * We use the OTLP/HTTP exporter to send OpenInference-conformant spans to
- * either:
- *   - Arize Cloud (set ARIZE_ENDPOINT + ARIZE_API_KEY + ARIZE_SPACE_ID)
- *   - Self-hosted / Phoenix Cloud (set ARIZE_ENDPOINT alone, or rely on PHOENIX_OTLP_ENDPOINT)
+ * We use the OTLP/HTTP exporter to send OpenInference-conformant spans to an
+ * Arize AX tracing project. The project route is controlled by
+ * ARIZE_PROJECT_NAME and is encoded as the OpenInference project resource
+ * attribute expected by AX.
  *
  * This adapter is intentionally independent of the existing
- * core/observability/tracing.ts dual-export init: that module is still used by
+ * core/observability/tracing.ts global OTel init: that module is still used by
  * call-sites that need the global OTel Tracer (withAgentSpan/withToolSpan). The
  * adapter manages its own provider so getTracer('arize') works even when
  * initTracing() was never called.
@@ -20,7 +20,13 @@ import { BasicTracerProvider, BatchSpanProcessor } from '@opentelemetry/sdk-trac
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
+import { SEMRESATTRS_PROJECT_NAME } from '@arizeai/openinference-semantic-conventions';
 import type { Span, StartSpanOpts, Tracer } from './tracer';
+import {
+  OPENINFERENCE_SPAN_KIND_ATTRIBUTE,
+  normalizeOpenInferenceSpanKind,
+  withOpenInferenceSpanKind,
+} from './tracer';
 import {
   deliverWithRetryAndSpool,
   markAdapterEnabled,
@@ -28,47 +34,37 @@ import {
   recordAdapterSent,
 } from './adapter-health';
 import { redactIo } from './io-redact';
+import { redactString } from './redact';
 
-function parseHeaders(raw: string | undefined): Record<string, string> {
-  if (!raw) return {};
-  const out: Record<string, string> = {};
-  for (const pair of raw.split(',')) {
-    const idx = pair.indexOf('=');
-    if (idx < 0) continue;
-    const k = pair.slice(0, idx).trim();
-    const v = pair.slice(idx + 1).trim();
-    if (k && v) out[k] = v;
-  }
-  return out;
+const DEFAULT_ARIZE_AX_ENDPOINT = 'https://otlp.arize.com/v1/traces';
+
+function normalizeTraceEndpoint(raw: string | undefined): string {
+  const endpoint = (raw ?? DEFAULT_ARIZE_AX_ENDPOINT).trim().replace(/\/+$/, '');
+  if (endpoint.endsWith('/v1/traces')) return endpoint;
+  if (endpoint.endsWith('/v1')) return `${endpoint}/traces`;
+  return `${endpoint}/v1/traces`;
 }
 
-function resolveEndpointAndHeaders(): { endpoint: string | null; headers: Record<string, string> } {
-  const endpoint =
-    process.env.ARIZE_ENDPOINT ||
-    process.env.PHOENIX_OTLP_ENDPOINT ||
-    null;
-  const headers = parseHeaders(process.env.PHOENIX_OTLP_HEADERS);
-  if (process.env.ARIZE_API_KEY) headers['api_key'] = process.env.ARIZE_API_KEY;
-  if (process.env.ARIZE_SPACE_ID) headers['space_id'] = process.env.ARIZE_SPACE_ID;
-  // model_id routes spans to the correct Arize AX project (required for Arize Cloud)
-  const modelId = process.env.ARIZE_MODEL_ID || process.env.OTEL_SERVICE_NAME;
-  if (modelId) headers['model_id'] = modelId;
-  return { endpoint, headers };
+function requiredEnv(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`OBSERVABILITY_BACKEND=arize requires ${name}.`);
+  return value;
 }
 
-function openinferenceKind(kind: StartSpanOpts['kind']): string {
-  switch (kind) {
-    case 'llm':
-      return 'LLM';
-    case 'tool':
-      return 'TOOL';
-    case 'evaluator':
-      return 'EVALUATOR';
-    case 'phase':
-      return 'CHAIN';
-    default:
-      return 'CHAIN';
-  }
+function resolveArizeConfig(): {
+  endpoint: string;
+  headers: Record<string, string>;
+  projectName: string;
+} {
+  const endpoint = normalizeTraceEndpoint(process.env.ARIZE_ENDPOINT);
+  return {
+    endpoint,
+    headers: {
+      'arize-space-id': requiredEnv('ARIZE_SPACE_ID'),
+      'arize-api-key': requiredEnv('ARIZE_API_KEY'),
+    },
+    projectName: requiredEnv('ARIZE_PROJECT_NAME'),
+  };
 }
 
 const otelSpanSymbol = Symbol('arize.otel.span');
@@ -80,12 +76,7 @@ export class ArizeTracer implements Tracer {
 
   constructor() {
     try {
-      const { endpoint, headers } = resolveEndpointAndHeaders();
-      if (!endpoint) {
-        throw new Error(
-          'OBSERVABILITY_BACKEND=arize requires ARIZE_ENDPOINT (or PHOENIX_OTLP_ENDPOINT).'
-        );
-      }
+      const { endpoint, headers, projectName } = resolveArizeConfig();
       const exporter = new OTLPTraceExporter({ url: endpoint, headers });
       this.provider = new BasicTracerProvider({
         resource: new Resource({
@@ -93,6 +84,7 @@ export class ArizeTracer implements Tracer {
             process.env.OTEL_SERVICE_NAME || 'oss-support-agent',
           [SemanticResourceAttributes.SERVICE_VERSION]:
             process.env.npm_package_version || '0.1.0',
+          [SEMRESATTRS_PROJECT_NAME]: projectName,
         }),
         spanProcessors: [new BatchSpanProcessor(exporter)] as any,
       } as any);
@@ -119,12 +111,14 @@ export class ArizeTracer implements Tracer {
       parentCtx = trace.setSpan(otelContext(), parentOtel);
     }
 
+    const openInferenceKind = normalizeOpenInferenceSpanKind(opts.kind, opts.attributes);
+    const attributes = withOpenInferenceSpanKind(opts.attributes, openInferenceKind);
     const otelSpan = this.otelTracer.startSpan(
       name,
-      { kind: OtelSpanKind.INTERNAL, attributes: stringifyAttrs(opts.attributes) },
+      { kind: OtelSpanKind.INTERNAL, attributes: stringifyAttrs(attributes) },
       parentCtx
     );
-    otelSpan.setAttribute('openinference.span.kind', openinferenceKind(opts.kind));
+    otelSpan.setAttribute(OPENINFERENCE_SPAN_KIND_ATTRIBUTE, openInferenceKind);
 
     const wrapped: Span & { [otelSpanSymbol]: OtelSpan } = {
       [otelSpanSymbol]: otelSpan,
@@ -144,9 +138,9 @@ export class ArizeTracer implements Tracer {
         otelSpan.setAttribute('output.mime_type', 'application/json');
       },
       recordError(err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = redactString(err instanceof Error ? err.message : String(err));
         otelSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
-        otelSpan.recordException(err instanceof Error ? err : new Error(msg));
+        otelSpan.recordException(new Error(msg));
       },
       end() {
         otelSpan.end();

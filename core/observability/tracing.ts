@@ -1,5 +1,5 @@
 /**
- * OTEL tracing with dual export to Phoenix + Braintrust.
+ * OTEL tracing for the selected observability backend.
  */
 
 import { NodeSDK } from '@opentelemetry/sdk-node';
@@ -8,39 +8,53 @@ import { BatchSpanProcessor, type SpanProcessor } from '@opentelemetry/sdk-trace
 import { Resource } from '@opentelemetry/resources';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
 import { trace, type Tracer } from '@opentelemetry/api';
+import { SEMRESATTRS_PROJECT_NAME } from '@arizeai/openinference-semantic-conventions';
 
 let sdk: NodeSDK | null = null;
 let started = false;
 let shutdownHooked = false;
 
-function parseHeaders(raw: string | undefined): Record<string, string> {
-  if (!raw) return {};
-  const result: Record<string, string> = {};
-  for (const pair of raw.split(',')) {
-    const idx = pair.indexOf('=');
-    if (idx < 0) continue;
-    const k = pair.slice(0, idx).trim();
-    const v = pair.slice(idx + 1).trim();
-    if (k && v) result[k] = v;
-  }
-  return result;
+const DEFAULT_ARIZE_AX_ENDPOINT = 'https://otlp.arize.com/v1/traces';
+
+function backendEnabled(name: 'arize' | 'braintrust'): boolean {
+  const backend = (process.env.OBSERVABILITY_BACKEND ?? 'none').trim().toLowerCase();
+  return backend === name || backend === 'all';
+}
+
+function normalizeTraceEndpoint(raw: string | undefined): string {
+  const endpoint = (raw ?? DEFAULT_ARIZE_AX_ENDPOINT).trim().replace(/\/+$/, '');
+  if (endpoint.endsWith('/v1/traces')) return endpoint;
+  if (endpoint.endsWith('/v1')) return `${endpoint}/traces`;
+  return `${endpoint}/v1/traces`;
 }
 
 function makeProcessors(): SpanProcessor[] {
   const processors: SpanProcessor[] = [];
 
-  if (process.env.PHOENIX_OTLP_ENDPOINT) {
+  if (
+    backendEnabled('arize') &&
+    process.env.ARIZE_API_KEY &&
+    process.env.ARIZE_SPACE_ID &&
+    process.env.ARIZE_PROJECT_NAME
+  ) {
     processors.push(
       new BatchSpanProcessor(
         new OTLPTraceExporter({
-          url: process.env.PHOENIX_OTLP_ENDPOINT,
-          headers: parseHeaders(process.env.PHOENIX_OTLP_HEADERS),
+          url: normalizeTraceEndpoint(process.env.ARIZE_ENDPOINT),
+          headers: {
+            'arize-space-id': process.env.ARIZE_SPACE_ID,
+            'arize-api-key': process.env.ARIZE_API_KEY,
+          },
         })
       )
     );
   }
 
-  if (process.env.BRAINTRUST_OTLP_ENDPOINT && process.env.BRAINTRUST_API_KEY) {
+  if (
+    backendEnabled('braintrust') &&
+    process.env.BRAINTRUST_OTLP_ENDPOINT &&
+    process.env.BRAINTRUST_API_KEY
+  ) {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${process.env.BRAINTRUST_API_KEY}`,
     };
@@ -73,6 +87,8 @@ export async function initTracing(): Promise<void> {
       [SemanticResourceAttributes.SERVICE_NAME]:
         process.env.OTEL_SERVICE_NAME || 'oss-support-agent',
       [SemanticResourceAttributes.SERVICE_VERSION]: process.env.npm_package_version || '0.1.0',
+      [SEMRESATTRS_PROJECT_NAME]:
+        process.env.ARIZE_PROJECT_NAME || process.env.OTEL_SERVICE_NAME || 'oss-support-agent',
     }),
     spanProcessors: processors as any,
   });
@@ -108,7 +124,12 @@ export function getTracer(name = 'oss-support-agent'): Tracer {
 
 export function tracingConfigured(): boolean {
   return Boolean(
-    process.env.PHOENIX_OTLP_ENDPOINT ||
-      (process.env.BRAINTRUST_OTLP_ENDPOINT && process.env.BRAINTRUST_API_KEY)
+    (backendEnabled('arize') &&
+      process.env.ARIZE_API_KEY &&
+      process.env.ARIZE_SPACE_ID &&
+      process.env.ARIZE_PROJECT_NAME) ||
+      (backendEnabled('braintrust') &&
+        process.env.BRAINTRUST_OTLP_ENDPOINT &&
+        process.env.BRAINTRUST_API_KEY)
   );
 }

@@ -7,7 +7,7 @@ describe('OpenInferenceAdapter (US-111)', () => {
     const output: SandboxOutput = [
       { command: 'python -m pytest -q', exitCode: 0, stdout: 'ok', stderr: '' },
       { command: 'npm test', exitCode: 0, stdout: 'ok', stderr: '' },
-      { command: 'python scripts/validate_spans.py --phoenix-url http://localhost:6006/', exitCode: 0, stdout: '', stderr: '' },
+      { command: 'python scripts/validate_spans.py --arize-url https://otlp.arize.com/v1/traces', exitCode: 0, stdout: '', stderr: '' },
     ];
 
     const res = await adapter.runCustomEval(output);
@@ -19,7 +19,7 @@ describe('OpenInferenceAdapter (US-111)', () => {
     const adapter = new OpenInferenceAdapter();
     const output: SandboxOutput = [
       { command: 'python -m pytest -q', exitCode: 0, stdout: 'ok', stderr: '' },
-      { command: 'python scripts/validate_spans.py --phoenix-url http://localhost:6006/', exitCode: 1, stdout: 'VIOLATION: bad span\nVIOLATION: missing attribute\n', stderr: '' },
+      { command: 'python scripts/validate_spans.py --arize-url https://otlp.arize.com/v1/traces', exitCode: 1, stdout: 'VIOLATION: bad span\nVIOLATION: missing attribute\n', stderr: '' },
     ];
 
     const res = await adapter.runCustomEval(output);

@@ -2,7 +2,7 @@
  * Shared telemetry wrapper for the OSS Fix Loop.
  *
  * Wraps every LLM call so the same trace is fanned out to all registered
- * observability platforms (Arize Phoenix, LangSmith, Braintrust) in parallel.
+ * observability platforms (Arize AX, LangSmith, Braintrust) in parallel.
  *
  * Design goals:
  *   - Non-blocking: a downed platform never affects the agent. Each platform

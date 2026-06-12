@@ -569,7 +569,7 @@ async function runReproFilesPath(
       ],
       requiresCredentials: candidate.requiresCredentials,
       verbatimSnippetIncompatible: false,
-      approach: `reproFiles:${candidate.source}`,
+      approach: buildRecipeApproach(candidate, reproFilesCandidate),
       provenance: {
         exerciseImports: [],
         preconditionsSatisfied: resolvedPreconditionsSatisfied,
@@ -619,6 +619,18 @@ function rej(stage: BuilderRejectStage, reason: string): ReproBuilderResult {
   // eslint-disable-next-line no-console
   console.log(`[v2-builder] reject stage=${stage} reason=${JSON.stringify(reason).slice(0, 240)}`);
   return { ok: false, rejectStage: stage, reason, runs: [] };
+}
+
+function buildRecipeApproach(candidate: CandidateRepro, reproFilesCandidate: ReproFilesCandidate): string {
+  const parts = [
+    `reproFiles:${candidate.source}`,
+    reproFilesCandidate.rationale,
+    candidate.rationale,
+    reproFilesCandidate.fixHypothesis?.description,
+  ]
+    .map((part) => part?.trim())
+    .filter((part): part is string => !!part);
+  return Array.from(new Set(parts)).join(' — ').slice(0, 2000);
 }
 
 function observe(run: SandboxRun): BuilderRunObservation {

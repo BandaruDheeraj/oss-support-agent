@@ -33,7 +33,7 @@ describe('LangSmithTracer', () => {
   it('issues createRun and updateRun with the expected shape for an LLM span', async () => {
     const tracer = new LangSmithTracer();
     const span = tracer.startSpan('llm.test-model', {
-      kind: 'llm',
+      kind: 'LLM',
       attributes: { 'llm.model_name': 'test-model', 'llm.temperature': 0.2 },
     });
     span.setInput({ messages: [{ role: 'user', content: 'hi' }] });
@@ -47,6 +47,7 @@ describe('LangSmithTracer', () => {
     const createArgs = createRunMock.mock.calls[0][0];
     expect(createArgs.name).toBe('llm.test-model');
     expect(createArgs.run_type).toBe('llm');
+    expect(createArgs.extra.metadata['openinference.span.kind']).toBe('LLM');
     expect(createArgs.project_name).toBe('test-proj');
     expect(createArgs.parent_run_id).toBeUndefined();
 
@@ -55,6 +56,7 @@ describe('LangSmithTracer', () => {
     expect(updatedId).toBe(createArgs.id);
     expect((patch.outputs as any).value.content).toBe('hello');
     expect((patch.extra as any).metadata['llm.token_count.prompt']).toBe(10);
+    expect((patch.extra as any).metadata['openinference.span.kind']).toBe('LLM');
 
     expect(awaitPendingMock).toHaveBeenCalled();
   });
@@ -62,7 +64,7 @@ describe('LangSmithTracer', () => {
   it('emits LangSmith feedback entries for evaluator spans', async () => {
     const tracer = new LangSmithTracer();
     const span = tracer.startSpan('evaluator.repro', {
-      kind: 'evaluator',
+      kind: 'EVALUATOR',
       attributes: {
         'evaluation.name': 'repro_passed',
         'evaluation.stage': 'repro',
@@ -83,6 +85,33 @@ describe('LangSmithTracer', () => {
         score: 1,
         value: 'pass',
       })
+    );
+  });
+
+  it('maps OpenInference kinds to LangSmith run types while preserving metadata', async () => {
+    const tracer = new LangSmithTracer();
+    const cases = [
+      ['CHAIN', 'chain'],
+      ['AGENT', 'chain'],
+      ['LLM', 'llm'],
+      ['TOOL', 'tool'],
+      ['RETRIEVER', 'retriever'],
+      ['EMBEDDING', 'embedding'],
+      ['RERANKER', 'chain'],
+      ['GUARDRAIL', 'chain'],
+      ['EVALUATOR', 'chain'],
+    ] as const;
+
+    for (const [kind] of cases) {
+      tracer.startSpan(`span.${kind.toLowerCase()}`, { kind }).end();
+    }
+    await tracer.flush();
+
+    expect(createRunMock.mock.calls.map((c) => c[0].run_type)).toEqual(
+      cases.map(([, runType]) => runType)
+    );
+    expect(createRunMock.mock.calls.map((c) => c[0].extra.metadata['openinference.span.kind'])).toEqual(
+      cases.map(([kind]) => kind)
     );
   });
 

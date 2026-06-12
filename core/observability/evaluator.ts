@@ -22,7 +22,7 @@ export interface OnlineEvaluationEvent {
  * Emit an evaluation span into the active observability backend.
  *
  * The span carries both generic fields (evaluation.name/score/label) and
- * score-keyed attributes (evaluation.key.<metric>) so Arize/Phoenix-style
+ * score-keyed attributes (evaluation.key.<metric>) so Arize AX-style
  * metric queries can group by stable keys.
  */
 export async function emitOnlineEvaluation(event: OnlineEvaluationEvent): Promise<void> {
@@ -33,7 +33,7 @@ export async function emitOnlineEvaluation(event: OnlineEvaluationEvent): Promis
 
     const tracer = getTracer();
     const span = tracer.startSpan(`evaluator.${event.stage}`, {
-      kind: 'tool',
+      kind: 'EVALUATOR',
       parent: currentSpan(),
       attributes: {
         'openinference.span.kind': 'EVALUATOR',

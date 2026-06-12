@@ -5,7 +5,7 @@
  * Runs adapter.getTestCommands() as subprocesses inside the local workspace clone and
  * builds a SandboxArtifact[] compatible with adapter.runCustomEval().
  *
- * Service health checks (sandbox services like Phoenix) are NOT started by this runner —
+ * Service health checks (sandbox services like Arize AX) are NOT started by this runner —
  * the operator is expected to start them out-of-band (e.g. via docker compose) before
  * running the harness. If a service URL is unreachable, the corresponding command will
  * fail and that failure will flow through to the eval agent normally.

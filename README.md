@@ -149,7 +149,7 @@ The v2 stack replaces one-shot LLM repro/fix calls with bounded tool-using loops
 - **Repro loop**: Planner (one-shot) → Executor (tool loop, no `run_shell`) → AST preflight → mandatory Critic with independent re-run.
 - **Fix loop**: Investigator → Planner → Executor → Critic + orchestrator-level final gate (green evidence audit, hypothesis-consumption audit, HEAD-drift check).
 - **HITL**: `inbox_entries` state machine with CAS transitions, signed approval tokens, plus-addressed reply routing, eight typed email kinds (`triage_unrelated`, `need_credentials`, `repro_unreachable`, `fix_proposal`, `fix_failed`, `regression_blocker`, `human_decision_needed`, `pr_opened`).
-- **Observability**: dual OTEL export (Phoenix + Braintrust) with redaction, agent/tool span ownership, and a per-run eval-recorder row (sqlite/jsonl) for shadow-mode comparison.
+- **Observability**: Arize AX / Braintrust / LangSmith tracing with redaction, agent/tool span ownership, and a per-run eval-recorder row (sqlite/jsonl) for shadow-mode comparison.
 
 ### Cutover
 
@@ -180,7 +180,7 @@ The harness ships a pluggable observability layer that emits one parent span per
 | --- | --- | --- |
 | `none` (default) | No-op | No SDK loaded, zero runtime overhead. |
 | `langsmith` | LangSmith | Requires `LANGSMITH_API_KEY`. Spans appear in the LangSmith project named by `LANGSMITH_PROJECT` (default `oss-support-agent`). |
-| `arize` | Arize / Phoenix | OTLP/HTTP exporter; set `ARIZE_ENDPOINT` (Arize Cloud) or `PHOENIX_OTLP_ENDPOINT` (self-hosted). Add `ARIZE_API_KEY` + `ARIZE_SPACE_ID` for Arize Cloud. Spans carry OpenInference semantic conventions. |
+| `arize` | Arize AX | OTLP/HTTP exporter; set `ARIZE_API_KEY`, `ARIZE_SPACE_ID`, and `ARIZE_PROJECT_NAME` (production uses `oss-fix-loop`). `ARIZE_ENDPOINT` is optional and defaults to the US AX OTLP traces endpoint. Spans carry OpenInference semantic conventions. |
 | `braintrust` | Braintrust | Requires `BRAINTRUST_API_KEY`. Project name comes from `BRAINTRUST_PROJECT` (default `oss-support-agent`). |
 | `all` | LangSmith + Arize + Braintrust | Fans out the same spans to all three backends in one run. Startup is fail-fast on missing config, includes per-adapter contract logs, emits a `telemetry_smoke` span to each enabled backend, and tracks adapter delivery counters (`sent`, `failed`, `dropped`) exposed by `/healthz`. |
 

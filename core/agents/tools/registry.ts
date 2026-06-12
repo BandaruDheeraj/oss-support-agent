@@ -235,7 +235,7 @@ export class ToolRegistry {
             durationMs: Math.max(0, Date.now() - startedAt.getTime()),
           };
           this.transcript.push(entry);
-          span.setAttribute('tool.turn', entry.turn);
+          span.setAttributes({ 'tool.turn': entry.turn });
         }
       }
     );

@@ -41,7 +41,7 @@ const VALID_MULTI_REPO_MANIFEST = {
   ...VALID_BASE,
   schema_version: '2',
   coordinated_repos: [
-    { repo: 'Arize-ai/phoenix' },
+    { repo: 'Arize-ai/openinference-js' },
     { repo: 'Arize-ai/arize-otel', fork_org: 'custom-org' },
   ],
 };
@@ -126,7 +126,7 @@ describe('US-018: Manifest schema versioning and multi-repo support', () => {
       const result = validateVersionedManifest(VALID_MULTI_REPO_MANIFEST);
       expect(result.schema_version).toBe('2');
       expect(result.coordinated_repos).toHaveLength(2);
-      expect(result.coordinated_repos![0].repo).toBe('Arize-ai/phoenix');
+      expect(result.coordinated_repos![0].repo).toBe('Arize-ai/openinference-js');
       expect(result.coordinated_repos![1].fork_org).toBe('custom-org');
     });
 
@@ -246,7 +246,7 @@ describe('US-018: Manifest schema versioning and multi-repo support', () => {
         max_retries: 3,
         sandbox_timeout_mins: 15,
         coordinated_repos: [
-          { repo: 'Arize-ai/phoenix' },
+          { repo: 'Arize-ai/openinference-js' },
           { repo: 'Arize-ai/arize-otel', fork_org: 'custom-org' },
         ],
       };
@@ -254,8 +254,8 @@ describe('US-018: Manifest schema versioning and multi-repo support', () => {
       expect(run.repos).toHaveLength(3);
       expect(run.repos[0].repo).toBe('Arize-ai/openinference');
       expect(run.repos[0].forkFullName).toBe('oss-fix-bot/openinference');
-      expect(run.repos[1].repo).toBe('Arize-ai/phoenix');
-      expect(run.repos[1].forkFullName).toBe('oss-fix-bot/phoenix');
+      expect(run.repos[1].repo).toBe('Arize-ai/openinference-js');
+      expect(run.repos[1].forkFullName).toBe('oss-fix-bot/openinference-js');
       expect(run.repos[2].repo).toBe('Arize-ai/arize-otel');
       expect(run.repos[2].forkFullName).toBe('custom-org/arize-otel');
     });

@@ -229,7 +229,6 @@ function parseCliArgs(argv: string[]): CliOptions {
 
 function normalizeBackendName(raw: string): string {
   const value = (raw || 'unknown').trim().toLowerCase();
-  if (value === 'phoenix') return 'arize';
   if (value === '') return 'unknown';
   return value;
 }
@@ -465,9 +464,7 @@ function formatPercent(value: number | null): string {
 function requiredEnvFor(platform: string): string[] {
   switch (platform) {
     case 'arize':
-      return [
-        'PHOENIX_COLLECTOR_ENDPOINT (local) and/or ARIZE_API_KEY + (ARIZE_SPACE_KEY or ARIZE_SPACE_ID) (cloud)',
-      ];
+      return ['ARIZE_API_KEY + ARIZE_SPACE_ID + ARIZE_PROJECT_NAME'];
     case 'langsmith':
       return ['LANGCHAIN_API_KEY (or LANGSMITH_API_KEY)'];
     case 'braintrust':
@@ -502,7 +499,7 @@ function writeFrictionLog(outPath: string): void {
     '',
     '- **No standard exists for parent/child agent traces.** Each platform models a multi-stage pipeline differently: OpenInference uses OTel spans with `openinference.span.kind`; LangSmith uses `RunTree` with explicit parent IDs; Braintrust uses nested `startSpan` calls inside an Experiment row. Every platform required custom adapter code to express the same triage → PM flow.',
     '- **None of the SDKs auto-detected a pre-existing OTel SDK setup.** When the OpenInference instrumentation registers a tracer provider, neither LangSmith nor Braintrust hook into it; each platform requires its own initialisation path.',
-    '- **"Evaluations" mean three different things.** Phoenix evaluations are post-hoc LLM-as-a-judge over recorded traces, LangSmith evaluations re-run the pipeline against a dataset on demand, and Braintrust evaluations are first-class Experiments with custom scorers. Picking which abstraction to use is itself a research project.',
+    '- **"Evaluations" mean three different things.** Arize AX evaluations are trace-centered, LangSmith evaluations re-run the pipeline against a dataset on demand, and Braintrust evaluations are first-class Experiments with custom scorers. Picking which abstraction to use is itself a research project.',
     '- **Token tracking only happens if the adapter populates token attributes.** None of the platforms inferred input/output token counts from the Anthropic response shape; every platform required us to extract `usage.input_tokens` / `usage.output_tokens` manually and set the platform-specific attribute keys.',
     '- **Non-LLM pipeline steps (the PM heuristic) are awkward on all three.** OpenInference has no clean span kind for "deterministic stage"; LangSmith expects an `inputs`/`outputs` JSON object; Braintrust expects an `input`/`output` pair on a span. We emitted shim "stage" spans that contain a JSON-stringified summary instead of an LLM prompt — readable, but not native to any platform.',
     '',
@@ -525,7 +522,7 @@ function writeComparisonTemplate(
     )
     .join('\n');
 
-  const md = `# Observability platform comparison: Arize Phoenix vs LangSmith vs Braintrust
+  const md = `# Observability platform comparison: Arize AX vs LangSmith vs Braintrust
 
 > Test subject: the OSS Fix Loop multi-agent harness (\`BandaruDheeraj/oss-support-agent\`). The eval ran ${results.total_issues} real-looking openinference issues through the triage and PM scoring stages, fanning every span out to all three platforms in parallel using a single shared wrapper at \`core/telemetry.ts\`.
 
@@ -575,7 +572,7 @@ ${friction}
 
 ## 4. Developer productivity observations — by platform
 
-### Arize Phoenix
+### Arize AX
 - **Time to first trace visible in UI:** [MANUAL]
 - **Trace UI quality for multi-agent pipelines:** [MANUAL]
 - **Dataset and eval management workflow:** [MANUAL]

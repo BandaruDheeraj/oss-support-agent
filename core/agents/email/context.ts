@@ -23,7 +23,7 @@ export interface EmailContext {
   replyTo: string;
   expectedActions: string[];
   links: {
-    phoenix: string | null;
+    arize: string | null;
     braintrust: string | null;
     pr: string | null;
     issue: string | null;
@@ -46,5 +46,7 @@ export interface EmailContext {
     branchUrl?: string;
     commitSha?: string;
     reproTestPath?: string;
+    reproTestUrl?: string;
+    reproMethodNote?: string;
   };
 }

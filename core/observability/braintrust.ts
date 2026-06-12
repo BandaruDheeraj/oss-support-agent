@@ -10,6 +10,12 @@
  */
 import type { Span, StartSpanOpts, Tracer } from './tracer';
 import {
+  normalizeOpenInferenceSpanKind,
+  withOpenInferenceSpanKind,
+  type OpenInferenceSpanKind,
+} from './tracer';
+import { redactString } from './redact';
+import {
   deliverWithRetryAndSpool,
   markAdapterEnabled,
   recordAdapterDropped,
@@ -36,16 +42,12 @@ type BraintrustModule = {
 
 const btSpanSymbol = Symbol('braintrust.span');
 
-function btSpanType(kind: StartSpanOpts['kind']): string {
+function btSpanType(kind: OpenInferenceSpanKind): string {
   switch (kind) {
-    case 'llm':
+    case 'LLM':
       return 'llm';
-    case 'tool':
+    case 'TOOL':
       return 'tool';
-    case 'evaluator':
-      return 'task';
-    case 'phase':
-      return 'task';
     default:
       return 'task';
   }
@@ -98,14 +100,16 @@ export class BraintrustTracer implements Tracer {
       recordAdapterDropped('braintrust', this.initError ?? 'braintrust not initialized');
       return new NoopBtSpan();
     }
+    const openInferenceKind = normalizeOpenInferenceSpanKind(opts.kind, opts.attributes);
+    const attributes = withOpenInferenceSpanKind(opts.attributes, openInferenceKind);
     const parentBt = opts.parent ? (opts.parent as unknown as { [btSpanSymbol]?: BtSpan })[btSpanSymbol] : undefined;
     const carrier: BtSpan = parentBt ?? this.logger;
     let bt: BtSpan;
     try {
       bt = carrier.startSpan({
         name,
-        type: btSpanType(opts.kind),
-        spanAttributes: opts.attributes ?? {},
+        type: btSpanType(openInferenceKind),
+        spanAttributes: attributes,
       });
     } catch (err) {
       recordAdapterDropped('braintrust', err);
@@ -117,7 +121,7 @@ export class BraintrustTracer implements Tracer {
     }
 
     const buffer: { input?: unknown; output?: unknown; metadata: Record<string, unknown>; error?: string } = {
-      metadata: { ...(opts.attributes ?? {}) },
+      metadata: { ...attributes },
     };
     const tracer = this;
 
@@ -133,7 +137,7 @@ export class BraintrustTracer implements Tracer {
         buffer.output = redactIo('output', output);
       },
       recordError(err) {
-        buffer.error = err instanceof Error ? err.message : String(err);
+        buffer.error = redactString(err instanceof Error ? err.message : String(err));
       },
       end() {
         const payload: Record<string, unknown> = { metadata: buffer.metadata };
