@@ -2915,6 +2915,27 @@ export async function runPipeline(args: {
       log(`[v2-driver] test-infra fingerprint failed (non-fatal): ${err?.message ?? err}`);
     }
 
+    let relatedIssuesForAnalyst: Array<{ number: number; title: string; reason: string }> = [];
+    if (deps.live) {
+      try {
+        const related = await deps.live.issueSearcher.searchRelatedIssues(
+          repoFullName,
+          routing.result.affectedModule,
+          null,
+          null
+        );
+        relatedIssuesForAnalyst = related
+          .filter((i) => i.number !== issueNumber)
+          .slice(0, 10)
+          .map((i) => ({ number: i.number, title: i.title, reason: i.reason }));
+        if (relatedIssuesForAnalyst.length > 0) {
+          log(`[v2-driver] related issues for pattern analysis: ${relatedIssuesForAnalyst.map((i) => '#' + i.number).join(', ')}`);
+        }
+      } catch (err: any) {
+        log(`[v2-driver] related issues fetch failed (non-blocking): ${err?.message ?? err}`);
+      }
+    }
+
     let reproOutcome: ReproPipelineOutcome;
     if (process.env.OSA_FIX_ONLY === '1') {
       // Skip semantic search + repro pipeline. Requires OSA_SEED_DOSSIER_PATH
@@ -2971,6 +2992,7 @@ export async function runPipeline(args: {
                 getFileContents: (repo: string, filePath: string, ref: string) =>
                   ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
               },
+              relatedIssues: relatedIssuesForAnalyst,
               log,
             }),
         });
@@ -3131,6 +3153,7 @@ export async function runPipeline(args: {
           symbol: s.symbol,
           reasoning: s.reasoning,
         })),
+        patternAssessment: reproDossier.body.patternAssessment ?? null,
       } : null;
       const pmResult = await runPMDesignLoop({
         payload,

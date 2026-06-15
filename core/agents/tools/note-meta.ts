@@ -118,6 +118,16 @@ const RecordEvidence = z.object({
      * suspectSymbols + preconditions.
      */
     oracleSpec: ReproOracleSpecInputSchema.optional(),
+    /**
+     * Optional pattern assessment — emitted by the Analyst when relatedIssues
+     * context is provided. Classifies the bug as isolated vs part of a cluster.
+     */
+    patternAssessment: z.object({
+      kind: z.enum(['isolated', 'cluster']),
+      clusterSize: z.number().int().min(1),
+      relatedIssueNumbers: z.array(z.number().int()),
+      structuralNote: z.string(),
+    }).optional(),
   })
   .passthrough();
 export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = {
@@ -259,6 +269,7 @@ export const recordEvidence: ToolDef<z.infer<typeof RecordEvidence>, unknown> = 
       ...(candidateRepro ? { candidateRepro } : {}),
       ...(reproTargets ? { reproTargets } : {}),
       ...(reproFiles ? { reproFiles } : {}),
+      ...(args.patternAssessment ? { patternAssessment: args.patternAssessment } : {}),
     });
     return {
       snapshot_id: snap.snapshotId,

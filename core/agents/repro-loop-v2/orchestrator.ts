@@ -76,6 +76,12 @@ export interface RunReproV2Args {
    * which builds a working test from known-good patterns without an LLM loop.
    */
   gitClient?: { getFileContents(repo: string, path: string, ref: string): Promise<{ok: boolean, content?: string}> };
+  /**
+   * Related open issues fetched before the analyst runs. When present, the
+   * analyst classifies the bug as isolated vs cluster and emits a
+   * patternAssessment on record_evidence.
+   */
+  relatedIssues?: Array<{ number: number; title: string; reason: string }>;
 }
 
 export interface ReproCandidateEvaluation {
@@ -193,6 +199,7 @@ export async function runReproV2(args: RunReproV2Args): Promise<ReproV2Outcome> 
       carryforwardSummary: args.carryforwardSummary,
       semanticSuspectSeed: args.semanticSuspectSeed ?? null,
       testInfraProfile: args.testInfraProfile,
+      relatedIssues: args.relatedIssues,
     });
     if (!analyst.snapshot) {
       if (analyst.terminated === 'api_unavailable') {

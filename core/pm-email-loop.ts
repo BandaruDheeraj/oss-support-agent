@@ -84,6 +84,25 @@ export class HeuristicBriefGenerator implements DesignBriefGenerator {
 function generateApproaches(input: DesignBriefInput): ApproachOption[] {
   if (input.reproDossierSnapshot?.suspectSymbols.length) {
     const primary = input.reproDossierSnapshot.suspectSymbols[0];
+    const pa = input.reproDossierSnapshot.patternAssessment;
+
+    if (pa?.kind === 'cluster' && pa.clusterSize > 1) {
+      return [
+        {
+          name: `Structural fix (addresses all ${pa.clusterSize} related issues)`,
+          description: pa.structuralNote || `Fix the root cause in \`${primary.file}\` so all ${pa.clusterSize} issues in this cluster are resolved together.`,
+          pros: ['Addresses the structural root cause', `Closes ${pa.clusterSize} issues at once`, 'No future instances of this pattern'],
+          cons: ['Larger diff — review scope carefully before merging'],
+        },
+        {
+          name: 'Targeted fix (this issue only)',
+          description: `Modify \`${primary.symbol}\` in \`${primary.file}\`: ${primary.reasoning}`,
+          pros: ['Minimal scope', 'Easy to review and revert'],
+          cons: [`Leaves ${pa.clusterSize - 1} related issue(s) open`, 'Pattern may recur'],
+        },
+      ];
+    }
+
     return [{
       name: 'Agent-proposed fix',
       description: `Modify \`${primary.symbol}\` in \`${primary.file}\`: ${primary.reasoning}`,
@@ -178,7 +197,11 @@ function buildRootCauseAnalysis(input: DesignBriefInput): string {
   if (input.reproDossierSnapshot) {
     const d = input.reproDossierSnapshot;
     const confidence = d.confidence.charAt(0).toUpperCase() + d.confidence.slice(1);
-    return `${d.summary} (Analyst confidence: ${confidence})`;
+    const pa = d.patternAssessment;
+    const clusterNote = pa?.kind === 'cluster' && pa.clusterSize > 1
+      ? `⚠️ **Pattern cluster** — analyst identified this as one of ${pa.clusterSize} issues sharing the same root cause (related: ${pa.relatedIssueNumbers.map((n) => '#' + n).join(', ')}).\n\n`
+      : '';
+    return `${clusterNote}${d.summary} (Analyst confidence: ${confidence})`;
   }
   // ... keep existing heuristic logic below unchanged ...
   const issueContext = `${input.issueTitle}\n${input.issueSummary}\n${input.issueBody ?? ''}`.toLowerCase();

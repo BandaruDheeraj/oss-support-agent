@@ -779,6 +779,20 @@ export const DossierBodySchema = z.object({
    * legacy snapshot ids remain stable.
    */
   reproFiles: ReproFilesInputSchema.optional(),
+  /**
+   * Pattern assessment emitted by the Analyst when relatedIssues context is
+   * provided. Classifies the bug as isolated vs part of a structural cluster.
+   * OPTIONAL: absent on snapshots predating this field.
+   */
+  patternAssessment: z.object({
+    kind: z.enum(['isolated', 'cluster']),
+    /** Total issues in the cluster, including this one. */
+    clusterSize: z.number().int().min(1),
+    /** Issue numbers from related issues that share the pattern. */
+    relatedIssueNumbers: z.array(z.number().int()),
+    /** 1-2 sentences: what structural fix addresses the whole cluster. Empty string for isolated. */
+    structuralNote: z.string(),
+  }).optional(),
 });
 
 export type DossierBody = z.infer<typeof DossierBodySchema>;

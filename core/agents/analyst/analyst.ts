@@ -24,6 +24,12 @@ export interface RunAnalystArgs {
   semanticSuspectSeed?: SemanticSuspectSeed | null;
   /** Optional test infrastructure fingerprint for the affected package. */
   testInfraProfile?: import('../repro-loop-v2/test-infra-fingerprint').TestInfraProfile | null;
+  /**
+   * Related open issues fetched before the analyst runs.
+   * When present, the analyst classifies the bug as isolated vs cluster
+   * and emits a patternAssessment on record_evidence.
+   */
+  relatedIssues?: Array<{ number: number; title: string; reason: string }>;
 }
 
 export interface AnalystResult {
@@ -116,7 +122,16 @@ Independent of candidateRepro, you SHOULD include a \`reproTargets\` field on re
 
 reproTargets is independent of confidence — even a low-confidence dossier benefits from naming the right package dir. Omit reproTargets entirely (or set both fields to []) when you cannot identify either.
 
-FINAL REMINDER: regardless of how much you investigated or how confident you are, you MUST end this session by calling record_evidence (with whatever you have). Use abandon ONLY when the issue itself is contradictory or empty — NEVER as a way out of an incomplete investigation. Plain-text summaries without a terminal tool call are discarded.`;
+FINAL REMINDER: regardless of how much you investigated or how confident you are, you MUST end this session by calling record_evidence (with whatever you have). Use abandon ONLY when the issue itself is contradictory or empty — NEVER as a way out of an incomplete investigation. Plain-text summaries without a terminal tool call are discarded.
+
+Pattern assessment (when related issues are provided):
+When a "RELATED OPEN ISSUES" section appears in your user prompt, you MUST include patternAssessment in record_evidence:
+- kind: 'cluster' if ≥1 related issue shares the same suspect file or root-cause pattern; else 'isolated'
+- clusterSize: total issues in the cluster including this one
+- relatedIssueNumbers: issue numbers of the related issues that are in the cluster
+- structuralNote: 1-2 sentences on what single structural change would fix the whole cluster (or "" if isolated)
+Also mention the pattern in your summary: "This is one of N issues stemming from <pattern>." or "This appears to be an isolated bug."
+Omit patternAssessment when no related issues section is present.`;
 
 function resolveAnalystPreflightTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.OSA_ANALYST_PREFLIGHT_TIMEOUT_MS;
@@ -241,7 +256,16 @@ export async function runAnalyst(args: RunAnalystArgs): Promise<AnalystResult> {
     ? `\n\n=== TEST INFRASTRUCTURE PROFILE ===\n${JSON.stringify(args.testInfraProfile, null, 2)}`
     : '';
 
-  const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\n${args.issue.body}\n\nRepo: ${args.repo.fullName} (affected module: ${args.repo.affectedModule}, language: ${args.repo.language})${carry}${semanticSeed}${testInfraSection}\n\nInvestigate and produce an EvidenceDossier via record_evidence.`;
+  const relatedIssuesSection = args.relatedIssues && args.relatedIssues.length > 0
+    ? `\n\n=== RELATED OPEN ISSUES (for pattern assessment) ===\n` +
+      `The following ${args.relatedIssues.length} open issue(s) may share the same root cause. ` +
+      `Compare their affected areas with your suspect list.\n\n` +
+      args.relatedIssues.map((i) => `- #${i.number}: ${i.title} (reason: ${i.reason})`).join('\n') +
+      `\n\nYou MUST include patternAssessment in record_evidence. ` +
+      `Set kind='cluster' if ≥1 related issue shares the same suspect file or root-cause pattern. Otherwise kind='isolated'.`
+    : '';
+
+  const userPrompt = `Issue #${args.issue.number}: ${args.issue.title}\n\n${args.issue.body}\n\nRepo: ${args.repo.fullName} (affected module: ${args.repo.affectedModule}, language: ${args.repo.language})${carry}${semanticSeed}${testInfraSection}${relatedIssuesSection}\n\nInvestigate and produce an EvidenceDossier via record_evidence.`;
 
   // Pin Analyst to a strong tool-calling model unless explicitly overridden.
   // We bypass OPENROUTER_MODEL_DEFAULT here because some defaults (e.g.

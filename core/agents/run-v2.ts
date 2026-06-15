@@ -98,6 +98,10 @@ export interface ReproPipelineInput {
    * function source from the repo and build a working test without an LLM loop.
    */
   gitClient?: { getFileContents(repo: string, path: string, ref: string): Promise<{ok: boolean, content?: string}> };
+  /**
+   * Related open issues for analyst pattern classification.
+   */
+  relatedIssues?: Array<{ number: number; title: string; reason: string }>;
   log?: (msg: string) => void;
 }
 
@@ -265,6 +269,7 @@ async function runReproPipelineImpl(input: ReproPipelineInput): Promise<ReproPip
     ...(input.gitClient ? { gitClient: input.gitClient } : {}),
     ...(semanticSuspectSeed ? { semanticSuspectSeed } : {}),
     ...(seedDossier ? { dossier: seedDossier } : {}),
+    ...(input.relatedIssues ? { relatedIssues: input.relatedIssues } : {}),
   });
 
   // Dossier save: write the analyst output so future runs can replay it.

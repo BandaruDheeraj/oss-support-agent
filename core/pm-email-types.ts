@@ -35,6 +35,12 @@ export interface DesignBriefInput {
     summary: string;
     confidence: 'low' | 'medium' | 'high';
     suspectSymbols: Array<{ file: string; symbol: string; reasoning: string }>;
+    patternAssessment?: {
+      kind: 'isolated' | 'cluster';
+      clusterSize: number;
+      relatedIssueNumbers: number[];
+      structuralNote: string;
+    } | null;
   } | null;
   /** Repro outcome — populated when PM gate runs after repro. */
   reproEvidence?: { reproduced: boolean; message?: string } | null;
