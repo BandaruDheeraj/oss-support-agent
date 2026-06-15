@@ -11,7 +11,7 @@
 import { generateText } from 'ai';
 import Ajv from 'ajv';
 
-import { currentSpan, getTracer } from '../../observability';
+import { currentSpan, getAISDKTelemetrySettings, getTracer } from '../../observability';
 import type {
   LLMChatJsonOptions,
   LLMChatOptions,
@@ -57,21 +57,23 @@ export class ChatClient {
     const model = getModel(agent ?? 'TRIAGE', options.model);
     const temperature = options.temperature ?? 0;
     const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
-
-    const tracer = getTracer();
-    const span = tracer.startSpan('llm.chat', {
-      kind: 'LLM',
-      parent: currentSpan(),
-      attributes: {
-        'llm.temperature': temperature,
-        'llm.agent': options.agent ?? null,
+    const aiTelemetry = getAISDKTelemetrySettings({
+      functionId: `llm.chat.${String(options.agent ?? agent ?? 'unknown').toLowerCase()}`,
+      metadata: {
+        'llm.agent': String(options.agent ?? agent ?? 'unknown'),
         'llm.message_count': messages.length,
+        'llm.temperature': temperature,
       },
+      recordInputs: true,
+      recordOutputs: true,
     });
-    span.setInput({ messages });
     const startMs = Date.now();
 
-    try {
+    const runGenerateText = async (): Promise<{
+      content: string;
+      usage: LLMUsage | null;
+      raw: unknown;
+    }> => {
       const result = await generateText({
         model,
         messages: messages.map((m) => ({
@@ -80,6 +82,7 @@ export class ChatClient {
         })),
         temperature,
         maxTokens,
+        ...(aiTelemetry ? { experimental_telemetry: aiTelemetry } : {}),
       });
 
       const content = result.text;
@@ -92,17 +95,38 @@ export class ChatClient {
         : null;
 
       if (usage && options.onUsage) options.onUsage(usage);
+      return { content, usage, raw: result };
+    };
+
+    if (aiTelemetry) {
+      return runGenerateText();
+    }
+
+    const tracer = getTracer();
+    const span = tracer.startSpan('llm.chat', {
+      kind: 'LLM',
+      parent: currentSpan(),
+      attributes: {
+        'llm.temperature': temperature,
+        'llm.agent': options.agent ?? null,
+        'llm.message_count': messages.length,
+      },
+    });
+    span.setInput({ messages });
+
+    try {
+      const result = await runGenerateText();
 
       span.setAttributes({
-        'llm.token_count.prompt': usage?.promptTokens ?? null,
-        'llm.token_count.completion': usage?.completionTokens ?? null,
-        'llm.token_count.total': usage?.totalTokens ?? null,
+        'llm.token_count.prompt': result.usage?.promptTokens ?? null,
+        'llm.token_count.completion': result.usage?.completionTokens ?? null,
+        'llm.token_count.total': result.usage?.totalTokens ?? null,
         'llm.latency_ms': Date.now() - startMs,
       });
-      span.setOutput({ content });
+      span.setOutput({ content: result.content });
       span.end();
 
-      return { content, usage, raw: result };
+      return result as LLMChatResult;
     } catch (err) {
       span.recordError(err);
       span.setAttributes({ 'llm.latency_ms': Date.now() - startMs });

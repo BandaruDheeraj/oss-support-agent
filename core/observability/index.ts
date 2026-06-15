@@ -11,6 +11,8 @@ export type {
   SpanKind,
   OpenInferenceSpanKind,
   BackendName,
+  AISDKTelemetrySettings,
+  AISDKTelemetrySettingsOptions,
 } from './tracer';
 export {
   OPENINFERENCE_SPAN_KIND_ATTRIBUTE,
@@ -18,6 +20,8 @@ export {
   getTracer,
   currentSpan,
   runWithSpan,
+  getAISDKTelemetrySettings,
+  getAISDKTelemetryTracer,
   normalizeOpenInferenceSpanKind,
   withOpenInferenceSpanKind,
   NoopTracer,
@@ -34,6 +38,8 @@ export {
   withOpenInferenceSpan,
   withAgentSpan,
   withToolSpan,
+  withPipelineStageSpan,
+  withExternalOperationSpan,
   currentTraceIds,
   type BaseSpanAttrs,
 } from './spans';

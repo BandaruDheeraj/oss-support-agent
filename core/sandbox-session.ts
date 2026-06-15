@@ -7,6 +7,7 @@ import {
   type ActionsClient,
   type WorkflowRun,
 } from './sandbox-types';
+import { withExternalOperationSpan, type Span } from './observability';
 
 export interface PackageVersion {
   name: string;
@@ -224,7 +225,92 @@ export class SandboxSession {
     this.gitClient = params.gitClient;
   }
 
+  private spanAttrs(extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      repo: this.targetRepo,
+      issue_number: this.issueNumber,
+      branch: this.branch,
+      sandbox_workflow_repo: this.sandboxWorkflowRepo,
+      sandbox_workflow_ref: this.sandboxWorkflowRef,
+      run_label: this.runLabel,
+      ...extra,
+    };
+  }
+
+  private annotatePhaseSpan(span: Span, result: SandboxPhaseResult): void {
+    span.setAttributes({
+      'sandbox.phase': result.phase,
+      'sandbox.ok': result.ok,
+      ...(result.ok && result.phase === 'branch' ? { 'sandbox.branch_sha': result.sha } : {}),
+      ...(result.ok && result.phase === 'setup'
+        ? { 'sandbox.install_manifest_count': result.installManifest.length }
+        : {}),
+      ...(!result.ok
+        ? {
+            'sandbox.reason': result.reason,
+            ...(typeof result.failedStep === 'number' ? { 'sandbox.failed_step': result.failedStep } : {}),
+          }
+        : {}),
+    });
+    span.setOutput(
+      result.ok
+        ? {
+            ok: true,
+            phase: result.phase,
+            ...(result.phase === 'setup' ? { install_manifest_count: result.installManifest.length } : {}),
+          }
+        : {
+            ok: false,
+            phase: result.phase,
+            reason: result.reason,
+            failed_step: result.failedStep ?? null,
+          }
+    );
+  }
+
+  private annotateDispatchSpan(span: Span, result: SandboxDispatchResult): void {
+    span.setAttributes({
+      'sandbox.ok': result.ok,
+      ...(result.ok
+        ? {
+            'sandbox.run_id': result.runId,
+            'sandbox.conclusion': result.conclusion ?? '',
+            'sandbox.exit_code': result.exitCode ?? -1,
+            'sandbox.step_count': result.stepOutcomes.length,
+          }
+        : {
+            'sandbox.reason': result.reason,
+          }),
+    });
+    span.setOutput(
+      result.ok
+        ? {
+            ok: true,
+            run_id: result.runId,
+            conclusion: result.conclusion,
+            exit_code: result.exitCode,
+            step_count: result.stepOutcomes.length,
+          }
+        : {
+            ok: false,
+            reason: result.reason,
+          }
+    );
+  }
+
   async verifyAndPushBranch(): Promise<SandboxPhaseResult> {
+    return withExternalOperationSpan(
+      'sandbox.branch_preflight',
+      this.spanAttrs({ phase: 'branch' }),
+      async (span) => {
+        const result = await this.verifyAndPushBranchImpl();
+        this.annotatePhaseSpan(span, result);
+        return result;
+      }
+    );
+  }
+
+  private async verifyAndPushBranchImpl(): Promise<SandboxPhaseResult> {
     const cached = this.phaseResults.branch;
     if (cached?.ok) {
       return cached;
@@ -300,10 +386,29 @@ export class SandboxSession {
    * that the GHA sandbox sees the updated test file on the branch.
    */
   async forceFlushBranch(): Promise<void> {
-    await this.gitClient.pushPendingChanges(this.targetRepo, this.branch);
+    await withExternalOperationSpan(
+      'sandbox.force_flush_branch',
+      this.spanAttrs({ phase: 'branch' }),
+      async (span) => {
+        await this.gitClient.pushPendingChanges(this.targetRepo, this.branch);
+        span.setOutput({ pushed: true });
+      }
+    );
   }
 
   async verifyWorkflowReachability(workflowId: string = SANDBOX_WORKFLOW_FILE): Promise<SandboxPhaseResult> {
+    return withExternalOperationSpan(
+      'sandbox.workflow_reachability',
+      this.spanAttrs({ phase: 'workflow', workflow_id: workflowId }),
+      async (span) => {
+        const result = await this.verifyWorkflowReachabilityImpl(workflowId);
+        this.annotatePhaseSpan(span, result);
+        return result;
+      }
+    );
+  }
+
+  private async verifyWorkflowReachabilityImpl(workflowId: string = SANDBOX_WORKFLOW_FILE): Promise<SandboxPhaseResult> {
     try {
       const probe = await this.gitClient.getFileContents(
         this.sandboxWorkflowRepo,
@@ -343,6 +448,23 @@ export class SandboxSession {
   }
 
   async dispatchWorkflow(request: WorkflowDispatchRequest): Promise<SandboxDispatchResult> {
+    return withExternalOperationSpan(
+      'sandbox.dispatch_workflow',
+      this.spanAttrs({
+        workflow_id: request.workflowId,
+        require_setup: request.requireSetup ?? false,
+        input_count: Object.keys(request.inputs).length,
+        timeout_mins: request.timeoutMins ?? this.timeoutMins,
+      }),
+      async (span) => {
+        const result = await this.dispatchWorkflowImpl(request);
+        this.annotateDispatchSpan(span, result);
+        return result;
+      }
+    );
+  }
+
+  private async dispatchWorkflowImpl(request: WorkflowDispatchRequest): Promise<SandboxDispatchResult> {
     this.assertPhaseSucceeded('branch', 'verifyAndPushBranch');
     this.assertPhaseSucceeded('workflow', 'verifyWorkflowReachability');
     if (request.requireSetup) {
@@ -389,6 +511,24 @@ export class SandboxSession {
   }
 
   async setupDependencies(spec: InstallSpec): Promise<SandboxPhaseResult> {
+    return withExternalOperationSpan(
+      'sandbox.setup_dependencies',
+      this.spanAttrs({
+        phase: 'setup',
+        semantic_conventions_path: spec.semanticConventionsPath,
+        instrumentation_core_path: spec.instrumentationCorePath,
+        instrumentation_package_path: spec.instrumentationPackagePath,
+        third_party_dep_count: spec.thirdPartyDeps.length,
+      }),
+      async (span) => {
+        const result = await this.setupDependenciesImpl(spec);
+        this.annotatePhaseSpan(span, result);
+        return result;
+      }
+    );
+  }
+
+  private async setupDependenciesImpl(spec: InstallSpec): Promise<SandboxPhaseResult> {
     // All commands — installs, import verification, AND pip show — run in a
     // SINGLE sandbox dispatch. Each GHA run starts with a fresh container, so
     // splitting across multiple dispatches means later commands never see
@@ -499,6 +639,23 @@ export class SandboxSession {
   }
 
   async dispatch(recipe: Recipe): Promise<SandboxDispatchResult> {
+    return withExternalOperationSpan(
+      'sandbox.dispatch_recipe',
+      this.spanAttrs({
+        command_count: recipe.commands.length,
+        has_sentinel: !!recipe.sentinel,
+        has_suspect_path: !!recipe.suspectPath,
+        suspect_path_needle_count: recipe.suspectPathNeedles?.length ?? 0,
+      }),
+      async (span) => {
+        const result = await this.dispatchImpl(recipe);
+        this.annotateDispatchSpan(span, result);
+        return result;
+      }
+    );
+  }
+
+  private async dispatchImpl(recipe: Recipe): Promise<SandboxDispatchResult> {
     this.assertPhaseSucceeded('branch', 'verifyAndPushBranch');
     this.assertPhaseSucceeded('workflow', 'verifyWorkflowReachability');
     // setup phase is NOT required — callers using the pipInstall()+recordReplayInstallCommand()
@@ -693,6 +850,50 @@ export class SandboxSession {
     inputs: Record<string, string>,
     timeoutMins: number
   ): Promise<CommandExecution> {
+    return withExternalOperationSpan(
+      'github_actions.workflow_execution',
+      this.spanAttrs({
+        workflow_id: workflowId,
+        input_count: Object.keys(inputs).length,
+        timeout_mins: timeoutMins,
+      }),
+      async (span) => {
+        const result = await this.executeWorkflowDispatchImpl(workflowId, inputs, timeoutMins);
+        span.setAttributes({
+          'github_actions.ok': result.ok,
+          ...(result.ok
+            ? {
+                'github_actions.run_id': result.runId,
+                'github_actions.conclusion': result.conclusion ?? '',
+                'github_actions.exit_code': result.exitCode ?? -1,
+              }
+            : {
+                'github_actions.reason': result.reason,
+              }),
+        });
+        span.setOutput(
+          result.ok
+            ? {
+                ok: true,
+                run_id: result.runId,
+                conclusion: result.conclusion,
+                exit_code: result.exitCode,
+              }
+            : {
+                ok: false,
+                reason: result.reason,
+              }
+        );
+        return result;
+      }
+    );
+  }
+
+  private async executeWorkflowDispatchImpl(
+    workflowId: string,
+    inputs: Record<string, string>,
+    timeoutMins: number
+  ): Promise<CommandExecution> {
     const createdAfter = new Date().toISOString();
     try {
       await this.actionsClient.triggerWorkflowDispatch(
@@ -869,6 +1070,25 @@ export class SandboxSession {
   }
 
   private async downloadSandboxOutputCommands(runId: number): Promise<SandboxCommandResult[] | null> {
+    return withExternalOperationSpan(
+      'github_actions.download_sandbox_output',
+      this.spanAttrs({ run_id: runId, artifact_name: 'sandbox-output' }),
+      async (span) => {
+        const result = await this.downloadSandboxOutputCommandsImpl(runId);
+        span.setAttributes({
+          'github_actions.artifact_found': !!result,
+          'github_actions.command_count': result?.length ?? 0,
+        });
+        span.setOutput({
+          artifact_found: !!result,
+          command_count: result?.length ?? 0,
+        });
+        return result;
+      }
+    );
+  }
+
+  private async downloadSandboxOutputCommandsImpl(runId: number): Promise<SandboxCommandResult[] | null> {
     if (!this.actionsClient.downloadWorkflowRunArtifact) {
       return null;
     }

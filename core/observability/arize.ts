@@ -16,14 +16,19 @@
  */
 import type { Span as OtelSpan, Tracer as OtelTracer } from '@opentelemetry/api';
 import { SpanKind as OtelSpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
-import { BasicTracerProvider, BatchSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { BasicTracerProvider } from '@opentelemetry/sdk-trace-base';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
 import { Resource } from '@opentelemetry/resources';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
 import { SEMRESATTRS_PROJECT_NAME } from '@arizeai/openinference-semantic-conventions';
-import type { Span, StartSpanOpts, Tracer } from './tracer';
+import {
+  isOpenInferenceSpan,
+  OpenInferenceBatchSpanProcessor,
+} from '@arizeai/openinference-vercel';
+import type { AISDKTelemetryBridge, Span, StartSpanOpts, Tracer } from './tracer';
 import {
   OPENINFERENCE_SPAN_KIND_ATTRIBUTE,
+  OTEL_SPAN_BRIDGE,
   normalizeOpenInferenceSpanKind,
   withOpenInferenceSpanKind,
 } from './tracer';
@@ -67,9 +72,7 @@ function resolveArizeConfig(): {
   };
 }
 
-const otelSpanSymbol = Symbol('arize.otel.span');
-
-export class ArizeTracer implements Tracer {
+export class ArizeTracer implements Tracer, AISDKTelemetryBridge {
   private provider: BasicTracerProvider | null = null;
   private otelTracer: OtelTracer | null = null;
   private initError: Error | null = null;
@@ -86,7 +89,12 @@ export class ArizeTracer implements Tracer {
             process.env.npm_package_version || '0.1.0',
           [SEMRESATTRS_PROJECT_NAME]: projectName,
         }),
-        spanProcessors: [new BatchSpanProcessor(exporter)] as any,
+        spanProcessors: [
+          new OpenInferenceBatchSpanProcessor({
+            exporter,
+            spanFilter: isOpenInferenceSpan,
+          }),
+        ] as any,
       } as any);
       // Do NOT register globally — that would conflict with the existing
       // initTracing() global provider. Instead, build a private Tracer.
@@ -104,7 +112,9 @@ export class ArizeTracer implements Tracer {
       recordAdapterDropped('arize', this.initError ?? 'arize not initialized');
       return new NoopArizeSpan();
     }
-    const parentOtel = opts.parent ? (opts.parent as unknown as { [otelSpanSymbol]?: OtelSpan })[otelSpanSymbol] : undefined;
+    const parentOtel = opts.parent
+      ? (opts.parent as unknown as { [OTEL_SPAN_BRIDGE]?: OtelSpan })[OTEL_SPAN_BRIDGE]
+      : undefined;
 
     let parentCtx;
     if (parentOtel) {
@@ -120,8 +130,8 @@ export class ArizeTracer implements Tracer {
     );
     otelSpan.setAttribute(OPENINFERENCE_SPAN_KIND_ATTRIBUTE, openInferenceKind);
 
-    const wrapped: Span & { [otelSpanSymbol]: OtelSpan } = {
-      [otelSpanSymbol]: otelSpan,
+    const wrapped: Span & { [OTEL_SPAN_BRIDGE]: OtelSpan } = {
+      [OTEL_SPAN_BRIDGE]: otelSpan,
       setAttributes(attrs) {
         for (const [k, v] of Object.entries(stringifyAttrs(attrs))) {
           otelSpan.setAttribute(k, v as any);
@@ -158,6 +168,10 @@ export class ArizeTracer implements Tracer {
       payload: null,
       run: () => this.provider!.forceFlush(),
     });
+  }
+
+  getAISDKTelemetryTracer(): OtelTracer | null {
+    return this.otelTracer;
   }
 
   private warnedInitFailure = false;

@@ -17,6 +17,7 @@ import type {
   WorkflowRunStatus,
   WorkflowRunLogs,
 } from '../../core/sandbox-types';
+import { withExternalOperationSpan } from '../../core/observability';
 
 export type { ActionsClient } from '../../core/sandbox-types';
 
@@ -117,17 +118,29 @@ export class GitHubActionsClient implements ActionsClient {
     branch: string,
     inputs: Record<string, string>
   ): Promise<void> {
-    const url = `${GITHUB_API}/repos/${forkFullName}/actions/workflows/${encodeURIComponent(workflowId)}/dispatches`;
-    const res = await this.request(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ref: branch, inputs }),
-    });
-    if (!res.ok) {
-      throw new Error(
-        `GitHub triggerWorkflowDispatch failed (${res.status}) for ${forkFullName} ${workflowId}@${branch}: ${await res.text()}`
-      );
-    }
+    return withExternalOperationSpan(
+      'github_actions.trigger_workflow_dispatch',
+      {
+        repo: forkFullName,
+        workflow_id: workflowId,
+        branch,
+        input_count: Object.keys(inputs).length,
+      },
+      async (span) => {
+        const url = `${GITHUB_API}/repos/${forkFullName}/actions/workflows/${encodeURIComponent(workflowId)}/dispatches`;
+        const res = await this.request(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ref: branch, inputs }),
+        });
+        if (!res.ok) {
+          throw new Error(
+            `GitHub triggerWorkflowDispatch failed (${res.status}) for ${forkFullName} ${workflowId}@${branch}: ${await res.text()}`
+          );
+        }
+        span.setOutput({ dispatched: true });
+      }
+    );
   }
 
   async branchRefExists(repoFullName: string, branch: string): Promise<boolean> {
@@ -186,32 +199,63 @@ export class GitHubActionsClient implements ActionsClient {
     timeoutMs: number,
     pollIntervalMs: number = 10_000
   ): Promise<WorkflowRunStatus> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      const url = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}`;
-      const res = await this.request(url);
-      if (!res.ok) {
-        throw new Error(`GitHub getWorkflowRun failed (${res.status}): ${await res.text()}`);
+    return withExternalOperationSpan(
+      'github_actions.wait_for_workflow_run',
+      {
+        repo: forkFullName,
+        run_id: runId,
+        timeout_ms: timeoutMs,
+        poll_interval_ms: pollIntervalMs,
+      },
+      async (span) => {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          const url = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}`;
+          const res = await this.request(url);
+          if (!res.ok) {
+            throw new Error(`GitHub getWorkflowRun failed (${res.status}): ${await res.text()}`);
+          }
+          const data: any = await res.json();
+          if (data.status === 'completed') {
+            const result = {
+              completed: true,
+              conclusion: data.conclusion ?? null,
+              timedOut: false,
+            };
+            span.setAttributes({
+              'github_actions.completed': result.completed,
+              'github_actions.conclusion': result.conclusion ?? '',
+              'github_actions.timed_out': result.timedOut,
+            });
+            span.setOutput(result);
+            return result;
+          }
+          await sleep(pollIntervalMs);
+        }
+        const result = { completed: false, conclusion: null, timedOut: true };
+        span.setAttributes({
+          'github_actions.completed': result.completed,
+          'github_actions.timed_out': result.timedOut,
+        });
+        span.setOutput(result);
+        return result;
       }
-      const data: any = await res.json();
-      if (data.status === 'completed') {
-        return {
-          completed: true,
-          conclusion: data.conclusion ?? null,
-          timedOut: false,
-        };
-      }
-      await sleep(pollIntervalMs);
-    }
-    return { completed: false, conclusion: null, timedOut: true };
+    );
   }
 
   async cancelWorkflowRun(forkFullName: string, runId: number): Promise<void> {
-    const url = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/cancel`;
-    const res = await this.request(url, { method: 'POST' });
-    if (!res.ok && res.status !== 409) {
-      throw new Error(`GitHub cancelWorkflowRun failed (${res.status}): ${await res.text()}`);
-    }
+    return withExternalOperationSpan(
+      'github_actions.cancel_workflow_run',
+      { repo: forkFullName, run_id: runId },
+      async (span) => {
+        const url = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/cancel`;
+        const res = await this.request(url, { method: 'POST' });
+        if (!res.ok && res.status !== 409) {
+          throw new Error(`GitHub cancelWorkflowRun failed (${res.status}): ${await res.text()}`);
+        }
+        span.setOutput({ cancelled_or_already_done: true });
+      }
+    );
   }
 
   /**
@@ -220,34 +264,62 @@ export class GitHubActionsClient implements ActionsClient {
    * Exit code is inferred from the run's conclusion ("success" => 0, else 1).
    */
   async getWorkflowRunLogs(forkFullName: string, runId: number): Promise<WorkflowRunLogs> {
-    const runUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}`;
-    const runRes = await this.request(runUrl);
-    if (!runRes.ok) {
-      throw new Error(`GitHub getWorkflowRun failed (${runRes.status}): ${await runRes.text()}`);
-    }
-    const runData: any = await runRes.json();
-    const exitCode = runData.conclusion === 'success' ? 0 : 1;
+    return withExternalOperationSpan(
+      'github_actions.get_workflow_run_logs',
+      { repo: forkFullName, run_id: runId },
+      async (span) => {
+        const runUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}`;
+        const runRes = await this.request(runUrl);
+        if (!runRes.ok) {
+          throw new Error(`GitHub getWorkflowRun failed (${runRes.status}): ${await runRes.text()}`);
+        }
+        const runData: any = await runRes.json();
+        const exitCode = runData.conclusion === 'success' ? 0 : 1;
 
-    const logsUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/logs`;
-    const logsRes = await this.request(logsUrl, { redirect: 'follow' });
-    if (!logsRes.ok) {
-      // Logs API can 404 briefly after completion; return partial info.
-      return {
-        stdout: '',
-        stderr: `Failed to fetch logs (${logsRes.status})`,
-        exitCode,
-      };
-    }
-    const buf = Buffer.from(await logsRes.arrayBuffer());
-    // The logs endpoint returns a zip archive; rather than unzipping here we
-    // surface a base64 hash + size so a downstream consumer can fetch the raw
-    // zip if needed. Most regression-guard diffing only compares exit codes
-    // and the short stdout/stderr we synthesize here.
-    return {
-      stdout: `(GHA log archive: ${buf.byteLength} bytes; run ${runData.html_url})`,
-      stderr: '',
-      exitCode,
-    };
+        const logsUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/logs`;
+        const logsRes = await this.request(logsUrl, { redirect: 'follow' });
+        if (!logsRes.ok) {
+          // Logs API can 404 briefly after completion; return partial info.
+          const result = {
+            stdout: '',
+            stderr: `Failed to fetch logs (${logsRes.status})`,
+            exitCode,
+          };
+          span.setAttributes({
+            'github_actions.logs_ok': false,
+            'github_actions.exit_code': exitCode ?? -1,
+            'github_actions.logs_status': logsRes.status,
+          });
+          span.setOutput({
+            logs_ok: false,
+            exit_code: exitCode,
+            logs_status: logsRes.status,
+          });
+          return result;
+        }
+        const buf = Buffer.from(await logsRes.arrayBuffer());
+        // The logs endpoint returns a zip archive; rather than unzipping here we
+        // surface a base64 hash + size so a downstream consumer can fetch the raw
+        // zip if needed. Most regression-guard diffing only compares exit codes
+        // and the short stdout/stderr we synthesize here.
+        const result = {
+          stdout: `(GHA log archive: ${buf.byteLength} bytes; run ${runData.html_url})`,
+          stderr: '',
+          exitCode,
+        };
+        span.setAttributes({
+          'github_actions.logs_ok': true,
+          'github_actions.log_archive_bytes': buf.byteLength,
+          'github_actions.exit_code': exitCode ?? -1,
+        });
+        span.setOutput({
+          logs_ok: true,
+          log_archive_bytes: buf.byteLength,
+          exit_code: exitCode,
+        });
+        return result;
+      }
+    );
   }
 
   async downloadWorkflowRunArtifact(
@@ -255,37 +327,68 @@ export class GitHubActionsClient implements ActionsClient {
     runId: number,
     artifactName: string
   ): Promise<string | null> {
-    const listUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/artifacts`;
-    const listRes = await this.request(listUrl);
-    if (!listRes.ok) {
-      throw new Error(`GitHub listArtifacts failed (${listRes.status}): ${await listRes.text()}`);
-    }
-    const listData: any = await listRes.json();
-    const artifacts: any[] = listData.artifacts ?? [];
-    const match = artifacts.find((a) => a.name === artifactName);
-    if (!match) return null;
-    const dlUrl = `${GITHUB_API}/repos/${forkFullName}/actions/artifacts/${match.id}/zip`;
-    const dlRes = await this.request(dlUrl, { redirect: 'follow' });
-    if (!dlRes.ok) {
-      throw new Error(`GitHub downloadArtifact failed (${dlRes.status}): ${await dlRes.text()}`);
-    }
-    const buf = Buffer.from(await dlRes.arrayBuffer());
-    let zip: JSZip;
-    try {
-      zip = await JSZip.loadAsync(buf);
-    } catch (err) {
-      throw new Error(
-        `GitHub downloadArtifact failed to read zip for "${artifactName}": ${err instanceof Error ? err.message : String(err)}`
-      );
-    }
-    const files = Object.values(zip.files).filter((file) => !file.dir);
-    if (files.length === 0) {
-      throw new Error(`GitHub artifact "${artifactName}" in run ${runId} had no files`);
-    }
-    const preferredNames = [`${artifactName}.json`, `${artifactName}.txt`, 'semantic-output.json', 'sandbox-output.json'];
-    const targetFile =
-      files.find((file) => preferredNames.some((name) => file.name.endsWith(name))) ?? files[0];
-    return targetFile.async('string');
+    return withExternalOperationSpan(
+      'github_actions.download_workflow_run_artifact',
+      { repo: forkFullName, run_id: runId, artifact_name: artifactName },
+      async (span) => {
+        const listUrl = `${GITHUB_API}/repos/${forkFullName}/actions/runs/${runId}/artifacts`;
+        const listRes = await this.request(listUrl);
+        if (!listRes.ok) {
+          throw new Error(`GitHub listArtifacts failed (${listRes.status}): ${await listRes.text()}`);
+        }
+        const listData: any = await listRes.json();
+        const artifacts: any[] = listData.artifacts ?? [];
+        const match = artifacts.find((a) => a.name === artifactName);
+        if (!match) {
+          span.setAttributes({
+            'github_actions.artifact_found': false,
+            'github_actions.artifact_count': artifacts.length,
+          });
+          span.setOutput({ artifact_found: false, artifact_count: artifacts.length });
+          return null;
+        }
+        const dlUrl = `${GITHUB_API}/repos/${forkFullName}/actions/artifacts/${match.id}/zip`;
+        const dlRes = await this.request(dlUrl, { redirect: 'follow' });
+        if (!dlRes.ok) {
+          throw new Error(`GitHub downloadArtifact failed (${dlRes.status}): ${await dlRes.text()}`);
+        }
+        const buf = Buffer.from(await dlRes.arrayBuffer());
+        let zip: JSZip;
+        try {
+          zip = await JSZip.loadAsync(buf);
+        } catch (err) {
+          throw new Error(
+            `GitHub downloadArtifact failed to read zip for "${artifactName}": ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+        const files = Object.values(zip.files).filter((file) => !file.dir);
+        if (files.length === 0) {
+          throw new Error(`GitHub artifact "${artifactName}" in run ${runId} had no files`);
+        }
+        const preferredNames = [
+          `${artifactName}.json`,
+          `${artifactName}.txt`,
+          'semantic-output.json',
+          'sandbox-output.json',
+        ];
+        const targetFile =
+          files.find((file) => preferredNames.some((name) => file.name.endsWith(name))) ?? files[0];
+        const content = await targetFile.async('string');
+        span.setAttributes({
+          'github_actions.artifact_found': true,
+          'github_actions.artifact_count': artifacts.length,
+          'github_actions.artifact_file_count': files.length,
+          'github_actions.artifact_chars': content.length,
+        });
+        span.setOutput({
+          artifact_found: true,
+          artifact_count: artifacts.length,
+          artifact_file_count: files.length,
+          artifact_chars: content.length,
+        });
+        return content;
+      }
+    );
   }
 
   /**
@@ -304,26 +407,52 @@ export class GitHubActionsClient implements ActionsClient {
   }
 
   async downloadJobLog(repoFullName: string, jobId: number): Promise<string> {
-    const url = GITHUB_API + '/repos/' + repoFullName + '/actions/jobs/' + jobId + '/logs';
-    const res = await this.request(url);
-    if (!res.ok) return '';
-    return res.text();
+    return withExternalOperationSpan(
+      'github_actions.download_job_log',
+      { repo: repoFullName, job_id: jobId },
+      async (span) => {
+        const url = GITHUB_API + '/repos/' + repoFullName + '/actions/jobs/' + jobId + '/logs';
+        const res = await this.request(url);
+        if (!res.ok) {
+          span.setAttributes({ 'github_actions.logs_ok': false, 'github_actions.status': res.status });
+          span.setOutput({ logs_ok: false, status: res.status });
+          return '';
+        }
+        const text = await res.text();
+        span.setAttributes({ 'github_actions.logs_ok': true, 'github_actions.log_chars': text.length });
+        span.setOutput({ logs_ok: true, log_chars: text.length });
+        return text;
+      }
+    );
   }
 
   async listPrCheckRuns(
     repoFullName: string,
     prSha: string
   ): Promise<Array<{ name: string; status: string; conclusion: string | null; detailsUrl: string }>> {
-    const url =
-      GITHUB_API + '/repos/' + repoFullName + '/commits/' + prSha + '/check-runs?per_page=100';
-    const res = await this.request(url);
-    if (!res.ok) return [];
-    const data: any = await res.json();
-    return (data.check_runs || []).map((c: any) => ({
-      name: c.name,
-      status: c.status,
-      conclusion: c.conclusion || null,
-      detailsUrl: c.details_url || '',
-    }));
+    return withExternalOperationSpan(
+      'github_actions.list_pr_check_runs',
+      { repo: repoFullName, pr_sha: prSha },
+      async (span) => {
+        const url =
+          GITHUB_API + '/repos/' + repoFullName + '/commits/' + prSha + '/check-runs?per_page=100';
+        const res = await this.request(url);
+        if (!res.ok) {
+          span.setAttributes({ 'github_actions.status': res.status, 'github_actions.check_count': 0 });
+          span.setOutput({ check_count: 0, status: res.status });
+          return [];
+        }
+        const data: any = await res.json();
+        const checks = (data.check_runs || []).map((c: any) => ({
+          name: c.name,
+          status: c.status,
+          conclusion: c.conclusion || null,
+          detailsUrl: c.details_url || '',
+        }));
+        span.setAttributes({ 'github_actions.check_count': checks.length });
+        span.setOutput({ check_count: checks.length });
+        return checks;
+      }
+    );
   }
 }

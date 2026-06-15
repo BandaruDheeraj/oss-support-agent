@@ -7,13 +7,14 @@
  *   - maxTurns hit
  *   - SDK finishReason !== 'tool-calls' (i.e. model returned final text)
  *
- * Emits an agent-level OTEL span around the whole call. LLM spans are
- * emitted by the SDK's experimental_telemetry; tool spans are emitted
- * by the registry.
+ * Emits an agent-level OTEL span around the whole call. When Arize hybrid
+ * instrumentation is enabled, LLM spans are emitted by the SDK's
+ * experimental_telemetry; tool spans are emitted by the registry.
  */
 
 import { generateText, type CoreMessage } from 'ai';
 import { getModelRoutes, type ModelRoute, type PhaseEAgent } from '../llm/v2/client';
+import { getAISDKTelemetrySettings } from '../observability';
 import { withAgentSpan } from '../observability/spans';
 import { ToolRegistry } from './tools/registry';
 
@@ -227,6 +228,23 @@ async function runAgentLoopOnce(args: RunAgentLoopArgs, route: ModelRoute): Prom
       let totalTurns = 0;
 
       try {
+        const telemetryMetadata: Record<string, string | number | boolean> = {
+          'agent.name': agent,
+          attempt_id: args.attemptId,
+          issue_number: args.issueNumber,
+          'llm.model_name': route.modelId,
+          'llm.route': route.routeId,
+        };
+        if (args.dossierSnapshotId) {
+          telemetryMetadata.dossier_snapshot_id = args.dossierSnapshotId;
+        }
+        const aiTelemetry = getAISDKTelemetrySettings({
+          functionId: `agent.${agent.toLowerCase()}.generateText`,
+          metadata: telemetryMetadata,
+          recordInputs: true,
+          recordOutputs: true,
+        });
+
         const result = await generateText({
           model,
           system: args.system,
@@ -238,7 +256,7 @@ async function runAgentLoopOnce(args: RunAgentLoopArgs, route: ModelRoute): Prom
           ...(typeof args.temperature === 'number'
             ? { temperature: args.temperature }
             : {}),
-          experimental_telemetry: { isEnabled: true, recordInputs: true, recordOutputs: true },
+          ...(aiTelemetry ? { experimental_telemetry: aiTelemetry } : {}),
           onStepFinish: (step) => {
             totalTurns += 1;
             registry.beginTurn();

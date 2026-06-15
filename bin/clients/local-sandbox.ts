@@ -21,6 +21,7 @@ import * as path from 'path';
 
 import type { SandboxCommandResult, ServiceConfig } from '../../core/adapter.interface';
 import type { SandboxArtifact, SandboxConfig, SandboxResult } from '../../core/sandbox-types';
+import { withExternalOperationSpan } from '../../core/observability';
 
 import { LocalWorkspace, execCommand } from './local-workspace';
 
@@ -140,6 +141,49 @@ export async function runLocalSandbox(args: {
   services: ServiceConfig[];
   options?: LocalSandboxOptions;
 }): Promise<SandboxArtifact> {
+  const commands = args.config.testCommands ?? (args.config.testCommand ? [args.config.testCommand] : []);
+  return withExternalOperationSpan(
+    'sandbox.local_run',
+    {
+      repo: args.config.repoFullName,
+      fork: args.config.forkFullName,
+      branch: args.config.branchName,
+      workflow_repo: args.config.workflowRepoFullName,
+      command_count: commands.length,
+      service_count: args.services.length,
+      workspace_dir: args.workspace.dir,
+      timeout_minutes: args.config.timeoutMinutes,
+    },
+    async (span) => {
+      const artifact = await runLocalSandboxImpl(args, commands);
+      span.setAttributes({
+        'sandbox.completed': artifact.result.completed,
+        'sandbox.exit_code': artifact.result.exitCode ?? -1,
+        'sandbox.timed_out': artifact.result.timedOut,
+        'sandbox.duration_seconds': artifact.result.durationSeconds,
+        'sandbox.command_count': artifact.commands.length,
+      });
+      span.setOutput({
+        completed: artifact.result.completed,
+        exit_code: artifact.result.exitCode,
+        timed_out: artifact.result.timedOut,
+        duration_seconds: artifact.result.durationSeconds,
+        command_count: artifact.commands.length,
+      });
+      return artifact;
+    }
+  );
+}
+
+async function runLocalSandboxImpl(
+  args: {
+    workspace: LocalWorkspace;
+    config: SandboxConfig;
+    services: ServiceConfig[];
+    options?: LocalSandboxOptions;
+  },
+  commands: string[]
+): Promise<SandboxArtifact> {
   const log = args.options?.log ?? noopLog;
   const timeoutMs = args.options?.perCommandTimeoutMs ?? 600_000;
   const startedAt = new Date().toISOString();
@@ -149,7 +193,22 @@ export async function runLocalSandbox(args: {
   // Set up an isolated Python venv for this sandbox run. If creation fails
   // (e.g. python3 missing), we still proceed: the per-command pip will fail
   // naturally and halt-and-email surfaces the real error to the operator.
-  const venv = await ensurePythonVenv(args.workspace.dir, log, timeoutMs);
+  const venv = await withExternalOperationSpan(
+    'sandbox.local_venv',
+    {
+      repo: args.config.repoFullName,
+      fork: args.config.forkFullName,
+      branch: args.config.branchName,
+      workspace_dir: args.workspace.dir,
+      timeout_ms: timeoutMs,
+    },
+    async (span) => {
+      const result = await ensurePythonVenv(args.workspace.dir, log, timeoutMs);
+      span.setAttributes({ 'sandbox.venv_available': !!result });
+      span.setOutput({ venv_available: !!result });
+      return result;
+    }
+  );
   const sandboxEnv: NodeJS.ProcessEnv = {};
   if (venv) {
     const sep = process.platform === 'win32' ? ';' : ':';
@@ -161,7 +220,6 @@ export async function runLocalSandbox(args: {
     log(`[sandbox] proceeding WITHOUT venv (python3/python not available); pip commands likely to fail`);
   }
 
-  const commands = args.config.testCommands ?? (args.config.testCommand ? [args.config.testCommand] : []);
   const results: SandboxCommandResult[] = [];
   let totalDurationSec = 0;
   let aggregateExitCode: number | null = 0;
@@ -171,11 +229,38 @@ export async function runLocalSandbox(args: {
 
   for (const cmd of commands) {
     log(`[sandbox] $ ${cmd}`);
-    const r = await execCommand(cmd, [], args.workspace.dir, {
-      timeoutMs,
-      shell: true,
-      env: sandboxEnv,
-    });
+    const r = await withExternalOperationSpan(
+      'sandbox.local_command',
+      {
+        repo: args.config.repoFullName,
+        fork: args.config.forkFullName,
+        branch: args.config.branchName,
+        command: cmd,
+        timeout_ms: timeoutMs,
+      },
+      async (span) => {
+        const result = await execCommand(cmd, [], args.workspace.dir, {
+          timeoutMs,
+          shell: true,
+          env: sandboxEnv,
+        });
+        span.setAttributes({
+          'sandbox.exit_code': result.exitCode ?? -1,
+          'sandbox.timed_out': result.timedOut,
+          'sandbox.duration_ms': result.durationMs,
+          'sandbox.stdout_bytes': result.stdout.length,
+          'sandbox.stderr_bytes': result.stderr.length,
+        });
+        span.setOutput({
+          exit_code: result.exitCode,
+          timed_out: result.timedOut,
+          duration_ms: result.durationMs,
+          stdout_bytes: result.stdout.length,
+          stderr_bytes: result.stderr.length,
+        });
+        return result;
+      }
+    );
     const durSec = r.durationMs / 1000;
     totalDurationSec += durSec;
     if (r.timedOut) timedOut = true;

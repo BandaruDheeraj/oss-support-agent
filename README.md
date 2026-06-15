@@ -190,7 +190,7 @@ Set `OBSERVABILITY_BACKEND` to route traces to your preferred backend:
 | `braintrust` | Braintrust | `BRAINTRUST_API_KEY` |
 | `all` | All three | All of the above |
 
-Every pipeline run emits one parent span per stage (`pipeline.repro`, `pipeline.fix`) and one child span per LLM call. Spans carry OpenInference semantic conventions and include token counts, latency, and pass/fail eval signals.
+Every pipeline run emits one parent span per stage (`pipeline.repro`, `pipeline.fix`) and spans for agent/tool/eval work. For Arize AX, LLM calls use hybrid instrumentation: Vercel AI SDK telemetry emits the LLM spans through the `@arizeai/openinference-vercel` span processor, while the pipeline-specific spans remain manual. Set `OBSERVABILITY_AI_SDK_AUTO=false` to disable the Vercel AI SDK auto span path.
 
 Run `npm run trace-smoke` to confirm spans are reaching your backend before running a live issue.
 

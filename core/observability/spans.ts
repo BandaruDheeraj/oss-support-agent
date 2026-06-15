@@ -87,6 +87,22 @@ export function withToolSpan<T>(
   );
 }
 
+export function withPipelineStageSpan<T>(
+  stageName: string,
+  attrs: BaseSpanAttrs,
+  fn: (span: Span) => Promise<T>
+): Promise<T> {
+  return withOpenInferenceSpan(`pipeline.${stageName}`, 'CHAIN', attrs, fn);
+}
+
+export function withExternalOperationSpan<T>(
+  operationName: string,
+  attrs: BaseSpanAttrs,
+  fn: (span: Span) => Promise<T>
+): Promise<T> {
+  return withOpenInferenceSpan(`external.${operationName}`, 'TOOL', attrs, fn);
+}
+
 export function currentTraceIds(): { traceId: string | null; spanId: string | null } {
   const span = trace.getSpan(context.active());
   if (!span) return { traceId: null, spanId: null };

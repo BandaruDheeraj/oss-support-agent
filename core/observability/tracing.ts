@@ -9,6 +9,10 @@ import { Resource } from '@opentelemetry/resources';
 import { SemanticResourceAttributes } from '@opentelemetry/semantic-conventions';
 import { trace, type Tracer } from '@opentelemetry/api';
 import { SEMRESATTRS_PROJECT_NAME } from '@arizeai/openinference-semantic-conventions';
+import {
+  isOpenInferenceSpan,
+  OpenInferenceBatchSpanProcessor,
+} from '@arizeai/openinference-vercel';
 
 let sdk: NodeSDK | null = null;
 let started = false;
@@ -38,15 +42,16 @@ function makeProcessors(): SpanProcessor[] {
     process.env.ARIZE_PROJECT_NAME
   ) {
     processors.push(
-      new BatchSpanProcessor(
-        new OTLPTraceExporter({
+      new OpenInferenceBatchSpanProcessor({
+        exporter: new OTLPTraceExporter({
           url: normalizeTraceEndpoint(process.env.ARIZE_ENDPOINT),
           headers: {
             'arize-space-id': process.env.ARIZE_SPACE_ID,
             'arize-api-key': process.env.ARIZE_API_KEY,
           },
-        })
-      )
+        }),
+        spanFilter: isOpenInferenceSpan,
+      })
     );
   }
 

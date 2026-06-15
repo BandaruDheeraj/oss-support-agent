@@ -7,6 +7,8 @@ const setAttribute = jest.fn();
 const setStatus = jest.fn();
 const recordException = jest.fn();
 const end = jest.fn();
+const OpenInferenceBatchSpanProcessor = jest.fn();
+const isOpenInferenceSpan = jest.fn();
 const startSpan = jest.fn(() => ({
   setAttribute,
   setStatus,
@@ -20,11 +22,15 @@ jest.mock('@opentelemetry/sdk-trace-base', () => ({
     getTracer: () => ({ startSpan }),
     forceFlush,
   })),
-  BatchSpanProcessor: jest.fn(),
 }));
 
 jest.mock('@opentelemetry/exporter-trace-otlp-http', () => ({
   OTLPTraceExporter: jest.fn(),
+}));
+
+jest.mock('@arizeai/openinference-vercel', () => ({
+  OpenInferenceBatchSpanProcessor,
+  isOpenInferenceSpan,
 }));
 
 import { ArizeTracer } from '../arize';
@@ -38,6 +44,8 @@ describe('ArizeTracer', () => {
     setStatus.mockClear();
     recordException.mockClear();
     end.mockClear();
+    OpenInferenceBatchSpanProcessor.mockClear();
+    isOpenInferenceSpan.mockClear();
     startSpan.mockClear();
     forceFlush.mockClear();
     (OTLPTraceExporter as jest.Mock).mockClear();
@@ -74,6 +82,10 @@ describe('ArizeTracer', () => {
         'arize-api-key': 'arize-key',
         'arize-space-id': 'space-id',
       },
+    });
+    expect(OpenInferenceBatchSpanProcessor).toHaveBeenCalledWith({
+      exporter: expect.anything(),
+      spanFilter: isOpenInferenceSpan,
     });
     await tracer.flush();
     expect(forceFlush).toHaveBeenCalled();

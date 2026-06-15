@@ -13,6 +13,13 @@
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
+  context as otelContext,
+  trace as otelTrace,
+  type AttributeValue,
+  type Span as OtelApiSpan,
+  type Tracer as OtelApiTracer,
+} from '@opentelemetry/api';
+import {
   getAdapterDiagnostics,
   initializeAdapterDiagnostics,
   markAdapterEnabled,
@@ -75,6 +82,28 @@ export interface Tracer {
   flush(): Promise<void>;
 }
 
+export interface AISDKTelemetrySettings {
+  isEnabled: true;
+  recordInputs?: boolean;
+  recordOutputs?: boolean;
+  functionId?: string;
+  metadata?: Record<string, AttributeValue>;
+  tracer: OtelApiTracer;
+}
+
+export interface AISDKTelemetrySettingsOptions {
+  functionId?: string;
+  metadata?: Record<string, AttributeValue>;
+  recordInputs?: boolean;
+  recordOutputs?: boolean;
+}
+
+export interface AISDKTelemetryBridge {
+  getAISDKTelemetryTracer(): OtelApiTracer | null;
+}
+
+export const OTEL_SPAN_BRIDGE = Symbol.for('oss-support-agent.otel.span');
+
 const OPENINFERENCE_KIND_SET = new Set<string>(OPENINFERENCE_SPAN_KINDS);
 
 export function normalizeOpenInferenceSpanKind(
@@ -125,7 +154,13 @@ export function currentSpan(): Span | undefined {
  * Does not end the span — caller is still responsible for span.end().
  */
 export async function runWithSpan<T>(span: Span, fn: () => Promise<T>): Promise<T> {
-  return spanStorage.run(span, fn);
+  return spanStorage.run(span, () => {
+    const otelSpan = (span as unknown as { [OTEL_SPAN_BRIDGE]?: OtelApiSpan })[
+      OTEL_SPAN_BRIDGE
+    ];
+    if (!otelSpan) return fn();
+    return otelContext.with(otelTrace.setSpan(otelContext.active(), otelSpan), fn);
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -284,6 +319,33 @@ export function getTracer(): Tracer {
   return result.tracer;
 }
 
+export function getAISDKTelemetryTracer(): OtelApiTracer | undefined {
+  getTracer();
+  const arize = cachedAdapters.find((adapter) => adapter.name === 'arize')?.tracer as
+    | Partial<AISDKTelemetryBridge>
+    | undefined;
+  const tracer = arize?.getAISDKTelemetryTracer?.();
+  return tracer ?? undefined;
+}
+
+export function getAISDKTelemetrySettings(
+  opts: AISDKTelemetrySettingsOptions = {}
+): AISDKTelemetrySettings | undefined {
+  if ((process.env.OBSERVABILITY_AI_SDK_AUTO ?? 'true').trim().toLowerCase() === 'false') {
+    return undefined;
+  }
+  const tracer = getAISDKTelemetryTracer();
+  if (!tracer) return undefined;
+  return {
+    isEnabled: true,
+    recordInputs: opts.recordInputs ?? true,
+    recordOutputs: opts.recordOutputs ?? true,
+    functionId: opts.functionId,
+    metadata: opts.metadata,
+    tracer,
+  };
+}
+
 function instantiate(backend: BackendName): {
   tracer: Tracer;
   adapters: Array<{ name: AdapterName; tracer: Tracer }>;
@@ -363,8 +425,14 @@ function instantiateAll(): {
 class MultiSpan implements Span {
   // public so MultiTracer can route parent-child relationships per backend
   public readonly entries: ReadonlyArray<{ name: AdapterName; span: Span }>;
+  public readonly [OTEL_SPAN_BRIDGE]?: OtelApiSpan;
   constructor(entries: Array<{ name: AdapterName; span: Span }>) {
     this.entries = entries;
+    this[OTEL_SPAN_BRIDGE] = entries
+      .map((entry) => (entry.span as unknown as { [OTEL_SPAN_BRIDGE]?: OtelApiSpan })[
+        OTEL_SPAN_BRIDGE
+      ])
+      .find(Boolean);
   }
   private safe(op: string, fn: (e: { name: AdapterName; span: Span }) => void): void {
     for (const e of this.entries) {

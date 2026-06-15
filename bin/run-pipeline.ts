@@ -109,7 +109,11 @@ import type { UsabilityAgentInput } from '../core/agents/usability-types';
 import { GHAUsabilityExerciser } from './clients/gha-usability-exerciser';
 import { inferUsabilityIntrospection } from './clients/usability-introspect';
 import { emitOnlineEvaluation } from '../core/observability/evaluator';
-import { activeBackend } from '../core/observability';
+import {
+  activeBackend,
+  withExternalOperationSpan,
+  withPipelineStageSpan,
+} from '../core/observability';
 import { getEvalRecorder } from '../core/observability/eval-recorder';
 import { fingerprintTestInfra } from '../core/agents/repro-loop-v2/test-infra-fingerprint';
 import { watchAndFixPrChecks } from '../core/ci-check-watcher';
@@ -634,16 +638,82 @@ async function runPMDesignLoop(args: {
   } | null;
   reproEvidence?: { reproduced: boolean; message?: string } | null;
 }): Promise<{ approved: true; agreedDesign: string }> {
+  const repoFullName = args.payload.repository.full_name;
+  const issueNumber = args.payload.issue.number;
+  return withPipelineStageSpan(
+    'pm_design',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      attempt_id: args.runId,
+      issue_type: args.issueType,
+      affected_module: args.affectedModule,
+      has_repro_dossier: !!args.reproDossierSnapshot,
+      repro_reproduced: args.reproEvidence?.reproduced ?? null,
+    },
+    async (span) => {
+      const result = await runPMDesignLoopImpl(args);
+      span.setAttributes({
+        'pm_design.approved': result.approved,
+        'pm_design.agreed_design_chars': result.agreedDesign.length,
+      });
+      span.setOutput({
+        approved: result.approved,
+        agreed_design_chars: result.agreedDesign.length,
+      });
+      return result;
+    }
+  );
+}
+
+async function runPMDesignLoopImpl(args: {
+  payload: IssueEvent;
+  manifest: Manifest;
+  triageSummary: string;
+  affectedModule: string;
+  issueType: 'bug_fix' | 'new_feature' | 'docs';
+  live: LiveDeps;
+  log: (msg: string) => void;
+  runId: string;
+  reproDossierSnapshot?: {
+    summary: string;
+    confidence: 'low' | 'medium' | 'high';
+    suspectSymbols: Array<{ file: string; symbol: string; reasoning: string }>;
+  } | null;
+  reproEvidence?: { reproduced: boolean; message?: string } | null;
+}): Promise<{ approved: true; agreedDesign: string }> {
   const { payload, manifest, triageSummary, affectedModule, issueType, live, log, runId } = args;
   const repoFullName = payload.repository.full_name;
   const issueNumber = payload.issue.number;
 
   log('[pm] gathering design context (related issues, recent PRs, design docs)');
-  const [relatedIssues, recentPRs, designDocs] = await Promise.all([
-    live.issueSearcher.searchRelatedIssues(repoFullName, affectedModule, null, null),
-    live.prFetcher.getRecentMergedPRs(repoFullName, affectedModule, 30),
-    live.designDocFinder.findDesignDocs(repoFullName, affectedModule),
-  ]);
+  const [relatedIssues, recentPRs, designDocs] = await withExternalOperationSpan(
+    'pm.context_fetch',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      attempt_id: runId,
+      affected_module: affectedModule,
+    },
+    async (span) => {
+      const result = await Promise.all([
+        live.issueSearcher.searchRelatedIssues(repoFullName, affectedModule, null, null),
+        live.prFetcher.getRecentMergedPRs(repoFullName, affectedModule, 30),
+        live.designDocFinder.findDesignDocs(repoFullName, affectedModule),
+      ]);
+      span.setAttributes({
+        'pm.context.related_issue_count': result[0].length,
+        'pm.context.recent_pr_count': result[1].length,
+        'pm.context.design_doc_count': result[2].length,
+      });
+      span.setOutput({
+        related_issue_count: result[0].length,
+        recent_pr_count: result[1].length,
+        design_doc_count: result[2].length,
+      });
+      return result;
+    }
+  );
 
   const labels = (payload.issue.labels ?? []).map((l) => l.name);
 
@@ -711,13 +781,27 @@ async function runPMDesignLoop(args: {
     : new HeuristicFollowUpGenerator();
 
   log(`[pm] sending design brief to ${manifest.pm_email}`);
-  const sendResult = await sendDesignBrief(
-    live.gmail,
-    live.watcher,
-    config,
-    briefInput,
-    briefGen,
-    live.pmEmailStateStore
+  const sendResult = await withExternalOperationSpan(
+    'email.pm_design.send',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      attempt_id: runId,
+      recipient: manifest.pm_email,
+    },
+    async (span) => {
+      const result = await sendDesignBrief(
+        live.gmail,
+        live.watcher,
+        config,
+        briefInput,
+        briefGen,
+        live.pmEmailStateStore
+      );
+      span.setAttributes({ 'email.action': result.action });
+      span.setOutput({ action: result.action });
+      return result;
+    }
   );
   if (sendResult.action !== 'email_sent') {
     throw new Error(`Unexpected pm-email action ${sendResult.action} from sendDesignBrief`);
@@ -731,22 +815,56 @@ async function runPMDesignLoop(args: {
   // Loop: block on watcher reply, process, send follow-up, until approved.
   while (true) {
     log(`[pm] waiting for PM reply on thread ${thread.threadId} (runId=${runId})`);
-    const { reply } = await live.replyWaiter.waitForEmailReply(runId);
+    const { reply } = await withExternalOperationSpan(
+      'email.pm_design.wait_reply',
+      {
+        repo: repoFullName,
+        issue_number: issueNumber,
+        attempt_id: runId,
+        thread_id: thread.threadId,
+      },
+      async (span) => {
+        const result = await live.replyWaiter.waitForEmailReply(runId);
+        span.setAttributes({
+          'email.reply_chars': result.reply.body.length,
+          'email.reply_from': result.reply.from,
+        });
+        span.setOutput({
+          reply_chars: result.reply.body.length,
+          from: result.reply.from,
+        });
+        return result;
+      }
+    );
     log(`[pm] received reply (${reply.body.length} chars) from ${reply.from}`);
     thread = appendReplyToThread(thread, reply);
     live.watcher.registerThread(thread);
 
-    const result = await processReply(
-      live.gmail,
-      live.watcher,
-      config,
-      thread,
-      reply.body,
-      resolvedDecisions,
-      unresolvedQuestions,
-      briefInput,
-      followUpGen,
-      live.pmEmailStateStore
+    const result = await withExternalOperationSpan(
+      'email.pm_design.process_reply',
+      {
+        repo: repoFullName,
+        issue_number: issueNumber,
+        attempt_id: runId,
+        thread_id: thread.threadId,
+      },
+      async (span) => {
+        const processed = await processReply(
+          live.gmail,
+          live.watcher,
+          config,
+          thread,
+          reply.body,
+          resolvedDecisions,
+          unresolvedQuestions,
+          briefInput,
+          followUpGen,
+          live.pmEmailStateStore
+        );
+        span.setAttributes({ 'pm.reply.action': processed.action });
+        span.setOutput({ action: processed.action });
+        return processed;
+      }
     );
 
     if (result.action === 'approved') {
@@ -1317,6 +1435,52 @@ async function runVerification(args: {
   confirmedIssues: ConfirmedIssue[];
   log: (msg: string) => void;
 }): Promise<VerificationResult> {
+  return withPipelineStageSpan(
+    'verification',
+    {
+      repo: args.upstreamRepo,
+      issue_number: args.issueNumber,
+      attempt_id: args.runId,
+      fork: args.forkFullName,
+      branch: args.branchName,
+      sandbox_runner: args.manifest.sandbox_runner,
+      affected_module: args.affectedModule,
+      confirmed_issue_count: args.confirmedIssues.length,
+    },
+    async (span) => {
+      const result = await runVerificationImpl(args);
+      span.setAttributes({
+        'verification.ok': result.outcome.ok,
+        'verification.skipped': result.verificationSkipped,
+        'verification.regression_label_count': result.regressionLabels.length,
+        'verification.usability_label_count': result.usabilityLabels.length,
+      });
+      span.setOutput({
+        ok: result.outcome.ok,
+        skipped: result.verificationSkipped,
+        regression_labels: result.regressionLabels,
+        usability_labels: result.usabilityLabels,
+      });
+      return result;
+    }
+  );
+}
+
+async function runVerificationImpl(args: {
+  manifest: Manifest;
+  adapter: RepoAdapter;
+  token: string;
+  forkFullName: string;
+  branchName: string;
+  upstreamRepo: string;
+  upstreamDefaultBranch: string;
+  issueNumber: number;
+  runId: string;
+  workspace: LocalWorkspace;
+  affectedModule: string;
+  confirmedIssues: ConfirmedIssue[];
+  log: (msg: string) => void;
+}): Promise<VerificationResult> {
   const {
     manifest,
     adapter,
@@ -1424,7 +1588,29 @@ async function runVerification(args: {
       gitClient,
       runLabel: `${forkFullName}#${issueNumber} verify`,
     });
-    const branchPhase = await verificationSandboxSession.verifyAndPushBranch();
+    const branchPhase = await withExternalOperationSpan(
+      'sandbox.verification_init',
+      {
+        repo: upstreamRepo,
+        issue_number: issueNumber,
+        attempt_id: runId,
+        fork: forkFullName,
+        branch: branchName,
+        sandbox_workflow_repo: sandboxWorkflowRepo,
+        sandbox_workflow_ref: sandboxWorkflowRef,
+      },
+      async (span) => {
+        const result = await verificationSandboxSession!.verifyAndPushBranch();
+        span.setAttributes({
+          'sandbox.phase': result.phase,
+          'sandbox.ok': result.ok,
+          ...(result.ok && result.phase === 'branch' ? { 'sandbox.branch_sha': result.sha } : {}),
+          ...(!result.ok ? { 'sandbox.reason': result.reason } : {}),
+        });
+        span.setOutput(result.ok ? { ok: true, phase: result.phase } : result);
+        return result;
+      }
+    );
     if (!branchPhase.ok) {
       throw new Error(
         `verification sandbox branch preflight failed: phase=${branchPhase.phase} reason=${branchPhase.reason} diagnostics=${JSON.stringify(branchPhase.diagnostics ?? {})}`
@@ -1465,11 +1651,34 @@ async function runVerification(args: {
       manifest.sandbox_timeout_mins ?? 15
     );
 
-    const regressionResult = await runRegressionGuard(
-      regressionConfig,
-      actionsClient,
-      undefined,
-      verificationSandboxSession
+    const regressionResult = await withPipelineStageSpan(
+      'verification.regression_guard',
+      {
+        repo: upstreamRepo,
+        issue_number: issueNumber,
+        attempt_id: runId,
+        fork: forkFullName,
+        branch: branchName,
+        command_count: testCommands.length,
+        service_count: serviceNames.length,
+      },
+      async (span) => {
+        const result = await runRegressionGuard(
+          regressionConfig,
+          actionsClient,
+          undefined,
+          verificationSandboxSession
+        );
+        span.setAttributes({
+          'regression.detected': result.regressionDetected,
+          'regression.diff_count': result.diffs.length,
+        });
+        span.setOutput({
+          regression_detected: result.regressionDetected,
+          diff_count: result.diffs.length,
+        });
+        return result;
+      }
     );
     regressionSection = generateRegressionSummary(regressionResult);
     regressionDetected = regressionResult.regressionDetected;
@@ -1524,11 +1733,36 @@ async function runVerification(args: {
     };
 
     const exerciser = new GHAUsabilityExerciser(token, actionsClient);
-    const usabilityResult = await runUsabilityAgent(
-      usabilityInput,
-      exerciser,
-      actionsClient,
-      verificationSandboxSession
+    const usabilityResult = await withPipelineStageSpan(
+      'verification.usability',
+      {
+        repo: upstreamRepo,
+        issue_number: issueNumber,
+        attempt_id: runId,
+        fork: forkFullName,
+        branch: branchName,
+        service_count: serviceNames.length,
+        entry_point_count: introspection.entryPoints.length,
+      },
+      async (span) => {
+        const result = await runUsabilityAgent(
+          usabilityInput,
+          exerciser,
+          actionsClient,
+          verificationSandboxSession
+        );
+        span.setAttributes({
+          'usability.completed': result.completed,
+          'usability.dx_score': result.dxScore,
+          'usability.blocker_count': result.blockers.length,
+        });
+        span.setOutput({
+          completed: result.completed,
+          dx_score: result.dxScore,
+          blocker_count: result.blockers.length,
+        });
+        return result;
+      }
     );
     usabilitySection = usabilityResult.summary;
     usabilityBlockers = usabilityResult.blockers;
@@ -1595,6 +1829,22 @@ function resolveRecordedBackend(): string {
  * Returns the diff string (capped at 20KB), or an error description on failure.
  */
 async function gatherFixDiff(workspaceDir: string, log: (msg: string) => void, baseSha?: string): Promise<string> {
+  return withExternalOperationSpan(
+    'git.diff',
+    {
+      workspace_dir: workspaceDir,
+      has_base_sha: !!baseSha,
+    },
+    async (span) => {
+      const diff = await gatherFixDiffImpl(workspaceDir, log, baseSha);
+      span.setAttributes({ 'git.diff_chars': diff.length });
+      span.setOutput({ diff_chars: diff.length });
+      return diff;
+    }
+  );
+}
+
+async function gatherFixDiffImpl(workspaceDir: string, log: (msg: string) => void, baseSha?: string): Promise<string> {
   try {
     const range = baseSha ? [baseSha, 'HEAD'] : ['HEAD~1', 'HEAD'];
     const result = await execCommand('git', ['diff', ...range], workspaceDir, {
@@ -1621,6 +1871,30 @@ async function gatherFixDiff(workspaceDir: string, log: (msg: string) => void, b
  * throwing when mail is not configured.
  */
 async function sendPrePrNotificationEmail(args: {
+  issueUrl: string;
+  branchUrl: string;
+  reproMethodNote?: string | null;
+  reproTestUrl?: string | null;
+  log: (msg: string) => void;
+  live: import('./clients/live-deps').LiveDeps | null | undefined;
+}): Promise<void> {
+  return withExternalOperationSpan(
+    'email.pre_pr_notification',
+    {
+      issue_url: args.issueUrl,
+      has_live_deps: !!args.live,
+      has_send_mail: !!args.live?.sendMail,
+      has_repro_method_note: !!args.reproMethodNote,
+      has_repro_test_url: !!args.reproTestUrl,
+    },
+    async (span) => {
+      await sendPrePrNotificationEmailImpl(args);
+      span.setOutput({ sent_or_skipped: true });
+    }
+  );
+}
+
+async function sendPrePrNotificationEmailImpl(args: {
   issueUrl: string;
   branchUrl: string;
   reproMethodNote?: string | null;
@@ -1678,6 +1952,54 @@ interface PrePrReviewGate {
  * Email subject always carries the "[upstream-pr-review]" prefix for easy filtering.
  */
 async function sendPrePrReviewEmail(args: {
+  issueTitle: string;
+  issueNumber: number;
+  issueUrl: string;
+  repoFullName: string;
+  reproTestPath: string | undefined;
+  reproTestContent: string | undefined;
+  fixDiff: string;
+  sandbox1ExitCode: number | null;
+  sandbox1Output: string;
+  sandbox2ExitCode: number | null;
+  sandbox2Output: string;
+  changedFiles: string[];
+  reproMethodNote?: string | null;
+  reproTestUrl?: string | null;
+  forkFullName: string;
+  branchName: string;
+  pmEmail: string;
+  approvalKeywords: string[];
+  live: import('./clients/live-deps').LiveDeps;
+  runId: string;
+  log: (msg: string) => void;
+}): Promise<PrePrReviewGate> {
+  return withPipelineStageSpan(
+    'pre_pr_review',
+    {
+      repo: args.repoFullName,
+      issue_number: args.issueNumber,
+      attempt_id: args.runId,
+      fork: args.forkFullName,
+      branch: args.branchName,
+      changed_file_count: args.changedFiles.length,
+      has_repro_test: !!args.reproTestPath,
+      has_repro_method_note: !!args.reproMethodNote,
+    },
+    async (span) => {
+      const result = await sendPrePrReviewEmailImpl(args);
+      span.setAttributes({
+        'pre_pr_review.approved': result.approved,
+        'pre_pr_review.skipped': result.skipped,
+        ...(result.skipReason ? { 'pre_pr_review.skip_reason': result.skipReason } : {}),
+      });
+      span.setOutput(result);
+      return result;
+    }
+  );
+}
+
+async function sendPrePrReviewEmailImpl(args: {
   issueTitle: string;
   issueNumber: number;
   issueUrl: string;
@@ -1812,7 +2134,20 @@ async function sendPrePrReviewEmail(args: {
   log(`[pre-pr-review] sending pre-PR review email to ${pmEmail} (runId=${prReviewRunId})`);
 
   try {
-    await live.failureNotifier.sendEmail(pmEmail, subject, emailBody, replyToAddress);
+    await withExternalOperationSpan(
+      'email.pre_pr_review.send',
+      {
+        repo: repoFullName,
+        issue_number: issueNumber,
+        attempt_id: runId,
+        recipient: pmEmail,
+        body_chars: emailBody.length,
+      },
+      async (span) => {
+        await live.failureNotifier.sendEmail(pmEmail, subject, emailBody, replyToAddress);
+        span.setOutput({ sent: true });
+      }
+    );
   } catch (err: any) {
     log(`[pre-pr-review] failed to send email (fail-safe: opening PR directly): ${err?.message ?? err}`);
     return { approved: true, skipped: true, skipReason: `email-send-failed: ${err?.message ?? err}` };
@@ -1825,7 +2160,27 @@ async function sendPrePrReviewEmail(args: {
 
   let reply: import('../core/gmail-types').GmailReply;
   try {
-    const result = await live.replyWaiter.waitForEmailReply(prReviewRunId);
+    const result = await withExternalOperationSpan(
+      'email.pre_pr_review.wait_reply',
+      {
+        repo: repoFullName,
+        issue_number: issueNumber,
+        attempt_id: runId,
+        pr_review_run_id: prReviewRunId,
+      },
+      async (span) => {
+        const waitResult = await live.replyWaiter.waitForEmailReply(prReviewRunId);
+        span.setAttributes({
+          'email.reply_chars': waitResult.reply.body.length,
+          'email.reply_from': waitResult.reply.from,
+        });
+        span.setOutput({
+          reply_chars: waitResult.reply.body.length,
+          from: waitResult.reply.from,
+        });
+        return waitResult;
+      }
+    );
     reply = result.reply;
   } catch (err: any) {
     log(`[pre-pr-review] waitForEmailReply threw (fail-safe: opening PR directly): ${err?.message ?? err}`);
@@ -1869,6 +2224,40 @@ async function runIssueSweepLoop(args: {
   parentRunId: string;
   sweepStateStore: InMemorySweepStateStore;
 }): Promise<{ confirmedIssueNumbers: number[]; skipped: boolean; reason?: string }> {
+  return withPipelineStageSpan(
+    'issue_sweep',
+    {
+      repo: args.repoFullName,
+      issue_number: args.primaryIssueNumber,
+      attempt_id: args.parentRunId,
+      affected_module: args.affectedModule,
+    },
+    async (span) => {
+      const result = await runIssueSweepLoopImpl(args);
+      span.setAttributes({
+        'sweep.confirmed_issue_count': result.confirmedIssueNumbers.length,
+        'sweep.skipped': result.skipped,
+        ...(result.reason ? { 'sweep.reason': result.reason } : {}),
+      });
+      span.setOutput(result);
+      return result;
+    }
+  );
+}
+
+async function runIssueSweepLoopImpl(args: {
+  repoFullName: string;
+  primaryIssueNumber: number;
+  primaryIssueTitle: string;
+  agreedDesign: string;
+  affectedModule: string;
+  manifest: Manifest;
+  live: LiveDeps;
+  token: string;
+  log: (msg: string) => void;
+  parentRunId: string;
+  sweepStateStore: InMemorySweepStateStore;
+}): Promise<{ confirmedIssueNumbers: number[]; skipped: boolean; reason?: string }> {
   const {
     repoFullName,
     primaryIssueNumber,
@@ -1886,7 +2275,21 @@ async function runIssueSweepLoop(args: {
   log(`[sweep] fetching open issues for ${repoFullName}`);
   let openIssues;
   try {
-    openIssues = await listOpenIssues(token, repoFullName, 50);
+    openIssues = await withExternalOperationSpan(
+      'github.list_open_issues',
+      {
+        repo: repoFullName,
+        issue_number: primaryIssueNumber,
+        attempt_id: parentRunId,
+        limit: 50,
+      },
+      async (span) => {
+        const result = await listOpenIssues(token, repoFullName, 50);
+        span.setAttributes({ 'github.issue_count': result.length });
+        span.setOutput({ issue_count: result.length });
+        return result;
+      }
+    );
   } catch (err) {
     log(`[sweep] failed to list issues (${(err as Error).message}); skipping sweep`);
     return { confirmedIssueNumbers: [primaryIssueNumber], skipped: true, reason: 'list-failed' };
@@ -1936,15 +2339,45 @@ async function runIssueSweepLoop(args: {
   };
 
   log('[sweep] writing plain-language explanations for the scope email');
-  await enrichSweepWithExplanations(live.llm, sweepResult, agreedDesign, log);
+  await withPipelineStageSpan(
+    'issue_sweep.explain',
+    {
+      repo: repoFullName,
+      issue_number: primaryIssueNumber,
+      attempt_id: parentRunId,
+      high_confidence_count: sweepResult.highConfidence.length,
+      maybe_count: sweepResult.maybeInScope.length,
+    },
+    async (span) => {
+      await enrichSweepWithExplanations(live.llm, sweepResult, agreedDesign, log);
+      span.setOutput({
+        high_confidence_count: sweepResult.highConfidence.length,
+        maybe_count: sweepResult.maybeInScope.length,
+      });
+    }
+  );
 
   log(`[sweep] sending scope-confirmation email to ${manifest.pm_email} (runId=${sweepRunId})`);
-  const sendResult = await sendScopeConfirmation(
-    live.gmail,
-    live.watcher,
-    config,
-    sweepResult,
-    sweepStateStore
+  const sendResult = await withExternalOperationSpan(
+    'email.issue_sweep.send',
+    {
+      repo: repoFullName,
+      issue_number: primaryIssueNumber,
+      attempt_id: sweepRunId,
+      recipient: manifest.pm_email,
+    },
+    async (span) => {
+      const result = await sendScopeConfirmation(
+        live.gmail,
+        live.watcher,
+        config,
+        sweepResult,
+        sweepStateStore
+      );
+      span.setAttributes({ 'email.action': result.action });
+      span.setOutput({ action: result.action });
+      return result;
+    }
   );
   if (sendResult.action !== 'scope_email_sent') {
     log(`[sweep] unexpected sweep send action ${sendResult.action}; falling back to primary`);
@@ -1952,7 +2385,27 @@ async function runIssueSweepLoop(args: {
   }
 
   log(`[sweep] waiting for scope reply on thread ${sendResult.thread.threadId}`);
-  const { reply } = await live.replyWaiter.waitForEmailReply(sweepRunId);
+  const { reply } = await withExternalOperationSpan(
+    'email.issue_sweep.wait_reply',
+    {
+      repo: repoFullName,
+      issue_number: primaryIssueNumber,
+      attempt_id: sweepRunId,
+      thread_id: sendResult.thread.threadId,
+    },
+    async (span) => {
+      const result = await live.replyWaiter.waitForEmailReply(sweepRunId);
+      span.setAttributes({
+        'email.reply_chars': result.reply.body.length,
+        'email.reply_from': result.reply.from,
+      });
+      span.setOutput({
+        reply_chars: result.reply.body.length,
+        from: result.reply.from,
+      });
+      return result;
+    }
+  );
   log(`[sweep] received scope reply (${reply.body.length} chars)`);
 
   const confirmResult = processScopeReply(
@@ -1993,14 +2446,93 @@ async function runBuildAttempt(args: {
   ghClient: GitHubRestClient;
   log: (msg: string) => void;
 }): Promise<FixAttemptOutcome> {
+  return withPipelineStageSpan(
+    'build_attempt',
+    {
+      repo: args.payload.repository.full_name,
+      issue_number: args.payload.issue.number,
+      attempt_id: args.runId,
+      fork: args.forkFullName,
+      branch: args.branchName,
+      affected_module: args.buildInput.affectedModule,
+      sandbox_runner: args.manifest.sandbox_runner,
+      confirmed_issue_count: args.buildInput.confirmedIssues.length,
+      reference_module_count: args.buildInput.referenceModules.length,
+    },
+    async (span) => {
+      const result = await runBuildAttemptImpl(args);
+      span.setAttributes({
+        'build.ok': result.ok,
+        'build.eval_summary': result.evalSummary,
+        'build.fix_summary_chars': result.fixSummary.length,
+      });
+      span.setOutput({
+        ok: result.ok,
+        eval_summary: result.evalSummary,
+        fix_summary_chars: result.fixSummary.length,
+      });
+      return result;
+    }
+  );
+}
+
+async function runBuildAttemptImpl(args: {
+  buildInput: BuildAgentInput;
+  workspace: LocalWorkspace;
+  adapter: RepoAdapter;
+  manifest: Manifest;
+  payload: IssueEvent;
+  runId: string;
+  forkFullName: string;
+  branchName: string;
+  ghClient: GitHubRestClient;
+  log: (msg: string) => void;
+}): Promise<FixAttemptOutcome> {
   const { buildInput, workspace, adapter, manifest, payload, log, ghClient } = args;
   const reader = new LocalRepoFileReader(workspace);
-  const tokenScopes = await ghClient.getTokenScopes();
+  const tokenScopes = await withExternalOperationSpan(
+    'github.token_scopes',
+    {
+      repo: payload.repository.full_name,
+      issue_number: payload.issue.number,
+      attempt_id: args.runId,
+    },
+    async (span) => {
+      const scopes = await ghClient.getTokenScopes();
+      span.setAttributes({ 'github.scope_count': scopes.length });
+      span.setOutput({ scope_count: scopes.length });
+      return scopes;
+    }
+  );
   const committer = new LocalForkCommitter(workspace, tokenScopes);
   const generator = new OpenRouterScaffoldGenerator();
 
   log('[build] invoking OpenRouter scaffold generator');
-  const buildResult = await runBuildAgent(buildInput, generator, committer, reader);
+  const buildResult = await withPipelineStageSpan(
+    'build_agent',
+    {
+      repo: payload.repository.full_name,
+      issue_number: payload.issue.number,
+      attempt_id: args.runId,
+      affected_module: buildInput.affectedModule,
+    },
+    async (span) => {
+      const result = await runBuildAgent(buildInput, generator, committer, reader);
+      span.setAttributes({
+        'build_agent.success': result.success,
+        'build_agent.module_file_count': result.moduleFiles.length,
+        'build_agent.test_file_count': result.testFiles.length,
+        'build_agent.index_file_count': result.indexFiles.length,
+      });
+      span.setOutput({
+        success: result.success,
+        module_file_count: result.moduleFiles.length,
+        test_file_count: result.testFiles.length,
+        index_file_count: result.indexFiles.length,
+      });
+      return result;
+    }
+  );
   if (!buildResult.success) {
     return {
       ok: false,
@@ -2015,8 +2547,30 @@ async function runBuildAttempt(args: {
     buildResult.indexFiles.length;
   log(`[build] committed ${totalFiles} files: ${buildResult.summary}`);
 
-  const testCommands = await adapter.getTestCommands();
-  const sandboxServices = await adapter.getSandboxServices();
+  const [testCommands, sandboxServices] = await withExternalOperationSpan(
+    'adapter.sandbox_config',
+    {
+      repo: payload.repository.full_name,
+      issue_number: payload.issue.number,
+      attempt_id: args.runId,
+      affected_module: buildInput.affectedModule,
+    },
+    async (span) => {
+      const result = await Promise.all([
+        adapter.getTestCommands(),
+        adapter.getSandboxServices(),
+      ]);
+      span.setAttributes({
+        'adapter.test_command_count': result[0].length,
+        'adapter.sandbox_service_count': result[1].length,
+      });
+      span.setOutput({
+        test_command_count: result[0].length,
+        sandbox_service_count: result[1].length,
+      });
+      return result;
+    }
+  );
   log(
     `[sandbox] ${testCommands.length} command(s); services=${sandboxServices
       .map((s) => (typeof s === 'string' ? s : s.name))
@@ -2101,13 +2655,58 @@ async function runDocsPath(args: {
   log: (msg: string) => void;
   triageSummary: string;
 }): Promise<{ summary: string }> {
+  return withPipelineStageSpan(
+    'docs',
+    {
+      repo: args.payload.repository.full_name,
+      issue_number: args.payload.issue.number,
+      fork: args.forkFullName,
+      branch: args.branchName,
+      affected_module: args.affectedModule,
+    },
+    async (span) => {
+      const result = await runDocsPathImpl(args);
+      span.setAttributes({
+        'docs.summary_chars': result.summary.length,
+      });
+      span.setOutput({ summary_chars: result.summary.length });
+      return result;
+    }
+  );
+}
+
+async function runDocsPathImpl(args: {
+  payload: IssueEvent;
+  manifest: Manifest;
+  affectedModule: string;
+  workspace: LocalWorkspace;
+  forkFullName: string;
+  branchName: string;
+  ghClient: GitHubRestClient;
+  live: LiveDeps;
+  log: (msg: string) => void;
+  triageSummary: string;
+}): Promise<{ summary: string }> {
   const { payload, workspace, forkFullName, branchName, ghClient, live, log, triageSummary, affectedModule } = args;
   const reader = new LocalRepoFileReader(workspace);
-  const tokenScopes = await ghClient.getTokenScopes();
+  const tokenScopes = await withExternalOperationSpan(
+    'github.token_scopes',
+    {
+      repo: payload.repository.full_name,
+      issue_number: payload.issue.number,
+    },
+    async (span) => {
+      const scopes = await ghClient.getTokenScopes();
+      span.setAttributes({ 'github.scope_count': scopes.length });
+      span.setOutput({ scope_count: scopes.length });
+      return scopes;
+    }
+  );
   const committer = new LocalForkCommitter(workspace, tokenScopes);
 
   const docFiles = gatherDocFiles(workspace, affectedModule);
   log(`[docs] gathered ${docFiles.length} doc files`);
+  const docsRunId = `${payload.repository.full_name}#${payload.issue.number}-docs`;
 
   const docInput: DocsAgentInput = {
     confirmedIssues: [
@@ -2126,7 +2725,28 @@ async function runDocsPath(args: {
     triageSummary,
   };
 
-  const result = await runDocsAgent(docInput, live.docsGenerator, committer, reader);
+  const result = await withPipelineStageSpan(
+    'docs_agent',
+    {
+      repo: payload.repository.full_name,
+      issue_number: payload.issue.number,
+      attempt_id: docsRunId,
+      affected_module: affectedModule,
+      doc_file_count: docFiles.length,
+    },
+    async (span) => {
+      const docsResult = await runDocsAgent(docInput, live.docsGenerator, committer, reader);
+      span.setAttributes({
+        'docs_agent.success': docsResult.success,
+        'docs_agent.change_count': docsResult.changes.length,
+      });
+      span.setOutput({
+        success: docsResult.success,
+        change_count: docsResult.changes.length,
+      });
+      return docsResult;
+    }
+  );
   if (!result.success) {
     throw new Error('Docs agent produced no changes');
   }
@@ -2135,6 +2755,40 @@ async function runDocsPath(args: {
 }
 
 export async function runPipeline(args: {
+  payload: IssueEvent;
+  manifest: Manifest;
+  adapter: RepoAdapter;
+  deps: PipelineDeps;
+}): Promise<PipelineResult> {
+  const repoFullName = args.payload.repository.full_name;
+  const issueNumber = args.payload.issue.number;
+  const startedAt = Date.now();
+  return withPipelineStageSpan(
+    'run',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      trigger_label: args.manifest.trigger_label,
+      sandbox_runner: args.manifest.sandbox_runner,
+    },
+    async (span) => {
+      try {
+        const result = await runPipelineImpl(args);
+        span.setAttributes({
+          'pipeline.status': result.status,
+          'pipeline.duration_ms': Date.now() - startedAt,
+        });
+        span.setOutput(result);
+        return result;
+      } catch (err) {
+        span.setAttributes({ 'pipeline.duration_ms': Date.now() - startedAt });
+        throw err;
+      }
+    }
+  );
+}
+
+async function runPipelineImpl(args: {
   payload: IssueEvent;
   manifest: Manifest;
   adapter: RepoAdapter;
@@ -2178,11 +2832,23 @@ export async function runPipeline(args: {
           const subject = `[oss-agent] triage notice for ${repo}#${issueNumber}`;
           const issueUrl = `https://github.com/${repo}/issues/${issueNumber}`;
           const body = `${comment}\n\n---\nIssue: ${issueUrl}`;
-          await deps.live!.failureNotifier.sendEmail(
-            manifest.pm_email,
-            subject,
-            body,
-            manifest.pm_email
+          await withExternalOperationSpan(
+            'email.triage_notice',
+            {
+              repo,
+              issue_number: issueNumber,
+              recipient: manifest.pm_email,
+              body_chars: body.length,
+            },
+            async (span) => {
+              await deps.live!.failureNotifier.sendEmail(
+                manifest.pm_email,
+                subject,
+                body,
+                manifest.pm_email
+              );
+              span.setOutput({ sent: true });
+            }
           );
           log(`[triage] emailed maintainer at ${manifest.pm_email}`);
         },
@@ -2194,18 +2860,44 @@ export async function runPipeline(args: {
       };
   const triageInput = buildTriageInput(payload, manifest, []);
 
-  const routing = await runTriage(
-    repoFullName,
-    issueNumber,
-    triageInput,
-    adapter,
-    triageNotifier,
+  const routing = await withPipelineStageSpan(
+    'triage',
     {
-      typeClassifier: createDefaultTriageClassifier(
-        deps.live
-          ? { browser: deps.live.codeBrowser, repo: repoFullName }
-          : undefined
-      ),
+      repo: repoFullName,
+      issue_number: issueNumber,
+      trigger_label: manifest.trigger_label,
+      label_count: triageInput.labels.length,
+    },
+    async (span) => {
+      const result = await runTriage(
+        repoFullName,
+        issueNumber,
+        triageInput,
+        adapter,
+        triageNotifier,
+        {
+          typeClassifier: createDefaultTriageClassifier(
+            deps.live
+              ? { browser: deps.live.codeBrowser, repo: repoFullName }
+              : undefined
+          ),
+        }
+      );
+      span.setAttributes({
+        'triage.action': result.action,
+        'triage.issue_type': result.result.issueType,
+        'triage.affected_module': result.result.affectedModule,
+        'triage.confidence': result.result.confidence,
+        'triage.relevance': result.result.relevance,
+      });
+      span.setOutput({
+        action: result.action,
+        issue_type: result.result.issueType,
+        affected_module: result.result.affectedModule,
+        confidence: result.result.confidence,
+        relevance: result.result.relevance,
+      });
+      return result;
     }
   );
   log(
@@ -2248,13 +2940,34 @@ export async function runPipeline(args: {
         `safe production runs should use a separate bot fork/org.`
     );
   }
-  const fork = await createForkAndBranch(ghClient, {
-    upstream: repoFullName,
-    forkOrg: deps.forkOrg,
-    branchPrefix: manifest.branch_prefix,
-    issueIds: [issueNumber],
-    skipReset: process.env.OSA_FIX_ONLY === '1',
-  });
+  const fork = await withExternalOperationSpan(
+    'github.fork_branch',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      fork_org: deps.forkOrg,
+      branch_prefix: manifest.branch_prefix,
+      skip_reset: process.env.OSA_FIX_ONLY === '1',
+    },
+    async (span) => {
+      const result = await createForkAndBranch(ghClient, {
+        upstream: repoFullName,
+        forkOrg: deps.forkOrg,
+        branchPrefix: manifest.branch_prefix,
+        issueIds: [issueNumber],
+        skipReset: process.env.OSA_FIX_ONLY === '1',
+      });
+      span.setAttributes({
+        'github.fork_full_name': result.forkFullName,
+        'github.branch_name': result.branchName,
+        'github.fork_created': result.forkCreated,
+        'github.fork_synced': result.forkSynced,
+        'github.branch_reset': result.branchReset,
+      });
+      span.setOutput(result);
+      return result;
+    }
+  );
   log(
     `[fork] ${fork.forkFullName} branch=${fork.branchName} ` +
       `created=${fork.forkCreated} synced=${fork.forkSynced} reset=${fork.branchReset}`
@@ -2272,17 +2985,42 @@ export async function runPipeline(args: {
   // "⚠️ Not Run" if workflows are missing.
   if (manifest.sandbox_runner === 'gha') {
     try {
-      await ensureRegressionWorkflowOnFork(deps.token, fork.forkFullName, log);
-      await ensureRegressionWorkflowOnBranch(deps.token, fork.forkFullName, fork.branchName, log);
-      await ensureUsabilityWorkflowOnFork(deps.token, fork.forkFullName, log);
-      await ensureUsabilityWorkflowOnBranch(deps.token, fork.forkFullName, fork.branchName, log);
+      await withExternalOperationSpan(
+        'github.install_verification_workflows',
+        {
+          repo: repoFullName,
+          issue_number: issueNumber,
+          fork: fork.forkFullName,
+          branch: fork.branchName,
+        },
+        async (span) => {
+          await ensureRegressionWorkflowOnFork(deps.token, fork.forkFullName, log);
+          await ensureRegressionWorkflowOnBranch(deps.token, fork.forkFullName, fork.branchName, log);
+          await ensureUsabilityWorkflowOnFork(deps.token, fork.forkFullName, log);
+          await ensureUsabilityWorkflowOnBranch(deps.token, fork.forkFullName, fork.branchName, log);
+          span.setOutput({ installed: true });
+        }
+      );
     } catch (err: any) {
       log(`[verify/install] failed to install verification workflows (non-blocking): ${err?.message ?? err}`);
     }
   }
 
   // ---------- Local workspace ----------
-  const baseBranch = await ghClient.getDefaultBranch(fork.forkFullName);
+  const baseBranch = await withExternalOperationSpan(
+    'github.default_branch',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      fork: fork.forkFullName,
+    },
+    async (span) => {
+      const branch = await ghClient.getDefaultBranch(fork.forkFullName);
+      span.setAttributes({ 'github.default_branch': branch });
+      span.setOutput({ default_branch: branch });
+      return branch;
+    }
+  );
   const workspace = new LocalWorkspace(
     {
       rootDir: deps.workspaceRoot,
@@ -2294,7 +3032,21 @@ export async function runPipeline(args: {
     fork.branchName
   );
   log(`[workspace] cloning ${fork.forkFullName} → ${workspace.dir}`);
-  await workspace.ensureCheckedOut(baseBranch);
+  await withExternalOperationSpan(
+    'git.workspace_checkout',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      fork: fork.forkFullName,
+      branch: fork.branchName,
+      base_branch: baseBranch,
+      workspace_dir: workspace.dir,
+    },
+    async (span) => {
+      await workspace.ensureCheckedOut(baseBranch);
+      span.setOutput({ checked_out: true });
+    }
+  );
 
   const confirmedIssues: ConfirmedIssue[] = [
     {
@@ -2308,7 +3060,20 @@ export async function runPipeline(args: {
   // Hydrate extra confirmed issues from the sweep with full details.
   for (const num of extraConfirmedNumbers) {
     try {
-      const details = await getIssueDetails(deps.token, repoFullName, num);
+      const details = await withExternalOperationSpan(
+        'github.issue_details',
+        {
+          repo: repoFullName,
+          issue_number: issueNumber,
+          related_issue_number: num,
+        },
+        async (span) => {
+          const result = await getIssueDetails(deps.token, repoFullName, num);
+          span.setAttributes({ 'github.issue_found': !!result });
+          span.setOutput({ found: !!result });
+          return result;
+        }
+      );
       if (details) {
         confirmedIssues.push(details);
         log(`[sweep] added confirmed issue #${num}: ${details.title}`);
@@ -2485,12 +3250,34 @@ export async function runPipeline(args: {
           forkFullName: fork.forkFullName,
           branchName: fork.branchName,
         };
-        const decision = await runRetryLoop(
-          attempt.retryContext,
-          retryConfig,
-          deps.live.retryStateStore,
-          deps.live.failureNotifier,
-          deps.live.issueLabeler
+        const latestRetryContext = attempt.retryContext;
+        const decision = await withPipelineStageSpan(
+          'retry_loop',
+          {
+            repo: repoFullName,
+            issue_number: issueNumber,
+            attempt_id: runId,
+            agent_type: 'build',
+            max_retries: maxRetries,
+          },
+          async (span) => {
+            const result = await runRetryLoop(
+              latestRetryContext,
+              retryConfig,
+              deps.live!.retryStateStore,
+              deps.live!.failureNotifier,
+              deps.live!.issueLabeler
+            );
+            span.setAttributes({
+              'retry.action': result.action,
+              ...(result.action === 'retry' ? { 'retry.count': result.dispatch.retryCount } : {}),
+            });
+            span.setOutput({
+              action: result.action,
+              retry_count: result.action === 'retry' ? result.dispatch.retryCount : null,
+            });
+            return result;
+          }
         );
         if (decision.action === 'max_retries_exceeded') {
           log(`[retry] max_retries exceeded; labeled agent-failed and emailed PM`);
@@ -2558,22 +3345,60 @@ export async function runPipeline(args: {
       }
       log("[v2-halt] HALT (" + args.logTag + ")");
       if (deps.live) {
-        await dispatchTypedHaltEmail({
-          kind: args.kind,
-          context: args.context,
-          notifier: deps.live.failureNotifier,
-          appendBody: args.appendBody,
-          log,
-        });
+        await withExternalOperationSpan(
+          'email.typed_halt',
+          {
+            repo: repoFullName,
+            issue_number: issueNumber,
+            attempt_id: runId,
+            halt_kind: args.kind,
+            label: args.label ?? '',
+            body_chars: args.appendBody.length,
+          },
+          async (span) => {
+            await dispatchTypedHaltEmail({
+              kind: args.kind,
+              context: args.context,
+              notifier: deps.live!.failureNotifier,
+              appendBody: args.appendBody,
+              log,
+            });
+            span.setOutput({ sent: true, kind: args.kind });
+          }
+        );
         try {
           const issueCommenter = new GitHubIssueCommenter(deps.token);
-          await issueCommenter.postComment(repoFullName, issueNumber, args.commentBody);
+          await withExternalOperationSpan(
+            'github.issue_comment',
+            {
+              repo: repoFullName,
+              issue_number: issueNumber,
+              attempt_id: runId,
+              body_chars: args.commentBody.length,
+            },
+            async (span) => {
+              await issueCommenter.postComment(repoFullName, issueNumber, args.commentBody);
+              span.setOutput({ posted: true });
+            }
+          );
         } catch (commentErr: any) {
           log("[v2-halt] issue comment failed: " + (commentErr?.message ?? commentErr));
         }
         if (args.label) {
           try {
-            await ghClient.addLabelsToPR(repoFullName, issueNumber, [args.label]);
+            await withExternalOperationSpan(
+              'github.issue_label',
+              {
+                repo: repoFullName,
+                issue_number: issueNumber,
+                attempt_id: runId,
+                labels: [args.label],
+              },
+              async (span) => {
+                await ghClient.addLabelsToPR(repoFullName, issueNumber, [args.label!]);
+                span.setOutput({ labels: [args.label] });
+              }
+            );
           } catch (labelErr: any) {
             log("[v2-halt] label add failed: " + (labelErr?.message ?? labelErr));
           }
@@ -2805,11 +3630,40 @@ export async function runPipeline(args: {
     const v2SandboxDriver = manifest.sandbox_runner ?? 'local';
     const v2GhActionsSandboxOptions =
       v2SandboxDriver === 'gha'
-        ? await (async () => {
-            const [testCommands, sandboxServices] = await Promise.all([
-              adapter.getTestCommands(),
-              adapter.getSandboxServices(),
-            ]);
+        ? await withExternalOperationSpan(
+            'sandbox.gha_options',
+            {
+              repo: repoFullName,
+              issue_number: issueNumber,
+              attempt_id: runId,
+              fork: fork.forkFullName,
+              branch: fork.branchName,
+            },
+            async (span) => {
+            const [testCommands, sandboxServices] = await withExternalOperationSpan(
+              'adapter.sandbox_config',
+              {
+                repo: repoFullName,
+                issue_number: issueNumber,
+                attempt_id: runId,
+                affected_module: routing.result.affectedModule,
+              },
+              async (configSpan) => {
+                const result = await Promise.all([
+                  adapter.getTestCommands(),
+                  adapter.getSandboxServices(),
+                ]);
+                configSpan.setAttributes({
+                  'adapter.test_command_count': result[0].length,
+                  'adapter.sandbox_service_count': result[1].length,
+                });
+                configSpan.setOutput({
+                  test_command_count: result[0].length,
+                  sandbox_service_count: result[1].length,
+                });
+                return result;
+              }
+            );
             const actionsClient = new GitHubActionsClient(deps.token);
             const sandboxWorkflowRepo =
               manifest.sandbox_workflow_repo?.trim() ||
@@ -2862,7 +3716,7 @@ export async function runPipeline(args: {
               runLabel: `${fork.forkFullName}#${issueNumber} repro`,
             });
 
-            return {
+            const options = {
               actionsClient,
               baseConfig: {
                 repoFullName,
@@ -2877,7 +3731,21 @@ export async function runPipeline(args: {
               sandboxSession,
               log,
             };
-          })()
+            span.setAttributes({
+              'sandbox.workflow_repo': sandboxWorkflowRepo,
+              'sandbox.workflow_ref': sandboxWorkflowRef,
+              'sandbox.test_command_count': testCommands.length,
+              'sandbox.service_count': sandboxServices.length,
+            });
+            span.setOutput({
+              workflow_repo: sandboxWorkflowRepo,
+              workflow_ref: sandboxWorkflowRef,
+              test_command_count: testCommands.length,
+              service_count: sandboxServices.length,
+            });
+            return options;
+          }
+        )
         : undefined;
 
     log(
@@ -2895,16 +3763,38 @@ export async function runPipeline(args: {
     let testInfraProfile = null;
     const ghRestForFingerprint = new GitHubRestClient(deps.token);
     try {
-      const ghClientForFingerprint = new GitHubActionsClient(deps.token);
-      testInfraProfile = await fingerprintTestInfra({
-        repoFullName: fork.forkFullName,
-        affectedPackagePath: routing.result.affectedModule ?? '',
-        gitClient: {
-          getDefaultBranch: (repo) => ghRestForFingerprint.getDefaultBranch(repo).catch(() => 'main'),
-          getFileContents: (repo, filePath, ref) =>
-            ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
+      testInfraProfile = await withPipelineStageSpan(
+        'repro.test_infra_fingerprint',
+        {
+          repo: repoFullName,
+          issue_number: issueNumber,
+          attempt_id: runId,
+          fork: fork.forkFullName,
+          affected_module: routing.result.affectedModule,
         },
-      });
+        async (span) => {
+          const profile = await fingerprintTestInfra({
+            repoFullName: fork.forkFullName,
+            affectedPackagePath: routing.result.affectedModule ?? '',
+            gitClient: {
+              getDefaultBranch: (repo) => ghRestForFingerprint.getDefaultBranch(repo).catch(() => 'main'),
+              getFileContents: (repo, filePath, ref) =>
+                ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
+            },
+          });
+          span.setAttributes({
+            'test_infra.profile_found': !!profile,
+            'test_infra.fixture_count': profile?.availableFixtures.length ?? 0,
+            'test_infra.cassette_count': profile?.existingCassettes.length ?? 0,
+          });
+          span.setOutput({
+            profile_found: !!profile,
+            fixture_count: profile?.availableFixtures.length ?? 0,
+            cassette_count: profile?.existingCassettes.length ?? 0,
+          });
+          return profile;
+        }
+      );
       if (testInfraProfile) {
         log(`[v2-driver] test-infra fingerprint: cassette_convention=${testInfraProfile.cassetteNamingConvention ?? 'unknown'} ` +
             `fixtures=${testInfraProfile.availableFixtures.length} ` +
@@ -2918,11 +3808,25 @@ export async function runPipeline(args: {
     let relatedIssuesForAnalyst: Array<{ number: number; title: string; reason: string }> = [];
     if (deps.live) {
       try {
-        const related = await deps.live.issueSearcher.searchRelatedIssues(
-          repoFullName,
-          routing.result.affectedModule,
-          null,
-          null
+        const related = await withExternalOperationSpan(
+          'github.related_issues',
+          {
+            repo: repoFullName,
+            issue_number: issueNumber,
+            attempt_id: runId,
+            affected_module: routing.result.affectedModule,
+          },
+          async (span) => {
+            const result = await deps.live!.issueSearcher.searchRelatedIssues(
+              repoFullName,
+              routing.result.affectedModule,
+              null,
+              null
+            );
+            span.setAttributes({ 'github.related_issue_count': result.length });
+            span.setOutput({ related_issue_count: result.length });
+            return result;
+          }
         );
         relatedIssuesForAnalyst = related
           .filter((i) => i.number !== issueNumber)
@@ -2971,31 +3875,63 @@ export async function runPipeline(args: {
       };
     } else {
       try {
-        reproOutcome = await runReproPipelineWithTimeout({
-          attemptId: reproAttemptId,
-          timeoutMs: reproStageTimeoutMs,
-          log,
-          run: () =>
-            runReproPipeline({
+        reproOutcome = await withPipelineStageSpan(
+          'repro',
+          {
+            repo: repoFullName,
+            issue_number: issueNumber,
+            attempt_id: reproAttemptId,
+            fork: fork.forkFullName,
+            branch: fork.branchName,
+            sandbox_runner: v2SandboxDriver,
+            affected_module: routing.result.affectedModule,
+            timeout_ms: reproStageTimeoutMs,
+            related_issue_count: relatedIssuesForAnalyst.length,
+            has_test_infra_profile: !!testInfraProfile,
+          },
+          async (span) => {
+            const outcome = await runReproPipelineWithTimeout({
               attemptId: reproAttemptId,
-              payload,
-              workspace,
-              forkFullName: fork.forkFullName,
-              branch: fork.branchName,
-              baselineSha,
-              affectedModule: routing.result.affectedModule,
-              language: 'python',
-              sandboxDriver: v2SandboxDriver,
-              ghActionsSandboxOptions: v2GhActionsSandboxOptions,
-              testInfraProfile,
-              gitClient: {
-                getFileContents: (repo: string, filePath: string, ref: string) =>
-                  ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
-              },
-              relatedIssues: relatedIssuesForAnalyst,
+              timeoutMs: reproStageTimeoutMs,
               log,
-            }),
-        });
+              run: () =>
+                runReproPipeline({
+                  attemptId: reproAttemptId,
+                  payload,
+                  workspace,
+                  forkFullName: fork.forkFullName,
+                  branch: fork.branchName,
+                  baselineSha,
+                  affectedModule: routing.result.affectedModule,
+                  language: 'python',
+                  sandboxDriver: v2SandboxDriver,
+                  ghActionsSandboxOptions: v2GhActionsSandboxOptions,
+                  testInfraProfile,
+                  gitClient: {
+                    getFileContents: (repo: string, filePath: string, ref: string) =>
+                      ghRestForFingerprint.getFileContents(repo, filePath, ref).catch(() => ({ ok: false as const })),
+                  },
+                  relatedIssues: relatedIssuesForAnalyst,
+                  log,
+                }),
+            });
+            span.setAttributes({
+              'repro.ok': outcome.ok,
+              'repro.status': outcome.status,
+              'repro.has_candidate_test': !!outcome.candidateTestPath,
+              'repro.candidate_count': outcome.v2.candidates.length,
+              'repro.approach': outcome.v2.recipe?.approach ?? outcome.v2.plan?.approach ?? '',
+            });
+            span.setOutput({
+              ok: outcome.ok,
+              status: outcome.status,
+              candidate_test_path: outcome.candidateTestPath ?? null,
+              candidate_count: outcome.v2.candidates.length,
+              approach: outcome.v2.recipe?.approach ?? outcome.v2.plan?.approach ?? null,
+            });
+            return outcome;
+          }
+        );
       } catch (err) {
         if (err instanceof ReproStageTimeoutError) {
           return finish(
@@ -3103,15 +4039,32 @@ export async function runPipeline(args: {
 
     // Commit ONLY the verified repro file (clean) and push.
     const reproPath = reproOutcome.candidateTestPath;
-    await workspace.resetWorkingTree();
-    workspace.writeFile(reproPath, reproOutcome.candidateTestContent);
-    try {
-      await workspace.commitPaths([reproPath], "test: add repro for #" + issueNumber);
-    } catch (e) {
-      if (!(e instanceof Error && e.message === 'No changes to commit')) throw e;
-      // File already committed with identical content from a prior run — treat as success.
-    }
-    await workspace.push();
+    const reproContent = reproOutcome.candidateTestContent;
+    await withExternalOperationSpan(
+      'git.commit_repro',
+      {
+        repo: repoFullName,
+        issue_number: issueNumber,
+        attempt_id: reproAttemptId,
+        fork: fork.forkFullName,
+        branch: fork.branchName,
+        repro_path: reproPath,
+      },
+      async (span) => {
+        await workspace.resetWorkingTree();
+        workspace.writeFile(reproPath, reproContent);
+        try {
+          const sha = await workspace.commitPaths([reproPath], "test: add repro for #" + issueNumber);
+          span.setAttributes({ 'git.commit_sha': sha });
+        } catch (e) {
+          if (!(e instanceof Error && e.message === 'No changes to commit')) throw e;
+          span.setAttributes({ 'git.no_changes': true });
+          // File already committed with identical content from a prior run — treat as success.
+        }
+        await workspace.push();
+        span.setOutput({ pushed: true, repro_path: reproPath });
+      }
+    );
     log("[v2-repro] committed and pushed " + reproPath);
 
     reproTestUrl = buildGitHubBlobUrl(fork.forkFullName, fork.branchName, reproPath);
@@ -3128,7 +4081,20 @@ export async function runPipeline(args: {
         sandboxRunner: v2SandboxDriver,
         forkFullName: fork.forkFullName,
       });
-      await issueCommenter.postComment(repoFullName, issueNumber, reproComment);
+      await withExternalOperationSpan(
+        'github.repro_confirmed_comment',
+        {
+          repo: repoFullName,
+          issue_number: issueNumber,
+          attempt_id: reproAttemptId,
+          body_chars: reproComment.length,
+          sandbox_runner: v2SandboxDriver,
+        },
+        async (span) => {
+          await issueCommenter.postComment(repoFullName, issueNumber, reproComment);
+          span.setOutput({ posted: true });
+        }
+      );
       log('[v2-repro] posted repro-confirmed comment on issue #' + issueNumber);
     } catch (commentErr: any) {
       log('[v2-repro] repro comment failed (non-blocking): ' + (commentErr?.message ?? commentErr));
@@ -3193,21 +4159,47 @@ export async function runPipeline(args: {
 
     // ---- Fix stage (v2) -------------------------------------------------
     const fixAttemptId = runId + "-fix";
-    const fixOutcome = await runFixPipeline({
-      attemptId: fixAttemptId,
-      payload,
-      workspace,
-      forkFullName: fork.forkFullName,
-      branch: fork.branchName,
-      baselineSha: fixBaselineSha,
-      affectedModule: routing.result.affectedModule,
-      language: 'python',
-      dossier: reproOutcome.v2.dossier,
-      reproTestPath: reproPath,
-      sandboxDriver: v2SandboxDriver,
-      ghActionsSandboxOptions: v2GhActionsSandboxOptions,
-      log,
-    });
+    const fixOutcome = await withPipelineStageSpan(
+      'fix',
+      {
+        repo: repoFullName,
+        issue_number: issueNumber,
+        attempt_id: fixAttemptId,
+        fork: fork.forkFullName,
+        branch: fork.branchName,
+        sandbox_runner: v2SandboxDriver,
+        affected_module: routing.result.affectedModule,
+        repro_test_path: reproPath,
+      },
+      async (span) => {
+        const outcome = await runFixPipeline({
+          attemptId: fixAttemptId,
+          payload,
+          workspace,
+          forkFullName: fork.forkFullName,
+          branch: fork.branchName,
+          baselineSha: fixBaselineSha,
+          affectedModule: routing.result.affectedModule,
+          language: 'python',
+          dossier: reproOutcome.v2.dossier,
+          reproTestPath: reproPath,
+          sandboxDriver: v2SandboxDriver,
+          ghActionsSandboxOptions: v2GhActionsSandboxOptions,
+          log,
+        });
+        span.setAttributes({
+          'fix.ok': outcome.ok,
+          'fix.status': outcome.status,
+          'fix.changed_file_count': outcome.changedFiles.length,
+        });
+        span.setOutput({
+          ok: outcome.ok,
+          status: outcome.status,
+          changed_file_count: outcome.changedFiles.length,
+        });
+        return outcome;
+      }
+    );
 
     fixDossier = fixOutcome.v2.dossier.latest() ?? reproDossier;
     v2FixOutcomeForEmail = fixOutcome;
@@ -3230,27 +4222,40 @@ export async function runPipeline(args: {
         const dossierSummary = fixDossier?.body?.summary;
         const branchUrl = `https://github.com/${fork.forkFullName}/tree/${fork.branchName}`;
         const fixDiff = await gatherFixDiff(workspace.dir, log, fixBaselineSha);
-        await dispatchTypedHaltEmail({
-          kind: 'fix_ready_for_review',
-          context: buildFixReadyContext({
-            attemptId: fixAttemptId,
-            recipient: manifest.pm_email,
-            issueNumber,
-            issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
-            branchUrl,
-            commitSha: headAfterFix!,
-            summary: dossierSummary ?? planSummary ?? "See dossier for details.",
-            fixApproach: planSummary,
-            changedFiles: fixOutcome.changedFiles,
-            diff: fixDiff,
-            reproTestPath: reproPath,
-            reproTestUrl,
-            reproMethodNote: buildReproMethodNoteFromV2(reproOutcome.v2),
-            dossier: fixDossier,
-          }),
-          notifier: deps.live.failureNotifier,
-          log,
-        });
+        await withExternalOperationSpan(
+          'email.fix_ready_for_review',
+          {
+            repo: repoFullName,
+            issue_number: issueNumber,
+            attempt_id: fixAttemptId,
+            changed_file_count: fixOutcome.changedFiles.length,
+            diff_chars: fixDiff.length,
+          },
+          async (span) => {
+            await dispatchTypedHaltEmail({
+              kind: 'fix_ready_for_review',
+              context: buildFixReadyContext({
+                attemptId: fixAttemptId,
+                recipient: manifest.pm_email,
+                issueNumber,
+                issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
+                branchUrl,
+                commitSha: headAfterFix!,
+                summary: dossierSummary ?? planSummary ?? "See dossier for details.",
+                fixApproach: planSummary,
+                changedFiles: fixOutcome.changedFiles,
+                diff: fixDiff,
+                reproTestPath: reproPath,
+                reproTestUrl,
+                reproMethodNote: buildReproMethodNoteFromV2(reproOutcome.v2),
+                dossier: fixDossier,
+              }),
+              notifier: deps.live!.failureNotifier,
+              log,
+            });
+            span.setOutput({ sent: true });
+          }
+        );
         return finish({ status: 'max-retries-exceeded', reason: 'fix committed to branch; awaiting manual review' });
       }
 
@@ -3280,23 +4285,36 @@ export async function runPipeline(args: {
           for (const f of fixOutcome.changedFiles) appendLines.push("  - " + f);
         }
         appendLines.push('', "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber, "Run: " + runId);
-        await dispatchTypedHaltEmail({
-          kind: 'fix_failed',
-          context: buildHaltContext({
-            attemptId: fixAttemptId,
-            recipient: manifest.pm_email,
-            issueNumber,
-            issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
-            failureSnippet: criticReason ?? fixOutcome.message,
-            summary: "Status: " + fixOutcome.status,
-            fixApproach: planSummary,
-            changedFiles: fixOutcome.changedFiles,
-            dossier: fixDossier,
-          }),
-          notifier: deps.live.failureNotifier,
-          appendBody: appendLines.join('\n'),
-          log,
-        });
+        await withExternalOperationSpan(
+          'email.fix_failed',
+          {
+            repo: repoFullName,
+            issue_number: issueNumber,
+            attempt_id: fixAttemptId,
+            status: fixOutcome.status,
+            changed_file_count: fixOutcome.changedFiles.length,
+          },
+          async (span) => {
+            await dispatchTypedHaltEmail({
+              kind: 'fix_failed',
+              context: buildHaltContext({
+                attemptId: fixAttemptId,
+                recipient: manifest.pm_email,
+                issueNumber,
+                issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
+                failureSnippet: criticReason ?? fixOutcome.message,
+                summary: "Status: " + fixOutcome.status,
+                fixApproach: planSummary,
+                changedFiles: fixOutcome.changedFiles,
+                dossier: fixDossier,
+              }),
+              notifier: deps.live!.failureNotifier,
+              appendBody: appendLines.join('\n'),
+              log,
+            });
+            span.setOutput({ sent: true });
+          }
+        );
       }
       return finish({ status: 'max-retries-exceeded', reason: fixOutcome.message });
     }
@@ -3345,24 +4363,36 @@ export async function runPipeline(args: {
           for (const f of fixOutcome.changedFiles) appendLines.push("  - " + f);
         }
         appendLines.push('', "Issue: https://github.com/" + repoFullName + "/issues/" + issueNumber, "Run: " + runId);
-        await dispatchTypedHaltEmail({
-          kind: 'regression_blocker',
-          context: buildHaltContext({
-            attemptId: fixAttemptId,
-            recipient: manifest.pm_email,
-            issueNumber,
-            issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
-            failureSnippet: verify.outcome.retryContext,
-            regressionStatus: 'red',
-            failureKind: 'verification_gate',
-            changedFiles: fixOutcome.changedFiles,
-            fixApproach: fixOutcome.v2.plan?.summary,
-            dossier: fixDossier,
-          }),
-          notifier: deps.live.failureNotifier,
-          appendBody: appendLines.join('\n'),
-          log,
-        });
+        await withExternalOperationSpan(
+          'email.regression_blocker',
+          {
+            repo: repoFullName,
+            issue_number: issueNumber,
+            attempt_id: fixAttemptId,
+            changed_file_count: fixOutcome.changedFiles.length,
+          },
+          async (span) => {
+            await dispatchTypedHaltEmail({
+              kind: 'regression_blocker',
+              context: buildHaltContext({
+                attemptId: fixAttemptId,
+                recipient: manifest.pm_email,
+                issueNumber,
+                issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
+                failureSnippet: verify.outcome.retryContext,
+                regressionStatus: 'red',
+                failureKind: 'verification_gate',
+                changedFiles: fixOutcome.changedFiles,
+                fixApproach: fixOutcome.v2.plan?.summary,
+                dossier: fixDossier,
+              }),
+              notifier: deps.live!.failureNotifier,
+              appendBody: appendLines.join('\n'),
+              log,
+            });
+            span.setOutput({ sent: true });
+          }
+        );
       }
       return finish({
         status: 'max-retries-exceeded',
@@ -3396,7 +4426,21 @@ export async function runPipeline(args: {
         bodyText,
         issueNumber
       );
-      await workspace.squashAndRebaseOntoUpstream(upstreamUrl, conventionalMsg);
+      await withExternalOperationSpan(
+        'git.squash_rebase',
+        {
+          repo: repoFullName,
+          issue_number: issueNumber,
+          fork: fork.forkFullName,
+          branch: fork.branchName,
+          upstream_url: upstreamUrl,
+          scope,
+        },
+        async (span) => {
+          await workspace.squashAndRebaseOntoUpstream(upstreamUrl, conventionalMsg);
+          span.setOutput({ rebased: true });
+        }
+      );
       log(`[pr/squash] squash-rebase complete; branch ${fork.branchName} now 1 commit above upstream/main`);
     } catch (squashErr: any) {
       // Non-fatal: log and continue. A PR with more commits is still valid.
@@ -3417,13 +4461,32 @@ export async function runPipeline(args: {
   }
 
   // ---------- Draft PR ----------
-  const prMeta = await adapter.getPRMetadata(
-    confirmedIssues.map((i) => ({
-      number: i.number,
-      title: i.title,
-      body: i.body ?? '',
-      labels: i.labels,
-    }))
+  const prMeta = await withExternalOperationSpan(
+    'adapter.pr_metadata',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      confirmed_issue_count: confirmedIssues.length,
+    },
+    async (span) => {
+      const result = await adapter.getPRMetadata(
+        confirmedIssues.map((i) => ({
+          number: i.number,
+          title: i.title,
+          body: i.body ?? '',
+          labels: i.labels,
+        }))
+      );
+      span.setAttributes({
+        'pr.extra_label_count': result.extraLabels?.length ?? 0,
+        'pr.extra_body_section_count': result.extraBodySections?.length ?? 0,
+      });
+      span.setOutput({
+        extra_label_count: result.extraLabels?.length ?? 0,
+        extra_body_section_count: result.extraBodySections?.length ?? 0,
+      });
+      return result;
+    }
   );
   const prTitle = `${prSummary} (closes #${issueNumber})`;
   const prBody = [
@@ -3535,15 +4598,35 @@ export async function runPipeline(args: {
     }
   }
 
-  const pr = await ghClient.createPullRequest({
-    upstream: repoFullName,
-    forkFullName: fork.forkFullName,
-    headBranch: fork.branchName,
-    baseBranch,
-    title: prTitle,
-    body: prBody,
-    draft: true,
-  });
+  const pr = await withExternalOperationSpan(
+    'github.create_pr',
+    {
+      repo: repoFullName,
+      issue_number: issueNumber,
+      fork: fork.forkFullName,
+      branch: fork.branchName,
+      base_branch: baseBranch,
+      draft: true,
+      body_chars: prBody.length,
+    },
+    async (span) => {
+      const result = await ghClient.createPullRequest({
+        upstream: repoFullName,
+        forkFullName: fork.forkFullName,
+        headBranch: fork.branchName,
+        baseBranch,
+        title: prTitle,
+        body: prBody,
+        draft: true,
+      });
+      span.setAttributes({
+        'pr.number': result.number,
+        'pr.url': result.url,
+      });
+      span.setOutput(result);
+      return result;
+    }
+  );
   log(`[pr] opened ${pr.url}`);
 
   // Watch PR CI checks and auto-fix lint/format failures with the exact
@@ -3568,13 +4651,37 @@ export async function runPipeline(args: {
       .catch((err: any) => {
         log(`[ci-watch] error (non-fatal): ${err?.message ?? err}`);
       });
+    await withExternalOperationSpan(
+      'github.ci_watch_start',
+      {
+        repo: repoFullName,
+        issue_number: issueNumber,
+        pr_number: pr.number,
+        branch: fork.branchName,
+      },
+      async (span) => {
+        span.setOutput({ started: true });
+      }
+    );
     log(`[ci-watch] watching PR #${pr.number} for CI failures`);
   }
 
   const allLabels = [...(prMeta.extraLabels ?? []), ...regressionLabels, ...usabilityLabels];
   if (allLabels.length) {
     try {
-      await ghClient.addLabelsToPR(repoFullName, pr.number, allLabels);
+      await withExternalOperationSpan(
+        'github.label_pr',
+        {
+          repo: repoFullName,
+          issue_number: issueNumber,
+          pr_number: pr.number,
+          labels: allLabels,
+        },
+        async (span) => {
+          await ghClient.addLabelsToPR(repoFullName, pr.number, allLabels);
+          span.setOutput({ labels: allLabels });
+        }
+      );
     } catch (err: any) {
       log(`[pr] label apply failed (non-fatal): ${err?.message ?? err}`);
     }
@@ -3584,31 +4691,44 @@ export async function runPipeline(args: {
   // recipient doesn't have to open the PR to understand the agent's work.
   if (deps.live && v2FixOutcomeForEmail) {
     const fxo = v2FixOutcomeForEmail;
-    await dispatchTypedHaltEmail({
-      kind: 'pr_opened',
-      context: buildSuccessContext({
-        attemptId: runId,
-        recipient: manifest.pm_email,
-        issueNumber,
-        issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
-        prNumber: pr.number,
-        prUrl: pr.url,
-        summary: prSummary,
-        fixApproach: fxo.v2.plan?.summary,
-        diffSummary: evalSummary,
-        changedFiles: fxo.changedFiles,
-        failureSnippet: v2ReproOutcomeForEmail?.v2.criticVerdict?.reason,
-        reproTestPath: v2ReproOutcomeForEmail?.candidateTestPath,
-        reproTestUrl,
-        reproMethodNote,
-        dossier: fixDossier ?? reproDossier,
-      }),
-      notifier: deps.live.failureNotifier,
-      appendBody: agentInvestigationSection
-        ? agentInvestigationSection + "\n\nPR: " + pr.url
-        : "PR: " + pr.url,
-      log,
-    });
+    await withExternalOperationSpan(
+      'email.pr_opened',
+      {
+        repo: repoFullName,
+        issue_number: issueNumber,
+        attempt_id: runId,
+        pr_number: pr.number,
+        changed_file_count: fxo.changedFiles.length,
+      },
+      async (span) => {
+        await dispatchTypedHaltEmail({
+          kind: 'pr_opened',
+          context: buildSuccessContext({
+            attemptId: runId,
+            recipient: manifest.pm_email,
+            issueNumber,
+            issueUrl: "https://github.com/" + repoFullName + "/issues/" + issueNumber,
+            prNumber: pr.number,
+            prUrl: pr.url,
+            summary: prSummary,
+            fixApproach: fxo.v2.plan?.summary,
+            diffSummary: evalSummary,
+            changedFiles: fxo.changedFiles,
+            failureSnippet: v2ReproOutcomeForEmail?.v2.criticVerdict?.reason,
+            reproTestPath: v2ReproOutcomeForEmail?.candidateTestPath,
+            reproTestUrl,
+            reproMethodNote,
+            dossier: fixDossier ?? reproDossier,
+          }),
+          notifier: deps.live!.failureNotifier,
+          appendBody: agentInvestigationSection
+            ? agentInvestigationSection + "\n\nPR: " + pr.url
+            : "PR: " + pr.url,
+          log,
+        });
+        span.setOutput({ sent: true, pr_url: pr.url });
+      }
+    );
   }
 
   return finish({ status: 'pr-opened', prUrl: pr.url, prNumber: pr.number });
