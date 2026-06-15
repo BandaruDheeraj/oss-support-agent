@@ -13,7 +13,6 @@
 import {
   PMScoringInput,
   PMScoringResult,
-  PMRouting,
   DesignSignal,
 } from './pm-types';
 
@@ -231,28 +230,3 @@ export function scoreDesign(input: PMScoringInput): PMScoringResult {
   return { designNeeded, reasoning, signals };
 }
 
-/**
- * Routes the PM scoring result in Phase 1 mode.
- *
- * - design_needed=true → FAILED with note (email loop not yet implemented)
- * - design_needed=false → FORKING
- */
-export function routePMResult(result: PMScoringResult): PMRouting {
-  if (result.designNeeded) {
-    return {
-      action: 'route_failed',
-      result,
-      note: 'design needed - email loop not yet implemented',
-    };
-  }
-  return { action: 'route_forking', result };
-}
-
-/**
- * Full PM agent pipeline: searches context, scores design, and routes.
- * In Phase 1, this is a synchronous scoring pass without email.
- */
-export function runPMScoring(input: PMScoringInput): PMRouting {
-  const result = scoreDesign(input);
-  return routePMResult(result);
-}

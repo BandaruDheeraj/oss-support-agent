@@ -23,7 +23,7 @@ jest.mock('ai', () => ({
 }));
 jest.mock('../../llm/v2/client', () => ({
   getModelRoutes: jest.fn(),
-  MissingOpenRouterApiKeyError: class MissingOpenRouterApiKeyError extends Error {},
+  MissingLlmApiKeyError: class MissingLlmApiKeyError extends Error {},
 }));
 
 function makeLoopResult(overrides: Partial<AgentLoopResult> = {}): AgentLoopResult {

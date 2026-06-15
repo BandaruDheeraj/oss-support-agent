@@ -48,8 +48,6 @@ export class MissingLlmApiKeyError extends Error {
   }
 }
 
-/** @deprecated Use MissingLlmApiKeyError */
-export class MissingOpenRouterApiKeyError extends MissingLlmApiKeyError {}
 
 export function resetProviderForTests(): void {
   openrouterByKey.clear();

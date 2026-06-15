@@ -3,8 +3,8 @@
  * Covers each scoring heuristic from PRD section 4.2.
  */
 
-import { scoreDesign, routePMResult, runPMScoring } from './pm';
-import { PMScoringInput, PMScoringResult } from './pm-types';
+import { scoreDesign } from './pm';
+import { PMScoringInput } from './pm-types';
 
 /** Helper to create a minimal valid input */
 function makeInput(overrides: Partial<PMScoringInput> = {}): PMScoringInput {
@@ -377,75 +377,5 @@ describe('PM Agent Design Scoring', () => {
     });
   });
 
-  describe('routePMResult', () => {
-    it('routes to FORKING when designNeeded=false', () => {
-      const result: PMScoringResult = {
-        designNeeded: false,
-        reasoning: 'No design review needed',
-        signals: [],
-      };
-      const routing = routePMResult(result);
-      expect(routing.action).toBe('route_forking');
-    });
 
-    it('routes to FAILED with note when designNeeded=true', () => {
-      const result: PMScoringResult = {
-        designNeeded: true,
-        reasoning: 'Design review needed: keywords found',
-        signals: [],
-      };
-      const routing = routePMResult(result);
-      expect(routing.action).toBe('route_failed');
-      if (routing.action === 'route_failed') {
-        expect(routing.note).toBe(
-          'design needed - email loop not yet implemented'
-        );
-      }
-    });
-  });
-
-  describe('runPMScoring (full pipeline)', () => {
-    it('routes simple bug fix to FORKING', () => {
-      const input = makeInput({
-        title: 'Fix null check in auth handler',
-        body: 'Simple null pointer fix.',
-      });
-      const routing = runPMScoring(input);
-      expect(routing.action).toBe('route_forking');
-    });
-
-    it('routes design-needed issue to FAILED with note', () => {
-      const input = makeInput({
-        title: 'Redesign authentication architecture',
-        body: 'We need to rethink the entire auth architecture',
-      });
-      const routing = runPMScoring(input);
-      expect(routing.action).toBe('route_failed');
-      if (routing.action === 'route_failed') {
-        expect(routing.note).toContain('email loop not yet implemented');
-      }
-    });
-
-    it('routes issue with many related issues to FAILED', () => {
-      const input = makeInput({
-        relatedIssues: [
-          { number: 1, title: 'A', labels: [], reason: 'same' },
-          { number: 2, title: 'B', labels: [], reason: 'same' },
-          { number: 3, title: 'C', labels: [], reason: 'same' },
-          { number: 4, title: 'D', labels: [], reason: 'same' },
-        ],
-      });
-      const routing = runPMScoring(input);
-      expect(routing.action).toBe('route_failed');
-    });
-
-    it('includes result in routing output', () => {
-      const input = makeInput();
-      const routing = runPMScoring(input);
-      expect(routing.result).toBeDefined();
-      expect(routing.result.signals).toHaveLength(5);
-      expect(typeof routing.result.designNeeded).toBe('boolean');
-      expect(typeof routing.result.reasoning).toBe('string');
-    });
-  });
 });

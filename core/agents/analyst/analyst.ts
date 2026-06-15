@@ -9,7 +9,8 @@ import { classifyAgentLoopError, runAgentLoop } from '../agent-loop';
 import { makeAnalystRegistry } from '../tools';
 import type { IssueHandle, RepoHandle, SandboxHandle, WorkspaceReader, WorkspaceWriter } from '../tools/handles';
 import type { SemanticSuspectSeed } from './semantic-search';
-import { getModelRoutes, MissingOpenRouterApiKeyError, type ModelRoute } from '../../llm/v2/client';
+import { getModelRoutes, MissingLlmApiKeyError, type ModelRoute } from '../../llm/v2/client';
+import { getAISDKTelemetrySettings } from '../../observability';
 
 export interface RunAnalystArgs {
   issue: IssueHandle;
@@ -160,7 +161,7 @@ async function probeAnalystApiAvailability(
     routes = getModelRoutes('ANALYST', modelOverride);
   } catch (err) {
     const reason =
-      err instanceof MissingOpenRouterApiKeyError
+      err instanceof MissingLlmApiKeyError
         ? `[no-api-keys] ${err.message}`
         : classifyAnalystProbeError(err, resolveAnalystPreflightTimeoutMs());
     return {
@@ -180,6 +181,16 @@ async function probeAnalystApiAvailability(
     const abortController = new AbortController();
     const timeoutHandle = setTimeout(() => abortController.abort(), timeoutMs);
     try {
+      const aiTelemetry = getAISDKTelemetrySettings({
+        functionId: 'analyst.preflight.generateText',
+        metadata: {
+          'agent.name': 'ANALYST',
+          'llm.route': route.routeId,
+          'llm.model_name': route.modelId,
+        },
+        recordInputs: true,
+        recordOutputs: true,
+      });
       await generateText({
         model: route.model,
         system: 'Analyst API preflight probe. Reply with "ok".',
@@ -187,6 +198,7 @@ async function probeAnalystApiAvailability(
         maxTokens: 4,
         temperature: 0,
         abortSignal: abortController.signal,
+        ...(aiTelemetry ? { experimental_telemetry: aiTelemetry } : {}),
       });
       return { ok: true };
     } catch (err) {
