@@ -2,7 +2,7 @@
  * Test Assembler.
  *
  * Generates a repro test for a given dossier snapshot. Uses a single LLM call
- * (claude-opus-4-8) when a client is provided — the LLM reads the full suspect
+ * (claude-sonnet-4-6) when a client is provided — the LLM reads the full suspect
  * source file, the bug description, the oracle spec, and the fix hypothesis,
  * then writes an appropriate pytest test. This generalises across all bug types
  * without hardcoded pattern detection.
@@ -467,10 +467,7 @@ Return ONLY raw Python source code — no markdown fences, no prose explanation.
 
   const options: LLMChatOptions = {
     agent: 'REPRO_ASSEMBLER',
-    // claude-opus-4-8: highest-quality model, best at reading unfamiliar code
-    // and reasoning about what will fail vs pass. The assembler is called once
-    // per pipeline (not in a loop) so the extra cost is acceptable.
-    model: 'claude-opus-4-8',
+    model: 'claude-sonnet-4-6',
     maxTokens: 4096,
   };
 
