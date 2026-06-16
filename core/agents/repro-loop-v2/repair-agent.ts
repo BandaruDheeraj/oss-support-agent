@@ -105,17 +105,15 @@ export async function repairHarness(ctx: RepairContext): Promise<RepairOutput | 
       ? `\nPrevious repair rounds (${ctx.repairHistory.length}):\n${ctx.repairHistory.map((h, i) => `  Round ${i + 1}: ${h}`).join('\n')}`
       : '';
 
-  const sandboxSection = ctx.sandboxContext
-    ? `\n${ctx.sandboxContext}`
-    : '';
-
-  const issueSection =
+  const optionalSections = [
     ctx.issueTitle
-      ? `\nIssue title: ${ctx.issueTitle}\n${ctx.issueBody ? `Issue body (truncated):\n${ctx.issueBody.slice(0, 800)}` : ''}`
-      : '';
+      ? `━━━ ISSUE ━━━\nTitle: ${ctx.issueTitle}${ctx.issueBody ? `\nBody (truncated):\n${ctx.issueBody.slice(0, 800)}` : ''}`
+      : null,
+    ctx.sandboxContext ?? null,
+  ].filter(Boolean).join('\n\n');
 
   const prompt = `You are a test-harness repair agent. A Python test that should reproduce a library bug is failing for the WRONG reason.
-Your job: fix the test files and/or install spec so the test reproduces the actual bug.${issueSection}${sandboxSection}
+Your job: fix the test files and/or install spec so the test reproduces the actual bug.${optionalSections ? `\n\n${optionalSections}` : ''}
 
 ━━━ ERROR (round ${ctx.roundNumber + 1} of ${ctx.maxRounds}) ━━━
 Phase: ${ctx.errorPhase}

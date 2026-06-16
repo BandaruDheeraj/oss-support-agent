@@ -1,6 +1,6 @@
 import type { EmailContext } from '../context';
 import type { EmailPayload } from '../composer';
-import { build, header, dossierBlock, decisionSection, footer, redact } from './shared';
+import { build, header, dossierBlock, decisionSection, footer, redact, reproTestLine } from './shared';
 
 export function triageUnrelated(ctx: EmailContext): EmailPayload {
   const md = [
@@ -123,11 +123,6 @@ export function humanDecisionNeeded(ctx: EmailContext): EmailPayload {
 }
 
 export function fixReadyForReview(ctx: EmailContext): EmailPayload {
-  const reproTestLine = ctx.context.reproTestUrl && ctx.context.reproTestPath
-    ? `**Repro test:** [${ctx.context.reproTestPath}](${ctx.context.reproTestUrl})`
-    : ctx.context.reproTestPath
-      ? `**Repro test:** \`${ctx.context.reproTestPath}\``
-      : '';
   const md = [
     header(ctx, 'Fix committed — ready for your review'),
     '',
@@ -143,7 +138,7 @@ export function fixReadyForReview(ctx: EmailContext): EmailPayload {
     '## Branch & commit',
     ctx.context.branchUrl ? `**Branch:** [${ctx.context.branchUrl}](${ctx.context.branchUrl})` : '',
     ctx.context.commitSha ? `**Commit SHA:** \`${ctx.context.commitSha}\`` : '',
-    reproTestLine,
+    reproTestLine(ctx),
     ctx.context.reproMethodNote ? `**Repro method:** ${redact(ctx.context.reproMethodNote)}` : '',
     '',
     '## Changed files',
@@ -164,11 +159,6 @@ export function fixReadyForReview(ctx: EmailContext): EmailPayload {
 }
 
 export function prOpened(ctx: EmailContext): EmailPayload {
-  const reproTestLine = ctx.context.reproTestUrl && ctx.context.reproTestPath
-    ? `**Repro test:** [${ctx.context.reproTestPath}](${ctx.context.reproTestUrl})`
-    : ctx.context.reproTestPath
-      ? `**Repro test:** \`${ctx.context.reproTestPath}\``
-      : '';
   const arizeTraceLine = ctx.context.arizeReproTraceUrl
     ? `**Broken trace in Arize AX:** [View trace →](${ctx.context.arizeReproTraceUrl})\n> This is the trace the repro sandbox emitted showing the bug. The fix branch trace should show corrected attributes.`
     : '';
@@ -184,7 +174,7 @@ export function prOpened(ctx: EmailContext): EmailPayload {
     `**PR:** ${ctx.prUrl ?? '(no url)'}`,
     '',
     '## Evidence the bug was real',
-    reproTestLine,
+    reproTestLine(ctx),
     arizeTraceLine,
     sandboxRunLine,
     localReproLine,

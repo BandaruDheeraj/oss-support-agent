@@ -34,32 +34,35 @@ export interface SandboxContext {
   promptBlock: string;
 }
 
-/** Map from instrumentation package name fragments to sandbox dir names. */
+/** Map from canonical SDK name fragments to sandbox dir names.
+ *  The `openinference-instrumentation-` prefix is stripped before matching,
+ *  so each SDK needs only one entry. Entries are sorted longest-first so the
+ *  most-specific match wins (e.g. "llama-index" beats "llama").
+ */
 const SDK_DIR_MAP: Record<string, string> = {
   openllmetry: 'openllmetry',
-  'openinference-instrumentation-openllmetry': 'openllmetry',
   langchain: 'langchain',
-  'openinference-instrumentation-langchain': 'langchain',
-  llamaindex: 'llamaindex',
   'llama-index': 'llamaindex',
-  'openinference-instrumentation-llama-index': 'llamaindex',
+  llamaindex: 'llamaindex',
   dspy: 'dspy',
-  'openinference-instrumentation-dspy': 'dspy',
   bedrock: 'bedrock',
-  'openinference-instrumentation-bedrock': 'bedrock',
   anthropic: 'anthropic',
-  'openinference-instrumentation-anthropic': 'anthropic',
   groq: 'groq',
-  'openinference-instrumentation-groq': 'groq',
   mistralai: 'mistralai',
-  'openinference-instrumentation-mistralai': 'mistralai',
   vertexai: 'vertexai',
-  'openinference-instrumentation-vertexai': 'vertexai',
 };
 
+// Pre-sorted (longest fragment first) so most-specific match wins; hoisted to avoid
+// re-allocating on every resolveSdkDir call.
+const SDK_DIR_ENTRIES = Object.entries(SDK_DIR_MAP).sort((a, b) => b[0].length - a[0].length);
+
+// Cache loadSandboxContext results to avoid repeated disk reads within a single repair session.
+const _sandboxCache = new Map<string, SandboxContext | null>();
+
 function resolveSdkDir(repoOwner: string, hint: string): string | null {
-  const lower = hint.toLowerCase();
-  for (const [fragment, dir] of Object.entries(SDK_DIR_MAP)) {
+  // Strip the common prefix so the SDK_DIR_MAP stays half the size.
+  const lower = hint.toLowerCase().replace('openinference-instrumentation-', '');
+  for (const [fragment, dir] of SDK_DIR_ENTRIES) {
     if (lower.includes(fragment)) {
       return path.join('sandboxes', repoOwner, dir);
     }
@@ -76,8 +79,14 @@ export function loadSandboxContext(
   sdkHint: string,
   repoRoot: string = process.cwd()
 ): SandboxContext | null {
+  const cacheKey = `${repoOwner}:${sdkHint}:${repoRoot}`;
+  if (_sandboxCache.has(cacheKey)) return _sandboxCache.get(cacheKey)!;
+
   const sandboxDir = resolveSdkDir(repoOwner, sdkHint);
-  if (!sandboxDir) return null;
+  if (!sandboxDir) {
+    _sandboxCache.set(cacheKey, null);
+    return null;
+  }
 
   const absDir = path.join(repoRoot, sandboxDir);
   if (!fs.existsSync(absDir)) return null;
@@ -107,7 +116,10 @@ export function loadSandboxContext(
     });
   }
 
-  if (files.length === 0) return null;
+  if (files.length === 0) {
+    _sandboxCache.set(cacheKey, null);
+    return null;
+  }
 
   const sdkName = sandboxDir.split('/').pop() ?? sdkHint;
 
@@ -121,7 +133,9 @@ export function loadSandboxContext(
     ...files.map((f) => `=== ${f.path} ===\n${f.content}`),
   ].join('\n');
 
-  return { sdkName, sandboxDir, files, promptBlock };
+  const ctx: SandboxContext = { sdkName, sandboxDir, files, promptBlock };
+  _sandboxCache.set(cacheKey, ctx);
+  return ctx;
 }
 
 /**

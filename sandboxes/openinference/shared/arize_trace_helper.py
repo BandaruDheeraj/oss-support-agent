@@ -10,12 +10,11 @@ Usage in a repro test:
 """
 
 import os
-import struct
 import sys
 from typing import Optional
 
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 
@@ -60,7 +59,7 @@ def make_tracer_provider(service_name: str = "osa-repro") -> tuple:
 
     arize_exporter = _make_arize_exporter()
     if arize_exporter:
-        provider.add_span_processor(SimpleSpanProcessor(arize_exporter))
+        provider.add_span_processor(BatchSpanProcessor(arize_exporter))
         print(f"[arize_trace_helper] Arize AX export enabled → project={os.environ.get('ARIZE_PROJECT_NAME', 'osa-repro')}", file=sys.stderr)
     else:
         print("[arize_trace_helper] Arize AX export skipped (no creds)", file=sys.stderr)
@@ -91,3 +90,13 @@ def write_trace_url_file(url: Optional[str], path: str = "sandbox-trace-url.txt"
         with open(path, "w") as f:
             f.write(url)
         print(f"[arize_trace_helper] Trace URL written → {path}", file=sys.stderr)
+
+
+def get_span_attrs(spans, name_filter: str = None) -> list:
+    """Return attribute dicts for finished spans, optionally filtered by span name."""
+    result = []
+    for span in spans:
+        if name_filter and span.name != name_filter:
+            continue
+        result.append({k: v for k, v in span.attributes.items()})
+    return result

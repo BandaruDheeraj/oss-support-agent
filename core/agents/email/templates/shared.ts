@@ -77,3 +77,13 @@ export function build(
 export function redact(s: string | undefined): string {
   return redactString(s ?? '');
 }
+
+export function reproTestLine(ctx: EmailContext): string {
+  if (ctx.context.reproTestUrl && ctx.context.reproTestPath) {
+    return `**Repro test:** [${ctx.context.reproTestPath}](${ctx.context.reproTestUrl})`;
+  }
+  if (ctx.context.reproTestPath) {
+    return `**Repro test:** \`${ctx.context.reproTestPath}\``;
+  }
+  return '';
+}
