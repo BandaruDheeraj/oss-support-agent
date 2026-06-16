@@ -11,5 +11,5 @@ pm_email: "dheeraj.bandaru@hotmail.com"
 max_retries: 3
 sandbox_timeout_mins: 15
 sandbox_runner: gha
-sandbox_workflow_repo: "BandaruDheeraj/oss-support-agent"
+sandbox_workflow_repo: "BandaruDheeraj/openinference-support-agent"
 sandbox_workflow_ref: "main"

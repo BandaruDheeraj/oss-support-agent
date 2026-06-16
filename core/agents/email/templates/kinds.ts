@@ -165,19 +165,33 @@ export function fixReadyForReview(ctx: EmailContext): EmailPayload {
 
 export function prOpened(ctx: EmailContext): EmailPayload {
   const reproTestLine = ctx.context.reproTestUrl && ctx.context.reproTestPath
-    ? `Repro test: [${ctx.context.reproTestPath}](${ctx.context.reproTestUrl})`
+    ? `**Repro test:** [${ctx.context.reproTestPath}](${ctx.context.reproTestUrl})`
     : ctx.context.reproTestPath
-      ? `Repro test: \`${ctx.context.reproTestPath}\``
+      ? `**Repro test:** \`${ctx.context.reproTestPath}\``
       : '';
+  const arizeTraceLine = ctx.context.arizeReproTraceUrl
+    ? `**Broken trace in Arize AX:** [View trace →](${ctx.context.arizeReproTraceUrl})\n> This is the trace the repro sandbox emitted showing the bug. The fix branch trace should show corrected attributes.`
+    : '';
+  const sandboxRunLine = ctx.context.sandboxRunUrl
+    ? `**Sandbox run (bug confirmed):** [GHA logs →](${ctx.context.sandboxRunUrl})`
+    : '';
+  const localReproLine = ctx.context.localReproSnippet
+    ? `**Reproduce locally:**\n\`\`\`bash\n${ctx.context.localReproSnippet}\n\`\`\``
+    : '';
   const md = [
-    header(ctx, 'PR opened from approved fix'),
+    header(ctx, 'PR opened — fix ready for review'),
     '',
-    `PR: ${ctx.prUrl ?? '(no url)'}`,
+    `**PR:** ${ctx.prUrl ?? '(no url)'}`,
+    '',
+    '## Evidence the bug was real',
     reproTestLine,
-    ctx.context.reproMethodNote ? `Repro method: ${redact(ctx.context.reproMethodNote)}` : '',
+    arizeTraceLine,
+    sandboxRunLine,
+    localReproLine,
+    ctx.context.reproMethodNote ? `**Repro method:** ${redact(ctx.context.reproMethodNote)}` : '',
     '',
     'This email is informational; no action required.',
     footer(ctx),
-  ].join('\n');
+  ].filter(Boolean).join('\n');
   return build(ctx, { kind: 'pr_opened', subject: `[osa] PR opened for #${ctx.issueNumber}`, bodyMarkdown: md });
 }

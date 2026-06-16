@@ -73,6 +73,9 @@ export function buildSuccessContext(args: {
   reproTestPath?: string;
   reproTestUrl?: string | null;
   reproMethodNote?: string | null;
+  arizeReproTraceUrl?: string | null;
+  sandboxRunUrl?: string | null;
+  localReproSnippet?: string | null;
   dossier?: DossierSnapshot | null;
 }): EmailContext {
   return {
@@ -105,6 +108,9 @@ export function buildSuccessContext(args: {
       reproTestPath: args.reproTestPath,
       reproTestUrl: args.reproTestUrl ?? undefined,
       reproMethodNote: args.reproMethodNote ?? undefined,
+      arizeReproTraceUrl: args.arizeReproTraceUrl ?? undefined,
+      sandboxRunUrl: args.sandboxRunUrl ?? undefined,
+      localReproSnippet: args.localReproSnippet ?? undefined,
     },
   };
 }

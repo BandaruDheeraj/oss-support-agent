@@ -77,3 +77,81 @@ services:
         value: oss-support-agent
       - key: GIT_AUTHOR_EMAIL
         value: agent@users.noreply.github.com
+
+  # ── OpenInference-specific deployment ────────────────────────────────────────
+  # Separate service configured exclusively for Arize-ai/openinference issues.
+  # Deploys from BandaruDheeraj/openinference-support-agent (fork of this repo).
+  - type: web
+    name: openinference-support-agent
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    repo: https://github.com/BandaruDheeraj/openinference-support-agent
+    autoDeploy: true
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+
+    healthCheckPath: /healthz
+    numInstances: 1
+
+    disk:
+      name: oi-state
+      mountPath: /var/data
+      sizeGB: 1
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: OSA_REPRO_STAGE_TIMEOUT_MS
+        value: "3600000"
+      - key: STATE_ROOT
+        value: /var/data/state
+      - key: WORKSPACE_ROOT
+        value: /tmp/oss-agent/workspaces
+      - key: HARNESS_REPO_FULL_NAME
+        value: BandaruDheeraj/openinference-support-agent
+      - key: HARNESS_WORKFLOW_REF
+        value: main
+
+      # Arize AX — pipeline traces go to oss-fix-loop; repro traces go to osa-repro
+      - key: OBSERVABILITY_BACKEND
+        value: arize
+      - key: ARIZE_ENDPOINT
+        value: https://otlp.arize.com/v1/traces
+      - key: ARIZE_PROJECT_NAME
+        value: oss-fix-loop
+      - key: ARIZE_API_KEY
+        sync: false
+      - key: ARIZE_SPACE_ID
+        sync: false
+      # Deep-link base for Arize trace URLs in emails.
+      # Set to e.g. https://app.arize.com/organizations/{org}/spaces/{space}/projects/osa-repro/traces
+      - key: ARIZE_UI_BASE_URL
+        sync: false
+
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: DEFAULT_FORK_ORG
+        sync: false
+
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_ADDRESS
+        sync: false
+      - key: RESEND_REPLY_TO_BASE
+        sync: false
+      - key: RESEND_WEBHOOK_SECRET
+        sync: false
+
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+
+      - key: GIT_AUTHOR_NAME
+        value: openinference-support-agent
+      - key: GIT_AUTHOR_EMAIL
+        value: agent@users.noreply.github.com

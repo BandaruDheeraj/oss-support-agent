@@ -61,6 +61,8 @@ export interface RepairContext {
   roundNumber: number;
   maxRounds: number;
   repairHistory: string[];
+  /** Pre-built sandbox context from sandbox-registry (existing conftest + tests for this SDK). */
+  sandboxContext?: string;
 }
 
 const PHASE_CONTEXT: Record<RepairErrorPhase, string> = {
@@ -103,13 +105,17 @@ export async function repairHarness(ctx: RepairContext): Promise<RepairOutput | 
       ? `\nPrevious repair rounds (${ctx.repairHistory.length}):\n${ctx.repairHistory.map((h, i) => `  Round ${i + 1}: ${h}`).join('\n')}`
       : '';
 
+  const sandboxSection = ctx.sandboxContext
+    ? `\n${ctx.sandboxContext}`
+    : '';
+
   const issueSection =
     ctx.issueTitle
       ? `\nIssue title: ${ctx.issueTitle}\n${ctx.issueBody ? `Issue body (truncated):\n${ctx.issueBody.slice(0, 800)}` : ''}`
       : '';
 
   const prompt = `You are a test-harness repair agent. A Python test that should reproduce a library bug is failing for the WRONG reason.
-Your job: fix the test files and/or install spec so the test reproduces the actual bug.${issueSection}
+Your job: fix the test files and/or install spec so the test reproduces the actual bug.${issueSection}${sandboxSection}
 
 ━━━ ERROR (round ${ctx.roundNumber + 1} of ${ctx.maxRounds}) ━━━
 Phase: ${ctx.errorPhase}
@@ -139,7 +145,9 @@ ${availableSection}${historySection}
 4. Test PASSED when it should fail → Rewrite the test to actually call the function that has the bug and assert the incorrect (buggy) behavior triggers.
 5. Test fails with wrong error → The test is hitting a setup error before reaching the buggy code. Fix imports, mocks, and setup so the test reaches the bug.
 6. Keep changes minimal. Only return files you actually changed.
-7. Set abandon=true only if reproducing the bug requires external services, live network calls, or real credentials that cannot be mocked.`;
+7. Set abandon=true only if reproducing the bug requires external services, live network calls, or real credentials that cannot be mocked.
+8. ARIZE AX EXPORT: For instrumentation bugs (span processors, exporters, attribute mapping), use the sandbox conftest fixtures (oi_tracer, memory_exporter) and arize_trace_helper.make_tracer_provider() to export the broken spans to Arize AX. This gives reviewers a direct link to see the broken trace in the observability UI. After the test body, call flush_and_get_trace_url() and write_trace_url_file() so the GHA sandbox captures the Arize URL. The test should still FAIL via an assert — the Arize export happens in the fixture teardown regardless of test outcome.
+9. TRACE-LEVEL REPRO PATTERN: For instrumentation bugs, prefer end-to-end tests that: (a) create spans using the instrumentation library under test (or mock its internal span creation), (b) process them through the buggy code path, (c) assert the broken attribute values. This is more convincing than testing internal functions directly.`;
 
   let result;
   try {
