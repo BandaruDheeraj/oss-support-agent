@@ -37,7 +37,12 @@ Rules:
 - Use read_file / grep / find_symbol / find_callers / git_blame to confirm suspicions.
 - Use state_hypothesis(file, observedEvidenceIds, expectedEffect, successCheck) for EACH file you believe the fix will touch. observedEvidenceIds MUST come from the dossier evidence ids.
 - Terminate by calling write_investigation_notes with all findings. Without that call no downstream agent can proceed.
-- If evidence is too thin, call abandon with a clear reason — do not invent root causes.`;
+- If evidence is too thin, call abandon with a clear reason — do not invent root causes.
+
+TURN BUDGET (strictly enforced):
+- You have 40 turns total. Spend turns 1-30 on investigation (grep, read_file, find_symbol). By turn 30 you MUST call write_investigation_notes.
+- Do NOT spend more than 5 turns on list_dir — directory trees are expensive. Read the dossier suspect files directly instead.
+- Do NOT defer write_investigation_notes to "after one more search". Write your best hypothesis based on what you have found by turn 25 at the latest.`;
 
 export async function runFixInvestigator(args: RunFixInvestigatorArgs): Promise<FixInvestigatorResult> {
   const registry = makeFixInvestigatorRegistry({
