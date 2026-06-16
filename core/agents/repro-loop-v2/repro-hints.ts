@@ -45,6 +45,9 @@ const IGNORED_DIRS = new Set([
   '.semantic-index-cache',
   '.idea',
   '.vscode',
+  // examples/ dirs often have broken setup.py deps (e.g. require OTLP exporters not
+  // available in the sandbox). They are never the target of a bug fix anyway.
+  'examples',
 ]);
 
 const DEFAULT_MAX_DEPTH = 6;
