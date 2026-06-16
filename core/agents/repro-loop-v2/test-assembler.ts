@@ -235,28 +235,38 @@ export async function assembleReproTest(
       // best-effort; proceed without a base class
     }
 
-    // TYPE 1.5 — Span processor guard: suspect file defines a SpanProcessor
-    // subclass. The bug is that on_end() runs on ALL spans (no framework-
-    // specific guard), destroying attributes of non-framework spans.
-    // Generate a test that creates a plain OTEL span with custom attributes
-    // and asserts they survive the processor.
+    // TYPE 1.5 — Span processor bug: suspect file defines a SpanProcessor
+    // subclass. Two distinct sub-bugs share this shape:
+    //   A) Mapping bug: on_end() maps framework spans but sets wrong/missing
+    //      attributes (e.g. drops tool.name, leaves raw envelopes in
+    //      input.value). Test: inject a span with framework-style attributes,
+    //      assert the mapped OpenInference attributes are correct.
+    //   B) Guard bug: on_end() runs on ALL spans with no framework guard,
+    //      destroying attributes of non-framework spans. Test: inject a plain
+    //      span with custom attributes, assert they survive the processor.
     if (spanProcessorClass) {
-      const testContent = buildSpanProcessorGuardTest(
-        suspectModule,
-        spanProcessorClass
-      );
+      const summary = String(body.summary ?? '');
+      const rootCause = String((body as any).rootCause ?? '');
+      const combined = (summary + ' ' + rootCause).toLowerCase();
+      const isMappingBug = [
+        'tool.name', 'input.value', 'output.value', 'tool name',
+        'envelope', 'traceloop', 'map_generic', '_map_generic',
+      ].some((kw) => combined.includes(kw));
+
+      const testContent = isMappingBug
+        ? buildSpanAttributeMappingTest(suspectModule, spanProcessorClass, body)
+        : buildSpanProcessorGuardTest(suspectModule, spanProcessorClass);
+
+      const rationale = isMappingBug
+        ? `Span attribute mapping bug in ${spanProcessorClass} (${suspectFilePath}): assembling Traceloop-style span to assert tool.name / input.value / output.value are correctly set.`
+        : `Span processor guard bug in ${spanProcessorClass} (${suspectFilePath}): assembling non-framework-span attribute-preservation test.`;
+
       return {
-        reproFiles: [
-          {
-            path: 'tests/repro/test_repro.py',
-            content: testContent,
-            append: false,
-          },
-        ],
+        reproFiles: [{ path: 'tests/repro/test_repro.py', content: testContent, append: false }],
         testEntryPoint: 'tests/repro/test_repro.py::test_repro',
         installSpec,
         bugType: 'function-level',
-        rationale: `Span processor guard bug in ${spanProcessorClass} (${suspectFilePath}): assembling non-framework-span attribute-preservation test.`,
+        rationale,
       };
     }
 
@@ -461,7 +471,6 @@ Return ONLY raw Python source code — no markdown fences, no prose explanation.
     // and reasoning about what will fail vs pass. The assembler is called once
     // per pipeline (not in a loop) so the extra cost is acceptable.
     model: 'claude-opus-4-8',
-    temperature: 0,
     maxTokens: 4096,
   };
 
@@ -618,6 +627,77 @@ function buildSpanProcessorGuardTest(
     "    assert attrs.get('custom.key') == 'preserved_value', (",
     `        f'REPRO: {SENTINEL} — {processorClass}.on_end() destroyed non-framework span attributes. '`,
     "        f'Expected custom.key=preserved_value but got: {attrs}'",
+    '    )',
+  ].join('\n');
+}
+
+/**
+ * Build a span-attribute mapping test: injects a span with Traceloop-style
+ * attributes (traceloop.span.kind=tool, traceloop.entity.name, etc.) and
+ * asserts the processor maps them to correct OpenInference attributes
+ * (tool.name, input.value, output.value).
+ *
+ * This test FAILS on buggy code (tool.name absent, raw envelopes in
+ * input.value) and PASSES on fixed code.
+ */
+function buildSpanAttributeMappingTest(
+  suspectModule: string,
+  processorClass: string,
+  body: Record<string, unknown>
+): string {
+  // Try to extract a tool name from the dossier summary to make the test realistic.
+  const summary = String(body['summary'] ?? '');
+  const toolNameMatch = summary.match(/\btool[_ ]?name[^a-z]*([a-z_][a-z_0-9]*)/i) ??
+    summary.match(/`([a-z_][a-z_0-9]+)`/i);
+  const toolName = toolNameMatch?.[1] ?? 'example_tool';
+
+  const inputEnvelope = JSON.stringify(JSON.stringify({
+    input_str: '',
+    tags: [],
+    metadata: {},
+    inputs: { arg: 'value' },
+    kwargs: { name: toolName },
+  }));
+  const outputEnvelope = JSON.stringify(JSON.stringify({
+    output: 'result',
+    kwargs: { name: toolName },
+  }));
+
+  return [
+    'from opentelemetry.sdk.trace import TracerProvider',
+    'from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter',
+    'from opentelemetry.sdk.trace.export import SimpleSpanProcessor',
+    `from ${suspectModule} import ${processorClass}`,
+    '',
+    'SENTINEL = "REPRO_BUG_SENTINEL"',
+    '',
+    'def test_repro():',
+    `    # Inject a span with Traceloop-style TOOL attributes and assert that`,
+    `    # ${processorClass} maps them to correct OpenInference attributes.`,
+    '    exporter = InMemorySpanExporter()',
+    '    provider = TracerProvider()',
+    `    provider.add_span_processor(${processorClass}())`,
+    '    provider.add_span_processor(SimpleSpanProcessor(exporter))',
+    '    tracer = provider.get_tracer("test")',
+    '',
+    `    with tracer.start_as_current_span("${toolName}.tool") as span:`,
+    '        span.set_attribute("traceloop.span.kind", "tool")',
+    `        span.set_attribute("traceloop.entity.name", "${toolName}")`,
+    `        span.set_attribute("traceloop.entity.input", ${inputEnvelope})`,
+    `        span.set_attribute("traceloop.entity.output", ${outputEnvelope})`,
+    '',
+    '    spans = exporter.get_finished_spans()',
+    "    assert spans, f'REPRO: {SENTINEL} — no spans recorded'",
+    '    attrs = dict(spans[0].attributes or {})',
+    '',
+    `    assert attrs.get('tool.name') == '${toolName}', (`,
+    "        f'REPRO: {SENTINEL} — tool.name not set by " + processorClass + ". '",
+    "        f'Got attributes: {attrs}'",
+    '    )',
+    "    input_val = str(attrs.get('input.value', ''))",
+    "    assert 'arg' in input_val or 'value' in input_val, (",
+    "        f'REPRO: {SENTINEL} — input.value contains raw Traceloop envelope instead of unwrapped args. '",
+    "        f'Got: {input_val}'",
     '    )',
   ].join('\n');
 }

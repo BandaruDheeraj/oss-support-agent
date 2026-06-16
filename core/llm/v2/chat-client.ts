@@ -55,14 +55,14 @@ export class ChatClient {
   async chat(messages: LLMMessage[], options: LLMChatOptions = {}): Promise<LLMChatResult> {
     const agent: PhaseEAgent | undefined = options.agent as PhaseEAgent | undefined;
     const model = getModel(agent ?? 'TRIAGE', options.model);
-    const temperature = options.temperature ?? 0;
+    const temperature = options.temperature;
     const maxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
     const aiTelemetry = getAISDKTelemetrySettings({
       functionId: `llm.chat.${String(options.agent ?? agent ?? 'unknown').toLowerCase()}`,
       metadata: {
         'llm.agent': String(options.agent ?? agent ?? 'unknown'),
         'llm.message_count': messages.length,
-        'llm.temperature': temperature,
+        ...(temperature !== undefined ? { 'llm.temperature': temperature } : {}),
       },
       recordInputs: true,
       recordOutputs: true,
@@ -80,7 +80,7 @@ export class ChatClient {
           role: m.role as 'system' | 'user' | 'assistant',
           content: m.content,
         })),
-        temperature,
+        ...(temperature !== undefined ? { temperature } : {}),
         maxTokens,
         ...(aiTelemetry ? { experimental_telemetry: aiTelemetry } : {}),
       });
@@ -107,7 +107,7 @@ export class ChatClient {
       kind: 'LLM',
       parent: currentSpan(),
       attributes: {
-        'llm.temperature': temperature,
+        ...(temperature !== undefined ? { 'llm.temperature': temperature } : {}),
         'llm.agent': options.agent ?? null,
         'llm.message_count': messages.length,
       },
