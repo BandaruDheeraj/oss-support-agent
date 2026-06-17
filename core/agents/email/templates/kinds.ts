@@ -159,8 +159,11 @@ export function fixReadyForReview(ctx: EmailContext): EmailPayload {
 }
 
 export function prOpened(ctx: EmailContext): EmailPayload {
-  const arizeTraceLine = ctx.context.arizeReproTraceUrl
-    ? `**Broken trace in Arize AX:** [View trace →](${ctx.context.arizeReproTraceUrl})\n> This is the trace the repro sandbox emitted showing the bug. The fix branch trace should show corrected attributes.`
+  const arizeReproTraceLine = ctx.context.arizeReproTraceUrl
+    ? `**Broken trace (before fix) in Arize AX:** [View trace →](${ctx.context.arizeReproTraceUrl})\n> Shows the bug — incorrect attributes as emitted by the instrumentation.`
+    : '';
+  const arizeFixTraceLine = ctx.context.arizeFixTraceUrl
+    ? `**Fixed trace (after fix) in Arize AX:** [View trace →](${ctx.context.arizeFixTraceUrl})\n> Shows the fix — correct attributes after the patch was applied.`
     : '';
   const sandboxRunLine = ctx.context.sandboxRunUrl
     ? `**Sandbox run (bug confirmed):** [GHA logs →](${ctx.context.sandboxRunUrl})`
@@ -175,7 +178,8 @@ export function prOpened(ctx: EmailContext): EmailPayload {
     '',
     '## Evidence the bug was real',
     reproTestLine(ctx),
-    arizeTraceLine,
+    arizeReproTraceLine,
+    arizeFixTraceLine,
     sandboxRunLine,
     localReproLine,
     ctx.context.reproMethodNote ? `**Repro method:** ${redact(ctx.context.reproMethodNote)}` : '',

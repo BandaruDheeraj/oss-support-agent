@@ -49,7 +49,9 @@ export interface EmailContext {
     reproTestUrl?: string;
     reproMethodNote?: string;
     /** Direct link into Arize AX showing the broken trace emitted by the repro sandbox. */
-    arizeReproTraceUrl?: string;
+    arizeReproTraceUrl?: string;  // Broken trace (before fix) — repro sandbox
+    /** Direct link into Arize AX showing the fixed trace emitted by the verification sandbox. */
+    arizeFixTraceUrl?: string;    // Fixed trace (after fix) — verification sandbox
     /** GHA sandbox run URL (the run that confirmed the bug / verified the fix). */
     sandboxRunUrl?: string;
     /** Copy-pasteable shell snippet to reproduce locally. */

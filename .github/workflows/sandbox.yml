@@ -102,6 +102,14 @@ jobs:
             target/sandbox-trace-url.txt
         if: always()
 
+      - name: Upload Arize trace URL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox-trace-url
+          path: target/sandbox-trace-url.txt
+          if-no-files-found: ignore
+        if: always()
+
       - name: Fail job if commands failed
         shell: bash
         run: |

@@ -1409,6 +1409,8 @@ interface VerificationResult {
   usabilitySection: string;
   /** Labels to apply to the PR for usability findings. */
   usabilityLabels: string[];
+  /** Arize AX trace URL from the fix verification sandbox (after fix), or null if unavailable. */
+  arizeFixTraceUrl: string | null;
 }
 
 /**
@@ -1527,6 +1529,7 @@ async function runVerificationImpl(args: {
       regressionLabels: [],
       usabilitySection: '',
       usabilityLabels: [],
+      arizeFixTraceUrl: null,
     };
   }
 
@@ -1807,6 +1810,27 @@ async function runVerificationImpl(args: {
     },
   });
 
+  // Capture fix verification trace URL for "after fix" Arize evidence.
+  let verifyArizeFixTraceUrl: string | null = null;
+  if (verificationSandboxSession) {
+    const verifyLastRunId = verificationSandboxSession.getLastReproRunId();
+    if (verifyLastRunId && actionsClient.downloadWorkflowRunArtifact) {
+      try {
+        const raw = await actionsClient.downloadWorkflowRunArtifact(
+          manifest.sandbox_workflow_repo?.trim() ||
+            process.env.HARNESS_REPO_FULL_NAME?.trim() ||
+            process.env.GITHUB_REPOSITORY?.trim() ||
+            '',
+          verifyLastRunId,
+          'sandbox-trace-url'
+        );
+        if (raw) verifyArizeFixTraceUrl = raw.trim();
+      } catch {
+        // non-fatal — fix trace URL is best-effort
+      }
+    }
+  }
+
   return {
     outcome,
     verificationSkipped: false,
@@ -1814,6 +1838,7 @@ async function runVerificationImpl(args: {
     regressionLabels,
     usabilitySection,
     usabilityLabels,
+    arizeFixTraceUrl: verifyArizeFixTraceUrl,
   };
 }
 
@@ -3096,6 +3121,9 @@ async function runPipelineImpl(args: {
   let v2FixOutcomeForEmail: import('../core/agents/run-v2').FixPipelineOutcome | null = null;
   let reproDossier: import('../core/agents/analyst/dossier').DossierSnapshot | null = null;
   let fixDossier: import('../core/agents/analyst/dossier').DossierSnapshot | null = null;
+  let reproSandboxRunUrl: string | null = null;
+  let arizeReproTraceUrl: string | null = null;
+  let arizeFixTraceUrl: string | null = null;
 
   if (routing.action === 'route_docs') {
     // ---------- Docs path ----------
@@ -3219,6 +3247,7 @@ async function runPipelineImpl(args: {
         regressionLabels = verify.regressionLabels;
         usabilitySection = verify.usabilitySection;
         usabilityLabels = verify.usabilityLabels;
+        if (verify.arizeFixTraceUrl) arizeFixTraceUrl = verify.arizeFixTraceUrl;
         verificationGatePassed = verify.verificationSkipped ? null : verify.outcome.ok;
         verificationStage = verify.verificationSkipped
           ? 'skipped_non_gha'
@@ -3949,6 +3978,43 @@ async function runPipelineImpl(args: {
     v2ReproOutcomeForEmail = reproOutcome;
     reproPassed = reproOutcome.ok;
 
+    // Capture repro sandbox evidence: GHA run URL + Arize trace URL.
+    if (reproOutcome.ok && v2SandboxDriver === 'gha' && v2GhActionsSandboxOptions?.sandboxSession) {
+      reproSandboxRunUrl = v2GhActionsSandboxOptions.sandboxSession.getLastReproRunUrl();
+      const lastRunId = v2GhActionsSandboxOptions.sandboxSession.getLastReproRunId();
+      if (lastRunId && v2GhActionsSandboxOptions.actionsClient.downloadWorkflowRunArtifact) {
+        try {
+          const raw = await v2GhActionsSandboxOptions.actionsClient.downloadWorkflowRunArtifact(
+            v2GhActionsSandboxOptions.baseConfig.workflowRepoFullName,
+            lastRunId,
+            'sandbox-trace-url'
+          );
+          if (raw) arizeReproTraceUrl = raw.trim();
+          log(`[sandbox-evidence] repro runUrl=${reproSandboxRunUrl ?? '(none)'} traceUrl=${arizeReproTraceUrl ?? '(none)'}`);
+        } catch (err: any) {
+          log(`[sandbox-evidence] failed to download sandbox-trace-url (non-fatal): ${err?.message ?? err}`);
+        }
+      }
+    }
+
+    // Persist new repro test to the sandbox registry so future issues build on it.
+    if (reproOutcome.ok && reproOutcome.candidateTestPath && reproOutcome.candidateTestContent) {
+      try {
+        const { registerNewTest } = await import('../core/agents/repro-loop-v2/sandbox-registry');
+        const repoName = payload.repository?.full_name?.split('/')[1] ?? '';
+        const savedPath = registerNewTest(
+          repoName,
+          routing.result.affectedModule,
+          issueNumber,
+          path.basename(reproOutcome.candidateTestPath),
+          reproOutcome.candidateTestContent
+        );
+        if (savedPath) log(`[sandbox-registry] persisted repro test → ${savedPath}`);
+      } catch (err: any) {
+        log(`[sandbox-registry] registerNewTest failed (non-fatal): ${err?.message ?? err}`);
+      }
+    }
+
     if (reproOutcome.status === 'credentials_required') {
       const term = reproOutcome.v2.credentialsTerminal;
       const envVars = term?.inferredEnvVars ?? [];
@@ -4339,6 +4405,7 @@ async function runPipelineImpl(args: {
     regressionLabels = verify.regressionLabels;
     usabilitySection = verify.usabilitySection;
     usabilityLabels = verify.usabilityLabels;
+    if (verify.arizeFixTraceUrl) arizeFixTraceUrl = verify.arizeFixTraceUrl;
     verificationGatePassed = verify.verificationSkipped ? null : verify.outcome.ok;
     verificationStage = verify.verificationSkipped
       ? 'skipped_non_gha'
@@ -4718,6 +4785,9 @@ async function runPipelineImpl(args: {
             reproTestPath: v2ReproOutcomeForEmail?.candidateTestPath,
             reproTestUrl,
             reproMethodNote,
+            arizeReproTraceUrl: arizeReproTraceUrl,
+            arizeFixTraceUrl: arizeFixTraceUrl,
+            sandboxRunUrl: reproSandboxRunUrl,
             dossier: fixDossier ?? reproDossier,
           }),
           notifier: deps.live!.failureNotifier,

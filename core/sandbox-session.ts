@@ -156,6 +156,7 @@ export class SandboxSession {
   private lastDispatch:
     | {
         ok: boolean;
+        runId: number | null;
         exitCode: number | null;
         rawLogs: string;
         failureOutput: string;
@@ -673,6 +674,7 @@ export class SandboxSession {
     if (!run.ok) {
       this.lastDispatch = {
         ok: false,
+        runId: null,
         exitCode: run.exitCode,
         rawLogs: run.rawLogs,
         failureOutput: run.stderr || run.stdout,
@@ -704,6 +706,7 @@ export class SandboxSession {
 
     this.lastDispatch = {
       ok: true,
+      runId: run.runId,
       exitCode: run.exitCode,
       rawLogs: run.rawLogs,
       failureOutput,
@@ -786,6 +789,18 @@ export class SandboxSession {
       phaseFailures,
       rawLogs: this.lastDispatch.rawLogs,
     };
+  }
+
+  /** Returns the GHA run ID of the most recent sandbox dispatch, or null if none ran. */
+  getLastReproRunId(): number | null {
+    return this.lastDispatch?.runId ?? null;
+  }
+
+  /** Returns the GHA run URL for the most recent sandbox dispatch, or null if none ran. */
+  getLastReproRunUrl(): string | null {
+    const runId = this.lastDispatch?.runId;
+    if (!runId) return null;
+    return `https://github.com/${this.sandboxWorkflowRepo}/actions/runs/${runId}`;
   }
 
   private assertPhaseSucceeded(phase: SandboxPhase, methodName: string): void {

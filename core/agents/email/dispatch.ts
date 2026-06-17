@@ -74,6 +74,7 @@ export function buildSuccessContext(args: {
   reproTestUrl?: string | null;
   reproMethodNote?: string | null;
   arizeReproTraceUrl?: string | null;
+  arizeFixTraceUrl?: string | null;
   sandboxRunUrl?: string | null;
   localReproSnippet?: string | null;
   dossier?: DossierSnapshot | null;
@@ -109,6 +110,7 @@ export function buildSuccessContext(args: {
       reproTestUrl: args.reproTestUrl ?? undefined,
       reproMethodNote: args.reproMethodNote ?? undefined,
       arizeReproTraceUrl: args.arizeReproTraceUrl ?? undefined,
+      arizeFixTraceUrl: args.arizeFixTraceUrl ?? undefined,
       sandboxRunUrl: args.sandboxRunUrl ?? undefined,
       localReproSnippet: args.localReproSnippet ?? undefined,
     },
